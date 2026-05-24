@@ -157,9 +157,22 @@ function gdsGui_scrollBar_create (id, strgPage, x, y, width, height, anchorPoint
 		end
 
 		-- Pre-compute frame draw scale (updated in resize() after each geometry change).
+		-- Horizontal scrollbars reuse vertical sprites rotated 90° CW: swap the scale axes
+		-- and store the rotation + pivot so draw calls don't need to branch on orientation.
 		if t.frame.img then
-			t.frame.scaleX = t.frame.width  / t._dimFrameW
-			t.frame.scaleY = t.frame.height / t._dimFrameH
+			if t.orientation == "horizontal" then
+				-- CCW 90° (-π/2): source top-right lands at (frame.x, frame.y); sprite fills
+				-- [frame.x, frame.x+frame.width] × [frame.y, frame.y+frame.height] correctly.
+				t.frame.rotation = -math.pi / 2
+				t.frame.originX  = t._dimFrameW
+				t.frame.scaleX   = t.frame.height / t._dimFrameW
+				t.frame.scaleY   = t.frame.width  / t._dimFrameH
+			else
+				t.frame.rotation = 0
+				t.frame.originX  = 0
+				t.frame.scaleX   = t.frame.width  / t._dimFrameW
+				t.frame.scaleY   = t.frame.height / t._dimFrameH
+			end
 		end
 
 		t.bar = {}
@@ -182,8 +195,17 @@ function gdsGui_scrollBar_create (id, strgPage, x, y, width, height, anchorPoint
 
 		-- Pre-compute bar draw scale (updated in resize() after each geometry change).
 		if t.bar.img then
-			t.bar.scaleX = t.bar.width  / t._dimBarW
-			t.bar.scaleY = t.bar.height / t._dimBarH
+			if t.orientation == "horizontal" then
+				t.bar.rotation = -math.pi / 2
+				t.bar.originX  = t._dimBarW
+				t.bar.scaleX   = t.bar.height / t._dimBarW
+				t.bar.scaleY   = t.bar.width  / t._dimBarH
+			else
+				t.bar.rotation = 0
+				t.bar.originX  = 0
+				t.bar.scaleX   = t.bar.width  / t._dimBarW
+				t.bar.scaleY   = t.bar.height / t._dimBarH
+			end
 		end
 
 	-- table.insert(scrollBars,t)
@@ -285,13 +307,24 @@ function gdsGui_scrollBar_create (id, strgPage, x, y, width, height, anchorPoint
 		end
 
 		-- Refresh pre-computed draw scales after geometry changes.
+		-- (rotation and originX never change after create(), only scales are recalculated.)
 		if self.frame.img then
-			self.frame.scaleX = self.frame.width  / self._dimFrameW
-			self.frame.scaleY = self.frame.height / self._dimFrameH
+			if self.orientation == "horizontal" then
+				self.frame.scaleX = self.frame.height / self._dimFrameW
+				self.frame.scaleY = self.frame.width  / self._dimFrameH
+			else
+				self.frame.scaleX = self.frame.width  / self._dimFrameW
+				self.frame.scaleY = self.frame.height / self._dimFrameH
+			end
 		end
 		if self.bar.img then
-			self.bar.scaleX = self.bar.width  / self._dimBarW
-			self.bar.scaleY = self.bar.height / self._dimBarH
+			if self.orientation == "horizontal" then
+				self.bar.scaleX = self.bar.height / self._dimBarW
+				self.bar.scaleY = self.bar.width  / self._dimBarH
+			else
+				self.bar.scaleX = self.bar.width  / self._dimBarW
+				self.bar.scaleY = self.bar.height / self._dimBarH
+			end
 		end
 	end
 	t.resize = t.resize
@@ -321,12 +354,12 @@ end
 function gdsGui_scrollBar_drawSingle(x)
 	love.graphics.setColor(1, 1, 1, 1)
 	if x.frame.img then
-		love.graphics.draw(x.frame.img, x.frame.x, x.frame.y, 0, x.frame.scaleX, x.frame.scaleY)
+		love.graphics.draw(x.frame.img, x.frame.x, x.frame.y, x.frame.rotation, x.frame.scaleX, x.frame.scaleY, x.frame.originX, 0)
 	else
 		love.graphics.rectangle("fill", x.frame.x, x.frame.y, x.frame.width, x.frame.height)
 	end
 	if x.bar.img then
-		love.graphics.draw(x.bar.img, x.bar.x, x.bar.y, 0, x.bar.scaleX, x.bar.scaleY)
+		love.graphics.draw(x.bar.img, x.bar.x, x.bar.y, x.bar.rotation, x.bar.scaleX, x.bar.scaleY, x.bar.originX, 0)
 	else
 		love.graphics.setColor(x.isFocused and _COLOR_BAR_FOCUSED or _COLOR_BAR_UNFOCUSED)
 		love.graphics.rectangle("fill", x.bar.x, x.bar.y, x.bar.width, x.bar.height)
@@ -347,6 +380,21 @@ function gdsGui_scrollBar_drawSingle(x)
 			love.graphics.setColor(1, 1, 1, 1)
 			local img = x.downButton.isActive and x.imgButtonDownArrow_active or x.imgButtonDownArrow_inactive
 			love.graphics.draw(img, x.downButton.centeredX, x.downButton.centeredY, 0, x.downButton.factorWidth, x.downButton.factorHeight)
+		end
+	elseif x.orientation == "horizontal" then
+		if x.leftButton then
+			love.graphics.setColor(_btnBg)
+			love.graphics.rectangle("fill", x.leftButton.x, x.leftButton.y, x.leftButton.width, x.leftButton.height)
+			love.graphics.setColor(1, 1, 1, 1)
+			local img = x.leftButton.isActive and x.imgButtonLeftArrow_active or x.imgButtonLeftArrow_inactive
+			love.graphics.draw(img, x.leftButton.centeredX, x.leftButton.centeredY, 0, x.leftButton.factorWidth, x.leftButton.factorHeight)
+		end
+		if x.rightButton then
+			love.graphics.setColor(_btnBg)
+			love.graphics.rectangle("fill", x.rightButton.x, x.rightButton.y, x.rightButton.width, x.rightButton.height)
+			love.graphics.setColor(1, 1, 1, 1)
+			local img = x.rightButton.isActive and x.imgButtonRightArrow_active or x.imgButtonRightArrow_inactive
+			love.graphics.draw(img, x.rightButton.centeredX, x.rightButton.centeredY, 0, x.rightButton.factorWidth, x.rightButton.factorHeight)
 		end
 	end
 	love.graphics.setColor(1, 1, 1, 1)
@@ -369,7 +417,7 @@ function gdsGui_scrollBar_draw (pageName)
 					--------------------------------------------------------------------------
 					love.graphics.setColor(1, 1, 1, 1)
 					if x.frame.img then
-						love.graphics.draw(x.frame.img, x.frame.x, x.frame.y, 0, x.frame.scaleX, x.frame.scaleY)
+						love.graphics.draw(x.frame.img, x.frame.x, x.frame.y, x.frame.rotation, x.frame.scaleX, x.frame.scaleY, x.frame.originX, 0)
 					else
 						love.graphics.rectangle("fill", x.frame.x, x.frame.y, x.frame.width, x.frame.height)
 					end
@@ -378,7 +426,7 @@ function gdsGui_scrollBar_draw (pageName)
 											--BAR
 					---------------------------------------------------------------------------
 					if x.bar.img then
-						love.graphics.draw(x.bar.img, x.bar.x, x.bar.y, 0, x.bar.scaleX, x.bar.scaleY)
+						love.graphics.draw(x.bar.img, x.bar.x, x.bar.y, x.bar.rotation, x.bar.scaleX, x.bar.scaleY, x.bar.originX, 0)
 					else
 						love.graphics.setColor(x.isFocused and _COLOR_BAR_FOCUSED or _COLOR_BAR_UNFOCUSED)
 						love.graphics.rectangle("fill", x.bar.x, x.bar.y, x.bar.width, x.bar.height)
