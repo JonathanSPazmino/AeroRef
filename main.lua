@@ -155,6 +155,20 @@ local _LEARN_CALC_RAW = {
     {text="RESULTS", sub=true},
     {text="REQ FPM — required vertical rate in feet per minute.\nREQ DIST — start-of-descent distance in nautical miles."},
 }
+local _LEARN_DUTY_RAW = {
+    {text="DUTY / FLIGHT TIME", sub=true},
+    {text="Calculates the latest departure time that keeps your last flight within the duty period.\n"},
+    {text="DUTY START", sub=true},
+    {text="Scrollbar sets when the duty period begins in UTC (00:00Z – 23:55Z in 5-minute steps).\n"},
+    {text="MAX DUTY", sub=true},
+    {text="Scrollbar sets the maximum allowed duty period length (1 – 20 hours).\n"},
+    {text="LAST FLT BLOCK TIME", sub=true},
+    {text="Scrollbar sets the expected block time of the last flight (0.0 – 18.0 hours in 0.1-hour steps).\n"},
+    {text="DUTY OUT", sub=true},
+    {text="Shows the end of the duty period: Duty Start + Max Duty.\n"},
+    {text="DEPART BY", sub=true},
+    {text="Latest UTC time to depart so the last flight lands before duty out: Duty Out − Last Flt Block Time."},
+}
 local _LEARN_SETTINGS_RAW = {
     {text="ACCESS", sub=true},
     {text="Tap the gear icon in the navigation bar to open Settings.\n"},
@@ -199,6 +213,7 @@ local function _applyTheme(isDark)
         {name="timerLearnContent",    raw=_LEARN_TIMER_RAW},
         {name="windLearnContent",     raw=_LEARN_WIND_RAW},
         {name="calcLearnContent",     raw=_LEARN_CALC_RAW},
+        {name="dutyLearnContent",     raw=_LEARN_DUTY_RAW},
         {name="settingsLearnContent", raw=_LEARN_SETTINGS_RAW},
     }
     for _, pair in ipairs(_learnUpdates) do
@@ -481,7 +496,7 @@ function love.load()
     gdsGui_outputTxtBox_create("dutyMaxHoursBox", "MainMenu", nil,
         160, 80, "CT", 270, 25, colorYellow, "MAX DUTY: 1 HR",     12, "dutyPanel")
     gdsGui_outputTxtBox_create("lastFlightBox",   "MainMenu", nil,
-        160,152, "CT", 270, 25, colorYellow, "LAST FLT: 0:00 HRS", 12, "dutyPanel")
+        160,152, "CT", 270, 25, colorYellow, "LAST FLT BLOCK TIME: 0.0 HRS", 12, "dutyPanel")
 
     gdsGui_scrollBar_create("dutyStartScale", "MainMenu",
         160,  35, 270, 30, "CT", 32, 289, 0,
@@ -545,6 +560,14 @@ function love.load()
         learnTxtW, learnH(_LEARN_CALC_RAW),
         {1, 1, 1, 1}, _learnSegsColored(_LEARN_CALC_RAW, true),
         learnFontSize, "calcLearn"
+    )
+
+    gdsGui_container_create("dutyLearn", "Learn", "DUTY / FLIGHT TIME", 32, 0)
+    gdsGui_outputTxtBox_create("dutyLearnContent", "Learn", nil,
+        learnTxtX, 10, "CT",
+        learnTxtW, learnH(_LEARN_DUTY_RAW),
+        {1, 1, 1, 1}, _learnSegsColored(_LEARN_DUTY_RAW, true),
+        learnFontSize, "dutyLearn"
     )
 
     gdsGui_container_create("settingsLearn", "Learn", "SETTINGS", 32, 0)
@@ -730,7 +753,7 @@ function love.update(dt)
         gdsGui_outputTxtBox_setText("dutyMaxHoursBox", "MAX DUTY: " .. dutyHrsLabel)
         gdsGui_outputTxtBox_setText("dutyStartBox",
             string.format("DUTY START: %02d:%02dZ", math.floor(dutyStartMins / 60), dutyStartMins % 60))
-        gdsGui_outputTxtBox_setText("lastFlightBox", string.format("LAST FLT: %.1f HRS", lastFlightHours))
+        gdsGui_outputTxtBox_setText("lastFlightBox", string.format("LAST FLT BLOCK TIME: %.1f HRS", lastFlightHours))
         local dutyEndTotalMins = dutyStartMins + dutyMaxHours * 60
         local dutyOutH = math.floor(dutyEndTotalMins / 60) % 24
         local dutyOutM = dutyEndTotalMins % 60
