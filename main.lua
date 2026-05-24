@@ -41,6 +41,10 @@ local timer = {
     running = false      -- Timer running state
 }
 
+local dutyMaxHours    = 1    -- 1–20 hrs
+local dutyStartMins   = 0    -- total minutes from 00:00Z (0–1435, 5-min steps)
+local lastFlightHours = 0.0  -- 0.0–18.0 in 0.1-hr steps
+
 -- Dirty-flag sentinels: values that can never match real state on first frame.
 local _prevTimerT        = -1
 local _prevTimerMode     = ""
@@ -51,6 +55,9 @@ local _prevWindDir       = -1
 local _prevWindSpeed     = -1
 local _prevWindGust      = -1
 local _prevKnobPos       = -1
+local _prevDutyMaxHours    = -1
+local _prevDutyStartMins   = -1
+local _prevLastFlightHours = -1e9
 
 -- Countdown finished blink state
 local blink = {active = false, timer = 0, state = false, navSent = false, navigatingToMain = false}
@@ -465,6 +472,36 @@ function love.load()
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "calcPanel")
 
     ---------------------------------------------------------------------------
+    -- DUTY / FLIGHT TIME PANEL
+    ---------------------------------------------------------------------------
+    gdsGui_container_create("dutyPanel", "MainMenu", "DUTY / FLIGHT TIME", 32, 0)
+
+    gdsGui_outputTxtBox_create("dutyStartBox",    "MainMenu", nil,
+        160,  8, "CT", 270, 25, colorYellow, "DUTY START: 00:00Z", 12, "dutyPanel")
+    gdsGui_outputTxtBox_create("dutyMaxHoursBox", "MainMenu", nil,
+        160, 80, "CT", 270, 25, colorYellow, "MAX DUTY: 1 HR",     12, "dutyPanel")
+    gdsGui_outputTxtBox_create("lastFlightBox",   "MainMenu", nil,
+        160,152, "CT", 270, 25, colorYellow, "LAST FLT: 0:00 HRS", 12, "dutyPanel")
+
+    gdsGui_scrollBar_create("dutyStartScale", "MainMenu",
+        160,  35, 270, 30, "CT", 32, 289, 0,
+        "independent", "horizontal", 289, "dutyStartChanged",
+        {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "dutyPanel")
+    gdsGui_scrollBar_create("dutyHoursScale", "MainMenu",
+        160, 107, 270, 30, "CT", 5, 20, 0,
+        "independent", "horizontal", 20, "dutyHoursChanged",
+        {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "dutyPanel")
+    gdsGui_scrollBar_create("lastFlightScale", "MainMenu",
+        160, 179, 270, 30, "CT", 20, 181, 0,
+        "independent", "horizontal", 181, "lastFlightChanged",
+        {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "dutyPanel")
+
+    gdsGui_outputTxtBox_create("dutyOutBox",  "MainMenu", nil,
+         80, 225, "CT", 120, 50, colorYellow, "DUTY OUT\n--:--Z",  12, "dutyPanel")
+    gdsGui_outputTxtBox_create("departByBox", "MainMenu", nil,
+        240, 225, "CT", 120, 50, colorYellow, "DEPART BY\n--:--Z", 12, "dutyPanel")
+
+    ---------------------------------------------------------------------------
     -- LEARN PAGE CONTAINERS
     ---------------------------------------------------------------------------
     local learnFontSize = math.floor(gdsGui_general_smartFontScaling(0.035, 0.045))
@@ -686,6 +723,25 @@ function love.update(dt)
         gdsGui_outputTxtBox_setText("crosswindData", crosswindText)
         _prevWindDir, _prevWindSpeed, _prevWindGust, _prevKnobPos =
             selectedWindDirection, selectedWindSpeed, selectedWindGust, selectedKnobPos
+    end
+
+    if dutyMaxHours ~= _prevDutyMaxHours or dutyStartMins ~= _prevDutyStartMins or lastFlightHours ~= _prevLastFlightHours then
+        local dutyHrsLabel = dutyMaxHours == 1 and "1 HR" or (dutyMaxHours .. " HRS")
+        gdsGui_outputTxtBox_setText("dutyMaxHoursBox", "MAX DUTY: " .. dutyHrsLabel)
+        gdsGui_outputTxtBox_setText("dutyStartBox",
+            string.format("DUTY START: %02d:%02dZ", math.floor(dutyStartMins / 60), dutyStartMins % 60))
+        gdsGui_outputTxtBox_setText("lastFlightBox", string.format("LAST FLT: %.1f HRS", lastFlightHours))
+        local dutyEndTotalMins = dutyStartMins + dutyMaxHours * 60
+        local dutyOutH = math.floor(dutyEndTotalMins / 60) % 24
+        local dutyOutM = dutyEndTotalMins % 60
+        gdsGui_outputTxtBox_setText("dutyOutBox", string.format("DUTY OUT\n%02d:%02dZ", dutyOutH, dutyOutM))
+        local fltTotalMins = math.floor(lastFlightHours * 60 + 0.5)
+        local departMins   = (dutyEndTotalMins - fltTotalMins) % (24 * 60)
+        gdsGui_outputTxtBox_setText("departByBox",
+            string.format("DEPART BY\n%02d:%02dZ", math.floor(departMins / 60), departMins % 60))
+        _prevDutyMaxHours    = dutyMaxHours
+        _prevDutyStartMins   = dutyStartMins
+        _prevLastFlightHours = lastFlightHours
     end
 
     -- Unlock T&C agree toggle once user has scrolled to the bottom at least once.
@@ -991,6 +1047,21 @@ function windKnobChanged(pos)
     local runway          = (index == 0) and 36 or index
     selectedWindDirection = runway * 10
     return selectedWindDirection
+end
+
+function dutyHoursChanged(pos)
+    dutyMaxHours = 1 + math.floor(19 * pos + 0.5)
+    return dutyMaxHours
+end
+
+function dutyStartChanged(pos)
+    dutyStartMins = math.floor(287 * pos + 0.5) * 5   -- 00:00 (left) … 23:55 (right)
+    return dutyStartMins
+end
+
+function lastFlightChanged(pos)
+    lastFlightHours = math.floor(180 * pos + 0.5) * 0.1   -- 0.0 (left) … 18.0 (right)
+    return lastFlightHours
 end
 
 -------------------------------------------------------------------------------

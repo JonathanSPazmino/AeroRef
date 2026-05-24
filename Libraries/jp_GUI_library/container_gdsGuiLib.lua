@@ -97,23 +97,54 @@ local function _setObjDimensions(obj, pixW, pixH)
     elseif obj.objectType == "scrollBar" then
         obj.original.width  = pixW
         obj.original.height = pixH
-        obj.frame.width     = pixW
-        if obj.upButton then
-            local arrowSide = pixW
-            obj.upButton.width          = pixW;     obj.upButton.height          = arrowSide
-            obj.downButton.width        = pixW;     obj.downButton.height        = arrowSide
-            obj.upButton.factorWidth    = pixW / obj.imgButtonUpArrow_active:getWidth()
-            obj.upButton.factorHeight   = arrowSide / obj.imgButtonUpArrow_active:getHeight()
-            obj.downButton.factorWidth  = pixW / obj.imgButtonDownArrow_active:getWidth()
-            obj.downButton.factorHeight = arrowSide / obj.imgButtonDownArrow_active:getHeight()
-            obj.frame.height = pixH - 2 * arrowSide
-        else
+        if obj.orientation == "horizontal" then
             obj.frame.height = pixH
-        end
-        if obj.orientation == "vertical" then
-            obj.bar.width = pixW;  obj.bar.height = pixW
-        else
+            if obj.leftButton then
+                local arrowSide = pixH
+                obj.leftButton.width          = arrowSide;  obj.leftButton.height  = pixH
+                obj.rightButton.width         = arrowSide;  obj.rightButton.height = pixH
+                obj.leftButton.factorWidth    = arrowSide / obj.imgButtonLeftArrow_active:getWidth()
+                obj.leftButton.factorHeight   = pixH / obj.imgButtonLeftArrow_active:getHeight()
+                obj.rightButton.factorWidth   = arrowSide / obj.imgButtonRightArrow_active:getWidth()
+                obj.rightButton.factorHeight  = pixH / obj.imgButtonRightArrow_active:getHeight()
+                obj.frame.width = pixW - 2 * arrowSide
+            else
+                obj.frame.width = pixW
+            end
             obj.bar.width = pixH;  obj.bar.height = pixH
+        else  -- vertical
+            obj.frame.width = pixW
+            if obj.upButton then
+                local arrowSide = pixW
+                obj.upButton.width          = pixW;     obj.upButton.height          = arrowSide
+                obj.downButton.width        = pixW;     obj.downButton.height        = arrowSide
+                obj.upButton.factorWidth    = pixW / obj.imgButtonUpArrow_active:getWidth()
+                obj.upButton.factorHeight   = arrowSide / obj.imgButtonUpArrow_active:getHeight()
+                obj.downButton.factorWidth  = pixW / obj.imgButtonDownArrow_active:getWidth()
+                obj.downButton.factorHeight = arrowSide / obj.imgButtonDownArrow_active:getHeight()
+                obj.frame.height = pixH - 2 * arrowSide
+            else
+                obj.frame.height = pixH
+            end
+            obj.bar.width = pixW;  obj.bar.height = pixW
+        end
+        if obj.frame.img then
+            if obj.orientation == "horizontal" then
+                obj.frame.scaleX = obj.frame.height / obj._dimFrameW
+                obj.frame.scaleY = obj.frame.width  / obj._dimFrameH
+            else
+                obj.frame.scaleX = obj.frame.width  / obj._dimFrameW
+                obj.frame.scaleY = obj.frame.height / obj._dimFrameH
+            end
+        end
+        if obj.bar.img then
+            if obj.orientation == "horizontal" then
+                obj.bar.scaleX = obj.bar.height / obj._dimBarW
+                obj.bar.scaleY = obj.bar.width  / obj._dimBarH
+            else
+                obj.bar.scaleX = obj.bar.width  / obj._dimBarW
+                obj.bar.scaleY = obj.bar.height / obj._dimBarH
+            end
         end
 
     elseif obj.objectType == "rotaryKnob" then
@@ -164,22 +195,41 @@ local function _initObjForContainer(obj, natX, natY)
     elseif obj.objectType == "scrollBar" then
         local top  = math.floor(natY)
         local left = math.floor(natX)
-        if obj.upButton then
-            obj.upButton.x   = left
-            obj.upButton.y   = top
-            obj.upButton.centeredX = left + (obj.upButton.width  - obj._dimUpW   * obj.upButton.factorWidth)  / 2
-            obj.upButton.centeredY = top  + (obj.upButton.height - obj._dimUpH   * obj.upButton.factorHeight) / 2
-            obj.downButton.x = left
-            obj.downButton.y = top + obj.original.height - obj.downButton.height
-            obj.downButton.centeredX = left + (obj.downButton.width  - obj._dimDownW * obj.downButton.factorWidth)  / 2
-            obj.downButton.centeredY = obj.downButton.y + (obj.downButton.height - obj._dimDownH * obj.downButton.factorHeight) / 2
-            obj.frame.y      = top + obj.upButton.height
-        else
+        if obj.orientation == "horizontal" then
             obj.frame.y = top
+            if obj.leftButton then
+                obj.leftButton.x  = left
+                obj.leftButton.y  = top
+                obj.leftButton.centeredX  = left + (obj.leftButton.width  - obj._dimLeftW  * obj.leftButton.factorWidth)  / 2
+                obj.leftButton.centeredY  = top  + (obj.leftButton.height - obj._dimLeftH  * obj.leftButton.factorHeight) / 2
+                obj.rightButton.x = left + obj.original.width - obj.rightButton.width
+                obj.rightButton.y = top
+                obj.rightButton.centeredX = obj.rightButton.x + (obj.rightButton.width  - obj._dimRightW * obj.rightButton.factorWidth)  / 2
+                obj.rightButton.centeredY = top + (obj.rightButton.height - obj._dimRightH * obj.rightButton.factorHeight) / 2
+                obj.frame.x = left + obj.leftButton.width
+            else
+                obj.frame.x = left
+            end
+            obj.bar.y = top
+            obj.bar.x = obj.frame.x + (obj.bar.position * (obj.frame.width - obj.bar.width))
+        else  -- vertical
+            if obj.upButton then
+                obj.upButton.x   = left
+                obj.upButton.y   = top
+                obj.upButton.centeredX = left + (obj.upButton.width  - obj._dimUpW   * obj.upButton.factorWidth)  / 2
+                obj.upButton.centeredY = top  + (obj.upButton.height - obj._dimUpH   * obj.upButton.factorHeight) / 2
+                obj.downButton.x = left
+                obj.downButton.y = top + obj.original.height - obj.downButton.height
+                obj.downButton.centeredX = left + (obj.downButton.width  - obj._dimDownW * obj.downButton.factorWidth)  / 2
+                obj.downButton.centeredY = obj.downButton.y + (obj.downButton.height - obj._dimDownH * obj.downButton.factorHeight) / 2
+                obj.frame.y      = top + obj.upButton.height
+            else
+                obj.frame.y = top
+            end
+            obj.frame.x = left
+            obj.bar.x   = left
+            obj.bar.y   = obj.frame.y + (obj.bar.position * (obj.frame.height - obj.bar.height))
         end
-        obj.frame.x = left
-        obj.bar.x   = left
-        obj.bar.y   = obj.frame.y + (obj.bar.position * (obj.frame.height - obj.bar.height))
 
     elseif obj.objectType == "rotaryKnob" then
         obj.x       = math.floor(natX)
@@ -209,16 +259,27 @@ local function _setObjY(obj, newY)
 
     elseif obj.objectType == "scrollBar" then
         local top = math.floor(newY)
-        if obj.upButton then
-            obj.upButton.y   = top
-            obj.upButton.centeredY   = top + (obj.upButton.height  - obj._dimUpH   * obj.upButton.factorHeight)  / 2
-            obj.frame.y      = top + obj.upButton.height
-            obj.downButton.y = top + obj.original.height - obj.downButton.height
-            obj.downButton.centeredY = obj.downButton.y + (obj.downButton.height - obj._dimDownH * obj.downButton.factorHeight) / 2
-        else
+        if obj.orientation == "horizontal" then
             obj.frame.y = top
+            if obj.leftButton then
+                obj.leftButton.y          = top
+                obj.leftButton.centeredY  = top + (obj.leftButton.height  - obj._dimLeftH  * obj.leftButton.factorHeight)  / 2
+                obj.rightButton.y         = top
+                obj.rightButton.centeredY = top + (obj.rightButton.height - obj._dimRightH * obj.rightButton.factorHeight) / 2
+            end
+            obj.bar.y = top
+        else  -- vertical
+            if obj.upButton then
+                obj.upButton.y   = top
+                obj.upButton.centeredY   = top + (obj.upButton.height  - obj._dimUpH   * obj.upButton.factorHeight)  / 2
+                obj.frame.y      = top + obj.upButton.height
+                obj.downButton.y = top + obj.original.height - obj.downButton.height
+                obj.downButton.centeredY = obj.downButton.y + (obj.downButton.height - obj._dimDownH * obj.downButton.factorHeight) / 2
+            else
+                obj.frame.y = top
+            end
+            obj.bar.y = obj.frame.y + (obj.bar.position * (obj.frame.height - obj.bar.height))
         end
-        obj.bar.y = obj.frame.y + (obj.bar.position * (obj.frame.height - obj.bar.height))
 
     elseif obj.objectType == "rotaryKnob" then
         obj.y       = math.floor(newY)
@@ -859,10 +920,17 @@ local function _isTouchOnWidget(obj, x, y)
         local contentH = obj.text and obj.text.combinedTxtHeight or 0
         return obj.frame.height - contentH < -0.5
     elseif ot == "scrollBar" then
-        local top    = obj.upButton   and obj.upButton.y                          or obj.frame.y
-        local bottom = obj.downButton and (obj.downButton.y + obj.downButton.height) or (obj.frame.y + obj.frame.height)
-        return x >= obj.frame.x and x <= obj.frame.x + obj.frame.width and
-               y >= top and y <= bottom
+        if obj.orientation == "horizontal" then
+            local left  = obj.leftButton  and obj.leftButton.x  or obj.frame.x
+            local right = obj.rightButton and (obj.rightButton.x + obj.rightButton.width) or (obj.frame.x + obj.frame.width)
+            return x >= left and x <= right and
+                   y >= obj.frame.y and y <= obj.frame.y + obj.frame.height
+        else
+            local top    = obj.upButton   and obj.upButton.y                             or obj.frame.y
+            local bottom = obj.downButton and (obj.downButton.y + obj.downButton.height) or (obj.frame.y + obj.frame.height)
+            return x >= obj.frame.x and x <= obj.frame.x + obj.frame.width and
+                   y >= top and y <= bottom
+        end
     elseif ot == "rotaryKnob" then
         return x >= obj.x and x <= obj.x + obj.size and y >= obj.y and y <= obj.y + obj.size
     end

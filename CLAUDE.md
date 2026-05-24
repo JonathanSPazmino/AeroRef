@@ -33,6 +33,7 @@ All module files follow the naming pattern `<name>_gdsGuiLib.lua`. All public fu
 | `general_gdsGuiLib.lua` | `globApp` initialization, DPI/safe-area helpers, resize detection, all touch/mouse routing, `gdsGui_update()`, `gdsGui_draw()` |
 | `pages_gdsGuiLib.lua` | Page creation, switching, loading-screen transitions |
 | `buttons_gdsGuiLib.lua` | Button creation, state machine (released/pressed/deactivated), drawing |
+| `container_gdsGuiLib.lua` | Layout containers (header/footer/body roles), scrollable regions, widget grouping |
 | `scrollBar_gdsGuiLib.lua` | Independent and table-linked scrollbars, drag, discrete stepping, sprite support |
 | `outputTxtBox_gdsGuiLib.lua` | Read-only text labels with momentum scroll (coasting + bounce) |
 | `table_gdsGuiLib.lua` | Sortable/filterable data table with momentum scroll matching outputTxtBox physics |
@@ -62,7 +63,15 @@ All module files follow the naming pattern `<name>_gdsGuiLib.lua`. All public fu
 
 **Momentum scroll physics** — Both `outputTxtBox` and `table` implement identical spring-damper physics: friction-based coasting, elastic rubber-band resistance past boundaries, and a critically-damped spring snap-back. Constants (friction, omega, rubber-band factor) are local to each module.
 
+**Container system** — Widgets are always placed inside named containers, not directly on pages. Create containers first with `gdsGui_container_create(name, pageName, title, height, padding, role)`, where role is `"pageHeader"`, `"pageFooter"`, or omitted for a scrollable body. Pass the container name as the last argument to widget constructors. After all widgets on a page are defined, call `gdsGui_container_finalise(pageName)` — this triggers layout, sizing, and scroll-state initialization. Skipping this call leaves the page broken.
+
+**Object lookup by name** — Every widget has a unique `.name` string. The API operates on names, not references: `gdsGui_button_setState("myBtn", state)`, `gdsGui_outputTxtBox_setText("myLabel", text)`. Widget names in `main.lua` use a `panelName_widgetRole` convention (e.g. `"timerPanel_resetBtn"`).
+
 **Dirty-flag rendering** — `main.lua` uses sentinel variables (`_prevTimerT`, `_prevAltitude`, etc.) so `gdsGui_outputTxtBox_setText()` is only called when values actually change, avoiding per-frame string allocation.
+
+**Sprite naming** — Button sprites follow the three-state pattern: `button_<name>_pressed.png`, `button_<name>_released.png`, `button_<name>_deactivated.png`, stored in `Sprites/`. Library sprites live in `Libraries/jp_GUI_library/librarySprites/` with the prefix `jpLoveGUI_`.
+
+**Persistent settings** — `appSettings` is a global Lua table loaded at startup via `gdsGui_saveLoad_loadFileContents("appSettings.lua")` and written back with `love.filesystem.write("appSettings.lua", table.show(appSettings, "appSettings"))`. `table.show()` (in `saveLoad_gdsGuiLib.lua`) serializes a table to valid Lua source that can be `load()`ed back. Add new settings keys with a `nil`-guard default immediately after load so they survive missing saves.
 
 ### LÖVE2D callbacks
 
