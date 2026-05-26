@@ -314,19 +314,19 @@ function love.load()
     -- Buttons (26×26 px square)
     gdsGui_button_create("resetRHTopTimer", "MainMenu", "pushonoff",
         "Sprites/button_reset_pressed.png", "Sprites/button_reset_released.png",
-        "Sprites/button_reset_deactivated.png", 269, 105, "RT",
+        "Sprites/button_reset_deactivated.png", 269, 90, "RT",
         33, 33,
         "resetRHTopTimer", globApp.BUTTON_STATES.RELEASED, true, "timerPanel"
     )
     gdsGui_button_create("pauseRHTopTimer", "MainMenu", "toggle",
         "Sprites/button_pause_play_pressed.png", "Sprites/button_pause_play_released.png",
-        "Sprites/button_pause_play_deactivated.png", 215, 105, "CT",
+        "Sprites/button_pause_play_deactivated.png", 215, 90, "CT",
         33, 33,
         "pauseRHTopTimer", globApp.BUTTON_STATES.RELEASED, true, "timerPanel"
     )
     gdsGui_button_create("modeSelectRHTopTimer", "MainMenu", "toggle",
         "Sprites/button_timer_mode_pressed.png", "Sprites/button_timer_mode_released.png",
-        "Sprites/button_timer_mode_deactivated.png", 160, 105, "LT",
+        "Sprites/button_timer_mode_deactivated.png", 160, 90, "LT",
         33, 33,
         "modeSelectRHTopTimer", globApp.BUTTON_STATES.RELEASED, true, "timerPanel"
     )
@@ -338,7 +338,7 @@ function love.load()
     )
     gdsGui_button_create("dcrsMinRHTopTimer", "MainMenu", "pushonoff",
         "Sprites/button_min_decrease_pressed.png", "Sprites/button_min_decrease_released.png",
-        nil, 120, 105, "LT",
+        nil, 120, 90, "LT",
         33, 33,
         "dcrsMinRHTopTimer", globApp.BUTTON_STATES.DEACTIVATED, true, "timerPanel"
     )
@@ -350,26 +350,26 @@ function love.load()
     )
     gdsGui_button_create("dcrsSecRHTopTimer", "MainMenu", "pushonoff",
         "Sprites/button_sec_decrease_pressed.png", "Sprites/button_sec_decrease_released.png",
-        nil, 274, 105, "LT",
+        nil, 274, 90, "LT",
         33, 33,
         "dcrsSecRHTopTimer", globApp.BUTTON_STATES.DEACTIVATED, true, "timerPanel"
     )
     gdsGui_button_create("acknowlegeAlarm", "MainMenu", "pushonoff",
         nil, nil,
-        nil, 300, 50, "RT",
+        nil, 300, 30, "RT",
         190, 95,
         "acknowlegeAlarm", globApp.BUTTON_STATES.DEACTIVATED, true, "timerPanel"
     )
 
     -- Text boxes
     gdsGui_outputTxtBox_create("utcData", "MainMenu", nil,
-        6, 50, "LT",
+        6, 30, "LT",
         128, 59,
         colorYellow, utcPrintString, 12, "timerPanel"
     )
     local text = timer.mode .. "\nTIMER:\nM " .. format_time(timer.t) .. " S"
     gdsGui_outputTxtBox_create("timerTopRight", "MainMenu", nil,
-        283, 50, "RT",
+        283, 30, "RT",
         120, 59,
         colorYellow, text, 12, "timerPanel"
     )
