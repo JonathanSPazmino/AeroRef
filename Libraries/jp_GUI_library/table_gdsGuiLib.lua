@@ -1137,8 +1137,7 @@ function gdsGui_table_buttonsReleased (x,y,button,istouch)
 							end
 
 							if selectedRcrdID ~= "" and wasFunctionDeclared == true then
-								local callback = loadstring(tablefuncCallbackToString (callBackId, callBackParameters))
-								callback () --executes callback
+								_G[callBackId](table.unpack(callBackParameters))
 							end
 							bt.isFocused = false
 						end

@@ -123,7 +123,7 @@ local _LEARN_TIMER_RAW = {
     {text="TIMER MODE", sub=true},
     {text="Press the mode button to switch between COUNT UP and COUNT DOWN.\n"},
     {text="COUNT DOWN", sub=true},
-    {text="Use the +/- buttons to set minutes (left pair) and seconds (right pair). Press play/pause to start. The app navigates here automatically 3 seconds before zero. Alarm sounds and the screen flashes red at zero. Press ACK to dismiss.\n"},
+    {text="Use the +/- buttons to set minutes (left pair) and seconds (right pair). Press play/pause to start. The app navigates here automatically 3 seconds before zero. Alarm sounds and the screen flashes red at zero. Press ACK to dismiss. Note: alarm sound and vibration require the app to be open and in the foreground.\n"},
     {text="COUNT UP", sub=true},
     {text="Press play/pause to start counting from zero.\n"},
     {text="RESET", sub=true},
@@ -436,19 +436,19 @@ function love.load()
     local textAltSlctd = "SLCTD ALT:\n" .. selectedAltitude .. " FT"
     gdsGui_outputTxtBox_create("selectedAltitudeBox", "MainMenu", nil,
         164, 47, "CC",
-        90, 47,
+        110, 47,
         colorYellow, textAltSlctd, 12, "calcPanel"
     )
     local textTimeSlctd = "SLCTD TIME:\n" .. selectedTime .. " min"
     gdsGui_outputTxtBox_create("selectedTimeBox", "MainMenu", nil,
         52, 47, "CC",
-        90, 47,
+        110, 47,
         colorYellow, textTimeSlctd, 12, "calcPanel"
     )
     local textDegreeSlctd = "SLCTD DEG:\n" .. string.format("%.2f", selectedDegree) .. "°"
     gdsGui_outputTxtBox_create("selectedDegreeBox", "MainMenu", nil,
         267, 47, "CC",
-        90, 47,
+        110, 47,
         colorYellow, textDegreeSlctd, 12, "calcPanel"
     )
     local requiredFPM = 0
