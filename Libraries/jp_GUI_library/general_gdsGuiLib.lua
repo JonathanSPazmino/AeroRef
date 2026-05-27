@@ -1226,7 +1226,7 @@ end
 			PRESSED = 2
 		}
 		globApp.objects = {}
-		globApp.developerMode = true
+		globApp.developerMode = false
 		globApp.OperatingSystem  = love.system.getOS( ) --[["OS X", "Windows", "Linux", "Android" or "iOS"]]
 		globApp.fourDevTap = false
 		globApp.devTapCounter = 0

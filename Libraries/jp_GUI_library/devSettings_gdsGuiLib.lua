@@ -9,7 +9,7 @@
 local guiVersion = MAIN_GDSGUI_VERSION
 
 local devSettings = {}
-		devSettings.amIdeveloping = true
+		devSettings.amIdeveloping = false
 		devSettings.gdsGui_dev_print = 1
 		devSettings.displayFPS = 1
 

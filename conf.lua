@@ -31,6 +31,7 @@ function love.conf(t)
     t.window.display = 1                -- Index of the monitor to show the window in (number)
     t.window.highdpi = true            -- Enable high-dpi mode for the window on a Retina display (boolean)
     t.window.usedpiscale = true         -- Enable automatic DPI scaling when highdpi is set to true as well (boolean)
+    t.window.orientation = "portrait"  -- Lock to portrait on mobile (iOS/Android)
     t.window.x = nil                    -- The x-coordinate of the window's position in the specified display (number)
     t.window.y = 40                    -- The y-coordinate of the window's position in the specified display (number)
  
