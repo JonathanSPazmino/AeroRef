@@ -34,6 +34,7 @@ end
 
 function gdsGui_generateConsoleMessage (mode, text)
 	if (mode == "info" or mode == "error") and (text ~= "" and text ~= nil) then
+		if mode == "info" and not (globApp and globApp.developerMode) then return end
 		local msg1 = "GDS_GUI_v" .. MAIN_GDSGUI_VERSION .. " | "
 		local msg2 = ""
 		if mode == "info" then
@@ -43,7 +44,7 @@ function gdsGui_generateConsoleMessage (mode, text)
 		end
 		local msg3 = text
 		print (msg1 .. msg2 .. msg3)
-	else 
+	else
 		print ("gdsGUI| CALLBACK ERROR| generateOutputMessage callback is missing parameters")
 	end
 end
