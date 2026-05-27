@@ -166,10 +166,12 @@ end
 
 function gdsGui_timeControl_testTrigger ()
 
+	if not globApp.developerMode then return end
+
 	for i, t in ipairs (timeTriggerObjetcs) do
 
 		love.graphics.print(math.ceil(t.currentTime), 50, (i*30) + 50, r, sx, sy, ox, oy, kx, ky)
-		
+
 		local timerIndex = ("Timer index: " .. #timeTriggerObjetcs )
 
 		love.graphics.print(timerIndex, 70, 80, r, sx, sy, ox, oy, kx, ky)
