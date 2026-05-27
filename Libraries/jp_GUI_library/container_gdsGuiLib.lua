@@ -908,6 +908,7 @@ end
 local function _isTouchOnWidget(obj, x, y)
     local ot = obj.objectType
     if ot == "button" then
+        if obj.state == globApp.BUTTON_STATES.DEACTIVATED then return false end
         return x >= obj.myx and x <= obj.myMaxx and y >= obj.myy and y <= obj.myMaxy
     elseif ot == "outputTextBox" then
         -- Include the scrollbar strip (right of text frame) in the hit area
