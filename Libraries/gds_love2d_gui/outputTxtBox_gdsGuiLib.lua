@@ -710,6 +710,17 @@ function gdsGui_outputTxtBox_setText(name, text)
 	end
 end
 
+function gdsGui_outputTxtBox_setFontSize(name, newSize)
+	for _, box in ipairs(globApp.objects.outputTextBox) do
+		if box.name == name then
+			box.text.font     = love.graphics.newFont(newSize)
+			box.text.height   = gdsGui_general_returnFontInfo(box.text.font, "height")
+			box.text.lastText = nil
+			break
+		end
+	end
+end
+
 -- Returns true once the named textbox has been scrolled to near its bottom
 -- at least once (or if its content fits the frame without any scrolling).
 function gdsGui_outputTxtBox_hasReachedBottom(name)
