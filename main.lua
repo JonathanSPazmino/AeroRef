@@ -294,6 +294,40 @@ function love.load()
     selectedWindGust      = 0
 
     ---------------------------------------------------------------------------
+    -- LOAD SETTINGS EARLY (needed for layout variables below)
+    ---------------------------------------------------------------------------
+    gdsGui_saveLoad_loadFileContents("appSettings.lua")
+    if appSettings.darkMode       == nil then appSettings.darkMode       = true  end
+    if appSettings.soundEnabled   == nil then appSettings.soundEnabled   = true  end
+    if appSettings.hapticsEnabled == nil then appSettings.hapticsEnabled = true  end
+    if appSettings.fontSize       == nil then appSettings.fontSize       = 12    end
+
+    -- Font-size-dependent layout variables (computed once at startup from real font metrics).
+    -- At fs=12 these reproduce the original hardcoded pixel values exactly.
+    local _fs  = appSettings.fontSize
+    local _lh  = love.graphics.newFont(_fs):getHeight()
+    local _h1  = _lh + 11           -- single-line textbox
+    local _h2  = _lh * 2 + 19      -- two-line textbox
+    local _h3  = _lh * 3 + 17      -- three-line textbox
+    local _h5  = _lh * 5 + 20      -- five-line textbox (crosswind max)
+    local _sbH = 30                  -- scrollbar height, fixed
+    local _wH  = love.graphics.newFont(math.max(8, _fs - 2)):getHeight() + 10
+    -- Wind panel: scrollbar sits below the speed/gust label with a 5 px gap
+    local _windSbY = 10 + _h2 + 5
+    local _windSbH = 231 - _windSbY
+    -- Calc panel: scrollbar starts 2 px below the bottom of the two-line selector box
+    local _calcSbY = 47 + math.ceil(_h2 / 2) + 2
+    -- Duty panel: rows computed top-to-bottom so nothing overlaps at any font size
+    local _d1 = 8
+    local _d2 = _d1 + _h1 + 2
+    local _d3 = _d2 + _sbH + 15
+    local _d4 = _d3 + _h1 + 2
+    local _d5 = _d4 + _sbH + 15
+    local _d6 = _d5 + _h1 + 2
+    local _d7 = _d6 + _sbH + 16
+    local _d8 = _d7 + _h2 + 10
+
+    ---------------------------------------------------------------------------
     -- SHARED HEADER / FOOTER LAYOUT VALUES
     ---------------------------------------------------------------------------
     local pageHdrH  = math.floor(globApp.safeScreenArea.h * 0.10)
@@ -403,13 +437,13 @@ function love.load()
     -- Text boxes
     gdsGui_outputTxtBox_create("utcData", "MainMenu", nil,
         6, 30, "LT",
-        128, 59,
+        128, _h3,
         colorYellow, utcPrintString, 12, "timerPanel"
     )
     local text = timer.mode .. "\nTIMER:\nM " .. format_time(timer.t) .. " S"
     gdsGui_outputTxtBox_create("timerTopRight", "MainMenu", nil,
         283, 30, "RT",
-        120, 59,
+        120, _h3,
         colorYellow, text, 12, "timerPanel"
     )
 
@@ -442,27 +476,27 @@ function love.load()
     -- Text boxes
     gdsGui_outputTxtBox_create("crosswindData", "MainMenu", nil,
         160, 10, "CT",
-        200, 90,
+        200, _h5,
         colorYellow, "WIND: 36000KT", 12, "windPanel"
     )
     gdsGui_outputTxtBox_create("windSpeedLabel", "MainMenu", nil,
         30, 10, "CT",
-        60, 40,
+        60, _h2,
         colorYellow, "WIND\nSPD", 12, "windPanel"
     )
     gdsGui_outputTxtBox_create("windGustLabel", "MainMenu", nil,
         290, 10, "CT",
-        60, 40,
+        60, _h2,
         colorYellow, "WIND\nGST", 12, "windPanel"
     )
 
-    -- Scrollbars (30×176 px): speed left of knob, gust right of knob
+    -- Scrollbars: top starts just below the speed/gust labels; bottom is fixed
     gdsGui_scrollBar_create("windSpeed", "MainMenu",
-        30, 55, 30, 176, "CT", 5, 46, 1,
+        30, _windSbY, 30, _windSbH, "CT", 5, 46, 1,
         "independent", "vertical", 46, "windSpeedChanged",
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "windPanel")
     gdsGui_scrollBar_create("windGust", "MainMenu",
-        290, 55, 30, 176, "CT", 5, 61, 1,
+        290, _windSbY, 30, _windSbH, "CT", 5, 61, 1,
         "independent", "vertical", 61, "windGustChanged",
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "windPanel")
 
@@ -475,19 +509,19 @@ function love.load()
     local textAltSlctd = "SLCTD ALT:\n" .. selectedAltitude .. " FT"
     gdsGui_outputTxtBox_create("selectedAltitudeBox", "MainMenu", nil,
         164, 47, "CC",
-        110, 47,
+        110, _h2,
         colorYellow, textAltSlctd, 12, "calcPanel"
     )
     local textTimeSlctd = "SLCTD TIME:\n" .. selectedTime .. " min"
     gdsGui_outputTxtBox_create("selectedTimeBox", "MainMenu", nil,
         52, 47, "CC",
-        110, 47,
+        110, _h2,
         colorYellow, textTimeSlctd, 12, "calcPanel"
     )
     local textDegreeSlctd = "SLCTD DEG:\n" .. string.format("%.2f", selectedDegree) .. "°"
     gdsGui_outputTxtBox_create("selectedDegreeBox", "MainMenu", nil,
         267, 47, "CC",
-        110, 47,
+        110, _h2,
         colorYellow, textDegreeSlctd, 12, "calcPanel"
     )
     local requiredFPM = 0
@@ -497,7 +531,7 @@ function love.load()
     local requiredFPMtext = "REQ FPM:\n" .. requiredFPM
     gdsGui_outputTxtBox_create("requiredFPM", "MainMenu", nil,
         110, 146, "CC",
-        80, 59,
+        80, _h2,
         colorYellow, requiredFPMtext, 12, "calcPanel"
     )
     local requiredDistance = 0
@@ -507,21 +541,21 @@ function love.load()
     local requiredDistText = "REQ DIST:\n" .. requiredDistance .. " nm"
     gdsGui_outputTxtBox_create("requiredDistance", "MainMenu", nil,
         211, 146, "CC",
-        80, 59,
+        80, _h2,
         colorYellow, requiredDistText, 12, "calcPanel"
     )
 
-    -- Scrollbars (30×185 px)
+    -- Scrollbars: top starts just below the selector boxes
     gdsGui_scrollBar_create("timeScale", "MainMenu",
-        51, 70, 30, 185, "CT", 5, 26, 1,
+        51, _calcSbY, 30, 185, "CT", 5, 26, 1,
         "independent", "vertical", 26, "roundSelectedTime",
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "calcPanel")
     gdsGui_scrollBar_create("altScale", "MainMenu",
-        160, 70, 30, 185, "CT", 5, 52, 1,
+        160, _calcSbY, 30, 185, "CT", 5, 52, 1,
         "independent", "vertical", 52, "roundSelectedAltitude",
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "calcPanel")
     gdsGui_scrollBar_create("deg", "MainMenu",
-        262, 70, 30, 185, "CT", 5, 33, 1,
+        262, _calcSbY, 30, 185, "CT", 5, 33, 1,
         "independent", "vertical", 33, "roundSelectedDegree",
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "calcPanel")
 
@@ -531,31 +565,31 @@ function love.load()
     gdsGui_container_create("dutyPanel", "MainMenu", "DUTY / FLIGHT TIME", 32, 0)
 
     gdsGui_outputTxtBox_create("dutyStartBox",    "MainMenu", nil,
-        160,  8, "CT", 270, 25, colorYellow, "DUTY START: 00:00Z", 12, "dutyPanel")
+        160, _d1, "CT", 270, _h1, colorYellow, "DUTY START: 00:00Z", 12, "dutyPanel")
     gdsGui_outputTxtBox_create("dutyMaxHoursBox", "MainMenu", nil,
-        160, 80, "CT", 270, 25, colorYellow, "MAX DUTY: 1 HR",     12, "dutyPanel")
+        160, _d3, "CT", 270, _h1, colorYellow, "MAX DUTY: 1 HR",     12, "dutyPanel")
     gdsGui_outputTxtBox_create("lastFlightBox",   "MainMenu", nil,
-        160,152, "CT", 270, 25, colorYellow, "LAST FLT BLOCK TIME: 0.0 HRS", 12, "dutyPanel")
+        160, _d5, "CT", 270, _h1, colorYellow, "LAST FLT BLOCK TIME: 0.0 HRS", 12, "dutyPanel")
 
     gdsGui_scrollBar_create("dutyStartScale", "MainMenu",
-        160,  35, 270, 30, "CT", 32, 289, 0,
+        160, _d2, 270, _sbH, "CT", 32, 289, 0,
         "independent", "horizontal", 289, "dutyStartChanged",
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "dutyPanel")
     gdsGui_scrollBar_create("dutyHoursScale", "MainMenu",
-        160, 107, 270, 30, "CT", 5, 20, 0,
+        160, _d4, 270, _sbH, "CT", 5, 20, 0,
         "independent", "horizontal", 20, "dutyHoursChanged",
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "dutyPanel")
     gdsGui_scrollBar_create("lastFlightScale", "MainMenu",
-        160, 179, 270, 30, "CT", 20, 181, 0,
+        160, _d6, 270, _sbH, "CT", 20, 181, 0,
         "independent", "horizontal", 181, "lastFlightChanged",
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "dutyPanel")
 
     gdsGui_outputTxtBox_create("dutyOutBox",  "MainMenu", nil,
-         80, 225, "CT", 120, 50, colorYellow, "DUTY OUT\n--:--Z",  12, "dutyPanel")
+         80, _d7, "CT", 120, _h2, colorYellow, "DUTY OUT\n--:--Z",  12, "dutyPanel")
     gdsGui_outputTxtBox_create("departByBox", "MainMenu", nil,
-        240, 225, "CT", 120, 50, colorYellow, "DEPART BY\n--:--Z", 12, "dutyPanel")
+        240, _d7, "CT", 120, _h2, colorYellow, "DEPART BY\n--:--Z", 12, "dutyPanel")
     gdsGui_outputTxtBox_create("dutyWarningBox", "MainMenu", nil,
-        160, 285, "CT", 270, 22, colorWarning,
+        160, _d8, "CT", 270, _wH, colorWarning,
         "FOR REFERENCE ONLY — verify against applicable FARs and ops specs.", 10, "dutyPanel")
 
     ---------------------------------------------------------------------------
@@ -692,13 +726,6 @@ function love.load()
     gdsGui_container_finalise("Learn")
     gdsGui_container_finalise("Settings")
     gdsGui_container_finalise("TermsAndConditions")
-
-    gdsGui_saveLoad_loadFileContents("appSettings.lua")
-
-    if appSettings.darkMode       == nil then appSettings.darkMode       = true end
-    if appSettings.soundEnabled   == nil then appSettings.soundEnabled   = true end
-    if appSettings.hapticsEnabled == nil then appSettings.hapticsEnabled = true end
-    if appSettings.fontSize       == nil then appSettings.fontSize       = 12   end
 
     _applyTheme(appSettings.darkMode)
     gdsGui_button_setState("darkModeToggle", appSettings.darkMode       and "pushed" or "released")
