@@ -233,12 +233,18 @@ end
 
 local function _applyFontSize(fontSize)
     local names = {
+        -- main menu data panels
         "utcData", "timerTopRight", "crosswindData",
         "windSpeedLabel", "windGustLabel",
         "selectedAltitudeBox", "selectedTimeBox", "selectedDegreeBox",
         "requiredFPM", "requiredDistance",
         "dutyStartBox", "dutyMaxHoursBox", "lastFlightBox",
         "dutyOutBox", "departByBox",
+        -- settings labels
+        "displayModeLabel", "soundsLabel", "hapticsLabel", "fontSizeLabel",
+        -- learn page content
+        "timerLearnContent", "windLearnContent", "calcLearnContent",
+        "dutyLearnContent", "settingsLearnContent",
     }
     for _, name in ipairs(names) do
         gdsGui_outputTxtBox_setFontSize(name, fontSize)
