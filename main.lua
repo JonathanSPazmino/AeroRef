@@ -302,16 +302,15 @@ function love.load()
     if appSettings.hapticsEnabled == nil then appSettings.hapticsEnabled = true  end
     if appSettings.fontSize       == nil then appSettings.fontSize       = 12    end
 
-    -- Font-size-dependent layout variables (computed once at startup from real font metrics).
-    -- At fs=12 these reproduce the original hardcoded pixel values exactly.
-    local _fs  = appSettings.fontSize
-    local _lh  = love.graphics.newFont(_fs):getHeight()
+    -- Layout height variables sized for fs=16 (the maximum user-selectable font size)
+    -- so textboxes never require internal scrolling at any font setting.
+    local _lh  = love.graphics.newFont(16):getHeight()
     local _h1  = _lh + 11           -- single-line textbox
     local _h2  = _lh * 2 + 19      -- two-line textbox
     local _h3  = _lh * 3 + 17      -- three-line textbox
     local _h5  = _lh * 5 + 20      -- five-line textbox (crosswind max)
     local _sbH = 30                  -- scrollbar height, fixed
-    local _wH  = love.graphics.newFont(math.max(8, _fs - 2)):getHeight() + 10
+    local _wH  = love.graphics.newFont(14):getHeight() + 10
     -- Wind panel: scrollbar sits below the speed/gust label with a 5 px gap
     local _windSbY = 10 + _h2 + 5
     local _windSbH = 231 - _windSbY
@@ -326,6 +325,12 @@ function love.load()
     local _d6 = _d5 + _h1 + 2
     local _d7 = _d6 + _sbH + 16
     local _d8 = _d7 + _h2 + 10
+
+    -- Scale pixel coordinates from the 320-pt design canvas to the actual container width
+    -- (iPhone SE 2nd gen = 375 pt reference; _x/_w return floor'd pixel values).
+    local _cW = globApp.safeScreenArea.w
+    local function _x(px) return math.floor(px / 320 * _cW) end
+    local function _w(px) return math.floor(px / 320 * _cW) end
 
     ---------------------------------------------------------------------------
     -- SHARED HEADER / FOOTER LAYOUT VALUES
@@ -387,63 +392,63 @@ function love.load()
     -- Buttons (26×26 px square)
     gdsGui_button_create("resetRHTopTimer", "MainMenu", "pushonoff",
         "Sprites/button_reset_pressed.png", "Sprites/button_reset_released.png",
-        "Sprites/button_reset_deactivated.png", 269, 90, "RT",
+        "Sprites/button_reset_deactivated.png", _x(269), 90, "RT",
         33, 33,
         "resetRHTopTimer", globApp.BUTTON_STATES.RELEASED, true, "timerPanel"
     )
     gdsGui_button_create("pauseRHTopTimer", "MainMenu", "toggle",
         "Sprites/button_pause_play_pressed.png", "Sprites/button_pause_play_released.png",
-        "Sprites/button_pause_play_deactivated.png", 215, 90, "CT",
+        "Sprites/button_pause_play_deactivated.png", _x(215), 90, "CT",
         33, 33,
         "pauseRHTopTimer", globApp.BUTTON_STATES.RELEASED, true, "timerPanel"
     )
     gdsGui_button_create("modeSelectRHTopTimer", "MainMenu", "toggle",
         "Sprites/button_timer_mode_pressed.png", "Sprites/button_timer_mode_released.png",
-        "Sprites/button_timer_mode_deactivated.png", 160, 90, "LT",
+        "Sprites/button_timer_mode_deactivated.png", _x(160), 90, "LT",
         33, 33,
         "modeSelectRHTopTimer", globApp.BUTTON_STATES.RELEASED, true, "timerPanel"
     )
     gdsGui_button_create("incrsMinRHTopTimer", "MainMenu", "pushonoff",
         "Sprites/button_min_increase_pressed.png", "Sprites/button_min_increase_released.png",
-        nil, 120, 50, "LT",
+        nil, _x(120), 50, "LT",
         33, 33,
         "incrsMinRHTopTimer", globApp.BUTTON_STATES.DEACTIVATED, true, "timerPanel"
     )
     gdsGui_button_create("dcrsMinRHTopTimer", "MainMenu", "pushonoff",
         "Sprites/button_min_decrease_pressed.png", "Sprites/button_min_decrease_released.png",
-        nil, 120, 90, "LT",
+        nil, _x(120), 90, "LT",
         33, 33,
         "dcrsMinRHTopTimer", globApp.BUTTON_STATES.DEACTIVATED, true, "timerPanel"
     )
     gdsGui_button_create("incrsSecRHTopTimer", "MainMenu", "pushonoff",
         "Sprites/button_sec_increase_pressed.png", "Sprites/button_sec_increase_released.png",
-        nil, 274, 50, "LT",
+        nil, _x(274), 50, "LT",
         33, 33,
         "incrsSecRHTopTimer", globApp.BUTTON_STATES.DEACTIVATED, true, "timerPanel"
     )
     gdsGui_button_create("dcrsSecRHTopTimer", "MainMenu", "pushonoff",
         "Sprites/button_sec_decrease_pressed.png", "Sprites/button_sec_decrease_released.png",
-        nil, 274, 90, "LT",
+        nil, _x(274), 90, "LT",
         33, 33,
         "dcrsSecRHTopTimer", globApp.BUTTON_STATES.DEACTIVATED, true, "timerPanel"
     )
     gdsGui_button_create("acknowlegeAlarm", "MainMenu", "pushonoff",
         nil, nil,
-        nil, 300, 30, "RT",
-        190, 95,
+        nil, _x(300), 30, "RT",
+        _w(190), 95,
         "acknowlegeAlarm", globApp.BUTTON_STATES.DEACTIVATED, true, "timerPanel"
     )
 
     -- Text boxes
     gdsGui_outputTxtBox_create("utcData", "MainMenu", nil,
         6, 30, "LT",
-        128, _h3,
+        _w(128), _h3,
         colorYellow, utcPrintString, 12, "timerPanel"
     )
     local text = timer.mode .. "\nTIMER:\nM " .. format_time(timer.t) .. " S"
     gdsGui_outputTxtBox_create("timerTopRight", "MainMenu", nil,
-        283, 30, "RT",
-        120, _h3,
+        _x(283), 30, "RT",
+        _w(120), _h3,
         colorYellow, text, 12, "timerPanel"
     )
 
@@ -454,7 +459,7 @@ function love.load()
 
     -- Compass background: inserted first so it renders under the knob
     gdsGui_outputTxtBox_create("compassBg", "MainMenu", "Sprites/bg_compass_visible.png",
-        160, 180, "CC",
+        _x(160), 180, "CC",
         208, 208,
         {1, 1, 1, 1}, "", 1, "windPanel"
     )
@@ -462,7 +467,7 @@ function love.load()
     -- Rotary knob (150×150 px square)
     gdsGui_rotaryKnob_createDual(
         "runwayKnob", "MainMenu",
-        80, 100, "LT",
+        _x(160) - 80, 100, "LT",
         160,
         36, 0,
         "Sprites/knob_runway_released.png", "Sprites/knob_runway_pressed.png",
@@ -475,28 +480,28 @@ function love.load()
 
     -- Text boxes
     gdsGui_outputTxtBox_create("crosswindData", "MainMenu", nil,
-        160, 10, "CT",
-        200, _h5,
+        _x(160), 10, "CT",
+        _w(200), _h5,
         colorYellow, "WIND: 36000KT", 12, "windPanel"
     )
     gdsGui_outputTxtBox_create("windSpeedLabel", "MainMenu", nil,
-        30, 10, "CT",
+        _x(30), 10, "CT",
         60, _h2,
         colorYellow, "WIND\nSPD", 12, "windPanel"
     )
     gdsGui_outputTxtBox_create("windGustLabel", "MainMenu", nil,
-        290, 10, "CT",
+        _x(290), 10, "CT",
         60, _h2,
         colorYellow, "WIND\nGST", 12, "windPanel"
     )
 
     -- Scrollbars: top starts just below the speed/gust labels; bottom is fixed
     gdsGui_scrollBar_create("windSpeed", "MainMenu",
-        30, _windSbY, 30, _windSbH, "CT", 5, 46, 1,
+        _x(30), _windSbY, 30, _windSbH, "CT", 5, 46, 1,
         "independent", "vertical", 46, "windSpeedChanged",
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "windPanel")
     gdsGui_scrollBar_create("windGust", "MainMenu",
-        290, _windSbY, 30, _windSbH, "CT", 5, 61, 1,
+        _x(290), _windSbY, 30, _windSbH, "CT", 5, 61, 1,
         "independent", "vertical", 61, "windGustChanged",
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "windPanel")
 
@@ -508,20 +513,20 @@ function love.load()
     -- Text boxes
     local textAltSlctd = "SLCTD ALT:\n" .. selectedAltitude .. " FT"
     gdsGui_outputTxtBox_create("selectedAltitudeBox", "MainMenu", nil,
-        164, 47, "CC",
-        110, _h2,
+        _x(164), 47, "CC",
+        _w(110), _h2,
         colorYellow, textAltSlctd, 12, "calcPanel"
     )
     local textTimeSlctd = "SLCTD TIME:\n" .. selectedTime .. " min"
     gdsGui_outputTxtBox_create("selectedTimeBox", "MainMenu", nil,
-        52, 47, "CC",
-        110, _h2,
+        _x(52), 47, "CC",
+        _w(110), _h2,
         colorYellow, textTimeSlctd, 12, "calcPanel"
     )
     local textDegreeSlctd = "SLCTD DEG:\n" .. string.format("%.2f", selectedDegree) .. "°"
     gdsGui_outputTxtBox_create("selectedDegreeBox", "MainMenu", nil,
-        267, 47, "CC",
-        110, _h2,
+        _x(267), 47, "CC",
+        _w(110), _h2,
         colorYellow, textDegreeSlctd, 12, "calcPanel"
     )
     local requiredFPM = 0
@@ -530,8 +535,8 @@ function love.load()
     end
     local requiredFPMtext = "REQ FPM:\n" .. requiredFPM
     gdsGui_outputTxtBox_create("requiredFPM", "MainMenu", nil,
-        110, 146, "CC",
-        80, _h2,
+        _x(110), 146, "CC",
+        _w(80), _h2,
         colorYellow, requiredFPMtext, 12, "calcPanel"
     )
     local requiredDistance = 0
@@ -540,22 +545,22 @@ function love.load()
     end
     local requiredDistText = "REQ DIST:\n" .. requiredDistance .. " nm"
     gdsGui_outputTxtBox_create("requiredDistance", "MainMenu", nil,
-        211, 146, "CC",
-        80, _h2,
+        _x(211), 146, "CC",
+        _w(80), _h2,
         colorYellow, requiredDistText, 12, "calcPanel"
     )
 
     -- Scrollbars: top starts just below the selector boxes
     gdsGui_scrollBar_create("timeScale", "MainMenu",
-        51, _calcSbY, 30, 185, "CT", 5, 26, 1,
+        _x(51), _calcSbY, 30, 185, "CT", 5, 26, 1,
         "independent", "vertical", 26, "roundSelectedTime",
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "calcPanel")
     gdsGui_scrollBar_create("altScale", "MainMenu",
-        160, _calcSbY, 30, 185, "CT", 5, 52, 1,
+        _x(160), _calcSbY, 30, 185, "CT", 5, 52, 1,
         "independent", "vertical", 52, "roundSelectedAltitude",
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "calcPanel")
     gdsGui_scrollBar_create("deg", "MainMenu",
-        262, _calcSbY, 30, 185, "CT", 5, 33, 1,
+        _x(262), _calcSbY, 30, 185, "CT", 5, 33, 1,
         "independent", "vertical", 33, "roundSelectedDegree",
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "calcPanel")
 
@@ -565,31 +570,31 @@ function love.load()
     gdsGui_container_create("dutyPanel", "MainMenu", "DUTY / FLIGHT TIME", 32, 0)
 
     gdsGui_outputTxtBox_create("dutyStartBox",    "MainMenu", nil,
-        160, _d1, "CT", 270, _h1, colorYellow, "DUTY START: 00:00Z", 12, "dutyPanel")
+        _x(160), _d1, "CT", _w(270), _h1, colorYellow, "DUTY START: 00:00Z", 12, "dutyPanel")
     gdsGui_outputTxtBox_create("dutyMaxHoursBox", "MainMenu", nil,
-        160, _d3, "CT", 270, _h1, colorYellow, "MAX DUTY: 1 HR",     12, "dutyPanel")
+        _x(160), _d3, "CT", _w(270), _h1, colorYellow, "MAX DUTY: 1 HR",     12, "dutyPanel")
     gdsGui_outputTxtBox_create("lastFlightBox",   "MainMenu", nil,
-        160, _d5, "CT", 270, _h1, colorYellow, "LAST FLT BLOCK TIME: 0.0 HRS", 12, "dutyPanel")
+        _x(160), _d5, "CT", _w(270), _h1, colorYellow, "LAST FLT BLOCK TIME: 0.0 HRS", 12, "dutyPanel")
 
     gdsGui_scrollBar_create("dutyStartScale", "MainMenu",
-        160, _d2, 270, _sbH, "CT", 32, 289, 0,
+        _x(160), _d2, _w(270), _sbH, "CT", 32, 289, 0,
         "independent", "horizontal", 289, "dutyStartChanged",
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "dutyPanel")
     gdsGui_scrollBar_create("dutyHoursScale", "MainMenu",
-        160, _d4, 270, _sbH, "CT", 5, 20, 0,
+        _x(160), _d4, _w(270), _sbH, "CT", 5, 20, 0,
         "independent", "horizontal", 20, "dutyHoursChanged",
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "dutyPanel")
     gdsGui_scrollBar_create("lastFlightScale", "MainMenu",
-        160, _d6, 270, _sbH, "CT", 20, 181, 0,
+        _x(160), _d6, _w(270), _sbH, "CT", 20, 181, 0,
         "independent", "horizontal", 181, "lastFlightChanged",
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "dutyPanel")
 
     gdsGui_outputTxtBox_create("dutyOutBox",  "MainMenu", nil,
-         80, _d7, "CT", 120, _h2, colorYellow, "DUTY OUT\n--:--Z",  12, "dutyPanel")
+        _x(80),  _d7, "CT", _w(120), _h2, colorYellow, "DUTY OUT\n--:--Z",  12, "dutyPanel")
     gdsGui_outputTxtBox_create("departByBox", "MainMenu", nil,
-        240, _d7, "CT", 120, _h2, colorYellow, "DEPART BY\n--:--Z", 12, "dutyPanel")
+        _x(240), _d7, "CT", _w(120), _h2, colorYellow, "DEPART BY\n--:--Z", 12, "dutyPanel")
     gdsGui_outputTxtBox_create("dutyWarningBox", "MainMenu", nil,
-        160, _d8, "CT", 270, _wH, colorWarning,
+        _x(160), _d8, "CT", _w(270), _wH, colorWarning,
         "FOR REFERENCE ONLY — verify against applicable FARs and ops specs.", 10, "dutyPanel")
 
     ---------------------------------------------------------------------------
@@ -602,13 +607,15 @@ function love.load()
     -- Compute the exact pixel height needed for a set of raw segments so the
     -- textbox shows all content without any internal scroll.  Mirrors _buildLines:
     -- frame.width = learnTxtW - 10 (SB_WIDTH), text.width = frame.width * 0.8.
-    local _learnFont  = love.graphics.newFont(learnFontSize)
-    local _learnTxtW  = (learnTxtW - 10) * 0.8
-    local _learnLineH = _learnFont:getHeight()
+    -- Use fs=16 for worst-case wrapping/height since _applyFontSize can set 16pt.
+    local _learnFont   = love.graphics.newFont(learnFontSize)
+    local _learnFont16 = love.graphics.newFont(16)
+    local _learnTxtW   = (learnTxtW - 10) * 0.8
+    local _learnLineH  = _learnFont16:getHeight()
     local function learnH(rawSegs)
         local n = 0
         for _, s in ipairs(rawSegs) do
-            local _, wrapped = _learnFont:getWrap(s.text, _learnTxtW)
+            local _, wrapped = _learnFont16:getWrap(s.text, _learnTxtW)
             n = n + #wrapped
         end
         return n * _learnLineH
@@ -660,10 +667,10 @@ function love.load()
     local settingsFontSize = math.floor(gdsGui_general_smartFontScaling(0.035, 0.045))
     local settingsBtnW     = 40
     local settingsBtnH     = 40
-    -- RT anchor: right edge sits 12 px from the container's right edge at 320 px reference
-    local settingsBtnX     = 300
+    -- RT anchor: right edge sits ~20 px from the container's right edge
+    local settingsBtnX     = _x(300)
     local settingsRowY     = 12
-    local settingsLabelW   = 200
+    local settingsLabelW   = _w(200)
     local settingsLabelH   = 40
 
     gdsGui_container_create("displaySettings", "Settings", "DISPLAY", 32, 0)
@@ -708,7 +715,7 @@ function love.load()
         {1, 1, 1, 1}, "FONT SIZE: 12pt", settingsFontSize, "fontSizeSettings"
     )
     gdsGui_scrollBar_create("fontSizeScale", "Settings",
-        160, 60, 270, 30, "CT", 7, 7, 0,
+        _x(160), 60, _w(270), 30, "CT", 7, 7, 0,
         "independent", "horizontal", 7, "fontSizeChanged",
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"},
         true, "fontSizeSettings"
