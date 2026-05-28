@@ -1,3 +1,4 @@
+-- Copyright (c) 2025-2026 Gateway Dynamic Software, LLC. All rights reserved.
 --[[ Main.lua
     Author: Jonathan Pazmino
     Description: Core entry file for LÖVE app with timer and GUI integration
@@ -6,7 +7,7 @@
 -------------------------------------------------------------------------------
 -- LIBRARIES LOAD
 -------------------------------------------------------------------------------
-require("Libraries.jp_GUI_library.loader_gdsGuiLib")
+require("Libraries.gds_love2d_gui.loader_gdsGuiLib")
 
 APP_VERSION = "1.0.0"
 
@@ -1131,7 +1132,7 @@ function createTermsAndConditionsObjects()
     local thisPageName = "TermsAndConditions"
     local tcText     = love.filesystem.read("terms.txt") or "Terms and Conditions text not found."
     tcText = tcText:gsub("{{APP_VERSION}}", APP_VERSION)
-    local libSprites = "Libraries/jp_GUI_library/librarySprites/"
+    local libSprites = "Libraries/gds_love2d_gui/librarySprites/"
 
     local pageHdrH = math.floor(globApp.safeScreenArea.h * 0.10)
     local pageFootH = pageHdrH

@@ -1,5 +1,6 @@
+-- Copyright (c) 2025-2026 Gateway Dynamic Software, LLC. All rights reserved.
 ================================================================================
-JP GUI LIBRARY
+GDS LOVE2D GUI
 Gateway Dynamic Software, LLC
 ================================================================================
 
@@ -16,7 +17,7 @@ For licensing inquiries contact Gateway Dynamic Software, LLC.
 OVERVIEW
 ================================================================================
 
-The JP GUI Library is a modular, reusable GUI framework built for LOVE2D (Lua).
+The GDS Love2D GUI is a modular, reusable GUI framework built for LOVE2D (Lua).
 It provides a complete set of UI widgets, page management, responsive layout,
 and developer tooling suitable for mobile and desktop applications.
 
@@ -24,7 +25,7 @@ The library is self-contained. Load it via a single require of jpGUIlib.lua,
 which in turn loads all modules in the correct order.
 
 Usage:
-  require("Libraries.jp_GUI_library.jpGUIlib")
+  require("Libraries.gds_love2d_gui.jpGUIlib")
 
 ================================================================================
 MODULES

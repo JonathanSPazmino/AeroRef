@@ -1,3 +1,4 @@
+-- Copyright (c) 2025-2026 Gateway Dynamic Software, LLC. All rights reserved.
 -- loader_gdsGuiLib.lua
 -- Created on 7/20/2021
 -- Created by Jonathan Pazmino
@@ -12,7 +13,7 @@ love.graphics.setDefaultFilter("nearest", "nearest")
 local function requireGUILibraries ()
 
 	--when calling files, no need for .lua externsions
-	local pathToLibrary = "Libraries.jp_GUI_library."
+	local pathToLibrary = "Libraries.gds_love2d_gui."
 
 	-- general_gdsGuiLib must be loaded first to initialize globApp
 	require (pathToLibrary .. "general_gdsGuiLib") --[[general functions]]

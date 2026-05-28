@@ -1,3 +1,4 @@
+-- Copyright (c) 2025-2026 Gateway Dynamic Software, LLC. All rights reserved.
 -- container_gdsGuiLib.lua
 -- Page-layout system: fixed header/footer zones + single scrollable body containing panels.
 --
@@ -57,12 +58,12 @@ local _pageSBImgs
 local function _ensurePageSBImgs()
     if _pageSBImgs then return end
     if globApp.OperatingSystem == "iOS" or globApp.OperatingSystem == "Android" then return end
-    local p = "Libraries/jp_GUI_library/librarySprites/"
+    local p = "Libraries/gds_love2d_gui/librarySprites/"
     _pageSBImgs = {
-        upActive     = love.graphics.newImage(p .. "jpLoveGUI_UpArrowButton_pushed.png"),
-        upInactive   = love.graphics.newImage(p .. "jpLoveGUI_UpArrowButton_released.png"),
-        downActive   = love.graphics.newImage(p .. "jpLoveGUI_downArrowButton_pushed.png"),
-        downInactive = love.graphics.newImage(p .. "jpLoveGUI_downArrowButton_released.png"),
+        upActive     = love.graphics.newImage(p .. "gdsLoveGUI_UpArrowButton_pushed.png"),
+        upInactive   = love.graphics.newImage(p .. "gdsLoveGUI_UpArrowButton_released.png"),
+        downActive   = love.graphics.newImage(p .. "gdsLoveGUI_downArrowButton_pushed.png"),
+        downInactive = love.graphics.newImage(p .. "gdsLoveGUI_downArrowButton_released.png"),
     }
 end
 

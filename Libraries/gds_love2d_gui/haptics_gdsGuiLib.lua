@@ -1,3 +1,4 @@
+-- Copyright (c) 2025-2026 Gateway Dynamic Software, LLC. All rights reserved.
 --[[
     lib_haptics.lua
     Single entry-point for haptic feedback across all GUI objects.

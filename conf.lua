@@ -1,3 +1,4 @@
+-- Copyright (c) 2025-2026 Gateway Dynamic Software, LLC. All rights reserved.
 --[[app_config.lua
 	contains all app configurations]]
 

@@ -22,7 +22,7 @@ To re-run tests at runtime, the dev panel has a re-run button. Test definitions 
 
 **Application layer** (`main.lua`, `conf.lua`): The pilot companion app — UTC clock, dual-mode timer (count up/down), altitude/time/degree selectors, crosswind calculator, FPM calculator, alarm system with beep/vibrate.
 
-**GUI framework** (`Libraries/jp_GUI_library/`): A reusable, self-contained GUI library. `loader_gdsGuiLib.lua` is the entry point that `require`s all modules in dependency order. The library is independent of application logic.
+**GUI framework** (`Libraries/gds_love2d_gui/`): A reusable, self-contained GUI library. `loader_gdsGuiLib.lua` is the entry point that `require`s all modules in dependency order. The library is independent of application logic.
 
 ### GUI library modules
 
@@ -69,7 +69,7 @@ All module files follow the naming pattern `<name>_gdsGuiLib.lua`. All public fu
 
 **Dirty-flag rendering** — `main.lua` uses sentinel variables (`_prevTimerT`, `_prevAltitude`, etc.) so `gdsGui_outputTxtBox_setText()` is only called when values actually change, avoiding per-frame string allocation.
 
-**Sprite naming** — Button sprites follow the three-state pattern: `button_<name>_pressed.png`, `button_<name>_released.png`, `button_<name>_deactivated.png`, stored in `Sprites/`. Library sprites live in `Libraries/jp_GUI_library/librarySprites/` with the prefix `jpLoveGUI_`.
+**Sprite naming** — Button sprites follow the three-state pattern: `button_<name>_pressed.png`, `button_<name>_released.png`, `button_<name>_deactivated.png`, stored in `Sprites/`. Library sprites live in `Libraries/gds_love2d_gui/librarySprites/` with the prefix `gdsLoveGUI_`.
 
 **Persistent settings** — `appSettings` is a global Lua table loaded at startup via `gdsGui_saveLoad_loadFileContents("appSettings.lua")` and written back with `love.filesystem.write("appSettings.lua", table.show(appSettings, "appSettings"))`. `table.show()` (in `saveLoad_gdsGuiLib.lua`) serializes a table to valid Lua source that can be `load()`ed back. Add new settings keys with a `nil`-guard default immediately after load so they survive missing saves.
 

@@ -1,3 +1,4 @@
+-- Copyright (c) 2025-2026 Gateway Dynamic Software, LLC. All rights reserved.
 --[[
     Library: lib_buttons.lua
     Author: Jonathan Pazmino
