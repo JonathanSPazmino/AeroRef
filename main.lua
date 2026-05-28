@@ -185,7 +185,9 @@ local _LEARN_SETTINGS_RAW = {
     {text="TIMER SOUND", sub=true},
     {text="Enable or disable the beep that sounds when the countdown timer reaches zero.\n"},
     {text="HAPTICS", sub=true},
-    {text="Enable or disable vibration on button taps and at timer alarm."},
+    {text="Enable or disable vibration on button taps and at timer alarm.\n"},
+    {text="FONT SIZE", sub=true},
+    {text="Drag the scrollbar to set the display font size between 10 pt and 16 pt. The change is applied immediately and saved between sessions."},
 }
 
 local function _learnSegsColored(rawSegs, isDark)
@@ -226,6 +228,29 @@ local function _applyTheme(isDark)
     }
     for _, pair in ipairs(_learnUpdates) do
         gdsGui_outputTxtBox_setText(pair.name, _learnSegsColored(pair.raw, isDark))
+    end
+end
+
+local function _applyFontSize(fontSize)
+    local names = {
+        "utcData", "timerTopRight", "crosswindData",
+        "windSpeedLabel", "windGustLabel",
+        "selectedAltitudeBox", "selectedTimeBox", "selectedDegreeBox",
+        "requiredFPM", "requiredDistance",
+        "dutyStartBox", "dutyMaxHoursBox", "lastFlightBox",
+        "dutyOutBox", "departByBox",
+    }
+    for _, name in ipairs(names) do
+        gdsGui_outputTxtBox_setFontSize(name, fontSize)
+    end
+    gdsGui_outputTxtBox_setFontSize("dutyWarningBox", math.max(8, fontSize - 2))
+    gdsGui_outputTxtBox_setText("fontSizeLabel", "FONT SIZE: " .. fontSize .. "pt")
+    for _, sb in ipairs(globApp.objects.scrollBars) do
+        if sb.id == "fontSizeScale" then
+            sb.bar.position = (fontSize - 10) / 6
+            gdsGui_scrollBar_updatePosition(sb, sb.bar.position)
+            break
+        end
     end
 end
 
@@ -637,6 +662,18 @@ function love.load()
         "hapticsToggled", globApp.BUTTON_STATES.PRESSED, false, "hapticsSettings"
     )
 
+    gdsGui_container_create("fontSizeSettings", "Settings", "FONT SIZE", 32, 0)
+    gdsGui_outputTxtBox_create("fontSizeLabel", "Settings", nil,
+        12, settingsRowY, "LT", settingsLabelW, settingsLabelH,
+        {1, 1, 1, 1}, "FONT SIZE: 12pt", settingsFontSize, "fontSizeSettings"
+    )
+    gdsGui_scrollBar_create("fontSizeScale", "Settings",
+        160, 60, 270, 30, "CT", 7, 7, 0,
+        "independent", "horizontal", 7, "fontSizeChanged",
+        {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"},
+        true, "fontSizeSettings"
+    )
+
     ---------------------------------------------------------------------------
     -- TERMS AND CONDITIONS PAGE
     ---------------------------------------------------------------------------
@@ -655,11 +692,13 @@ function love.load()
     if appSettings.darkMode       == nil then appSettings.darkMode       = true end
     if appSettings.soundEnabled   == nil then appSettings.soundEnabled   = true end
     if appSettings.hapticsEnabled == nil then appSettings.hapticsEnabled = true end
+    if appSettings.fontSize       == nil then appSettings.fontSize       = 12   end
 
     _applyTheme(appSettings.darkMode)
     gdsGui_button_setState("darkModeToggle", appSettings.darkMode       and "pushed" or "released")
     gdsGui_button_setState("soundToggle",    appSettings.soundEnabled   and "pushed" or "released")
     gdsGui_button_setState("hapticsToggle",  appSettings.hapticsEnabled and "pushed" or "released")
+    _applyFontSize(appSettings.fontSize)
 
     _navSyncAll("MainMenu")
 
@@ -1124,6 +1163,14 @@ function hapticsToggled(newState)
     _saveAppSettings()
 end
 
+function fontSizeChanged(pos)
+    local fontSize = 10 + math.floor(6 * pos + 0.5)
+    appSettings.fontSize = fontSize
+    _applyFontSize(fontSize)
+    _saveAppSettings()
+    return fontSize
+end
+
 -------------------------------------------------------------------------------
 -- TERMS AND CONDITIONS PAGE
 -------------------------------------------------------------------------------
@@ -1418,6 +1465,21 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcName"]={"windKnobChanged"},
         ["funcParameters"]={0.5},
         ["funcExpctOutput"]={180}}
+
+    gdsGui_dev_testExecute {["id"]="fontSizeChanged_min",
+        ["funcName"]={"fontSizeChanged"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={10}}
+
+    gdsGui_dev_testExecute {["id"]="fontSizeChanged_mid",
+        ["funcName"]={"fontSizeChanged"},
+        ["funcParameters"]={0.5},
+        ["funcExpctOutput"]={13}}
+
+    gdsGui_dev_testExecute {["id"]="fontSizeChanged_max",
+        ["funcName"]={"fontSizeChanged"},
+        ["funcParameters"]={1},
+        ["funcExpctOutput"]={16}}
 
 end)
 
