@@ -1,7 +1,7 @@
-NoBrainer - Application Summary and How-To Guide
+AeroRef - Application Summary and How-To Guide
 
 Application Summary:
-NoBrainer is a LÖVE2D application designed as a pilot's companion tool. It features a configurable timer (count up / count down), a UTC clock, an FPM calculator, a glide-slope distance calculator, and a crosswind/headwind component calculator with gust support.
+AeroRef is a LÖVE2D application designed as a pilot's companion tool. It features a configurable timer (count up / count down), a UTC clock, an FPM calculator, a glide-slope distance calculator, and a crosswind/headwind component calculator with gust support.
 
 How to Use:
 

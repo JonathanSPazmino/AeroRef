@@ -3,7 +3,7 @@
 
 function love.conf(t)
 
-	t.identity = "NoBrainer"     -- The name of the save directory (string)
+	t.identity = "AeroRef"     -- The name of the save directory (string)
     t.appendidentity = false            -- Search files in source directory before save directory (boolean)
     t.version = "12.0"                  -- The LÖVE version this game was made for (string)
     t.console = false                   -- Attach a console (boolean, Windows only)
@@ -14,7 +14,7 @@ function love.conf(t)
     t.audio.mic = false                 -- Request and use microphone capabilities in Android (boolean)
     t.audio.mixwithsystem = true        -- Keep background music playing when opening LOVE (boolean, iOS and Android only)
  
-    t.window.title = "NoBrainer"            -- The window title (string)
+    t.window.title = "AeroRef"            -- The window title (string)
     t.window.icon = nil   -- Filepath to an image to use as the window's icon (string)
     t.window.width = 320 				-- The window width (number)
     t.window.height = 617 				-- The window height (number)
