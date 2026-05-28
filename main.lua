@@ -232,6 +232,8 @@ local function _applyTheme(isDark)
 end
 
 local function _applyFontSize(fontSize)
+    globApp.appFont = love.graphics.newFont(fontSize)
+    love.graphics.setFont(globApp.appFont)
     local names = {
         -- main menu data panels
         "utcData", "timerTopRight", "crosswindData",
@@ -245,6 +247,10 @@ local function _applyFontSize(fontSize)
         -- learn page content
         "timerLearnContent", "windLearnContent", "calcLearnContent",
         "dutyLearnContent", "settingsLearnContent",
+        -- page header titles (all pages)
+        "mainMenu_pageTitle", "learn_pageTitle", "settings_pageTitle", "tc_pageTitle",
+        -- terms and conditions body
+        "tcText",
     }
     for _, name in ipairs(names) do
         gdsGui_outputTxtBox_setFontSize(name, fontSize)
@@ -744,9 +750,6 @@ function love.load()
 
     local showTC = (appSettings.tcAcceptedVersion ~= APP_VERSION)
     gdsGui_page_switch("IntialBooting", showTC and 4 or 3, 2, false)
-
-    font = love.graphics.newFont(20)
-    love.graphics.setFont(font)
 
     -- Initialize starting time
     timer.t = 0

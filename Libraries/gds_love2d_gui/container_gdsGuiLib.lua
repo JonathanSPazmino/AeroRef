@@ -870,6 +870,7 @@ local function _drawContainer(cont, clip)
         if cont.title and cont.title ~= "" then
             local tc = globApp.themeTextColor or {1, 1, 1, 1}
             love.graphics.setColor(tc[1], tc[2], tc[3], tc[4] or 1)
+            if globApp.appFont then love.graphics.setFont(globApp.appFont) end
             love.graphics.printf(cont.title, hr.x + PADDING, hr.y + PADDING,
                                  hr.width - 2 * PADDING, "left")
         end
