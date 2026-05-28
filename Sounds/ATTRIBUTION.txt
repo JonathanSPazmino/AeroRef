@@ -1,0 +1,15 @@
+SOUND ASSET ATTRIBUTION
+AeroRef — Gateway Dynamic Software, LLC
+Copyright (c) 2025-2026 Gateway Dynamic Software, LLC. All rights reserved.
+
+DoubleChime_piano.wav
+  Description : Double piano chime — used as countdown alarm tone
+  Author      : Jonathan Pazmino / Gateway Dynamic Software, LLC
+  Origin      : Original composition, rendered to WAV via FFmpeg (Lavf59.27.100)
+  License     : Proprietary — all rights reserved
+
+SingleChime_piano.wav
+  Description : Single piano chime — used as settings feedback tone
+  Author      : Jonathan Pazmino / Gateway Dynamic Software, LLC
+  Origin      : Original composition, rendered to WAV via FFmpeg (Lavf59.27.100)
+  License     : Proprietary — all rights reserved

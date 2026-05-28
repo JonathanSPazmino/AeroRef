@@ -1,3 +1,4 @@
+-- Copyright (c) 2025-2026 Gateway Dynamic Software, LLC. All rights reserved.
 --[[PAGE HANGLING CODE: 
 Contains code to load, switch and handle pages.
 This code is called by main.lua

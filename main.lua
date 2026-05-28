@@ -1,3 +1,4 @@
+-- Copyright (c) 2025-2026 Gateway Dynamic Software, LLC. All rights reserved.
 --[[ Main.lua
     Author: Jonathan Pazmino
     Description: Core entry file for LÖVE app with timer and GUI integration
@@ -6,7 +7,7 @@
 -------------------------------------------------------------------------------
 -- LIBRARIES LOAD
 -------------------------------------------------------------------------------
-require("Libraries.jp_GUI_library.loader_gdsGuiLib")
+require("Libraries.gds_love2d_gui.loader_gdsGuiLib")
 
 APP_VERSION = "1.0.0"
 
@@ -31,7 +32,8 @@ local lastSavedCountDownTime = 0
 local font
 
 -- Pre-defined colors to avoid creating tables in love.update
-local colorYellow = {1, 1, 0, 1}
+local colorYellow  = {1, 1, 0, 1}
+local colorWarning = {1, 0.55, 0, 1}
 
 -- Timer object
 local timer = {
@@ -117,13 +119,13 @@ local _THEME_LIGHT = {
 -- Learn textbox segment data (text + subtitle flag; colors resolved per theme).
 local _LEARN_TIMER_RAW = {
     {text="UTC CLOCK", sub=true},
-    {text="Shows current UTC date and time, updated each second.\n"},
+    {text="Shows current UTC date and time, updated each second. Sourced from the device system clock; verify against a certified time source for time-critical operations.\n"},
     {text="NAVIGATION", sub=true},
     {text="Use the tab bar at the bottom to switch between Main Menu, Learn, and Settings.\n"},
     {text="TIMER MODE", sub=true},
     {text="Press the mode button to switch between COUNT UP and COUNT DOWN.\n"},
     {text="COUNT DOWN", sub=true},
-    {text="Use the +/- buttons to set minutes (left pair) and seconds (right pair). Press play/pause to start. The app navigates here automatically 3 seconds before zero. Alarm sounds and the screen flashes red at zero. Press ACK to dismiss. Note: alarm sound and vibration require the app to be open and in the foreground.\n"},
+    {text="Use the +/- buttons to set minutes (left pair) and seconds (right pair). Press play/pause to start. The app navigates here automatically 3 seconds before zero. Alarm sounds and the screen flashes red at zero. Press ACK to dismiss. The alarm requires the app to be open and in the foreground. The device silent switch, Focus/Do Not Disturb mode, and low volume settings can prevent the alarm from sounding.\n"},
     {text="COUNT UP", sub=true},
     {text="Press play/pause to start counting from zero.\n"},
     {text="RESET", sub=true},
@@ -141,7 +143,9 @@ local _LEARN_WIND_RAW = {
     {text="WIND GUST", sub=true},
     {text="Right scrollbar sets gust speed. Range adjusts dynamically from current speed up to 60 kt.\n"},
     {text="RESULT", sub=true},
-    {text="Shows runway, sustained crosswind and headwind/tailwind components. When a gust is set, also shows gust crosswind components and gust factor."},
+    {text="Shows runway, sustained crosswind and headwind/tailwind components. When a gust is set, also shows gust crosswind components and gust factor.\n"},
+    {text="AIRCRAFT LIMITS", sub=true},
+    {text="Compare results against your aircraft's AFM/POH maximum crosswind component. This calculator has no knowledge of your aircraft type or its published limitations."},
 }
 local _LEARN_CALC_RAW = {
     {text="ASCENT / DESCENT CALCULATOR", sub=true},
@@ -153,9 +157,13 @@ local _LEARN_CALC_RAW = {
     {text="ANGLE", sub=true},
     {text="Right scrollbar sets desired descent angle (0-8.00 degrees in 0.25 degree steps).\n"},
     {text="RESULTS", sub=true},
-    {text="REQ FPM — required vertical rate in feet per minute.\nREQ DIST — start-of-descent distance in nautical miles."},
+    {text="REQ FPM — required vertical rate in feet per minute.\nREQ DIST — start-of-descent distance in nautical miles.\n"},
+    {text="ASSUMPTIONS", sub=true},
+    {text="REQ DIST assumes constant groundspeed. Actual distance varies with wind and aircraft configuration. Verify against your aircraft's performance charts."},
 }
 local _LEARN_DUTY_RAW = {
+    {text="FOR REFERENCE ONLY", sub=true},
+    {text="This calculator uses a simplified single-flight model. It does not substitute for applicable duty and rest regulations, your operator's operations specifications, or company fatigue policies. Always verify against the regulations and ops specs governing your operation.\n"},
     {text="DUTY / FLIGHT TIME", sub=true},
     {text="Calculates the latest departure time that keeps your last flight within the duty period.\n"},
     {text="DUTY START", sub=true},
@@ -515,6 +523,9 @@ function love.load()
          80, 225, "CT", 120, 50, colorYellow, "DUTY OUT\n--:--Z",  12, "dutyPanel")
     gdsGui_outputTxtBox_create("departByBox", "MainMenu", nil,
         240, 225, "CT", 120, 50, colorYellow, "DEPART BY\n--:--Z", 12, "dutyPanel")
+    gdsGui_outputTxtBox_create("dutyWarningBox", "MainMenu", nil,
+        160, 285, "CT", 270, 22, colorWarning,
+        "FOR REFERENCE ONLY — verify against applicable FARs and ops specs.", 10, "dutyPanel")
 
     ---------------------------------------------------------------------------
     -- LEARN PAGE CONTAINERS
@@ -1120,7 +1131,8 @@ end
 function createTermsAndConditionsObjects()
     local thisPageName = "TermsAndConditions"
     local tcText     = love.filesystem.read("terms.txt") or "Terms and Conditions text not found."
-    local libSprites = "Libraries/jp_GUI_library/librarySprites/"
+    tcText = tcText:gsub("{{APP_VERSION}}", APP_VERSION)
+    local libSprites = "Libraries/gds_love2d_gui/librarySprites/"
 
     local pageHdrH = math.floor(globApp.safeScreenArea.h * 0.10)
     local pageFootH = pageHdrH

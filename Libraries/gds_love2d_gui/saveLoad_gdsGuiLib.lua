@@ -1,3 +1,4 @@
+-- Copyright (c) 2025-2026 Gateway Dynamic Software, LLC. All rights reserved.
 --[[saveLoad.lua
 	contains all code necessary to manage project data. save and load
 	it uses open source software show.lua referenced below]]

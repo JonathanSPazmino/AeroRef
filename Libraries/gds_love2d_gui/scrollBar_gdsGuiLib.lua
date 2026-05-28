@@ -1,6 +1,7 @@
+-- Copyright (c) 2025-2026 Gateway Dynamic Software, LLC. All rights reserved.
 --scrollBar.lua
 
-local librarySpritesPath = "Libraries/jp_GUI_library/librarySprites/"
+local librarySpritesPath = "Libraries/gds_love2d_gui/librarySprites/"
 
 -- Pre-allocated colour tables to avoid creating a new table every draw call.
 local _COLOR_BAR_FOCUSED   = {0, 0, 1, 1}
@@ -15,14 +16,14 @@ function gdsGui_scrollBar_create (id, strgPage, x, y, width, height, anchorPoint
 		t.assets = assets or {}
 
 		-- Apply library sprite defaults for any nil sprite paths
-		t.assets.up_active     = t.assets.up_active     or (librarySpritesPath .. "jpLoveGUI_UpArrowButton_pushed.png")
-		t.assets.up_inactive   = t.assets.up_inactive   or (librarySpritesPath .. "jpLoveGUI_UpArrowButton_released.png")
-		t.assets.down_active   = t.assets.down_active   or (librarySpritesPath .. "jpLoveGUI_downArrowButton_pushed.png")
-		t.assets.down_inactive = t.assets.down_inactive or (librarySpritesPath .. "jpLoveGUI_downArrowButton_released.png")
-		t.assets.left_active   = t.assets.left_active   or (librarySpritesPath .. "jpLoveGUI_leftArrowButton_pushed.png")
-		t.assets.left_inactive = t.assets.left_inactive or (librarySpritesPath .. "jpLoveGUI_leftArrowButton_released.png")
-		t.assets.right_active  = t.assets.right_active  or (librarySpritesPath .. "jpLoveGUI_rightArrowButton_pushed.png")
-		t.assets.right_inactive= t.assets.right_inactive or (librarySpritesPath .. "jpLoveGUI_rightArrowButton_released.png")
+		t.assets.up_active     = t.assets.up_active     or (librarySpritesPath .. "gdsLoveGUI_UpArrowButton_pushed.png")
+		t.assets.up_inactive   = t.assets.up_inactive   or (librarySpritesPath .. "gdsLoveGUI_UpArrowButton_released.png")
+		t.assets.down_active   = t.assets.down_active   or (librarySpritesPath .. "gdsLoveGUI_downArrowButton_pushed.png")
+		t.assets.down_inactive = t.assets.down_inactive or (librarySpritesPath .. "gdsLoveGUI_downArrowButton_released.png")
+		t.assets.left_active   = t.assets.left_active   or (librarySpritesPath .. "gdsLoveGUI_leftArrowButton_pushed.png")
+		t.assets.left_inactive = t.assets.left_inactive or (librarySpritesPath .. "gdsLoveGUI_leftArrowButton_released.png")
+		t.assets.right_active  = t.assets.right_active  or (librarySpritesPath .. "gdsLoveGUI_rightArrowButton_pushed.png")
+		t.assets.right_inactive= t.assets.right_inactive or (librarySpritesPath .. "gdsLoveGUI_rightArrowButton_released.png")
 
 		t.id = id
 		t.type = sbType --[[independent or table-linked]]
