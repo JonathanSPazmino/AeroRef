@@ -162,7 +162,7 @@ local _LEARN_CALC_RAW = {
 }
 local _LEARN_DUTY_RAW = {
     {text="FOR REFERENCE ONLY", sub=true},
-    {text="This calculator uses a simplified single-flight model. It does not account for FAR Part 117, Part 135, rest requirements, cumulative hour limits, or your operator's ops specs. Always verify against applicable regulations and your operator's operations specifications.\n"},
+    {text="This calculator uses a simplified single-flight model. It does not substitute for applicable duty and rest regulations, your operator's operations specifications, or company fatigue policies. Always verify against the regulations and ops specs governing your operation.\n"},
     {text="DUTY / FLIGHT TIME", sub=true},
     {text="Calculates the latest departure time that keeps your last flight within the duty period.\n"},
     {text="DUTY START", sub=true},
