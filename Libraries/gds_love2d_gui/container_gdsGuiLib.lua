@@ -1381,6 +1381,15 @@ function gdsGui_container_scrollToBody(pageName, containerName)
     end
 end
 
+function gdsGui_container_scrollToTop(pageName)
+    local state = globApp.objects.pageScrollStates[pageName]
+    if not state then return end
+    state.scroll.offsetY   = 0
+    state.scroll.velocityY = 0
+    state.scroll.phase     = "idle"
+    _applyPageScroll(pageName)
+end
+
 -- ---------------------------------------------------------------------------
 --  PUBLIC API — container clip hit-test
 -- ---------------------------------------------------------------------------
@@ -1416,6 +1425,82 @@ end
 
 function gdsGui_container_resize(pageName)
     _layoutPage(pageName or gdsGui_page_currentName())
+end
+
+-- Re-runs a full layout from containerFrac (not origCF), then updates
+-- originalScrollHeight and origCF so future window-resize layouts are correct.
+-- Call this after updating containerFrac.h/y on any widgets (e.g. font resize).
+function gdsGui_container_relayoutPage(pageName)
+    local sa = globApp.safeScreenArea
+
+    local headerConts, footerConts, bodyConts = {}, {}, {}
+    for _, c in ipairs(globApp.objects.containers) do
+        if c.page == pageName then
+            if     c.pageRole == "pageHeader" then table.insert(headerConts, c)
+            elseif c.pageRole == "pageFooter" then table.insert(footerConts, c)
+            else                                   table.insert(bodyConts,   c)
+            end
+        end
+    end
+
+    local headerZoneH = 0
+    for _, cont in ipairs(headerConts) do
+        local h = cont.headerHeight
+        cont.frame = { x=sa.x, y=sa.y + headerZoneH, width=sa.w, height=h }
+        _computeSubrects(cont)
+        _layoutObjects(cont)
+        headerZoneH = headerZoneH + h
+    end
+
+    local footerZoneH = 0
+    for _, cont in ipairs(footerConts) do footerZoneH = footerZoneH + cont.headerHeight end
+    local footerCurY = sa.y + sa.h - footerZoneH
+    for _, cont in ipairs(footerConts) do
+        local h = cont.headerHeight
+        cont.frame = { x=sa.x, y=footerCurY, width=sa.w, height=h }
+        _computeSubrects(cont)
+        _layoutObjects(cont)
+        footerCurY = footerCurY + h
+    end
+
+    local bodyArea = {
+        x=sa.x, y=sa.y + headerZoneH,
+        width=sa.w, height=sa.h - headerZoneH - footerZoneH,
+    }
+
+    local contentH = 0
+    local curY = bodyArea.y
+    for _, cont in ipairs(bodyConts) do
+        cont.frame = { x=bodyArea.x, y=curY, width=bodyArea.width, height=0 }
+        _computeSubrects(cont)
+        _layoutObjects(cont)
+        cont.frame.height = cont.headerHeight + cont.contentHeight + cont.footerHeight
+
+        -- Refresh reference dimensions so the next window-resize uses the
+        -- new font-size heights rather than the old originals.
+        cont.originalScrollWidth  = cont.scrollRect.width
+        cont.originalScrollHeight = cont.contentHeight
+        for _, entry in ipairs(cont.objects) do
+            local cf = entry.ref.containerFrac
+            if cf then
+                entry.origCF = { x=cf.x, y=cf.y, w=cf.w, h=cf.h,
+                                 anchorPoint=cf.anchorPoint }
+            end
+        end
+
+        cont.frameNaturalY = curY
+        curY = curY + cont.frame.height
+    end
+    contentH = curY - bodyArea.y
+
+    local state = globApp.objects.pageScrollStates[pageName]
+    if state then
+        state.bodyArea      = bodyArea
+        state.contentHeight = contentH
+        local minOff = math.min(0, bodyArea.height - contentH)
+        if state.scroll.offsetY < minOff then state.scroll.offsetY = minOff end
+        if state.scroll.offsetY > 0 then state.scroll.offsetY = 0 end
+    end
 end
 
 -- ---------------------------------------------------------------------------
