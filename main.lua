@@ -26,8 +26,7 @@ gdsGui_page_create(6, "Settings",           false, false, globApp.appColor, 12, 
 -- GLOBAL STATE
 -------------------------------------------------------------------------------
 local utc = {}
-local utcPrintString = ""
-local lastUtcSec = -1 -- Add a variable to track the last updated second
+local lastUtcMin = -1
 local lastSavedCountDownTime = 0
 local font
 
@@ -119,7 +118,7 @@ local _THEME_LIGHT = {
 -- Learn textbox segment data (text + subtitle flag; colors resolved per theme).
 local _LEARN_TIMER_RAW = {
     {text="UTC CLOCK", sub=true},
-    {text="Shows current UTC date and time, updated each second. Sourced from the device system clock; verify against a certified time source for time-critical operations.\n"},
+    {text="Current UTC time is displayed in the Main Menu header in HHMM UTC format (e.g. 2359 UTC), always visible regardless of scroll position. Updates each minute. Sourced from the device system clock; verify against a certified time source for time-critical operations.\n"},
     {text="NAVIGATION", sub=true},
     {text="Use the tab bar at the bottom to switch between Main Menu, Learn, and Settings.\n"},
     {text="TIMER MODE", sub=true},
@@ -214,7 +213,11 @@ local function _applyTheme(isDark)
         cont.borderColor = { t.border[1], t.border[2], t.border[3], t.border[4] }
     end
     for _, obj in ipairs(globApp.objects.outputTextBox) do
-        obj.text.color = { t.text[1], t.text[2], t.text[3], t.text[4] }
+        if obj.name == "mainMenu_utcHeader" then
+            obj.text.color = isDark and colorYellow or {0.05, 0.10, 0.40, 1}
+        else
+            obj.text.color = { t.text[1], t.text[2], t.text[3], t.text[4] }
+        end
         if obj.name == "compassBg" then
             obj.bgCircle = (not isDark) and {0.35, 0.35, 0.35, 1} or nil
         end
@@ -236,7 +239,7 @@ local function _applyFontSize(fontSize)
     love.graphics.setFont(globApp.appFont)
     local names = {
         -- main menu data panels
-        "utcData", "timerTopRight", "crosswindData",
+        "mainMenu_utcHeader", "timerTopRight", "crosswindData",
         "windSpeedLabel", "windGustLabel",
         "selectedAltitudeBox", "selectedTimeBox", "selectedDegreeBox",
         "requiredFPM", "requiredDistance",
@@ -264,6 +267,138 @@ local function _applyFontSize(fontSize)
             break
         end
     end
+
+    -- Only relayout once containers have been finalised (not during early init).
+    if not globApp.objects.pageScrollStates["MainMenu"] then return end
+
+    -- Recompute each textbox height at the new font size, update containerFrac,
+    -- and relayout so containers shrink/grow to fit — no empty space left behind.
+    local font = love.graphics.newFont(fontSize)
+    local cW   = globApp.safeScreenArea.w
+    local function wS(px) return math.floor(px / 320 * cW) end
+    local function mH(maxText, fw)
+        local textW = (fw - 10) * 0.8
+        local lines = 0
+        for seg in (maxText .. "\n"):gmatch("([^\n]*)\n") do
+            local _, wrapped = font:getWrap(seg == "" and " " or seg, textW)
+            lines = lines + #wrapped
+        end
+        return lines * font:getHeight() + 8
+    end
+
+    local tx = globApp.objects.outputTextBox
+    local sb = globApp.objects.scrollBars
+    local rk = globApp.objects.rotaryKnobs
+    local function setCF(list, name, field, value)
+        for _, obj in ipairs(list) do
+            if (obj.name == name or obj.id == name) then
+                obj.containerFrac[field] = value; return
+            end
+        end
+    end
+
+    -- Timer panel
+    -- mainMenu_utcHeader lives in the fixed page header; no container relayout needed
+    setCF(tx, "timerTopRight", "h", mH("COUNT DOWN\nTIMER:\nM 59:59 S", wS(190)))
+
+    -- Wind panel
+    local hWindLabel = mH("WIND\nSPD", 75)
+    local hCrosswind = mH(
+        "WIND: 36046G61KT\nRWY: 36\nSUS XW:46L TW:46\nGST XW:61L TW:61\nGust Factor: 56",
+        wS(200))
+    setCF(tx, "windSpeedLabel", "h", hWindLabel)
+    setCF(tx, "windGustLabel",  "h", hWindLabel)
+    setCF(tx, "crosswindData",  "h", hCrosswind)
+    local windSbY  = 10 + hWindLabel + 5
+    local knobY    = math.max(100, 10 + hCrosswind + 20)
+    local compassY = knobY + 80
+    local windSbH  = knobY + 160 - windSbY
+    setCF(sb, "windSpeed",   "y", windSbY)
+    setCF(sb, "windSpeed",   "h", windSbH)
+    setCF(sb, "windGust",    "y", windSbY)
+    setCF(sb, "windGust",    "h", windSbH)
+    setCF(rk, "runwayKnob",  "y", knobY)
+    setCF(tx, "compassBg",   "y", compassY)
+
+    -- Calc panel
+    local hCalcSel = mH("SLCTD ALT:\n51000 FT", wS(110)) + 40
+    setCF(tx, "selectedAltitudeBox", "h", hCalcSel)
+    setCF(tx, "selectedTimeBox",     "h", hCalcSel)
+    setCF(tx, "selectedDegreeBox",   "h", hCalcSel)
+    local hCalcRes = mH("REQ DIST:\n1925 nm", wS(80)) + 40
+    setCF(tx, "requiredFPM",      "h", hCalcRes)
+    setCF(tx, "requiredDistance", "h", hCalcRes)
+    local calcSbY   = 47 + math.ceil(hCalcSel / 2) + 2
+    local calcResCY = calcSbY + math.floor(185 / 2)
+    setCF(sb, "timeScale", "y", calcSbY)
+    setCF(sb, "altScale",  "y", calcSbY)
+    setCF(sb, "deg",       "y", calcSbY)
+    setCF(tx, "requiredFPM",      "y", calcResCY)
+    setCF(tx, "requiredDistance", "y", calcResCY)
+
+    -- Duty panel (positions depend on heights above, mirroring the _d1.._d8 logic)
+    local warnFont = love.graphics.newFont(math.max(8, fontSize - 2))
+    local function mHW(maxText, fw)
+        local textW = (fw - 10) * 0.8
+        local lines = 0
+        for seg in (maxText .. "\n"):gmatch("([^\n]*)\n") do
+            local _, wrapped = warnFont:getWrap(seg == "" and " " or seg, textW)
+            lines = lines + #wrapped
+        end
+        return lines * warnFont:getHeight() + 8
+    end
+    local sbH          = 30
+    local hDutyStart   = mH("DUTY START: 23:59Z",                                               wS(310))
+    local hDutyMax     = mH("MAX DUTY: 20 HRS",                                                  wS(310))
+    local hLastFlight  = mH("LAST FLT BLOCK TIME: 18.0 HRS",                                     wS(310))
+    local hDutyOut     = mH("DEPART BY\n23:59Z",                                                 wS(120))
+    local hDutyWarn    = mHW("FOR REFERENCE ONLY — verify against applicable FARs and ops specs.", wS(310))
+    local dGap  = 8
+    local lsGap = 4
+    local d2 = dGap + hDutyStart  + lsGap
+    local d4 = d2 + sbH + dGap   + hDutyMax    + lsGap
+    local d6 = d4 + sbH + dGap   + hLastFlight + lsGap
+    local d1 = d2 - hDutyStart  - lsGap
+    local d3 = d4 - hDutyMax    - lsGap
+    local d5 = d6 - hLastFlight - lsGap
+    local d7 = d6 + sbH + dGap
+    local d8 = d7 + hDutyOut    + dGap
+    setCF(tx, "dutyStartBox",    "h", hDutyStart);   setCF(tx, "dutyStartBox",    "y", d1)
+    setCF(sb, "dutyStartScale",  "y", d2)
+    setCF(tx, "dutyMaxHoursBox", "h", hDutyMax);     setCF(tx, "dutyMaxHoursBox", "y", d3)
+    setCF(sb, "dutyHoursScale",  "y", d4)
+    setCF(tx, "lastFlightBox",   "h", hLastFlight);  setCF(tx, "lastFlightBox",   "y", d5)
+    setCF(sb, "lastFlightScale", "y", d6)
+    setCF(tx, "dutyOutBox",      "h", hDutyOut);     setCF(tx, "dutyOutBox",      "y", d7)
+    setCF(tx, "departByBox",     "h", hDutyOut);     setCF(tx, "departByBox",     "y", d7)
+    setCF(tx, "dutyWarningBox",  "h", hDutyWarn);    setCF(tx, "dutyWarningBox",  "y", d8)
+
+    gdsGui_container_relayoutPage("MainMenu")
+    gdsGui_container_scrollToTop("MainMenu")
+
+    -- Learn page: re-measure static content at the new font size
+    local lTxtW  = math.floor(cW * 0.85)
+    local lTextW = (lTxtW - 10) * 0.8
+    local function lH(rawSegs)
+        local n = 0
+        for _, s in ipairs(rawSegs) do
+            local _, wrapped = font:getWrap(s.text, lTextW)
+            n = n + #wrapped
+        end
+        return n * font:getHeight()
+    end
+    local learnPairs = {
+        {"timerLearnContent",    _LEARN_TIMER_RAW},
+        {"windLearnContent",     _LEARN_WIND_RAW},
+        {"calcLearnContent",     _LEARN_CALC_RAW},
+        {"dutyLearnContent",     _LEARN_DUTY_RAW},
+        {"settingsLearnContent", _LEARN_SETTINGS_RAW},
+    }
+    for _, p in ipairs(learnPairs) do
+        setCF(tx, p[1], "h", lH(p[2]))
+    end
+    gdsGui_container_relayoutPage("Learn")
+    gdsGui_container_scrollToTop("Learn")
 end
 
 -------------------------------------------------------------------------------
@@ -308,35 +443,62 @@ function love.load()
     if appSettings.hapticsEnabled == nil then appSettings.hapticsEnabled = true  end
     if appSettings.fontSize       == nil then appSettings.fontSize       = 12    end
 
-    -- Layout height variables sized for fs=16 (the maximum user-selectable font size)
-    -- so textboxes never require internal scrolling at any font setting.
-    local _lh  = love.graphics.newFont(16):getHeight()
-    local _h1  = _lh + 11           -- single-line textbox
-    local _h2  = _lh * 2 + 19      -- two-line textbox
-    local _h3  = _lh * 3 + 17      -- three-line textbox
-    local _h5  = _lh * 5 + 20      -- five-line textbox (crosswind max)
-    local _sbH = 30                  -- scrollbar height, fixed
-    local _wH  = love.graphics.newFont(14):getHeight() + 10
-    -- Wind panel: scrollbar sits below the speed/gust label with a 5 px gap
-    local _windSbY = 10 + _h2 + 5
-    local _windSbH = 231 - _windSbY
-    -- Calc panel: scrollbar starts 2 px below the bottom of the two-line selector box
-    local _calcSbY = 47 + math.ceil(_h2 / 2) + 2
-    -- Duty panel: rows computed top-to-bottom so nothing overlaps at any font size
-    local _d1 = 8
-    local _d2 = _d1 + _h1 + 2
-    local _d3 = _d2 + _sbH + 15
-    local _d4 = _d3 + _h1 + 2
-    local _d5 = _d4 + _sbH + 15
-    local _d6 = _d5 + _h1 + 2
-    local _d7 = _d6 + _sbH + 16
-    local _d8 = _d7 + _h2 + 10
-
     -- Scale pixel coordinates from the 320-pt design canvas to the actual container width
     -- (iPhone SE 2nd gen = 375 pt reference; _x/_w return floor'd pixel values).
     local _cW = globApp.safeScreenArea.w
     local function _x(px) return math.floor(px / 320 * _cW) end
     local function _w(px) return math.floor(px / 320 * _cW) end
+
+    -- Measure each textbox height from the actual fs=16 font (worst case) so no
+    -- textbox ever requires internal scrolling at any user-selectable font size.
+    local _sbH    = 30   -- scrollbar height, fixed
+    local _font16 = love.graphics.newFont(16)
+    local function _measuredH(maxText, frameWidth)
+        local textW = (frameWidth - 10) * 0.8
+        local lines = 0
+        for seg in (maxText .. "\n"):gmatch("([^\n]*)\n") do
+            local _, wrapped = _font16:getWrap(seg == "" and " " or seg, textW)
+            lines = lines + #wrapped
+        end
+        return lines * _font16:getHeight() + 8
+    end
+
+    local _hUTCHdr     = _measuredH("2359 UTC",                                          _w(96))
+    local _hTimer      = _measuredH("COUNT DOWN\nTIMER:\nM 59:59 S",                     _w(190))
+    local _hCrosswind  = _measuredH(
+        "WIND: 36046G61KT\nRWY: 36\nSUS XW:46L TW:46\nGST XW:61L TW:61\nGust Factor: 56",
+        _w(200))
+    local _hWindLabel  = _measuredH("WIND\nSPD",                                          75)
+    local _hCalcSel    = _measuredH("SLCTD ALT:\n51000 FT",                              _w(110)) + 40
+    local _hCalcRes    = _measuredH("REQ DIST:\n1925 nm",                                _w(80))  + 40
+    local _hDutyStart  = _measuredH("DUTY START: 23:59Z",                                _w(310))
+    local _hDutyMax    = _measuredH("MAX DUTY: 20 HRS",                                  _w(310))
+    local _hLastFlight = _measuredH("LAST FLT BLOCK TIME: 18.0 HRS",                     _w(310))
+    local _hDutyOut    = _measuredH("DEPART BY\n23:59Z",                                 _w(120))
+    local _hDutyWarn   = _measuredH(
+        "FOR REFERENCE ONLY — verify against applicable FARs and ops specs.",             _w(310))
+
+    local _windSbY  = 10 + _hWindLabel + 5
+    local _knobY    = math.max(100, 10 + _hCrosswind + 20)
+    local _compassY = _knobY + 80
+    local _windSbH  = _knobY + 160 - _windSbY   -- spans from below label to knob bottom
+    local _calcSbY  = 47 + math.ceil(_hCalcSel / 2) + 2
+    local _calcResCY = _calcSbY + math.floor(185 / 2)  -- vertical centre of the calc scrollbars
+    local _dutyGap  = 8   -- section gap: scrollbar bottom → next group top
+    local _lblSbGap = 4   -- label bottom → scrollbar top (tight coupling)
+
+    -- Scrollbar y positions anchor each group; labels are derived from them.
+    local _d2 = _dutyGap + _hDutyStart  + _lblSbGap
+    local _d4 = _d2 + _sbH + _dutyGap  + _hDutyMax    + _lblSbGap
+    local _d6 = _d4 + _sbH + _dutyGap  + _hLastFlight + _lblSbGap
+
+    -- Label y = scrollbar y − label height − small gap (just above the scrollbar)
+    local _d1 = _d2 - _hDutyStart  - _lblSbGap
+    local _d3 = _d4 - _hDutyMax    - _lblSbGap
+    local _d5 = _d6 - _hLastFlight - _lblSbGap
+
+    local _d7 = _d6 + _sbH + _dutyGap
+    local _d8 = _d7 + _hDutyOut    + _dutyGap
 
     ---------------------------------------------------------------------------
     -- SHARED HEADER / FOOTER LAYOUT VALUES
@@ -384,6 +546,12 @@ function love.load()
     end
 
     createPageHeaderFooter("MainMenu", "MAIN MENU", "mainMenu")
+    -- UTC time pinned to the right of the main menu header — always visible
+    gdsGui_outputTxtBox_create("mainMenu_utcHeader", "MainMenu", nil,
+        globApp.safeScreenArea.w - 4, hdrCY, "RC",
+        math.floor(globApp.safeScreenArea.w * 0.30), _hUTCHdr,
+        colorWarning, "0000 UTC", 16, "mainMenu_header"
+    )
     createPageHeaderFooter("Learn",    "LEARN",     "learn")
     createPageHeaderFooter("Settings", "SETTINGS",  "settings")
 
@@ -393,69 +561,75 @@ function love.load()
     -- Pixel positions are relative to the container's scroll-rect origin.
     -- Design canvas: 320 px wide, 585 px tall (portrait, 32 px header stripped).
     ---------------------------------------------------------------------------
-    gdsGui_container_create("timerPanel", "MainMenu", "UTC / TIMER", 32, 0)
+    gdsGui_container_create("timerPanel", "MainMenu", "TIMER", 32, 0)
 
-    -- Buttons (26×26 px square)
-    gdsGui_button_create("resetRHTopTimer", "MainMenu", "pushonoff",
-        "Sprites/button_reset_pressed.png", "Sprites/button_reset_released.png",
-        "Sprites/button_reset_deactivated.png", _x(269), 90, "RT",
-        33, 33,
-        "resetRHTopTimer", globApp.BUTTON_STATES.RELEASED, true, "timerPanel"
+    -- Layout anchors: timer text sits at top; control buttons clear it by 8 px.
+    local _timerY = 8
+    local _btnY   = _timerY + _hTimer + 8
+
+    -- Timer text — centred across the full container width
+    local text = timer.mode .. "\nTIMER:\nM " .. format_time(timer.t) .. " S"
+    gdsGui_outputTxtBox_create("timerTopRight", "MainMenu", nil,
+        _x(160), _timerY, "CT",
+        _w(190), _hTimer,
+        colorYellow, text, 12, "timerPanel"
     )
-    gdsGui_button_create("pauseRHTopTimer", "MainMenu", "toggle",
-        "Sprites/button_pause_play_pressed.png", "Sprites/button_pause_play_released.png",
-        "Sprites/button_pause_play_deactivated.png", _x(215), 90, "CT",
-        33, 33,
-        "pauseRHTopTimer", globApp.BUTTON_STATES.RELEASED, true, "timerPanel"
+
+    -- Invisible alarm-acknowledge overlay: same width as before, tall enough to
+    -- cover the full container content (text + gap + control button row).
+    gdsGui_button_create("acknowlegeAlarm", "MainMenu", "pushonoff",
+        nil, nil, nil,
+        _x(160), _timerY, "CT",
+        _w(190), _hTimer + 41,
+        "acknowlegeAlarm", globApp.BUTTON_STATES.DEACTIVATED, true, "timerPanel"
     )
-    gdsGui_button_create("modeSelectRHTopTimer", "MainMenu", "toggle",
-        "Sprites/button_timer_mode_pressed.png", "Sprites/button_timer_mode_released.png",
-        "Sprites/button_timer_mode_deactivated.png", _x(160), 90, "LT",
-        33, 33,
-        "modeSelectRHTopTimer", globApp.BUTTON_STATES.RELEASED, true, "timerPanel"
-    )
+
+    -- Min +/− buttons — inset from left edge, alongside timer text (countdown mode)
     gdsGui_button_create("incrsMinRHTopTimer", "MainMenu", "pushonoff",
         "Sprites/button_min_increase_pressed.png", "Sprites/button_min_increase_released.png",
-        nil, _x(120), 50, "LT",
+        nil, _x(20), _timerY, "LT",
         33, 33,
         "incrsMinRHTopTimer", globApp.BUTTON_STATES.DEACTIVATED, true, "timerPanel"
     )
     gdsGui_button_create("dcrsMinRHTopTimer", "MainMenu", "pushonoff",
         "Sprites/button_min_decrease_pressed.png", "Sprites/button_min_decrease_released.png",
-        nil, _x(120), 90, "LT",
+        nil, _x(20), _timerY + 36, "LT",
         33, 33,
         "dcrsMinRHTopTimer", globApp.BUTTON_STATES.DEACTIVATED, true, "timerPanel"
     )
+
+    -- Sec +/− buttons — inset from right edge, alongside timer text (countdown mode)
     gdsGui_button_create("incrsSecRHTopTimer", "MainMenu", "pushonoff",
         "Sprites/button_sec_increase_pressed.png", "Sprites/button_sec_increase_released.png",
-        nil, _x(274), 50, "LT",
+        nil, _x(300), _timerY, "RT",
         33, 33,
         "incrsSecRHTopTimer", globApp.BUTTON_STATES.DEACTIVATED, true, "timerPanel"
     )
     gdsGui_button_create("dcrsSecRHTopTimer", "MainMenu", "pushonoff",
         "Sprites/button_sec_decrease_pressed.png", "Sprites/button_sec_decrease_released.png",
-        nil, _x(274), 90, "LT",
+        nil, _x(300), _timerY + 36, "RT",
         33, 33,
         "dcrsSecRHTopTimer", globApp.BUTTON_STATES.DEACTIVATED, true, "timerPanel"
     )
-    gdsGui_button_create("acknowlegeAlarm", "MainMenu", "pushonoff",
-        nil, nil,
-        nil, _x(300), 30, "RT",
-        _w(190), 95,
-        "acknowlegeAlarm", globApp.BUTTON_STATES.DEACTIVATED, true, "timerPanel"
-    )
 
-    -- Text boxes
-    gdsGui_outputTxtBox_create("utcData", "MainMenu", nil,
-        6, 30, "LT",
-        _w(128), _h3,
-        colorYellow, utcPrintString, 12, "timerPanel"
+    -- Control buttons — evenly spaced row below timer text
+    gdsGui_button_create("modeSelectRHTopTimer", "MainMenu", "toggle",
+        "Sprites/button_timer_mode_pressed.png", "Sprites/button_timer_mode_released.png",
+        "Sprites/button_timer_mode_deactivated.png", _x(100), _btnY, "CT",
+        33, 33,
+        "modeSelectRHTopTimer", globApp.BUTTON_STATES.RELEASED, true, "timerPanel"
     )
-    local text = timer.mode .. "\nTIMER:\nM " .. format_time(timer.t) .. " S"
-    gdsGui_outputTxtBox_create("timerTopRight", "MainMenu", nil,
-        _x(283), 30, "RT",
-        _w(120), _h3,
-        colorYellow, text, 12, "timerPanel"
+    gdsGui_button_create("pauseRHTopTimer", "MainMenu", "toggle",
+        "Sprites/button_pause_play_pressed.png", "Sprites/button_pause_play_released.png",
+        "Sprites/button_pause_play_deactivated.png", _x(160), _btnY, "CT",
+        33, 33,
+        "pauseRHTopTimer", globApp.BUTTON_STATES.RELEASED, true, "timerPanel"
+    )
+    gdsGui_button_create("resetRHTopTimer", "MainMenu", "pushonoff",
+        "Sprites/button_reset_pressed.png", "Sprites/button_reset_released.png",
+        "Sprites/button_reset_deactivated.png", _x(220), _btnY, "CT",
+        33, 33,
+        "resetRHTopTimer", globApp.BUTTON_STATES.RELEASED, true, "timerPanel"
     )
 
     ---------------------------------------------------------------------------
@@ -465,7 +639,7 @@ function love.load()
 
     -- Compass background: inserted first so it renders under the knob
     gdsGui_outputTxtBox_create("compassBg", "MainMenu", "Sprites/bg_compass_visible.png",
-        _x(160), 180, "CC",
+        _x(160), _compassY, "CC",
         208, 208,
         {1, 1, 1, 1}, "", 1, "windPanel"
     )
@@ -473,7 +647,7 @@ function love.load()
     -- Rotary knob (150×150 px square)
     gdsGui_rotaryKnob_createDual(
         "runwayKnob", "MainMenu",
-        _x(160) - 80, 100, "LT",
+        _x(160) - 80, _knobY, "LT",
         160,
         36, 0,
         "Sprites/knob_runway_released.png", "Sprites/knob_runway_pressed.png",
@@ -487,17 +661,17 @@ function love.load()
     -- Text boxes
     gdsGui_outputTxtBox_create("crosswindData", "MainMenu", nil,
         _x(160), 10, "CT",
-        _w(200), _h5,
+        _w(200), _hCrosswind,
         colorYellow, "WIND: 36000KT", 12, "windPanel"
     )
     gdsGui_outputTxtBox_create("windSpeedLabel", "MainMenu", nil,
         _x(30), 10, "CT",
-        60, _h2,
+        75, _hWindLabel,
         colorYellow, "WIND\nSPD", 12, "windPanel"
     )
     gdsGui_outputTxtBox_create("windGustLabel", "MainMenu", nil,
         _x(290), 10, "CT",
-        60, _h2,
+        75, _hWindLabel,
         colorYellow, "WIND\nGST", 12, "windPanel"
     )
 
@@ -520,19 +694,19 @@ function love.load()
     local textAltSlctd = "SLCTD ALT:\n" .. selectedAltitude .. " FT"
     gdsGui_outputTxtBox_create("selectedAltitudeBox", "MainMenu", nil,
         _x(164), 47, "CC",
-        _w(110), _h2,
+        _w(110), _hCalcSel,
         colorYellow, textAltSlctd, 12, "calcPanel"
     )
     local textTimeSlctd = "SLCTD TIME:\n" .. selectedTime .. " min"
     gdsGui_outputTxtBox_create("selectedTimeBox", "MainMenu", nil,
         _x(52), 47, "CC",
-        _w(110), _h2,
+        _w(110), _hCalcSel,
         colorYellow, textTimeSlctd, 12, "calcPanel"
     )
     local textDegreeSlctd = "SLCTD DEG:\n" .. string.format("%.2f", selectedDegree) .. "°"
     gdsGui_outputTxtBox_create("selectedDegreeBox", "MainMenu", nil,
         _x(267), 47, "CC",
-        _w(110), _h2,
+        _w(110), _hCalcSel,
         colorYellow, textDegreeSlctd, 12, "calcPanel"
     )
     local requiredFPM = 0
@@ -541,8 +715,8 @@ function love.load()
     end
     local requiredFPMtext = "REQ FPM:\n" .. requiredFPM
     gdsGui_outputTxtBox_create("requiredFPM", "MainMenu", nil,
-        _x(110), 146, "CC",
-        _w(80), _h2,
+        _x(110), _calcResCY, "CC",
+        _w(80), _hCalcRes,
         colorYellow, requiredFPMtext, 12, "calcPanel"
     )
     local requiredDistance = 0
@@ -551,8 +725,8 @@ function love.load()
     end
     local requiredDistText = "REQ DIST:\n" .. requiredDistance .. " nm"
     gdsGui_outputTxtBox_create("requiredDistance", "MainMenu", nil,
-        _x(211), 146, "CC",
-        _w(80), _h2,
+        _x(211), _calcResCY, "CC",
+        _w(80), _hCalcRes,
         colorYellow, requiredDistText, 12, "calcPanel"
     )
 
@@ -576,31 +750,31 @@ function love.load()
     gdsGui_container_create("dutyPanel", "MainMenu", "DUTY / FLIGHT TIME", 32, 0)
 
     gdsGui_outputTxtBox_create("dutyStartBox",    "MainMenu", nil,
-        _x(160), _d1, "CT", _w(270), _h1, colorYellow, "DUTY START: 00:00Z", 12, "dutyPanel")
+        _x(160), _d1, "CT", _w(310), _hDutyStart,  colorYellow, "DUTY START: 00:00Z", 12, "dutyPanel")
     gdsGui_outputTxtBox_create("dutyMaxHoursBox", "MainMenu", nil,
-        _x(160), _d3, "CT", _w(270), _h1, colorYellow, "MAX DUTY: 1 HR",     12, "dutyPanel")
+        _x(160), _d3, "CT", _w(310), _hDutyMax,    colorYellow, "MAX DUTY: 1 HR",     12, "dutyPanel")
     gdsGui_outputTxtBox_create("lastFlightBox",   "MainMenu", nil,
-        _x(160), _d5, "CT", _w(270), _h1, colorYellow, "LAST FLT BLOCK TIME: 0.0 HRS", 12, "dutyPanel")
+        _x(160), _d5, "CT", _w(310), _hLastFlight, colorYellow, "LAST FLT BLOCK TIME: 0.0 HRS", 12, "dutyPanel")
 
     gdsGui_scrollBar_create("dutyStartScale", "MainMenu",
-        _x(160), _d2, _w(270), _sbH, "CT", 32, 289, 0,
+        _x(160), _d2, _w(310), _sbH, "CT", 32, 289, 0,
         "independent", "horizontal", 289, "dutyStartChanged",
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "dutyPanel")
     gdsGui_scrollBar_create("dutyHoursScale", "MainMenu",
-        _x(160), _d4, _w(270), _sbH, "CT", 5, 20, 0,
+        _x(160), _d4, _w(310), _sbH, "CT", 5, 20, 0,
         "independent", "horizontal", 20, "dutyHoursChanged",
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "dutyPanel")
     gdsGui_scrollBar_create("lastFlightScale", "MainMenu",
-        _x(160), _d6, _w(270), _sbH, "CT", 20, 181, 0,
+        _x(160), _d6, _w(310), _sbH, "CT", 20, 181, 0,
         "independent", "horizontal", 181, "lastFlightChanged",
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "dutyPanel")
 
     gdsGui_outputTxtBox_create("dutyOutBox",  "MainMenu", nil,
-        _x(80),  _d7, "CT", _w(120), _h2, colorYellow, "DUTY OUT\n--:--Z",  12, "dutyPanel")
+        _x(80),  _d7, "CT", _w(120), _hDutyOut, colorYellow, "DUTY OUT\n--:--Z",  12, "dutyPanel")
     gdsGui_outputTxtBox_create("departByBox", "MainMenu", nil,
-        _x(240), _d7, "CT", _w(120), _h2, colorYellow, "DEPART BY\n--:--Z", 12, "dutyPanel")
+        _x(240), _d7, "CT", _w(120), _hDutyOut, colorYellow, "DEPART BY\n--:--Z", 12, "dutyPanel")
     gdsGui_outputTxtBox_create("dutyWarningBox", "MainMenu", nil,
-        _x(160), _d8, "CT", _w(270), _wH, colorWarning,
+        _x(160), _d8, "CT", _w(310), _hDutyWarn, colorWarning,
         "FOR REFERENCE ONLY — verify against applicable FARs and ops specs.", 10, "dutyPanel")
 
     ---------------------------------------------------------------------------
@@ -767,15 +941,12 @@ function love.load()
 end
 
 function love.update(dt)
-    -- Update UTC clock string only when the second changes
+    -- Update UTC clock header label only when the minute changes
     utc = os.date("!*t")
-    if utc.sec ~= lastUtcSec then
-        utcPrintString = string.format(
-            "UTC:\n%04d-%02d-%02d\n%02d:%02d:%02d",
-            utc.year, utc.month, utc.day, utc.hour, utc.min, utc.sec
-        )
-        lastUtcSec = utc.sec
-        gdsGui_outputTxtBox_setText("utcData", utcPrintString)
+    if utc.min ~= lastUtcMin then
+        lastUtcMin = utc.min
+        gdsGui_outputTxtBox_setText("mainMenu_utcHeader",
+            string.format("%02d%02d UTC", utc.hour, utc.min))
     end
 
     if timer.t ~= _prevTimerT or timer.mode ~= _prevTimerMode then
