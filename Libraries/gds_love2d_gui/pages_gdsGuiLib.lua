@@ -48,7 +48,7 @@ end
 
 local loadingObjects = {}
 
-function gdsGui_page_loadingCreate (myName, myToPg, myMinTime_secs, myFromPg, testMode)
+function gdsGui_page_loadingCreate (myName, myToPg, myMinTime_secs, myFromPg, testMode, myProgressBarColor)
 
 	if testMode == true then
 		pgWidht = 1000
@@ -62,6 +62,7 @@ function gdsGui_page_loadingCreate (myName, myToPg, myMinTime_secs, myFromPg, te
 	NewLoadingObject.toPg = myToPg
 	NewLoadingObject.progress = 0
 	NewLoadingObject.minEndingProgress = myMinTime_secs
+	NewLoadingObject.progressBarColor = myProgressBarColor
 	NewLoadingObject.coreFontSize = love.graphics.newFont(math.floor(gdsGui_general_smartFontScaling (0.025, 0.044)))
 	NewLoadingObject.devMsgFontSize = love.graphics.newFont(math.floor(gdsGui_general_smartFontScaling (0.022, 0.041)))
 
@@ -306,7 +307,8 @@ function gdsGui_page_loadingDraw ()
 				-- love.graphics.rectangle("line", lp.msgTxtX, lp.msgTxtY, lp.msgTxtWidth, lp.msgTxtHeight)
 
 			--PROGRESS BAR:--------------------------------------------
-			love.graphics.setColor(0, 1, 0, 1)
+			local bc = lp.progressBarColor or globApp.themeProgressBarColor or {1, 1, 0, 1}
+			love.graphics.setColor(bc[1], bc[2], bc[3], bc[4] or 1)
 			love.graphics.rectangle("fill", lp.progressBarX, lp.progressBarY, lp.progressBarWidth, lp.progressBarHeight)
 
 			--PROGRESS BAR FRAME:
@@ -321,7 +323,7 @@ function gdsGui_page_loadingDraw ()
 end
 
 
-function gdsGui_page_switch (myName, myToPg, myMinTime_secs, testMode)
+function gdsGui_page_switch (myName, myToPg, myMinTime_secs, testMode, myProgressBarColor)
 
 	local toPageExists = gdsGui_page_doesExist (myToPg)
 
@@ -333,7 +335,7 @@ function gdsGui_page_switch (myName, myToPg, myMinTime_secs, testMode)
 
 		globApp.currentPageIndex = 2 --opens loading page index
 
-		gdsGui_page_loadingCreate (myName, myToPg, myMinTime_secs, initialPage, testMode)
+		gdsGui_page_loadingCreate (myName, myToPg, myMinTime_secs, initialPage, testMode, myProgressBarColor)
 
 		gdsGui_timeControl_createTrigger (timerName,  { myMinTime_secs, myMinTime_secs+.001}, {"gdsGui_page_loadingDelete","changePgto"})
 

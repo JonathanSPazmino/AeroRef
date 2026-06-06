@@ -101,18 +101,20 @@ function format_time(s)
 end
 
 local _THEME_DARK = {
-    app    = {0.20, 0.20, 0.20, 1},
-    bg     = {0.18, 0.18, 0.18, 1},
-    header = {0.25, 0.25, 0.25, 1},
-    border = {0.35, 0.35, 0.35, 1},
-    text   = {1.00, 1.00, 1.00, 1},
+    app         = {0.20, 0.20, 0.20, 1},
+    bg          = {0.18, 0.18, 0.18, 1},
+    header      = {0.25, 0.25, 0.25, 1},
+    border      = {0.35, 0.35, 0.35, 1},
+    text        = {1.00, 1.00, 1.00, 1},
+    progressBar = {1.00, 1.00, 0.00, 1},
 }
 local _THEME_LIGHT = {
-    app    = {0.88, 0.88, 0.88, 1},
-    bg     = {0.82, 0.82, 0.82, 1},
-    header = {0.72, 0.72, 0.72, 1},
-    border = {0.55, 0.55, 0.55, 1},
-    text   = {0.05, 0.10, 0.25, 1},
+    app         = {0.88, 0.88, 0.88, 1},
+    bg          = {0.82, 0.82, 0.82, 1},
+    header      = {0.72, 0.72, 0.72, 1},
+    border      = {0.55, 0.55, 0.55, 1},
+    text        = {0.05, 0.10, 0.25, 1},
+    progressBar = {0.05, 0.10, 0.40, 1},
 }
 
 -- Learn textbox segment data (text + subtitle flag; colors resolved per theme).
@@ -206,7 +208,8 @@ end
 local function _applyTheme(isDark)
     local t = isDark and _THEME_DARK or _THEME_LIGHT
     for i = 1, 4 do globApp.appColor[i] = t.app[i] end
-    globApp.themeTextColor = { t.text[1], t.text[2], t.text[3], t.text[4] }
+    globApp.themeTextColor        = { t.text[1],        t.text[2],        t.text[3],        t.text[4] }
+    globApp.themeProgressBarColor = { t.progressBar[1], t.progressBar[2], t.progressBar[3], t.progressBar[4] }
     for _, cont in ipairs(globApp.objects.containers) do
         cont.bgColor     = { t.bg[1],     t.bg[2],     t.bg[3],     t.bg[4] }
         cont.headerColor = { t.header[1], t.header[2], t.header[3], t.header[4] }
