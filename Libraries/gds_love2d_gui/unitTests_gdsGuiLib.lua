@@ -254,8 +254,8 @@ gdsGui_unitTests_registerSuite("gui", function()
 				testTextTable[2] = "1234567810123456782012345678301234567840123456785012345678601234567870"
 				testTextTable[3] = "some textsome text, more text"
 
-		gdsGui_dev_testExecute {["id"]="findMaxNumOfLinesNeeded_rtr5",
-						["funcName"]={"findMaxNumOfLinesNeeded"},
+		gdsGui_dev_testExecute {["id"]="gdsGui_findMaxNumOfLinesNeeded_rtr5",
+						["funcName"]={"gdsGui_findMaxNumOfLinesNeeded"},
 						["funcParameters"]={testFont, 10, testTextTable},
 						["funcExpctOutput"]={7}}
 

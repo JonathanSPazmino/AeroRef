@@ -4,6 +4,10 @@
 -- spreadSheets = {}
 globApp.objects.tables = {}
 local recordErased = false
+local TableCell_create
+local determineSizeOfArray
+local table_lookUp
+local tablefuncCallbackToString
 
 -- ---------------------------------------------------------------------------
 --  MOMENTUM SCROLL PHYSICS CONSTANTS  (mirrors lib_outputTxtBox.lua values)
@@ -264,7 +268,7 @@ function gdsGui_table_create (spreadSheetName, strgPage, strgspreadSheetType, da
 		for i=1, #dataTable, 1 do allTblHeaders[i] = dataTable[i]["ID"] end
 		
 		-- Header cell height: lines needed for header text + one font-size of padding on each side
-		local headerLineCount = math.max(1, findMaxNumOfLinesNeeded(tbl.fonts.headers.font, tbl.textWrapCellPercentWidth, headerData))
+		local headerLineCount = math.max(1, gdsGui_findMaxNumOfLinesNeeded(tbl.fonts.headers.font, tbl.textWrapCellPercentWidth, headerData))
 		local actualHeaderFontHeight = gdsGui_general_returnFontInfo(tbl.fonts.headers.font, "height")
 		tbl.headersBox.h = (actualHeaderFontHeight * headerLineCount) + (2 * tbl.fonts.headers.size)
 
@@ -274,7 +278,7 @@ function gdsGui_table_create (spreadSheetName, strgPage, strgspreadSheetType, da
 		for i = 1, tbl.rowsCount, 1 do
 			local textTable = {}
 			for z=1, #headerData, 1 do textTable[z] = table_lookUp(dataTable, i, headerData[z]) end
-			maxDataLineCount = math.max(maxDataLineCount, findMaxNumOfLinesNeeded(tbl.fonts.cells.font, tbl.textWrapCellPercentWidth, textTable))
+			maxDataLineCount = math.max(maxDataLineCount, gdsGui_findMaxNumOfLinesNeeded(tbl.fonts.cells.font, tbl.textWrapCellPercentWidth, textTable))
 		end
 		tbl.uniformCellHeight = (actualCellFontHeight * maxDataLineCount) * (1 + 0.30)
 		
@@ -393,8 +397,8 @@ function gdsGui_table_create (spreadSheetName, strgPage, strgspreadSheetType, da
 	end
 
 	-- Create the scrollbar objects
-	gdsGui_scrollBar_create (t.verticalScrollBar.name, t.page, t.verticalScrollBar.x, t.verticalScrollBar.y, t.verticalScrollBar.width, t.verticalScrollBar.height, "LT", t.numRowsPerDisplay, t.rowsCount, t.dataCurrentVertPosition, "table-linked", "vertical", 30, "spreadSheetScrollbarVertCallback")
-	gdsGui_scrollBar_create (t.horizontalScrollBar.name, t.page, t.horizontalScrollBar.x, t.horizontalScrollBar.y, t.horizontalScrollBar.width, t.horizontalScrollBar.height, "LT", t.numCollumnsPerDisplay, t.collumnsCount, t.dataCurrentHorzPosition, "table-linked", "horizontal", 30, "speadSheetScrollbarHorzCallback")
+	gdsGui_scrollBar_create (t.verticalScrollBar.name, t.page, t.verticalScrollBar.x, t.verticalScrollBar.y, t.verticalScrollBar.width, t.verticalScrollBar.height, "LT", t.numRowsPerDisplay, t.rowsCount, t.dataCurrentVertPosition, "table-linked", "vertical", 30, "gdsGui_table_scrollbarVertCallback")
+	gdsGui_scrollBar_create (t.horizontalScrollBar.name, t.page, t.horizontalScrollBar.x, t.horizontalScrollBar.y, t.horizontalScrollBar.width, t.horizontalScrollBar.height, "LT", t.numCollumnsPerDisplay, t.collumnsCount, t.dataCurrentHorzPosition, "table-linked", "horizontal", 30, "gdsGui_table_scrollbarHorzCallback")
 
 	-- Cache direct refs so _syncTblScrollbars and resize avoid O(n) search every frame
 	for _, sb in ipairs(globApp.objects.scrollBars) do
@@ -603,7 +607,7 @@ function gdsGui_table_draw (pageName)
 	-- end	
 end
 
-function TableCell_create (name, x, y, width, height, myRow, myCollumn, content, scrollable, addTo, recordID)
+TableCell_create = function (name, x, y, width, height, myRow, myCollumn, content, scrollable, addTo, recordID)
 
 	local newCell = {}
 
@@ -624,7 +628,7 @@ function TableCell_create (name, x, y, width, height, myRow, myCollumn, content,
 		table.insert(addTo, newCell)
 end
 
-function determineSizeOfArray (myArray, resultType)
+determineSizeOfArray = function (myArray, resultType)
 	--[[returns table with 1) #rows, 2) #collums, 3) #dimensions, 4) #dataPicies]]
 
 	--[[PARAMETERS:
@@ -724,7 +728,7 @@ function determineSizeOfArray (myArray, resultType)
 	end
 end
 
-function table_lookUp (array, rcrdIndex, header)
+table_lookUp = function (array, rcrdIndex, header)
 	--[[returns specified value based grid coordinates. returns empty if no value was found at coordinates]]
 
 	local cellContent = "empty"
@@ -856,7 +860,7 @@ end
 
 -- Called from gdsGui_general_touchreleased and gdsGui_general_mousereleased.
 -- Seeds the correct physics phase from accumulated drag velocity.
-function gui_touchReleasedTableScroll (x, y)
+function gdsGui_table_touchReleasedScroll (x, y)
 	for _, tbl in ipairs(globApp.objects.tables) do
 		if tbl.scroll then
 			tbl.scroll.touchStartedInside = false  -- reset so next press re-evaluates origin
@@ -1037,7 +1041,7 @@ function gdsGui_table_rowSelect (x,y,button,istouch)
 end
 
 
-function tablefuncCallbackToString (strgFuncCallBackName, parameters)
+tablefuncCallbackToString = function (strgFuncCallBackName, parameters)
 
 	--writes a string that corresponds to an executable function
 
@@ -1151,7 +1155,7 @@ end
 
 
 
-function spreadSheetScrollbarVertCallback (position)
+function gdsGui_table_scrollbarVertCallback (position)
 	for _, t in ipairs(globApp.objects.tables) do
 		if t.state == 1 and t.scroll then
 			if t.combinedRowsHeight > t.scrollBox.height then
@@ -1167,7 +1171,7 @@ function spreadSheetScrollbarVertCallback (position)
 end
 
 
-function speadSheetScrollbarHorzCallback (position)
+function gdsGui_table_scrollbarHorzCallback (position)
 	for _, t in ipairs(globApp.objects.tables) do
 		if t.state == 1 and t.scroll then
 			if t.combinedCollumnsWidth > t.scrollBox.width then
@@ -1182,7 +1186,7 @@ function speadSheetScrollbarHorzCallback (position)
 	end
 end
 
-function findMaxNumOfLinesNeeded (thisFont, wrapWidth, txt)
+function gdsGui_findMaxNumOfLinesNeeded (thisFont, wrapWidth, txt)
 	local maxLineFound = 1
 
 	if type(txt) == "table" then
