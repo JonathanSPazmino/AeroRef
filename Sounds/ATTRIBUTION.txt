@@ -1,6 +1,7 @@
 SOUND ASSET ATTRIBUTION
 AeroRef — Gateway Dynamic Software, LLC
 Copyright (c) 2025-2026 Gateway Dynamic Software, LLC. All rights reserved.
+Contact: support@gatewayds.us
 
 DoubleChime_piano.wav
   Description : Double piano chime — used as countdown alarm tone
