@@ -265,7 +265,7 @@ local function _applyFontSize(fontSize)
     gdsGui_outputTxtBox_setText("fontSizeLabel", "FONT SIZE: " .. fontSize .. "pt")
     for _, sb in ipairs(globApp.objects.scrollBars) do
         if sb.id == "fontSizeScale" then
-            sb.bar.position = (fontSize - 10) / 6
+            sb.bar.position = (fontSize - 12) / 4
             gdsGui_scrollBar_updatePosition(sb, sb.bar.position)
             break
         end
@@ -898,8 +898,8 @@ function love.load()
         {1, 1, 1, 1}, "FONT SIZE: 12pt", settingsFontSize, "fontSizeSettings"
     )
     gdsGui_scrollBar_create("fontSizeScale", "Settings",
-        _x(160), 60, _w(270), 30, "CT", 7, 7, 0,
-        "independent", "horizontal", 7, "fontSizeChanged",
+        _x(160), 60, _w(270), 30, "CT", 5, 5, 0,
+        "independent", "horizontal", 5, "fontSizeChanged",
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"},
         true, "fontSizeSettings"
     )
@@ -1381,7 +1381,7 @@ function hapticsToggled(newState)
 end
 
 function fontSizeChanged(pos)
-    local fontSize = 10 + math.floor(6 * pos + 0.5)
+    local fontSize = 12 + math.floor(4 * pos + 0.5)
     appSettings.fontSize = fontSize
     _applyFontSize(fontSize)
     _saveAppSettings()
@@ -1686,12 +1686,12 @@ gdsGui_unitTests_registerSuite("app", function()
     gdsGui_dev_testExecute {["id"]="fontSizeChanged_min",
         ["funcName"]={"fontSizeChanged"},
         ["funcParameters"]={0},
-        ["funcExpctOutput"]={10}}
+        ["funcExpctOutput"]={12}}
 
     gdsGui_dev_testExecute {["id"]="fontSizeChanged_mid",
         ["funcName"]={"fontSizeChanged"},
         ["funcParameters"]={0.5},
-        ["funcExpctOutput"]={13}}
+        ["funcExpctOutput"]={14}}
 
     gdsGui_dev_testExecute {["id"]="fontSizeChanged_max",
         ["funcName"]={"fontSizeChanged"},
