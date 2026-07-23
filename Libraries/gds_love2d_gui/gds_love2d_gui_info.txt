@@ -11,7 +11,7 @@ LLC. All rights reserved. Unauthorized use, reproduction, distribution, or
 modification of this library, in whole or in part, is strictly prohibited
 without the express written consent of Gateway Dynamic Software, LLC.
 
-For licensing inquiries contact Gateway Dynamic Software, LLC.
+For licensing inquiries contact Gateway Dynamic Software, LLC at support@gatewayds.us.
 
 ================================================================================
 OVERVIEW
