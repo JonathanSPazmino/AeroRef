@@ -75,7 +75,7 @@ function gdsGui_inputTxtBox_create (txtBxId, page, tblTextSpecs, theme_focus, th
 			nitb.lable.text.width = nitb.lable.frame.width - (nitb.lable.frame.width * 0.1)
 			nitb.lable.text.height = nitb.lable.frame.height - (nitb.lable.frame.height * 0.1)
 			nitb.lable.text.text = nitb.defaultText
-			nitb.lable.text.maxLineCount = findMaxNumOfLinesNeeded (nitb.textFont, nitb.lable.text.width, nitb.defaultText)
+			nitb.lable.text.maxLineCount = gdsGui_findMaxNumOfLinesNeeded (nitb.textFont, nitb.lable.text.width, nitb.defaultText)
 			nitb.lable.text.perLineTextHeight = gdsGui_general_returnFontInfo (nitb.textFont, "height")
 
 			--adds all lines height
@@ -99,7 +99,7 @@ function gdsGui_inputTxtBox_create (txtBxId, page, tblTextSpecs, theme_focus, th
 			nitb.userInput.text.x = nitb.userInput.frame.x + (nitb.userInput.frame.width * 0.05)
 			nitb.userInput.text.width = nitb.userInput.frame.width - (nitb.userInput.frame.width * 0.1)
 			nitb.userInput.text.height = nitb.userInput.frame.height - (nitb.userInput.frame.height * 0.1)
-			nitb.userInput.text.maxLineCount = findMaxNumOfLinesNeeded (nitb.textFont, nitb.userInput.text.width, nitb.defaultText)
+			nitb.userInput.text.maxLineCount = gdsGui_findMaxNumOfLinesNeeded (nitb.textFont, nitb.userInput.text.width, nitb.defaultText)
 			nitb.userInput.text.perLineTextHeight = gdsGui_general_returnFontInfo (nitb.textFont, "height")
 
 			--adds all lines height
@@ -164,7 +164,7 @@ function gdsGui_inputTxtBox_create (txtBxId, page, tblTextSpecs, theme_focus, th
 
 		nitb.userGuideBox.textMarginSpaces = 0.25
 
-		maxDefaultTextLineCount = findMaxNumOfLinesNeeded (nitb.textFont, nitb.frame.width, nitb.defaultText)
+		maxDefaultTextLineCount = gdsGui_findMaxNumOfLinesNeeded (nitb.textFont, nitb.frame.width, nitb.defaultText)
 		actualDefaultTextFontHeight = gdsGui_general_returnFontInfo (nitb.textFont, "height")
 
 		--adds all lines height
@@ -220,7 +220,7 @@ function gdsGui_inputTxtBox_update(txtBxId,anchorPoint, myx, myy, myWidth, myHei
 			
 			updTxtBx.lable.text.width = updTxtBx.lable.frame.width - (updTxtBx.lable.frame.width * 0.1)
 			updTxtBx.lable.text.height = updTxtBx.lable.frame.height - (updTxtBx.lable.frame.height * 0.1)
-			updTxtBx.lable.text.maxLineCount = findMaxNumOfLinesNeeded (updTxtBx.textFont, updTxtBx.lable.text.width, updTxtBx.defaultText)
+			updTxtBx.lable.text.maxLineCount = gdsGui_findMaxNumOfLinesNeeded (updTxtBx.textFont, updTxtBx.lable.text.width, updTxtBx.defaultText)
 			updTxtBx.lable.text.perLineTextHeight = gdsGui_general_returnFontInfo (updTxtBx.textFont, "height")
 
 			--adds all lines height
@@ -239,7 +239,7 @@ function gdsGui_inputTxtBox_update(txtBxId,anchorPoint, myx, myy, myWidth, myHei
 			updTxtBx.userInput.text.x = updTxtBx.userInput.frame.x + (updTxtBx.userInput.frame.width * 0.05)
 			updTxtBx.userInput.text.width = updTxtBx.userInput.frame.width - (updTxtBx.userInput.frame.width * 0.1)
 			updTxtBx.userInput.text.height = updTxtBx.userInput.frame.height - (updTxtBx.userInput.frame.height * 0.1)
-			updTxtBx.userInput.text.maxLineCount = findMaxNumOfLinesNeeded (updTxtBx.textFont, updTxtBx.userInput.text.width, updTxtBx.defaultText)
+			updTxtBx.userInput.text.maxLineCount = gdsGui_findMaxNumOfLinesNeeded (updTxtBx.textFont, updTxtBx.userInput.text.width, updTxtBx.defaultText)
 			updTxtBx.userInput.text.perLineTextHeight = gdsGui_general_returnFontInfo (updTxtBx.textFont, "height")
 
 			--adds all lines height
@@ -258,7 +258,7 @@ function gdsGui_inputTxtBox_update(txtBxId,anchorPoint, myx, myy, myWidth, myHei
 			updTxtBx.myMaxx = updTxtBx.frame.x + updTxtBx.frame.width --[[for button click detection]]
 			updTxtBx.myMaxy = updTxtBx.frame.y + updTxtBx.frame.height--[[for button click detection]]
 
-			maxDefaultTextLineCount = findMaxNumOfLinesNeeded (updTxtBx.textFont, updTxtBx.frame.width, updTxtBx.defaultText)
+			maxDefaultTextLineCount = gdsGui_findMaxNumOfLinesNeeded (updTxtBx.textFont, updTxtBx.frame.width, updTxtBx.defaultText)
 			actualDefaultTextFontHeight = gdsGui_general_returnFontInfo (updTxtBx.textFont, "height")
 
 			--adds all lines height

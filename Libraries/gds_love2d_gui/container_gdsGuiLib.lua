@@ -90,7 +90,7 @@ local function _setObjDimensions(obj, pixW, pixH)
             obj.bgSprite.height = pixH / obj.bgSprite.sprite:getHeight()
         end
         obj.text.width             = obj.frame.width * 0.8
-        obj.text.maxTextLineCount  = findMaxNumOfLinesNeeded(obj.text.font, obj.text.width, obj.text.text)
+        obj.text.maxTextLineCount  = gdsGui_findMaxNumOfLinesNeeded(obj.text.font, obj.text.width, obj.text.text)
         obj.text.height            = gdsGui_general_returnFontInfo(obj.text.font, "height")
         obj.text.combinedTxtHeight = obj.text.height * obj.text.maxTextLineCount
         obj.text.lastText          = nil  -- force line reflow on next update

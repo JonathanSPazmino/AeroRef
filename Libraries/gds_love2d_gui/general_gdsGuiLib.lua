@@ -932,7 +932,7 @@ function gdsGui_general_mousereleased (x, y, button, istouch, presses)
 			gdsGui_rotaryKnob_released ("mouse")
 
 			gdsGui_outputTxtBox_touchReleased ("mouse", x, y)
-			gui_touchReleasedTableScroll (x, y)
+			gdsGui_table_touchReleasedScroll (x, y)
 			gdsGui_container_touchReleased(x, y)
 
 			globApp.userInput = "none"
@@ -1118,7 +1118,7 @@ function gdsGui_general_touchreleased (id, x, y, dx, dy, pressure)
 	gdsGui_rotaryKnob_released (id)
 
 	gdsGui_outputTxtBox_touchReleased (id, x, y)
-	gui_touchReleasedTableScroll (x, y)
+	gdsGui_table_touchReleasedScroll (x, y)
 	gdsGui_container_touchReleased(x, y)
 
 	globApp.userInput = "none"
