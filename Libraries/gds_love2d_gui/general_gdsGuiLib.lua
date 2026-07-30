@@ -934,6 +934,7 @@ function gdsGui_general_mousereleased (x, y, button, istouch, presses)
 			gdsGui_outputTxtBox_touchReleased ("mouse", x, y)
 			gdsGui_table_touchReleasedScroll (x, y)
 			gdsGui_container_touchReleased(x, y)
+			gdsGui_page_loadingTouched (x, y)
 
 			globApp.userInput = "none"
 
@@ -1103,8 +1104,10 @@ function gdsGui_general_touchreleased (id, x, y, dx, dy, pressure)
 		gdsGui_button_released (x, y, 1, istouch, presses)		gdsGui_inputTxtBox_pressed (x,y,button,istouch) --runs when clicked or touched on textboxes
 		gdsGui_table_rowSelect (x,y,button,true)
 
+		gdsGui_page_loadingTouched (x, y)
+
 		if x >= .8 * globApp.safeScreenArea.xw and y >= .9 * globApp.safeScreenArea.yh then
-			gdsGui_dev_openByEightTap (x,y,button,istouch) -- opens and closes devPage 
+			gdsGui_dev_openByEightTap (x,y,button,istouch) -- opens and closes devPage
 		end
 
 	end
