@@ -9,7 +9,7 @@
 -------------------------------------------------------------------------------
 require("Libraries.gds_love2d_gui.loader_gdsGuiLib")
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 -- Original orientation the app was designed for; used by the GUI library to
 -- establish the reference container width at first finalize (portrait = 1 col).
@@ -926,7 +926,7 @@ function love.load()
     _navSyncAll("MainMenu")
 
     local showTC = (appSettings.tcAcceptedVersion ~= APP_VERSION)
-    gdsGui_page_switch("IntialBooting", showTC and 4 or 3, 2, false)
+    gdsGui_page_switch("IntialBooting", showTC and 4 or 3, 3, false)
 
     -- Initialize starting time
     timer.t = 0
@@ -1060,7 +1060,7 @@ function love.update(dt)
                 blink.navSent          = true
                 blink.navigatingToMain = true
                 _navSyncAll("MainMenu")
-                gdsGui_page_switch("LoadingMainMenu", 3, 0.5, false)
+                gdsGui_page_switch("LoadingMainMenu", 3, 3, false)
             end
 
             if timer.t == 0 then
@@ -1071,7 +1071,7 @@ function love.update(dt)
                 if gdsGui_page_currentName() ~= "MainMenu" and globApp.currentPageIndex ~= 2 then
                     blink.navigatingToMain = true
                     _navSyncAll("MainMenu")
-                    gdsGui_page_switch("LoadingMainMenu", 3, 0.5, false)
+                    gdsGui_page_switch("LoadingMainMenu", 3, 3, false)
                 end
                 for _, btn in ipairs(globApp.objects.buttons) do
                     if btn.name == "pauseRHTopTimer" and btn.state == globApp.BUTTON_STATES.PRESSED then
@@ -1463,7 +1463,7 @@ function tcContinuePressed()
     appSettings.tcAcceptedVersion = APP_VERSION
     love.filesystem.write("appSettings.lua", table.show(appSettings, "appSettings"))
     _navSyncAll("MainMenu")
-    gdsGui_page_switch("LoadingMainMenu", 3, 1, false)
+    gdsGui_page_switch("LoadingMainMenu", 3, 3, false)
 end
 
 -------------------------------------------------------------------------------
@@ -1472,17 +1472,17 @@ end
 
 function navGoToMainMenu()
     _navSyncAll("MainMenu")
-    gdsGui_page_switch("LoadingMainMenu", 3, 0.5, false)
+    gdsGui_page_switch("LoadingMainMenu", 3, 3, false)
 end
 
 function navGoToLearn()
     _navSyncAll("Learn")
-    gdsGui_page_switch("LoadingLearn", 5, 0.5, false)
+    gdsGui_page_switch("LoadingLearn", 5, 3, false)
 end
 
 function navGoToSettings()
     _navSyncAll("Settings")
-    gdsGui_page_switch("LoadingSettings", 6, 0.5, false)
+    gdsGui_page_switch("LoadingSettings", 6, 3, false)
 end
 
 -------------------------------------------------------------------------------

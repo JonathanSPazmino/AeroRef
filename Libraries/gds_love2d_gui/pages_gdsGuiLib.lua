@@ -76,7 +76,7 @@ function gdsGui_page_loadingCreate (myName, myToPg, myMinTime_secs, myFromPg, te
 
 	----------------------------
 	--TITLE TEXT
-	NewLoadingObject.title = ("Loading " .. NewLoadingObject.toPg .. "...")
+	NewLoadingObject.title = ("Loading " .. NewLoadingObject.toPg .. " page...")
 	NewLoadingObject.titleWidth = gdsGui_general_smartScaling ("inverse", .3, .8, .0375, 0.1, 0.125,"width" )
 	NewLoadingObject.titleHeight = gdsGui_general_smartScaling ("inverse", .3, .8, .0375, 0.1, 0.125,"height" )
 	local titleAnchorPoint = "CC"
@@ -87,6 +87,17 @@ function gdsGui_page_loadingCreate (myName, myToPg, myMinTime_secs, myFromPg, te
 	NewLoadingObject.titleX = myTitlePositions[1]
 	NewLoadingObject.titleY = myTitlePositions[2]
 
+	---------------------------------------------------------------------------
+	--WEBSITE LINK
+	NewLoadingObject.linkTxt = "gatewayds.us"
+	NewLoadingObject.linkWidth = gdsGui_general_smartScaling ("inverse", .3, .8, .0375, 0.1, 0.125, "width")
+	NewLoadingObject.linkHeight = gdsGui_general_smartScaling ("inverse", .3, .8, .0375, 0.1, 0.125, "height")
+	local linkAnchorPoint = "CC"
+	local linkToScreenRelation_X = 0.5
+	local linkToScreenRelation_Y = gdsGui_general_smartRelocation (.57,.0,.60,1,nil,nil,nil,nil,"y")
+	local myLinkPositions = gdsGui_general_relativePosition (linkAnchorPoint, linkToScreenRelation_X, linkToScreenRelation_Y, NewLoadingObject.linkWidth, NewLoadingObject.linkHeight, globApp.safeScreenArea.x, globApp.safeScreenArea.y, globApp.safeScreenArea.w, globApp.safeScreenArea.h)
+	NewLoadingObject.linkX = myLinkPositions[1]
+	NewLoadingObject.linkY = myLinkPositions[2]
 
 	---------------------------------------------------------------------------
 	--DEV MESSAGE
@@ -202,6 +213,17 @@ function gdsGui_page_loadingUpdate (dt)
 				lp.titleY = myTitlePositions[2]
 
 				---------------------------------------------------------------------------
+				--WEBSITE LINK
+				lp.linkWidth = gdsGui_general_smartScaling ("inverse", .3, .8, .036, 0.096, 0.12, "width")
+				lp.linkHeight = gdsGui_general_smartScaling ("inverse", .3, .8, .036, 0.096, 0.12, "height")
+				local linkAnchorPoint = "CC"
+				local linkToScreenRelation_X = 0.5
+				local linkToScreenRelation_Y = gdsGui_general_smartRelocation (.57,.0,.60,1,nil,nil,nil,nil,"y")
+				local myLinkPositions = gdsGui_general_relativePosition (linkAnchorPoint, linkToScreenRelation_X, linkToScreenRelation_Y, lp.linkWidth, lp.linkHeight, globApp.safeScreenArea.x, globApp.safeScreenArea.y, globApp.safeScreenArea.w, globApp.safeScreenArea.h)
+				lp.linkX = myLinkPositions[1]
+				lp.linkY = myLinkPositions[2]
+
+				---------------------------------------------------------------------------
 				--DEV MESSAGE
 				lp.msgTxtWidth = 0.8 * globApp.safeScreenArea.w
 				lp.msgTxtHeight = .2 * globApp.safeScreenArea.h
@@ -300,8 +322,18 @@ function gdsGui_page_loadingDraw ()
 				--testing only:
 				-- love.graphics.rectangle("line", lp.titleX, lp.titleY, lp.titleWidth, lp.titleHeight)
 
+			--WEBSITE LINK:-------------------------------------------
+			love.graphics.setColor(0.36, 0.5, 1, 1)
+			love.graphics.setFont(lp.coreFontSize)
+			love.graphics.printf(lp.linkTxt, lp.linkX, lp.linkY, lp.linkWidth, "center")
+			local linkTxtW = lp.coreFontSize:getWidth(lp.linkTxt)
+			local linkTxtH = lp.coreFontSize:getHeight()
+			local underlineX = lp.linkX + (lp.linkWidth - linkTxtW) / 2
+			love.graphics.line(underlineX, lp.linkY + linkTxtH, underlineX + linkTxtW, lp.linkY + linkTxtH)
+
 			--DEVELOPER MSG:------------------------------------------
 			love.graphics.setFont(lp.devMsgFontSize)
+			love.graphics.setColor(tc[1], tc[2], tc[3], tc[4] or 1)
 			love.graphics.printf(lp.msgTxt, lp.msgTxtX, lp.msgTxtY, lp.msgTxtWidth, "center", r, sx, sy, ox, oy, kx, ky)
 				--testing only:
 				-- love.graphics.rectangle("line", lp.msgTxtX, lp.msgTxtY, lp.msgTxtWidth, lp.msgTxtHeight)
@@ -320,6 +352,21 @@ function gdsGui_page_loadingDraw ()
 
 	end
 
+end
+
+
+function gdsGui_page_loadingTouched (x, y)
+	if globApp.currentPageIndex ~= 2 then return end
+	for _, lp in ipairs(loadingObjects) do
+		local txtW = lp.coreFontSize:getWidth(lp.linkTxt)
+		local txtH = lp.coreFontSize:getHeight()
+		local hitX = lp.linkX + (lp.linkWidth - txtW) / 2
+		local hitY = lp.linkY
+		if x >= hitX - 10 and x <= hitX + txtW + 10 and
+		   y >= hitY - 10 and y <= hitY + txtH + 10 then
+			love.system.openURL("https://gatewayds.us")
+		end
+	end
 end
 
 
