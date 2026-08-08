@@ -188,7 +188,7 @@ local _LEARN_SETTINGS_RAW = {
     {text="HAPTICS", sub=true},
     {text="Enable or disable vibration on button taps and at timer alarm.\n"},
     {text="FONT SIZE", sub=true},
-    {text="Drag the scrollbar to set the display font size between 10 pt and 16 pt. The change is applied immediately and saved between sessions."},
+    {text="Drag the scrollbar to set the display font size between 12 pt and 16 pt. The change is applied immediately and saved between sessions."},
 }
 
 local function _learnSegsColored(rawSegs, isDark)
