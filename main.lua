@@ -760,15 +760,15 @@ function love.load()
         _x(160), _d5, "CT", _w(310), _hLastFlight, colorYellow, "LAST FLT BLOCK TIME: 0.0 HRS", 12, "dutyPanel")
 
     gdsGui_scrollBar_create("dutyStartScale", "MainMenu",
-        _x(160), _d2, _w(310), _sbH, "CT", 32, 289, 0,
+        _x(160), _d2, _w(279), _sbH, "CT", 32, 289, 0,
         "independent", "horizontal", 289, "dutyStartChanged",
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "dutyPanel")
     gdsGui_scrollBar_create("dutyHoursScale", "MainMenu",
-        _x(160), _d4, _w(310), _sbH, "CT", 5, 20, 0,
+        _x(160), _d4, _w(279), _sbH, "CT", 5, 20, 0,
         "independent", "horizontal", 20, "dutyHoursChanged",
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "dutyPanel")
     gdsGui_scrollBar_create("lastFlightScale", "MainMenu",
-        _x(160), _d6, _w(310), _sbH, "CT", 20, 181, 0,
+        _x(160), _d6, _w(279), _sbH, "CT", 20, 181, 0,
         "independent", "horizontal", 181, "lastFlightChanged",
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"}, true, "dutyPanel")
 
@@ -853,7 +853,7 @@ function love.load()
     -- RT anchor: right edge sits ~20 px from the container's right edge
     local settingsBtnX     = _x(300)
     local settingsRowY     = 12
-    local settingsLabelW   = _w(200)
+    local settingsLabelW   = _w(240)
     local settingsLabelH   = 40
 
     gdsGui_container_create("displaySettings", "Settings", "DISPLAY", 32, 0)

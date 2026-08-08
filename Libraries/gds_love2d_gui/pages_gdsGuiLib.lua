@@ -101,7 +101,7 @@ function gdsGui_page_loadingCreate (myName, myToPg, myMinTime_secs, myFromPg, te
 
 	---------------------------------------------------------------------------
 	--DEV MESSAGE
-	NewLoadingObject.msgTxt = ("Follow us on facebook and tweeter for more information on how you can help inprove this app!")
+	NewLoadingObject.msgTxt = ("Follow us on social media to stay informed on upcoming updates.")
 	NewLoadingObject.msgTxtWidth = gdsGui_general_smartScaling ("inverse", 0.9,.95, .063, 0.0665, 0.07,"width" )
 	NewLoadingObject.msgTxtHeight = gdsGui_general_smartScaling ("inverse", 0.9,.95, .063, 0.0665, 0.07,"height")
 	local devMsgAnchorPoint = "CC"
