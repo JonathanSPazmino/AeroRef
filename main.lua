@@ -27,7 +27,6 @@ gdsGui_page_create(9, "SchematicHome",          false, false, globApp.appColor, 
 gdsGui_page_create(10, "SchematicFullScreen",   false, false, globApp.appColor, 12, 0, {.5, 1, .6, .6, "LT"}, "max")
 gdsGui_page_create(11, "SchematicManageGallery", false, false, globApp.appColor, 12, 0, {.5, 1, .6, .6, "LT"}, "max")
 gdsGui_page_create(12, "AircraftGallery",        false, false, globApp.appColor, 12, 0, {.5, 1, .6, .6, "LT"}, "max")
-gdsGui_page_create(13, "AircraftHome",           false, false, globApp.appColor, 12, 0, {.5, 1, .6, .6, "LT"}, "max")
 gdsGui_page_create(14, "SchematicSnapshots",     false, false, globApp.appColor, 12, 0, {.5, 1, .6, .6, "LT"}, "max")
 
 -------------------------------------------------------------------------------
@@ -88,7 +87,7 @@ appSettings = {}
 -- System Schematic (premium feature): a named collection of AIRCRAFT, each
 -- owning its own named SYSTEMS (schematicStore.aircraft[].systems), each
 -- system its own elements/wires/controls/snapshot-rules. currentAircraftId
--- tracks which aircraft the user is "inside" (the AircraftHome page);
+-- tracks which aircraft the user is "inside" (its systems gallery);
 -- currentSystemId tracks which of that aircraft's systems is currently
 -- loaded into the live "mainCanvas" (nil when the canvas page hasn't been
 -- opened this session). Loaded/migrated/seeded in love.load(), persisted via
@@ -103,15 +102,15 @@ schematicStore = nil
 
 -- Syncs all footer nav buttons so the button matching activeDest is PRESSED
 -- and all others are RELEASED, across every page that has a footer. Any page
--- inside the System Schematic flow (aircraft home/gallery, the per-aircraft
--- home, the systems gallery, the canvas itself) keeps the schematic dock
--- icon pressed.
+-- inside the System Schematic flow (aircraft gallery, the systems gallery —
+-- which doubles as "opening an aircraft" now, no separate home page in
+-- between — the canvas itself) keeps the schematic dock icon pressed.
 local function _navSyncAll(activeDest)
     local schematicFlow = (activeDest == "SystemSchematic" or activeDest == "SchematicHome"
         or activeDest == "SchematicManageGallery" or activeDest == "AircraftGallery"
-        or activeDest == "AircraftHome" or activeDest == "SchematicSnapshots")
+        or activeDest == "SchematicSnapshots")
     for _, pfx in ipairs({"mainMenu", "schematic", "schematicHome", "schematicManage",
-        "aircraftGallery", "aircraftHome", "schematicSnapshots", "learn", "settings"}) do
+        "aircraftGallery", "schematicSnapshots", "learn", "settings"}) do
         gdsGui_button_setState(pfx .. "_navMainMenu",  activeDest == "MainMenu" and "pushed" or "released")
         gdsGui_button_setState(pfx .. "_navSchematic", schematicFlow and "pushed" or "released")
         gdsGui_button_setState(pfx .. "_navLearn",     activeDest == "Learn"    and "pushed" or "released")
@@ -262,10 +261,17 @@ end
 -- gdsGui_schematic_addControl's spritePaths param).
 local _SWITCH_SPRITE_PATHS = {"Sprites/control_switchOpen.png", "Sprites/control_switchClosed.png"}
 
+-- A generator's housing is the same icon for OFF and ON (unlike a SWITCH's
+-- open/closed pair above, which has a distinct icon per position) — the gear
+-- overlay spinning in control mode (see gdsGui_schematic_addControl's
+-- overlaySpritePath) is what shows it's live, not a change of base icon.
+local _GENERATOR_SPRITE_PATHS = {"Sprites/control_generatorHousing.png", "Sprites/control_generatorHousing.png"}
+local _GENERATOR_OVERLAY_SPRITE_PATH = "Sprites/control_generatorGear.png"
+
 local SCHEMATIC_CATALOG = {
     { system = "ELECTRICAL", connectorColor = {0.85, 0.75, 0.15, 1}, items = {
-        { label = "GENERATOR", kind = "element", shapeType = "rect",
-          defaultProperties = {"VOLTAGE", "CURRENT"}, spritePath = "Sprites/element_generator.png" },
+        { label = "GENERATOR", kind = "control", presets = { {"OFF", "ON"} },
+          spritePaths = _GENERATOR_SPRITE_PATHS, overlaySpritePath = _GENERATOR_OVERLAY_SPRITE_PATH },
         { label = "BATTERY",   kind = "element", shapeType = "rect",
           defaultProperties = {"VOLTAGE", "CURRENT"}, spritePath = "Sprites/element_battery.png" },
         { label = "BUS",       kind = "element", shapeType = "rect",
@@ -298,35 +304,17 @@ local SCHEMATIC_CATALOG = {
     }},
 }
 
--- Every system a user creates is locked to exactly one of these types for
--- its whole lifetime (see "user can only create one system per type per
--- aircraft" below) — SCHEMATIC_CATALOG is the single source of truth for
--- which types exist and what each one's ADD ELEMENT/CONTROL catalog offers.
+-- Every system is locked to exactly one of these types for its whole
+-- lifetime, and an aircraft has at most one system per type — the systems
+-- gallery shows a tile for every catalog type whether or not it's been
+-- created yet (see _systemGalleryItems) — SCHEMATIC_CATALOG is the single
+-- source of truth for which types exist and what each one's ADD ELEMENT/
+-- CONTROL catalog offers.
 local function _findCatalogEntryForType(systemType)
     for _, sys in ipairs(SCHEMATIC_CATALOG) do
         if sys.system == systemType then return sys end
     end
     return nil
-end
-
--- System types already used by this aircraft's systems, as a set.
-local function _aircraftSystemTypesInUse(aircraft)
-    local used = {}
-    for _, sys in ipairs(aircraft.systems) do
-        if sys.systemType then used[sys.systemType] = true end
-    end
-    return used
-end
-
--- Catalog system names not yet used by this aircraft, in catalog order —
--- what's left to offer in the NEW SYSTEM type picker.
-local function _availableSystemTypesForAircraft(aircraft)
-    local used = _aircraftSystemTypesInUse(aircraft)
-    local available = {}
-    for _, sys in ipairs(SCHEMATIC_CATALOG) do
-        if not used[sys.system] then table.insert(available, sys.system) end
-    end
-    return available
 end
 
 -- "Bleed Air" from "BLEED AIR", for a friendlier default system name.
@@ -439,6 +427,66 @@ local function _findSystem(systemId)
     return nil
 end
 
+-- Per-systemType gallery tile thumbnail, keyed by SCHEMATIC_CATALOG's own
+-- system names (not a separate chosen-at-creation field like a aircraft's
+-- thumbnail — a system's type already fully determines its icon). A
+-- systemType with no entry here just falls back to the gallery's default
+-- elements/wires mini-diagram preview (see _drawGalleryTilePreview in
+-- schematic_gdsGuiLib.lua). pressedPath (optional): swapped in for the
+-- brief span a tile is actually held down, same released/pressed sprite-
+-- pair convention a real button uses (see gallery.pressedTileIndex).
+local SYSTEM_THUMBNAILS = {
+    ELECTRICAL = { path = "Sprites/systemThumb_electrical_released.png",
+                   pressedPath = "Sprites/systemThumb_electrical_pressed.png" },
+    HYDRAULIC  = { path = "Sprites/systemThumb_hydraulic_released.png",
+                   pressedPath = "Sprites/systemThumb_hydraulic_pressed.png" },
+    FUEL       = { path = "Sprites/systemThumb_fuel_released.png",
+                   pressedPath = "Sprites/systemThumb_fuel_pressed.png" },
+    ["BLEED AIR"] = { path = "Sprites/systemThumb_bleedAir_released.png",
+                       pressedPath = "Sprites/systemThumb_bleedAir_pressed.png" },
+    PRESSURIZATION = { path = "Sprites/systemThumb_pressurization_released.png",
+                        pressedPath = "Sprites/systemThumb_pressurization_pressed.png" },
+}
+
+-- Builds the manageGallery's item list from SCHEMATIC_CATALOG, not from
+-- aircraft.systems directly — every catalog type gets a tile, in catalog
+-- order, whether or not this aircraft has actually created it yet. A type
+-- the aircraft hasn't created gets a synthetic empty placeholder whose id
+-- is the catalog type name itself (e.g. "ELECTRICAL") rather than a real
+-- GDS-format serial — schematicSystemGallerySelected tells the two apart by
+-- trying _findSystem first, and creates the real record lazily the moment
+-- that placeholder is actually tapped. Also adds resolved thumbnailPath/
+-- thumbnailPressedPath per item (when its systemType has one — see
+-- SYSTEM_THUMBNAILS) without polluting the persisted system record, same
+-- "derive it at read time" shape as _aircraftGalleryItems.
+local function _systemGalleryItems(aircraft)
+    local items = {}
+    if not aircraft then return items end
+    local byType = {}
+    for _, sys in ipairs(aircraft.systems) do byType[sys.systemType] = sys end
+    for _, catalogEntry in ipairs(SCHEMATIC_CATALOG) do
+        local sys = byType[catalogEntry.system]
+        local item
+        if sys then
+            item = {}
+            for k, v in pairs(sys) do item[k] = v end
+        else
+            item = {
+                id = catalogEntry.system, name = _titleCase(catalogEntry.system) .. " System",
+                systemType = catalogEntry.system,
+                elements = {}, wires = {}, controls = {}, snapshots = {},
+            }
+        end
+        local thumb = SYSTEM_THUMBNAILS[catalogEntry.system]
+        if thumb then
+            item.thumbnailPath = thumb.path
+            item.thumbnailPressedPath = thumb.pressedPath
+        end
+        table.insert(items, item)
+    end
+    return items
+end
+
 local function _saveSchematicStore()
     love.filesystem.write("schematicProjects.lua", table.show(schematicStore, "schematicStore"))
 end
@@ -548,7 +596,8 @@ local function _openSystemIntoCanvas(systemId, mode)
     end
     for _, c in ipairs(sys.controls or {}) do
         gdsGui_schematic_addControl("mainCanvas", c.id, c.x, c.y, _deepCopyTable(c.positions), c.detentIndex,
-            c.label, c.callbackFunc, c.radiusScale, c.spritePaths, c.rotation)
+            c.label, c.callbackFunc, c.radiusScale, c.spritePaths, c.rotation, c.overlaySpritePath,
+            _deepCopyTable(c.defaultColor))
     end
     for _, w in ipairs(sys.wires or {}) do
         gdsGui_schematic_addWire("mainCanvas", w.id, w.fromElementId, w.toElementId, _deepCopyTable(w.defaultColor),
@@ -687,7 +736,7 @@ function schematicCatalogItemChosen(canvasName, index, optionText)
             item.defaultProperties, item.spritePath)
     elseif #item.presets == 1 then
         gdsGui_schematic_armControlPlacement(canvasName, item.presets[1], item.label, item.callbackFunc, item.label,
-            item.spritePaths)
+            item.spritePaths, item.overlaySpritePath)
     else
         _catalogChosenControlItem = item
         local names = {}
@@ -708,7 +757,7 @@ function schematicCatalogPresetChosen(canvasName, index, optionText)
     if not item then return end
     local preset = item.presets[index]
     gdsGui_schematic_armControlPlacement(canvasName, preset, item.label, item.callbackFunc, item.label,
-        item.spritePaths)
+        item.spritePaths, item.overlaySpritePath)
     _catalogChosenControlItem = nil
 end
 
@@ -837,13 +886,13 @@ function schematicControlActionChosen(canvasName, index, optionText)
 end
 
 -------------------------------------------------------------------------------
--- SYSTEM SCHEMATIC — AIRCRAFT HOME (NEW AIRCRAFT / MY AIRCRAFT)
--- The top landing point for the whole System Schematic flow (SchematicHome).
+-- SYSTEM SCHEMATIC — SCHEMATIC HOME (NEW AIRCRAFT / MY AIRCRAFT)
+-- The top landing point for the whole System Schematic flow.
 -------------------------------------------------------------------------------
 
--- AircraftHome's header reads "<aircraft name> [SYSTEMS]" so it's clear at a
--- glance which aircraft's systems the NEW/LOAD buttons below act on.
-local function _aircraftHomeTitle(aircraft)
+-- The systems gallery's header reads "<aircraft name> [SYSTEMS]" once an
+-- aircraft is open, so it's clear at a glance whose systems are listed.
+local function _aircraftSystemsTitle(aircraft)
     return aircraft.name .. " [SYSTEMS]"
 end
 
@@ -866,10 +915,11 @@ end
 -- by there being no other path to an aircraft record existing.
 local _pendingNewAircraftName = nil
 
--- A brand-new aircraft has no systems yet, so it lands on AircraftHome (where
--- the user can create its first system) rather than straight into the canvas.
--- Name is confirmed first, then the user must pick one of AIRCRAFT_THUMBNAILS
--- before the record is actually created (see schematicAircraftThumbnailChosen).
+-- A brand-new aircraft has no systems yet, so it lands on its (all-empty-
+-- placeholder) systems gallery rather than straight into the canvas — see
+-- navGoToAircraftSystems. Name is confirmed first, then the user must pick
+-- one of AIRCRAFT_THUMBNAILS before the record is actually created (see
+-- schematicAircraftThumbnailChosen).
 function schematicNewAircraftConfirmed(name)
     if name == "" then name = "Aircraft " .. schematicStore.nextAircraftNum end
     _pendingNewAircraftName = name
@@ -904,7 +954,7 @@ function schematicAircraftThumbnailChosen(optionText)
     })
     schematicStore.currentAircraftId = id
     _saveSchematicStore()
-    navGoToAircraftHome()
+    navGoToAircraftSystems()
 end
 
 -- Tapping outside the picker (or CANCEL) aborts the whole "new aircraft"
@@ -936,7 +986,7 @@ end
 function schematicAircraftActionChosen(galleryName, index, optionText)
     if optionText == "OPEN AIRCRAFT" then
         schematicStore.currentAircraftId = _manageMenuAircraftId
-        navGoToAircraftHome()
+        navGoToAircraftSystems()
     elseif optionText == "RENAME" then
         local aircraft = _findAircraft(_manageMenuAircraftId)
         if aircraft then
@@ -957,7 +1007,7 @@ function schematicAircraftRenameConfirmed(newName)
         _saveSchematicStore()
         gdsGui_schematicGallery_setItems("aircraftGallery", _aircraftGalleryItems())
         if schematicStore.currentAircraftId == aircraft.id then
-            gdsGui_outputTxtBox_setText("aircraftHome_pageTitle", _aircraftHomeTitle(aircraft))
+            gdsGui_outputTxtBox_setText("schematicManage_pageTitle", _aircraftSystemsTitle(aircraft))
         end
     end
     _manageMenuAircraftId = nil
@@ -985,60 +1035,48 @@ function schematicAircraftDeleteConfirmed(galleryName, index, optionText)
 end
 
 -------------------------------------------------------------------------------
--- SYSTEM SCHEMATIC — AIRCRAFT PAGE (NEW SYSTEM / MY SYSTEMS)
--- Reached by opening an aircraft, either fresh off NEW AIRCRAFT or via the
--- MY AIRCRAFT gallery's OPEN AIRCRAFT action (see above).
+-- SYSTEM SCHEMATIC — OPENING AN AIRCRAFT
+-- Reached fresh off NEW AIRCRAFT or via the MY AIRCRAFT gallery's OPEN
+-- AIRCRAFT action (see above). No separate "aircraft home" page in between
+-- any more — opening an aircraft lands directly on its systems gallery,
+-- which shows a tile for every SCHEMATIC_CATALOG type (not just ones
+-- already created — see _systemGalleryItems) and handles both creating+
+-- opening a not-yet-existing one and editing/deleting an existing one
+-- (schematicSystemGallerySelected below).
 -------------------------------------------------------------------------------
 
--- Keeps "MY SYSTEMS" in sync with whether the current aircraft has anything
--- to open, and "NEW" in sync with whether any system type is still unused on
--- it (one system per type per aircraft — see _availableSystemTypesForAircraft).
--- Called whenever AircraftHome is (re)entered and after a system is deleted.
-local function _refreshAircraftHomeAvailability()
-    local aircraft = _findCurrentAircraft()
-    gdsGui_button_setState("aircraftHomeMySystems",
-        (aircraft and #aircraft.systems > 0) and "released" or "deactivated")
-    gdsGui_button_setState("aircraftHomeNewSystem",
-        (aircraft and #_availableSystemTypesForAircraft(aircraft) > 0) and "released" or "deactivated")
-end
-
--- Lands on AircraftHome for whichever aircraft is current (schematicStore.
--- currentAircraftId), set by the caller before this runs.
-function navGoToAircraftHome()
+function navGoToAircraftSystems()
     local aircraft = _findCurrentAircraft()
     if not aircraft then navGoToSystemSchematic(); return end
-    gdsGui_outputTxtBox_setText("aircraftHome_pageTitle", _aircraftHomeTitle(aircraft))
-    _refreshAircraftHomeAvailability()
-    _navSyncAll("AircraftHome")
-    gdsGui_page_switch("LoadingAircraftHome", 13, 2, false)
+    gdsGui_schematicGallery_setItems("manageGallery", _systemGalleryItems(aircraft))
+    gdsGui_outputTxtBox_setText("schematicManage_pageTitle", _aircraftSystemsTitle(aircraft))
+    _navSyncAll("SchematicManageGallery")
+    gdsGui_page_switch("LoadingSchematicManage", 11, 2, false)
 end
 
--- A system's type is fixed for its whole lifetime and an aircraft can only
--- have one system per type, so creation starts with a type picker (limited
--- to types this aircraft doesn't already have) rather than going straight to
--- naming it.
-function aircraftHomeNewSystemPressed()
+-- A real (already-created) system's tile opens the usual action menu. A
+-- not-yet-created one (_systemGalleryItems gives it the catalog type name
+-- itself as its id, since there's no real id to use yet) skips straight to
+-- creating the record and opening it in design mode — no type picker, no
+-- naming prompt, no action menu first: tapping an empty slot IS "create and
+-- start editing." No RENAME on the real-system menu either — a system's
+-- name is its catalog type (see SCHEMATIC_CATALOG/_findCatalogEntryForType),
+-- not a freeform label, so there's nothing for the user to type.
+function schematicSystemGallerySelected(galleryName, systemId)
+    local sys = _findSystem(systemId)
+    if sys then
+        _manageMenuSystemId = systemId
+        gdsGui_schematicGallery_openMenu(galleryName, sys.name,
+            {"OPEN IN CONTROL MODE", "OPEN IN DESIGN MODE", "DELETE", "CANCEL"},
+            "schematicSystemActionChosen", nil)
+        return
+    end
     local aircraft = _findCurrentAircraft()
-    if not aircraft then return end
-    local available = _availableSystemTypesForAircraft(aircraft)
-    if #available == 0 then return end
-    table.insert(available, "CANCEL")
-    gdsGui_choiceMenu_open("SELECT SYSTEM TYPE", available, "schematicSystemTypeChosen", nil)
-end
-
--- No naming prompt: a new system is always named from its type (e.g.
--- "Electrical System"), matching the gallery tile/menu label the user just
--- picked, so creation is a single tap with no text entry step. id is a
--- GDS-format unique serial (see schematicNewAircraftConfirmed above),
--- unique within this aircraft's own systems list.
-function schematicSystemTypeChosen(optionText)
-    if optionText == "CANCEL" then return end
-    local aircraft = _findCurrentAircraft()
-    if not aircraft then return end
+    if not aircraft or not _findCatalogEntryForType(systemId) then return end
     local id = gdsGui_saveLoad_createIdNumber(aircraft.systems, "id", 17)
     local now = os.date("%Y-%m-%d %H:%M:%S")
     table.insert(aircraft.systems, {
-        id = id, name = _titleCase(optionText) .. " System", systemType = optionText,
+        id = id, name = _titleCase(systemId) .. " System", systemType = systemId,
         createdAt = now, modifiedAt = now,
         elements = {}, wires = {}, controls = {}, snapshots = {},
     })
@@ -1046,30 +1084,6 @@ function schematicSystemTypeChosen(optionText)
     _openSystemIntoCanvas(id, "design")
     _navSyncAll("SystemSchematic")
     gdsGui_page_switch("LoadingSchematic", 7, 3, false)
-end
-
--- Single consolidated entry point: opens the systems gallery that handles
--- both loading a system (in control or design mode) and editing it (rename/
--- delete), chosen per-system from the action menu in
--- schematicSystemGallerySelected below.
-function aircraftHomeMySystemsPressed()
-    local aircraft = _findCurrentAircraft()
-    if not aircraft then return end
-    gdsGui_schematicGallery_setItems("manageGallery", aircraft.systems)
-    _navSyncAll("SchematicManageGallery")
-    gdsGui_page_switch("LoadingSchematicManage", 11, 2, false)
-end
-
--- Tapping a system opens an action menu rather than jumping straight into
--- it, so the same gallery covers loading (control mode), editing (design
--- mode), renaming, and deleting.
-function schematicSystemGallerySelected(galleryName, systemId)
-    local sys = _findSystem(systemId)
-    if not sys then return end
-    _manageMenuSystemId = systemId
-    gdsGui_schematicGallery_openMenu(galleryName, sys.name,
-        {"OPEN IN CONTROL MODE", "OPEN IN DESIGN MODE", "RENAME", "DELETE", "CANCEL"},
-        "schematicSystemActionChosen", nil)
 end
 
 function schematicSystemActionChosen(galleryName, index, optionText)
@@ -1081,31 +1095,12 @@ function schematicSystemActionChosen(galleryName, index, optionText)
         _openSystemIntoCanvas(_manageMenuSystemId, "design")
         _navSyncAll("SystemSchematic")
         gdsGui_page_switch("LoadingSchematic", 7, 3, false)
-    elseif optionText == "RENAME" then
-        local sys = _findSystem(_manageMenuSystemId)
-        if sys then
-            gdsGui_textPrompt_open("RENAME SYSTEM", sys.name, 24, "schematicSystemRenameConfirmed", nil)
-        end
     elseif optionText == "DELETE" then
         local sys = _findSystem(_manageMenuSystemId)
         gdsGui_schematicGallery_openMenu(galleryName, "DELETE \"" .. (sys and sys.name or "") .. "\"?",
             {"DELETE", "CANCEL"}, "schematicSystemDeleteConfirmed", nil)
     end
     -- "CANCEL" (or tapping outside): no-op, _manageMenuSystemId is overwritten next time.
-end
-
-function schematicSystemRenameConfirmed(newName)
-    local sys = _findSystem(_manageMenuSystemId)
-    if sys and newName ~= "" then
-        sys.name = newName
-        _saveSchematicStore()
-        local aircraft = _findCurrentAircraft()
-        gdsGui_schematicGallery_setItems("manageGallery", aircraft and aircraft.systems or {})
-        if schematicStore.currentSystemId == sys.id then
-            gdsGui_outputTxtBox_setText("schematic_pageTitle", sys.name)
-        end
-    end
-    _manageMenuSystemId = nil
 end
 
 function schematicSystemDeleteConfirmed(galleryName, index, optionText)
@@ -1123,8 +1118,7 @@ function schematicSystemDeleteConfirmed(galleryName, index, optionText)
             _clearMainCanvas()
         end
         _saveSchematicStore()
-        gdsGui_schematicGallery_setItems("manageGallery", aircraft and aircraft.systems or {})
-        _refreshAircraftHomeAvailability()
+        gdsGui_schematicGallery_setItems("manageGallery", _systemGalleryItems(aircraft))
     end
     _manageMenuSystemId = nil
 end
@@ -1536,7 +1530,6 @@ function love.load()
     createPageHeaderFooter("SchematicHome",          "AIRCRAFT",          "schematicHome")
     createPageHeaderFooter("SchematicManageGallery", "SYSTEMS",           "schematicManage")
     createPageHeaderFooter("AircraftGallery",        "MY AIRCRAFT",       "aircraftGallery")
-    createPageHeaderFooter("AircraftHome",           "AIRCRAFT",          "aircraftHome")
     createPageHeaderFooter("SchematicSnapshots",     "SNAPSHOTS",         "schematicSnapshots")
 
     -- "<" back button on every schematic-flow page EXCEPT Home itself. Needed
@@ -1544,15 +1537,15 @@ function love.load()
     -- lua / buttons_gdsGuiLib.lua): once pressed it ignores all further taps
     -- until externally reset, so it cannot be tapped again to navigate while
     -- already inside the schematic flow — these pages need their own
-    -- explicit way back. The canvas and the systems gallery are "inside" the
-    -- current aircraft, so they step back to AircraftHome (one level); the
-    -- aircraft gallery and AircraftHome itself step back to the top
-    -- aircraft picker (SchematicHome).
+    -- explicit way back. The canvas is "inside" the current aircraft's
+    -- systems gallery (one level back — see navBackToAircraftSystems); the
+    -- systems gallery itself IS "opening an aircraft" now (no separate home
+    -- page in between), so it steps back to the top aircraft picker
+    -- (SchematicHome), same as the aircraft gallery one level above it.
     for _, backBtn in ipairs({
-        {page = "SystemSchematic",          prefix = "schematic",       callback = "navBackToAircraftHome"},
-        {page = "SchematicManageGallery",    prefix = "schematicManage", callback = "navBackToAircraftHome"},
+        {page = "SystemSchematic",          prefix = "schematic",       callback = "navBackToAircraftSystems"},
+        {page = "SchematicManageGallery",    prefix = "schematicManage", callback = "navGoToSystemSchematic"},
         {page = "AircraftGallery",           prefix = "aircraftGallery", callback = "navGoToSystemSchematic"},
-        {page = "AircraftHome",              prefix = "aircraftHome",    callback = "navGoToSystemSchematic"},
         {page = "SchematicSnapshots",        prefix = "schematicSnapshots", callback = "navBackToSystemSchematic"},
     }) do
         gdsGui_button_create(backBtn.prefix .. "_backBtn", backBtn.page, "pushonoff",
@@ -1562,6 +1555,16 @@ function love.load()
             backBtn.callback, globApp.BUTTON_STATES.RELEASED, false, backBtn.prefix .. "_header"
         )
     end
+
+    -- DELETE ALL on the snapshots list header, mirrored opposite the "<" back
+    -- button — deactivated whenever the gallery is empty (see
+    -- schematicViewSnapshotsPressed/schematicDeleteAllSnapshotsConfirmed).
+    gdsGui_button_create("schematicSnapshots_deleteAllBtn", "SchematicSnapshots", "pushonoff",
+        "Sprites/button_deleteAllSnapshots_pressed.png", "Sprites/button_deleteAllSnapshots_released.png",
+        "Sprites/button_deleteAllSnapshots_deactivated.png",
+        math.floor(globApp.safeScreenArea.w * 0.92), hdrCY, "CC", 32, 32,
+        "schematicDeleteAllSnapshotsPressed", globApp.BUTTON_STATES.DEACTIVATED, false, "schematicSnapshots_header"
+    )
 
     createPageHeaderFooter("Learn",    "LEARN",     "learn")
     createPageHeaderFooter("Settings", "SETTINGS",  "settings")
@@ -1973,11 +1976,10 @@ function love.load()
     )
     -- FULL SCREEN: viewing-only convenience, so it's only enabled in control
     -- mode (deactivated in design, same gating pattern as SNAPSHOT in reverse).
-    -- Reuses the library's generic "switch screen size" icon.
     gdsGui_button_create("schematicFullScreenToggle", "SystemSchematic", "pushonoff",
-        "Libraries/gds_love2d_gui/librarySprites/gdsLoveGUI_switchScreenSizeButton_pushed.png",
-        "Libraries/gds_love2d_gui/librarySprites/gdsLoveGUI_switchScreenSizeButton_released.png",
-        "Libraries/gds_love2d_gui/librarySprites/gdsLoveGUI_switchScreenSizeButton_deactivated.png",
+        "Sprites/button_fullScreen_pressed.png",
+        "Sprites/button_fullScreen_released.png",
+        "Sprites/button_fullScreen_deactivated.png",
         0.875, schBtnRowYFrac, "CT", 30, 30,
         "schematicFullScreenTogglePressed", globApp.BUTTON_STATES.DEACTIVATED, true, nil
     )
@@ -1993,6 +1995,10 @@ function love.load()
         colorYellow, "1.0x", 10, nil
     )
     gdsGui_schematic_create("mainCanvas", "SystemSchematic", schCanvasXFrac, schCanvasYFrac, "LT", schCanvasWFrac, schCanvasHFrac)
+    gdsGui_schematic_setBackgroundImage("mainCanvas", "Sprites/bg_schematicCanvas.png")
+    gdsGui_schematic_setCornerBackgroundImage("mainCanvas", "Sprites/bg_schematicCanvasCorner.png")
+    gdsGui_schematic_setCornerRightBackgroundImage("mainCanvas", "Sprites/bg_schematicCanvasCornerRight.png")
+    gdsGui_schematic_setCornerTopRightBackgroundImage("mainCanvas", "Sprites/bg_schematicCanvasCornerTopRight.png")
     -- Fires on every design-mode edit (add/move/rotate/recolor/rename/
     -- delete/property change — see _notifyChanged in schematic_gdsGuiLib.lua),
     -- so in-progress work survives a quit/background without waiting for the
@@ -2018,9 +2024,9 @@ function love.load()
     -- screen page; tapping it hands mainCanvas back to its normal embedded
     -- layout on SystemSchematic (see schematicFullScreenReturnPressed).
     gdsGui_button_create("schematicFullScreenReturnBtn", "SchematicFullScreen", "pushonoff",
-        "Libraries/gds_love2d_gui/librarySprites/gdsLoveGUI_returnPrevPageButton_pushed.png",
-        "Libraries/gds_love2d_gui/librarySprites/gdsLoveGUI_returnPrevPageButton_released.png",
-        "Libraries/gds_love2d_gui/librarySprites/gdsLoveGUI_returnPrevPageButton_deactivated.png",
+        "Sprites/button_smallerScreen_pressed.png",
+        "Sprites/button_smallerScreen_released.png",
+        "Sprites/button_smallerScreen_deactivated.png",
         0.95, 0.04, "RT", 36, 36,
         "schematicFullScreenReturnPressed", globApp.BUTTON_STATES.RELEASED, true, nil
     )
@@ -2052,29 +2058,6 @@ function love.load()
         "schematicHomeMyAircraftPressed",
         (#schematicStore.aircraft > 0) and globApp.BUTTON_STATES.RELEASED or globApp.BUTTON_STATES.DEACTIVATED,
         true, nil
-    )
-
-    ---------------------------------------------------------------------------
-    -- AIRCRAFT HOME PAGE — NEW SYSTEM / MY SYSTEMS for whichever aircraft is
-    -- current (schematicStore.currentAircraftId), reached from SchematicHome
-    -- or from AircraftGallery's OPEN AIRCRAFT action.
-    ---------------------------------------------------------------------------
-    gdsGui_button_create("aircraftHomeNewSystem", "AircraftHome", "pushonoff",
-        "Sprites/button_schematicHomeNew_pressed.png", "Sprites/button_schematicHomeNew_released.png",
-        "Sprites/button_schematicHomeNew_deactivated.png",
-        0.5, 0.40, "CC", schHomeBtnW, schHomeBtnH,
-        "aircraftHomeNewSystemPressed", globApp.BUTTON_STATES.RELEASED, true, nil
-    )
-    -- Single consolidated entry point for every saved system on this
-    -- aircraft: opening it (in design or control mode), renaming it, and
-    -- deleting it are all offered from the per-system action menu on
-    -- SchematicManageGallery (see schematicSystemActionChosen). Disabled
-    -- until the current aircraft has at least one system.
-    gdsGui_button_create("aircraftHomeMySystems", "AircraftHome", "pushonoff",
-        "Sprites/button_schematicHomeLoad_pressed.png", "Sprites/button_schematicHomeLoad_released.png",
-        "Sprites/button_schematicHomeLoad_deactivated.png",
-        0.5, 0.60, "CC", schHomeBtnW, schHomeBtnH,
-        "aircraftHomeMySystemsPressed", globApp.BUTTON_STATES.DEACTIVATED, true, nil
     )
 
     ---------------------------------------------------------------------------
@@ -2131,7 +2114,6 @@ function love.load()
     gdsGui_container_finalise("SchematicHome")
     gdsGui_container_finalise("SchematicManageGallery")
     gdsGui_container_finalise("AircraftGallery")
-    gdsGui_container_finalise("AircraftHome")
     gdsGui_container_finalise("SchematicSnapshots")
     gdsGui_container_finalise("SchematicPaywall")
     gdsGui_container_finalise("TermsAndConditions")
@@ -2834,8 +2816,8 @@ end
 -- the first visit this session or the user is leaving the canvas to switch
 -- aircraft/systems — never straight back into whatever was last open on the
 -- canvas. Used by the footer dock icon (from anywhere outside the flow) and
--- by the back buttons on AircraftGallery/AircraftHome, which are already one
--- level below this.
+-- by the back buttons on AircraftGallery/SchematicManageGallery, which are
+-- already one level below this.
 function navGoToSystemSchematic()
     if gdsGui_page_currentName() == "SystemSchematic" then _saveCurrentSystemIfDirty() end
     if not appSettings.schematicUnlocked then
@@ -2848,12 +2830,11 @@ function navGoToSystemSchematic()
 end
 
 -- Steps back one level (not all the way to the top aircraft picker) from the
--- canvas or the systems gallery — both are "inside" the current aircraft, so
--- the natural way back is AircraftHome, keeping the user's aircraft context
--- instead of dropping them back to MY AIRCRAFT every time.
-function navBackToAircraftHome()
+-- canvas to the current aircraft's systems gallery, keeping the user's
+-- aircraft context instead of dropping them back to MY AIRCRAFT every time.
+function navBackToAircraftSystems()
     if gdsGui_page_currentName() == "SystemSchematic" then _saveCurrentSystemIfDirty() end
-    navGoToAircraftHome()
+    navGoToAircraftSystems()
 end
 
 function navGoToLearn()
@@ -3065,6 +3046,8 @@ end
 function schematicViewSnapshotsPressed()
     if gdsGui_page_currentName() == "SystemSchematic" then _saveCurrentSystemIfDirty() end
     gdsGui_schematicGallery_setItems("snapshotsGallery", _buildSnapshotGalleryItems())
+    gdsGui_button_setState("schematicSnapshots_deleteAllBtn",
+        gdsGui_schematic_countSnapshots("mainCanvas") > 0 and "released" or "deactivated")
     _navSyncAll("SchematicSnapshots")
     gdsGui_page_switch("LoadingSchematicSnapshots", 14, 2, false)
 end
@@ -3119,8 +3102,30 @@ function schematicSnapshotDeleteConfirmed(galleryName, index, optionText)
         _schematicDirty = true
         _saveCurrentSystem()
         gdsGui_schematicGallery_setItems("snapshotsGallery", _buildSnapshotGalleryItems())
+        gdsGui_button_setState("schematicSnapshots_deleteAllBtn",
+            gdsGui_schematic_countSnapshots("mainCanvas") > 0 and "released" or "deactivated")
     end
     _snapshotActionTargetSig = nil
+end
+
+-- DELETE ALL button on the snapshots list header: same confirm-then-commit
+-- shape as a single snapshot's own DELETE above, just clearing every
+-- snapshot on the current system instead of one signature.
+function schematicDeleteAllSnapshotsPressed()
+    if gdsGui_schematic_countSnapshots("mainCanvas") == 0 then return end
+    gdsGui_schematicGallery_openMenu("snapshotsGallery", "DELETE ALL SNAPSHOTS?",
+        {"DELETE ALL", "CANCEL"}, "schematicDeleteAllSnapshotsConfirmed", nil)
+end
+
+function schematicDeleteAllSnapshotsConfirmed(galleryName, index, optionText)
+    if optionText == "DELETE ALL" then
+        gdsGui_schematic_removeAllSnapshots("mainCanvas")
+        gdsGui_outputTxtBox_setText("schematicSnapshotLabel", "SNAPSHOTS: 0")
+        _schematicDirty = true
+        _saveCurrentSystem()
+        gdsGui_schematicGallery_setItems("snapshotsGallery", _buildSnapshotGalleryItems())
+        gdsGui_button_setState("schematicSnapshots_deleteAllBtn", "deactivated")
+    end
 end
 
 -------------------------------------------------------------------------------

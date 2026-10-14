@@ -42,7 +42,7 @@ globApp.objects.schematics = {}
 --------------------------------------------------------------------------------
 
 local _CONTROL_RADIUS_FRAC   = 0.045   -- control hit/draw radius, as a fraction of min(canvas.contentW, canvas.contentH)
-local _GRID_SPACING_PX       = 24
+local _GRID_SPACING_PX       = 6  -- world units between grid lines; also the element/control placement snap pitch (see _snapToGrid)
 local _MIN_ZOOM               = 1      -- fully zoomed out: the whole canvas box fits exactly in the viewport
 local _MAX_ZOOM               = 4
 -- Design/edit mode opens pre-zoomed to 2x (see gdsGui_schematic_resetView's
@@ -56,7 +56,7 @@ local _EDIT_MODE_INITIAL_ZOOM = 2
 local _ELEMENT_DEFAULT_W_FRAC = 0.07
 local _ELEMENT_DEFAULT_H_FRAC = 0.05
 local _PINCH_MIN_DIST_PX      = 1      -- guards against a near-zero divisor right as a pinch begins
-local _WIRE_WIDTH_PX         = 4 / 3   -- 2/3 of the previous 2px width
+local _WIRE_WIDTH_PX         = 2 / 3   -- half of the previous 4/3px width
 local _WIRE_CROSS_HOP_RADIUS_PX = 5   -- radius of the little arc hop drawn where a wire crosses an unrelated one
 local _WIRE_PARALLEL_GAP_PX     = 5   -- spacing between adjacent lanes when 2+ wires' paths overlap (fully or partially)
 local _WIRE_PARALLEL_STUB_PX    = 8   -- unsplit length kept right at each anchor before a parallel lane's offset begins
@@ -71,11 +71,11 @@ local _LONG_PRESS_SECONDS    = 2.0 -- how long a held (not-yet-moved) press on a
 local _WIRE_TAP_SLOP_PX      = 10  -- max distance from a wire's drawn line still counted as tapping it
 local _SWATCH_ROW_H_PX       = 64  -- height of the single row of color squares in a swatch picker
 local _SWATCH_GAP_PX         = 8
-
--- shapeTypes whose icon is directional (e.g. a diode's anode/cathode arrow),
--- so it makes sense to spin it to one of the 4 cardinal orientations. Every
--- other shapeType ignores element.rotation entirely.
-local _ROTATABLE_SHAPES      = { diode = true }
+local _OVERLAY_SPIN_RADPS    = math.pi * 1.5  -- a control's overlaySpritePath spin rate in control mode (0.75 rev/s)
+local _MOVE_ARROW_SIZE_PX    = 7   -- move-mode edge-arrow glyph length (see _drawMoveModeOverlay)
+local _MOVE_ARROW_GAP_PX     = 5   -- gap between the bounding box edge and the nearest point of its arrow
+local _ROTATE_ARC_GAP_RAD    = math.rad(70)  -- open gap left in the rotate-mode ring (see _drawRotateModeOverlay) so it reads as an arrow, not a closed circle
+local _ROTATE_ARC_MARGIN_PX  = 6   -- gap between the shape's own outline and the rotate ring drawn around it
 
 -- Small built-in named palette for the in-canvas color picker. Colors are a
 -- generic concept (unlike element/control catalog naming), so this lives here
@@ -164,6 +164,19 @@ end
 -- (rotary switch) — looks across both id namespaces, elements first.
 local function _findAnchor(canvas, id)
     return _findElement(canvas, id) or _findControl(canvas, id)
+end
+
+-- Shared "look up a color-pick/resolve target by its kind" dispatch for
+-- gdsGui_schematic_setPendingColor/_resolveColor/_resolveDisplayColor below.
+-- Not the "A and B or C" idiom (see gdsGui_schematic_resolveColor's own
+-- comment on this): _findElement/_findWire can each themselves return nil
+-- for a bad targetId, which would otherwise silently fall through to the
+-- next kind's lookup and resolve/recolor the WRONG object if a different
+-- kind happened to share that id.
+local function _findByKind(canvas, targetKind, id)
+    if targetKind == "element" then return _findElement(canvas, id)
+    elseif targetKind == "wire" then return _findWire(canvas, id)
+    else return _findControl(canvas, id) end
 end
 
 local function _deepCopy(t)
@@ -300,7 +313,8 @@ function gdsGui_schematic_placementNameConfirmed(name)
     else
         _pushUndo(canvas)
         gdsGui_schematic_addControl(pending.canvasName, pending.newId, pending.fracX, pending.fracY,
-            pending.positions, 0, trimmed, pending.callbackFunc, 1 / _EDIT_MODE_INITIAL_ZOOM, pending.spritePaths)
+            pending.positions, 0, trimmed, pending.callbackFunc, 1 / _EDIT_MODE_INITIAL_ZOOM, pending.spritePaths,
+            nil, pending.overlaySpritePath)
         _notifyChanged(canvas)
     end
     _pendingNamedPlacement = nil
@@ -406,12 +420,18 @@ end
 
 -- Snaps a 0-1 fraction position to the same world-space grid _drawGrid
 -- renders, then clamps to [0,1]. Shared by every element/control placement
--- and drag site so a dragged piece always lands exactly on a drawn line —
--- spacing is expressed in world units (contentW/H at zoom 1) so, like the
--- grid itself, the snapped fraction grid gets finer as the user zooms in.
+-- and drag site so a dragged piece always lands exactly on a drawn line.
+-- Spacing is expressed in world units (contentW/H, zoom-independent) so the
+-- grid is a fixed reference: a position on-grid at one zoom level is still
+-- on-grid at any other, the same way physical graph paper doesn't redraw
+-- its own lines when you zoom a photo of it. (A spacing that divided by
+-- canvas.zoom here, matching _drawGrid's on-screen _GRID_SPACING_PX-apart appearance,
+-- would instead make "on-grid" itself zoom-dependent — two elements each
+-- perfectly snapped at different zoom levels would no longer align with
+-- each other, since each was snapped against a differently-pitched grid.)
 local function _snapToGrid(canvas, fracX, fracY)
-    local spacingX = (_GRID_SPACING_PX / canvas.zoom) / canvas.contentW
-    local spacingY = (_GRID_SPACING_PX / canvas.zoom) / canvas.contentH
+    local spacingX = _GRID_SPACING_PX / canvas.contentW
+    local spacingY = _GRID_SPACING_PX / canvas.contentH
     fracX = math.floor(fracX / spacingX + 0.5) * spacingX
     fracY = math.floor(fracY / spacingY + 0.5) * spacingY
     return math.max(0, math.min(1, fracX)), math.max(0, math.min(1, fracY))
@@ -602,9 +622,19 @@ function gdsGui_schematic_create(name, page, x, y, anchorPoint, wFrac, hFrac)
     -- user can lift and re-grab it without holding again) until a
     -- different element/control/wire is selected or selection is cleared.
     canvas.selectionMoveModeActive = false
+    -- True once move mode (above) has had a no-op tap-to-confirm land on
+    -- the SAME still-active target (see gdsGui_schematic_released) —
+    -- switches the drawn overlay/next-press meaning from "drag to move"
+    -- (4 edge arrows) to "drag to rotate" (ring arrow). Reset alongside
+    -- selectionMoveModeActive everywhere above/below it clears.
+    canvas.rotateModeActive = false
     canvas.wireToolActive    = false
     canvas.wireTool          = { fromId = nil, curX = nil, curY = nil, color = nil }
     canvas.defaultConnectorColor = nil  -- see gdsGui_schematic_setDefaultConnectorColor
+    canvas.backgroundImagePath = nil  -- see gdsGui_schematic_setBackgroundImage
+    canvas.cornerBackgroundImagePath = nil  -- see gdsGui_schematic_setCornerBackgroundImage
+    canvas.cornerRightBackgroundImagePath = nil  -- see gdsGui_schematic_setCornerRightBackgroundImage
+    canvas.cornerTopRightBackgroundImagePath = nil  -- see gdsGui_schematic_setCornerTopRightBackgroundImage
     canvas.focusTouchId      = nil
     canvas.dragKind          = nil   -- "element" | "control" | "wire" | "wireDirection" | "rotate" | "controlRotate" | "pendingLongPress" | "pan" | nil
     canvas.dragOffsetX       = 0
@@ -649,6 +679,12 @@ function gdsGui_schematic_create(name, page, x, y, anchorPoint, wFrac, hFrac)
     canvas.panY    = 0
     canvas.touches = {}
     canvas.pinch   = nil
+
+    -- Radians accumulated while canvas.mode == "control", driving any
+    -- control's overlaySpritePath spin (see gdsGui_schematic_update and
+    -- _drawControl) — frozen (not reset) the instant mode leaves "control",
+    -- so re-entering control mode resumes the spin rather than restarting it.
+    canvas._overlayAnimAngle = 0
 
     canvas.original = { x = x, y = y, anchorPoint = anchorPoint, wFrac = wFrac, hFrac = hFrac }
     canvas.zoomedOriginal = nil  -- see gdsGui_schematic_setZoomedLayout
@@ -751,6 +787,7 @@ function gdsGui_schematic_setMode(canvasName, mode)
     canvas.dragKind = nil
     canvas._pendingDragUndoSnapshot = nil
     canvas.selectionMoveModeActive = false
+    canvas.rotateModeActive = false
 end
 
 function gdsGui_schematic_getMode(canvasName)
@@ -840,8 +877,8 @@ end
 -- a generic, domain-agnostic key/value list (the app layer decides what keys
 -- mean, e.g. "VOLTAGE"/"CURRENT" for an electrical element). rotation
 -- (optional, degrees, defaults to 0): current cardinal orientation (0/90/
--- 180/270) of a rotatable shapeType's icon (see _ROTATABLE_SHAPES) — ignored
--- by every other shapeType. spritePath (optional): an app-supplied image
+-- 180/270) of the element's icon -- every shapeType is rotatable (see
+-- _drawElement). spritePath (optional): an app-supplied image
 -- path drawn letterboxed into the element's box instead of the plain
 -- rect/circle/diode shape (see _drawElementSprite) — same arm's-length
 -- "just a string the app layer resolved" relationship as a gallery tile's
@@ -946,10 +983,24 @@ end
 -- fall back to the vector icon for just that one position. Same
 -- arm's-length "just paths the app layer resolved" relationship as an
 -- element's own spritePath. rotation (optional, degrees, defaults to 0):
--- every control is rotatable (unlike an element, where only specific
--- shapeTypes are — see _ROTATABLE_SHAPES), spinning its icon — sprite or
--- vector alike — to one of the 4 cardinal orientations.
-function gdsGui_schematic_addControl(canvasName, id, x, y, positions, initialDetentIndex, label, callbackFunc, radiusScale, spritePaths, rotation)
+-- every control is rotatable, same as every element now, spinning its icon
+-- (sprite or vector alike) to one of the 4 cardinal orientations.
+-- overlaySpritePath
+-- (optional): a second image drawn on top of spritePaths' current-detent
+-- icon (or the plain vector fallback), same letterboxed size, continuously
+-- spinning while canvas.mode == "control" AND the control sits in its last
+-- ("ON"/flowing/conducting) position — same last-position-means-on
+-- convention as _SWITCH_SPRITE_PATHS — frozen at rest otherwise (design
+-- mode, or control mode with the control OFF) — see
+-- gdsGui_schematic_update's _OVERLAY_SPIN_RADPS accumulator and
+-- _drawControl. For a control whose base icon doesn't change per detent
+-- (e.g. a generator's housing, same for OFF/ON), the spin is the only thing
+-- that visually tells a user it's switched on and running. defaultColor
+-- (optional, defaults to the library's flat gray _DEFAULT_COLOR): a
+-- control's base tint, same ASSIGN COLOR/design-mode-edit-menu/snapshot
+-- machinery as an element or wire's own defaultColor — see
+-- gdsGui_schematic_resolveDisplayColor and _drawControl.
+function gdsGui_schematic_addControl(canvasName, id, x, y, positions, initialDetentIndex, label, callbackFunc, radiusScale, spritePaths, rotation, overlaySpritePath, defaultColor)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     local numDetents = math.max(2, #positions)
@@ -957,7 +1008,8 @@ function gdsGui_schematic_addControl(canvasName, id, x, y, positions, initialDet
         id = id, x = x, y = y, numDetents = numDetents, positions = positions,
         detentIndex = math.max(0, math.min(numDetents - 1, initialDetentIndex or 0)),
         label = label, callbackFunc = callbackFunc, radiusScale = radiusScale or 1,
-        spritePaths = spritePaths, rotation = rotation or 0,
+        spritePaths = spritePaths, rotation = rotation or 0, overlaySpritePath = overlaySpritePath,
+        defaultColor = defaultColor or _DEFAULT_COLOR, pendingColor = nil,
     })
     _resyncPlacementCounter(canvas, id)
 end
@@ -1059,14 +1111,15 @@ function gdsGui_schematic_armElementPlacement(canvasName, shapeType, label, defa
         spritePath = spritePath }
 end
 
--- spritePaths (optional): see gdsGui_schematic_addControl — threaded
--- through unchanged.
-function gdsGui_schematic_armControlPlacement(canvasName, positions, label, callbackFunc, idPrefix, spritePaths)
+-- spritePaths, overlaySpritePath (both optional): see
+-- gdsGui_schematic_addControl — threaded through unchanged.
+function gdsGui_schematic_armControlPlacement(canvasName, positions, label, callbackFunc, idPrefix, spritePaths, overlaySpritePath)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     gdsGui_schematic_cancelPlacement(canvasName)
     canvas.pendingPlacement = { kind = "control", positions = positions, label = label,
-        callbackFunc = callbackFunc, idPrefix = idPrefix or label, spritePaths = spritePaths }
+        callbackFunc = callbackFunc, idPrefix = idPrefix or label, spritePaths = spritePaths,
+        overlaySpritePath = overlaySpritePath }
 end
 
 -- Arms a one-shot "draw the next wire/pipe/etc." gesture: tap one element,
@@ -1095,6 +1148,43 @@ end
 function gdsGui_schematic_setDefaultConnectorColor(canvasName, color)
     local canvas = _findCanvas(canvasName)
     if canvas then canvas.defaultConnectorColor = color end
+end
+
+-- An app-supplied backdrop image drawn behind the grid/elements/wires, same
+-- arm's-length "just a path the app layer resolved" relationship as an
+-- element's own spritePath — the library never interprets what it depicts.
+-- Lives in the same world coordinate system elements/controls do, so it
+-- pans and zooms WITH the content rather than staying pinned to the
+-- viewport like a fixed wallpaper — see _drawCanvasBackground. nil clears
+-- it back to the library's plain flat fill.
+function gdsGui_schematic_setBackgroundImage(canvasName, path)
+    local canvas = _findCanvas(canvasName)
+    if canvas then canvas.backgroundImagePath = path end
+end
+
+-- A second, smaller backdrop image anchored to the bottom-left corner of
+-- the content box (see _drawCanvasCornerBackground for sizing/positioning),
+-- drawn BEHIND backgroundImagePath above rather than on top of it — same
+-- arm's-length "just a path" relationship, same world-space pan/zoom
+-- behavior. nil clears it.
+function gdsGui_schematic_setCornerBackgroundImage(canvasName, path)
+    local canvas = _findCanvas(canvasName)
+    if canvas then canvas.cornerBackgroundImagePath = path end
+end
+
+-- Mirror of gdsGui_schematic_setCornerBackgroundImage for the bottom-RIGHT
+-- corner of the content box — same size, same world-space pan/zoom,
+-- same layering behind backgroundImagePath. nil clears it.
+function gdsGui_schematic_setCornerRightBackgroundImage(canvasName, path)
+    local canvas = _findCanvas(canvasName)
+    if canvas then canvas.cornerRightBackgroundImagePath = path end
+end
+
+-- Same again for the TOP-right corner of the content box — same size,
+-- same world-space pan/zoom, same layering. nil clears it.
+function gdsGui_schematic_setCornerTopRightBackgroundImage(canvasName, path)
+    local canvas = _findCanvas(canvasName)
+    if canvas then canvas.cornerTopRightBackgroundImagePath = path end
 end
 
 -- Arms a one-shot "tap an element or wire to assign its snapshot color" pick,
@@ -1351,14 +1441,7 @@ end
 function gdsGui_schematic_setPendingColor(canvasName, targetKind, targetId, color)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
-    -- Not the "A and B or C" idiom (see gdsGui_schematic_resolveColor's
-    -- comment): B (_findElement's result) can itself be nil for a bad
-    -- targetId, which would otherwise silently fall through to a wire
-    -- lookup and recolor the WRONG object if a wire happened to share
-    -- that id.
-    local target
-    if targetKind == "element" then target = _findElement(canvas, targetId)
-    else target = _findWire(canvas, targetId) end
+    local target = _findByKind(canvas, targetKind, targetId)
     if target then target.pendingColor = color end
 end
 
@@ -1611,11 +1694,14 @@ function gdsGui_schematic_internal_onWireDeleteConfirmed(canvasName, index, opti
 end
 
 --------------------------------------------------------------------------------
--- PUBLIC API — DESIGN-MODE CONTROL EDIT MENU (position + delete, opened by a
--- plain tap on a control while in design mode; a drag still repositions it
--- instead, same tap-vs-drag gesture as the element/wire edit menus above). A
--- plain text list, not a swatch picker — controls have no color of their own
--- to set, just their named positions.
+-- PUBLIC API — DESIGN-MODE CONTROL EDIT MENU (color + position + delete,
+-- opened by a plain tap on a control while in design mode; a drag still
+-- repositions it instead, same tap-vs-drag gesture as the element/wire edit
+-- menus above). A swatch picker like those two, with the control's named
+-- positions and DELETE as extraOptions below the color row — sets the
+-- control's base defaultColor directly, same "no signature/snapshot
+-- involved, just the permanent appearance when no snapshot overrides it"
+-- semantics as an element/wire's own edit-menu color option.
 --------------------------------------------------------------------------------
 
 function gdsGui_schematic_openControlEditMenu(canvasName, controlId)
@@ -1624,10 +1710,10 @@ function gdsGui_schematic_openControlEditMenu(canvasName, controlId)
     local ctrl = _findControl(canvas, controlId)
     if not ctrl then return end
     canvas._controlEditTargetId = controlId
-    local options = {}
-    for _, p in ipairs(ctrl.positions) do table.insert(options, p) end
-    table.insert(options, "DELETE")
-    gdsGui_schematic_openMenu(canvasName, ctrl.label or controlId, options,
+    local extraOptions = {"ADD WIRE"}
+    for _, p in ipairs(ctrl.positions) do table.insert(extraOptions, p) end
+    table.insert(extraOptions, "DELETE")
+    _openSwatchColorMenu(canvasName, ctrl.label or controlId, extraOptions,
         "gdsGui_schematic_internal_onControlEditChosen", "gdsGui_schematic_internal_onControlEditCancelled")
 end
 
@@ -1635,6 +1721,34 @@ function gdsGui_schematic_internal_onControlEditChosen(canvasName, index, option
     local canvas = _findCanvas(canvasName)
     if not canvas or not canvas._controlEditTargetId then return end
     local controlId = canvas._controlEditTargetId
+    local nColors = #_COLOR_PALETTE
+    if index <= nColors then
+        -- Color swatch tapped: set the control's base defaultColor, same as
+        -- an element/wire's own edit-menu color pick.
+        canvas._controlEditTargetId = nil
+        canvas.selectedControlId = nil
+        local entry = _COLOR_PALETTE[index]
+        if entry then
+            local ctrl = _findControl(canvas, controlId)
+            if ctrl then
+                _pushUndo(canvas)
+                ctrl.defaultColor = entry.color
+                _notifyChanged(canvas)
+            end
+        end
+        return
+    end
+    if optionText == "ADD WIRE" then
+        -- ADD WIRE tapped: arm a one-shot wire-drag whose fixed start is
+        -- this control, same "stay armed, no need to land on an anchor
+        -- next press" convention as an element's own ADD WIRE (see
+        -- gdsGui_schematic_internal_onElementEditChosen) — _findAnchor
+        -- resolves a control id just as readily as an element id.
+        canvas._controlEditTargetId = nil
+        gdsGui_schematic_cancelPlacement(canvasName)
+        canvas.pendingWireFromId = controlId
+        return
+    end
     if optionText == "DELETE" then
         -- DELETE tapped: confirm before actually removing it. Keep
         -- _controlEditTargetId set — the confirm/cancel handler below clears it.
@@ -1652,8 +1766,10 @@ function gdsGui_schematic_internal_onControlEditChosen(canvasName, index, option
     -- deliberately NOT undoable (same as any other instrument interaction).
     -- This design-mode edit-menu path is a genuine edit though, same as
     -- every sibling mutation here (rename, delete, color pick, move).
+    -- Offset by one extra slot versus before: extraOptions now leads with
+    -- ADD WIRE, so a position's 0-based index is index - nColors - 2.
     _pushUndo(canvas)
-    gdsGui_schematic_setControlPosition(canvasName, controlId, index - 1)
+    gdsGui_schematic_setControlPosition(canvasName, controlId, index - nColors - 2)
     _notifyChanged(canvas)
 end
 
@@ -1855,22 +1971,31 @@ function gdsGui_schematic_colorsDiffer(existing, candidate)
         local ex = existing.wires and existing.wires[id]
         if ex and not _colorEquals(ex, col) then return true end
     end
+    for id, col in pairs(candidate.controls or {}) do
+        local ex = existing.controls and existing.controls[id]
+        if ex and not _colorEquals(ex, col) then return true end
+    end
     return false
 end
 
--- targetKind: "element" | "wire". Returns r,g,b,a for the entity's live resolved color:
--- 1) a pending color-picker override, else 2) the snapshot matching the current
--- control-position signature, else 3) the entity's default (gray) color.
+-- A snapshot's bucket for a given targetKind ("element"/"wire"/"control") —
+-- snap.controls can be absent on a snapshot captured before controls were
+-- colorable, same backward-compatible nil-bucket handling the caller below
+-- already relies on.
+local function _snapshotBucket(snap, targetKind)
+    if targetKind == "element" then return snap.elements
+    elseif targetKind == "wire" then return snap.wires
+    else return snap.controls end
+end
+
+-- targetKind: "element" | "wire" | "control". Returns r,g,b,a for the
+-- entity's live resolved color: 1) a pending color-picker override, else 2)
+-- the snapshot matching the current control-position signature, else 3) the
+-- entity's default (gray) color.
 function gdsGui_schematic_resolveColor(canvasName, targetKind, targetId)
     local canvas = _findCanvas(canvasName)
     if not canvas then return _DEFAULT_COLOR[1], _DEFAULT_COLOR[2], _DEFAULT_COLOR[3], _DEFAULT_COLOR[4] end
-    -- Not the "A and B or C" idiom: _findElement can itself return nil for
-    -- a bad targetId, which would otherwise silently fall through to a
-    -- wire lookup and resolve the WRONG object's color if a wire happened
-    -- to share that id.
-    local target
-    if targetKind == "element" then target = _findElement(canvas, targetId)
-    else target = _findWire(canvas, targetId) end
+    local target = _findByKind(canvas, targetKind, targetId)
     if not target then return _DEFAULT_COLOR[1], _DEFAULT_COLOR[2], _DEFAULT_COLOR[3], _DEFAULT_COLOR[4] end
 
     if target.pendingColor then
@@ -1881,12 +2006,12 @@ function gdsGui_schematic_resolveColor(canvasName, targetKind, targetId)
     local signature = gdsGui_schematic_computeSignature(canvasName)
     local snap = canvas.snapshots[signature]
     if snap then
-        local bucket = (targetKind == "element") and snap.elements or snap.wires
+        local bucket = _snapshotBucket(snap, targetKind)
         local c = bucket and bucket[targetId]
         if c then return c[1], c[2], c[3], c[4] end
     end
 
-    local dc = target.defaultColor
+    local dc = target.defaultColor or _DEFAULT_COLOR
     return dc[1], dc[2], dc[3], dc[4]
 end
 
@@ -1901,15 +2026,13 @@ end
 function gdsGui_schematic_resolveDisplayColor(canvasName, targetKind, targetId)
     local canvas = _findCanvas(canvasName)
     if canvas and canvas.mode == "design" then
-        local target
-        if targetKind == "element" then target = _findElement(canvas, targetId)
-        else target = _findWire(canvas, targetId) end
+        local target = _findByKind(canvas, targetKind, targetId)
         if not target then return _DEFAULT_COLOR[1], _DEFAULT_COLOR[2], _DEFAULT_COLOR[3], _DEFAULT_COLOR[4] end
         if target.pendingColor then
             local c = target.pendingColor
             return c[1], c[2], c[3], c[4]
         end
-        local dc = target.defaultColor
+        local dc = target.defaultColor or _DEFAULT_COLOR
         return dc[1], dc[2], dc[3], dc[4]
     end
     return gdsGui_schematic_resolveColor(canvasName, targetKind, targetId)
@@ -1964,7 +2087,7 @@ end
 ]]
 function gdsGui_schematic_prepareSnapshot(canvasName)
     local canvas = _findCanvas(canvasName)
-    local plan = { signature = "", elements = {}, wires = {}, conflict = nil, hasConflict = false, replacesKeys = {} }
+    local plan = { signature = "", elements = {}, wires = {}, controls = {}, conflict = nil, hasConflict = false, replacesKeys = {} }
     if not canvas then return plan end
     plan.signature = gdsGui_schematic_computeSignature(canvasName)
 
@@ -2002,6 +2125,19 @@ function gdsGui_schematic_prepareSnapshot(canvasName)
         end
         plan.wires[w.id] = { r, g, b, a }
     end
+    -- .controls is a newer bucket than .elements/.wires — an older snapshot
+    -- (captured before controls were colorable) simply lacks it, so every
+    -- access below is guarded rather than assumed present like the two loops
+    -- above.
+    for _, ctl in ipairs(canvas.controls) do
+        local r, g, b, a = gdsGui_schematic_resolveColor(canvasName, "control", ctl.id)
+        if not ctl.pendingColor and not (exactSnapshot and exactSnapshot.controls and exactSnapshot.controls[ctl.id])
+           and migratedFrom and migratedFrom.controls and migratedFrom.controls[ctl.id] then
+            local c = migratedFrom.controls[ctl.id]
+            r, g, b, a = c[1], c[2], c[3], c[4]
+        end
+        plan.controls[ctl.id] = { r, g, b, a }
+    end
 
     -- Conflict is only ever flagged against an EXACT signature match — i.e.
     -- re-capturing the identical combination with a different color, the
@@ -2029,11 +2165,12 @@ function gdsGui_schematic_commitSnapshot(canvasName, plan)
         canvas.snapshots[key] = nil
     end
     canvas.snapshots[plan.signature] = {
-        elements = plan.elements, wires = plan.wires,
+        elements = plan.elements, wires = plan.wires, controls = plan.controls,
         timestamp = os.date("%Y-%m-%d %H:%M:%S"),
     }
     for _, e in ipairs(canvas.elements) do e.pendingColor = nil end
     for _, w in ipairs(canvas.wires) do w.pendingColor = nil end
+    for _, c in ipairs(canvas.controls) do c.pendingColor = nil end
 end
 
 function gdsGui_schematic_countSnapshots(canvasName)
@@ -2049,17 +2186,23 @@ function gdsGui_schematic_removeSnapshot(canvasName, signature)
     if canvas then canvas.snapshots[signature] = nil end
 end
 
+function gdsGui_schematic_removeAllSnapshots(canvasName)
+    local canvas = _findCanvas(canvasName)
+    if canvas then canvas.snapshots = {} end
+end
+
 --------------------------------------------------------------------------------
 -- DRAWING
 --------------------------------------------------------------------------------
 
--- Grid lines live at fixed canvas-box positions spaced _GRID_SPACING_PX/zoom
--- apart, so on screen they land _GRID_SPACING_PX apart regardless of zoom
--- level (constant visual density) while the underlying world-space cell
--- shrinks as the user zooms in, exposing finer positions to place on/snap to.
+-- Grid lines live at fixed world-space positions spaced _GRID_SPACING_PX
+-- apart (same fixed pitch _snapToGrid snaps to — see its comment), so they
+-- spread apart on screen as the user zooms in and draw closer together
+-- zoomed out, exactly like physical units would. This keeps a position
+-- that's on-grid at one zoom level on-grid at every zoom level.
 local function _drawGrid(canvas)
     love.graphics.setColor(1, 1, 1, 0.06)
-    local spacing = _GRID_SPACING_PX / canvas.zoom
+    local spacing = _GRID_SPACING_PX
     local x0, y0, x1, y1 = canvas.x, canvas.y, canvas.x + canvas.w, canvas.y + canvas.h
 
     local worldLeft = (x0 - canvas.x - canvas.panX) / canvas.zoom
@@ -2120,6 +2263,71 @@ local function _drawElementSprite(path, ex, ey, ew, eh, r, g, b, a, rotationDeg)
     end
 end
 
+-- Draws canvas.backgroundImagePath (see gdsGui_schematic_setBackgroundImage)
+-- scaled, at the reference zoom/pan (zoom 1, pan 0 — the "whole canvas box
+-- fits exactly in the viewport" state, see _MIN_ZOOM), to exactly fill the
+-- content box's width — preserving aspect ratio, so height is whatever that
+-- implies — and vertically centered. Deliberately NOT "scale to fit" like
+-- _drawElementSprite above: filling width exactly means there's never a gap
+-- to either side regardless of the image's own aspect ratio, only possibly
+-- above/below (which the caller's scissor already clips, same as everything
+-- else drawn on the canvas).
+--
+-- Positioned/scaled against canvas.contentW/H (the fixed world-space basis
+-- _toPixel itself uses — see its own comment) rather than the live
+-- canvas.x/y/w/h viewport box, and the exact same
+-- "canvas.x + canvas.panX + worldUnits * canvas.zoom" shape _toPixel
+-- applies to every element/control — so the background pans and zooms
+-- WITH the content, instead of staying pinned to the viewport like a fixed
+-- wallpaper (canvas.w/h are clamped viewport sizes, not the true content
+-- extent, so they're the wrong basis for this — see _calculateGeometry).
+local function _drawCanvasBackground(canvas)
+    if not canvas.backgroundImagePath then return end
+    local image = _loadElementSprite(canvas.backgroundImagePath)
+    local iw, ih = image:getDimensions()
+    local worldScale = canvas.contentW / iw
+    local drawH = ih * worldScale
+    local worldY = (canvas.contentH - drawH) / 2
+    local px = canvas.x + canvas.panX
+    local py = canvas.y + canvas.panY + worldY * canvas.zoom
+    local scale = worldScale * canvas.zoom
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.draw(image, px, py, 0, scale, scale)
+end
+
+-- Draws canvas.cornerBackgroundImagePath / cornerRightBackgroundImagePath /
+-- cornerTopRightBackgroundImagePath (see gdsGui_schematic_setCorner*
+-- BackgroundImage) each sized to _CORNER_BG_HEIGHT_FRAC of the content
+-- box's height (preserving aspect ratio), anchored so the image's own
+-- bottom-left/bottom-right/top-right corner sits exactly on the content
+-- box's matching corner.
+-- Same world-space pan/zoom positioning as _drawCanvasBackground, so it
+-- moves and scales with the canvas content like every other image. Always
+-- drawn before _drawCanvasBackground (see gdsGui_schematic_draw) so it reads
+-- as sitting behind that backdrop wherever the two overlap.
+local _CORNER_BG_HEIGHT_FRAC = 0.175  -- 30% smaller than the original 0.25
+-- sizeMul (optional, defaults to 1): per-corner multiplier on _CORNER_BG_HEIGHT_FRAC.
+local function _drawCornerImage(canvas, path, alignRight, alignTop, sizeMul)
+    if not path then return end
+    local image = _loadElementSprite(path)
+    local iw, ih = image:getDimensions()
+    local targetH = canvas.contentH * _CORNER_BG_HEIGHT_FRAC * (sizeMul or 1)
+    local worldScale = targetH / ih
+    local worldX = alignRight and (canvas.contentW - iw * worldScale) or 0
+    local worldY = alignTop and 0 or (canvas.contentH - targetH)
+    local px = canvas.x + canvas.panX + worldX * canvas.zoom
+    local py = canvas.y + canvas.panY + worldY * canvas.zoom
+    local scale = worldScale * canvas.zoom
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.draw(image, px, py, 0, scale, scale)
+end
+
+local function _drawCanvasCornerBackground(canvas)
+    _drawCornerImage(canvas, canvas.cornerBackgroundImagePath, false)
+    _drawCornerImage(canvas, canvas.cornerRightBackgroundImagePath, true)
+    _drawCornerImage(canvas, canvas.cornerTopRightBackgroundImagePath, true, true, 1.5)
+end
+
 -- Standard diode symbol (triangle + cathode bar, no leads) pointing right
 -- at rotation 0; rotationDeg (0/90/180/270, see
 -- _snapRotationDegrees) spins it to the other 3 cardinal directions. Colored
@@ -2139,6 +2347,61 @@ local function _drawDiodeSymbol(cx, cy, ew, eh, rotationDeg, r, g, b, a)
     love.graphics.pop()
 end
 
+-- One small outward-pointing triangle glyph, used 4x by _drawMoveModeOverlay
+-- below — (px,py) is the glyph's own outward tip, (dx,dy) the outward unit
+-- direction it points in (so the base sits closer to the shape than the tip).
+local function _drawArrowGlyph(px, py, dx, dy, size)
+    local perpX, perpY = -dy, dx
+    local tipX,  tipY  = px + dx * size * 0.6, py + dy * size * 0.6
+    local baseX, baseY = px - dx * size * 0.6, py - dy * size * 0.6
+    love.graphics.polygon("fill",
+        tipX, tipY,
+        baseX + perpX * size * 0.5, baseY + perpY * size * 0.5,
+        baseX - perpX * size * 0.5, baseY - perpY * size * 0.5)
+end
+
+-- Move-mode affordance: once a long-press has unlocked drag (see
+-- canvas.selectionMoveModeActive), 4 small arrows sit just outside the
+-- element/control's own edges — one per cardinal direction — signaling
+-- "this can be dragged" on top of the existing yellow->magenta outline
+-- swap. cx,cy is the shape's own center; halfW,halfH its half-extents (a
+-- control passes its radius for both, reading as a diamond of 4 arrows
+-- around the circle).
+local function _drawMoveModeOverlay(cx, cy, halfW, halfH, zoom)
+    local size = _MOVE_ARROW_SIZE_PX * zoom
+    local gap  = _MOVE_ARROW_GAP_PX * zoom
+    _drawArrowGlyph(cx, cy - halfH - gap - size, 0, -1, size)
+    _drawArrowGlyph(cx, cy + halfH + gap + size, 0, 1, size)
+    _drawArrowGlyph(cx - halfW - gap - size, cy, -1, 0, size)
+    _drawArrowGlyph(cx + halfW + gap + size, cy, 1, 0, size)
+end
+
+-- Rotate-mode affordance: pressing an already-move-unlocked element/control
+-- again rotates it instead (see gdsGui_schematic_pressed's isActiveMoveTarget
+-- branch) — a semi-completed circular arrow contouring the shape (a ring
+-- with one end left open and an arrowhead at the other, like a classic
+-- "rotate" icon) hints at that drag-to-rotate gesture. Only drawn for
+-- rotatable targets -- every control and every element now (toggled each
+-- press, not shown together) -- see call sites.
+local function _drawRotateModeOverlay(cx, cy, radius, zoom)
+    local startAngle = -math.pi / 2 + _ROTATE_ARC_GAP_RAD / 2
+    local endAngle    = startAngle + (math.pi * 2 - _ROTATE_ARC_GAP_RAD)
+    local ringRadius  = radius + _ROTATE_ARC_MARGIN_PX * zoom
+    love.graphics.setLineWidth(2 * zoom)
+    love.graphics.arc("line", "open", cx, cy, ringRadius, startAngle, endAngle, 48)
+    love.graphics.setLineWidth(1)
+    -- Arrowhead at the arc's leading end, tangent to the ring so it reads
+    -- as continuing the curve's direction of travel.
+    local tipX, tipY   = cx + math.cos(endAngle) * ringRadius, cy + math.sin(endAngle) * ringRadius
+    local tanX, tanY   = -math.sin(endAngle), math.cos(endAngle)
+    local normX, normY = math.cos(endAngle), math.sin(endAngle)
+    local headSize = _MOVE_ARROW_SIZE_PX * zoom
+    love.graphics.polygon("fill",
+        tipX + tanX * headSize * 0.7, tipY + tanY * headSize * 0.7,
+        tipX - tanX * headSize * 0.4 + normX * headSize * 0.5, tipY - tanY * headSize * 0.4 + normY * headSize * 0.5,
+        tipX - tanX * headSize * 0.4 - normX * headSize * 0.5, tipY - tanY * headSize * 0.4 - normY * headSize * 0.5)
+end
+
 local function _drawElement(canvas, e)
     local ex, ey, ew, eh = _elementPixelRect(canvas, e)
     local r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "element", e.id)
@@ -2147,28 +2410,58 @@ local function _drawElement(canvas, e)
         _drawElementSprite(e.spritePath, ex, ey, ew, eh, r, g, b, a, e.rotation)
         love.graphics.setColor(1, 1, 1, 1)
     elseif e.shapeType == "circle" then
-        love.graphics.ellipse("fill", ex + ew / 2, ey + eh / 2, ew / 2, eh / 2)
+        -- Every shapeType is rotatable now (move/rotate mode applies
+        -- uniformly — see gdsGui_schematic_pressed's toggle), so an
+        -- off-square ellipse (ew ~= eh) visibly turns too, same
+        -- push/translate/rotate-around-center convention as the diode
+        -- symbol below.
+        love.graphics.push()
+        love.graphics.translate(ex + ew / 2, ey + eh / 2)
+        love.graphics.rotate(math.rad(e.rotation or 0))
+        love.graphics.ellipse("fill", 0, 0, ew / 2, eh / 2)
         love.graphics.setColor(1, 1, 1, 1)
-        love.graphics.ellipse("line", ex + ew / 2, ey + eh / 2, ew / 2, eh / 2)
+        love.graphics.ellipse("line", 0, 0, ew / 2, eh / 2)
+        love.graphics.pop()
     elseif e.shapeType == "diode" then
         _drawDiodeSymbol(ex + ew / 2, ey + eh / 2, ew, eh, e.rotation, r, g, b, a)
         love.graphics.setColor(1, 1, 1, 1)
     else
-        love.graphics.rectangle("fill", ex, ey, ew, eh)
+        -- Plain rect, same rotation treatment as circle above.
+        love.graphics.push()
+        love.graphics.translate(ex + ew / 2, ey + eh / 2)
+        love.graphics.rotate(math.rad(e.rotation or 0))
+        love.graphics.rectangle("fill", -ew / 2, -eh / 2, ew, eh)
         love.graphics.setColor(1, 1, 1, 1)
-        love.graphics.rectangle("line", ex, ey, ew, eh)
+        love.graphics.rectangle("line", -ew / 2, -eh / 2, ew, eh)
+        love.graphics.pop()
     end
     if canvas.selectedElementId == e.id then
         -- Magenta once the 2-second hold has unlocked drag/rotate for it
         -- (see gdsGui_schematic_update's long-press timer) — yellow is
         -- still "selected, but a drag here won't move/rotate it; a tap
-        -- opens its menu, or hold to unlock that."
+        -- opens its menu, or hold to unlock that." Magenta drawn at half
+        -- opacity (both the outline and the move/rotate overlay below,
+        -- which inherits this same setColor) so it reads as an active
+        -- affordance without visually competing with the element itself.
         if canvas.selectionMoveModeActive then
-            love.graphics.setColor(1, 0, 1, 1)
+            love.graphics.setColor(1, 0, 1, 0.5)
         else
             love.graphics.setColor(1, 1, 0, 1)
         end
         love.graphics.rectangle("line", ex - 3, ey - 3, ew + 6, eh + 6)
+        if canvas.selectionMoveModeActive then
+            -- Mutually exclusive, not both at once: every further tap on
+            -- the active target toggles between them (see
+            -- gdsGui_schematic_pressed's isActiveMoveTarget branch) rather
+            -- than opening the edit menu. Every element is rotatable now,
+            -- same as every control.
+            if canvas.rotateModeActive then
+                local ringBase = math.sqrt((ew / 2) ^ 2 + (eh / 2) ^ 2) + 3
+                _drawRotateModeOverlay(ex + ew / 2, ey + eh / 2, ringBase, canvas.zoom)
+            else
+                _drawMoveModeOverlay(ex + ew / 2, ey + eh / 2, ew / 2 + 3, eh / 2 + 3, canvas.zoom)
+            end
+        end
     end
     if e.label then
         love.graphics.setColor(1, 1, 1, 1)
@@ -2793,7 +3086,7 @@ local function _drawWire(canvas, w, plan)
         else
             love.graphics.setColor(1, 1, 0, 1)
         end
-        love.graphics.setLineWidth(wireWidth + 6 * canvas.zoom)
+        love.graphics.setLineWidth(wireWidth + 2.4 * canvas.zoom)
         _drawWirePlanSegments(plan, canvas.zoom)
     end
     local r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "wire", w.id)
@@ -2808,19 +3101,33 @@ local function _drawControl(canvas, c)
     local rad = canvas.controlRadius * canvas.zoom * (c.radiusScale or 1)
     if canvas.selectedControlId == c.id then
         -- Same yellow/magenta selection emphasis as an element's outline —
-        -- see its comment.
+        -- see its comment (including the half-opacity magenta).
         if canvas.selectionMoveModeActive then
-            love.graphics.setColor(1, 0, 1, 1)
+            love.graphics.setColor(1, 0, 1, 0.5)
         else
             love.graphics.setColor(1, 1, 0, 1)
         end
         love.graphics.circle("line", cx, cy, rad + 4)
+        if canvas.selectionMoveModeActive then
+            -- Mutually exclusive, not both at once — see the matching
+            -- comment in _drawElement.
+            if canvas.rotateModeActive then
+                _drawRotateModeOverlay(cx, cy, rad + 4, canvas.zoom)
+            else
+                _drawMoveModeOverlay(cx, cy, rad + 4, rad + 4, canvas.zoom)
+            end
+        end
     end
+    -- Same resolved-color machinery (pendingColor preview, then
+    -- signature-matched snapshot, then defaultColor) as an element/wire — see
+    -- gdsGui_schematic_resolveDisplayColor and ASSIGN COLOR/the design-mode
+    -- edit menu's swatch picker below.
+    local r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "control", c.id)
     local spritePath = c.spritePaths and c.spritePaths[c.detentIndex + 1]
     if spritePath then
-        _drawElementSprite(spritePath, cx - rad, cy - rad, rad * 2, rad * 2, 1, 1, 1, 1, c.rotation)
+        _drawElementSprite(spritePath, cx - rad, cy - rad, rad * 2, rad * 2, r, g, b, a, c.rotation)
     else
-        love.graphics.setColor(1, 1, 1, 1)
+        love.graphics.setColor(r, g, b, a)
         love.graphics.circle("line", cx, cy, rad)
         -- The detent-position angle and the control's own manual rotation
         -- (see gdsGui_schematic_addControl) both spin the same indicator
@@ -2831,6 +3138,20 @@ local function _drawControl(canvas, c)
         love.graphics.setLineWidth(3)
         love.graphics.line(cx, cy, cx + math.sin(angle) * rad, cy - math.cos(angle) * rad)
         love.graphics.setLineWidth(1)
+    end
+    if c.overlaySpritePath then
+        -- Spins only in control mode AND while the control sits in its last
+        -- ("ON"/flowing/conducting) position — same last-position-means-on
+        -- convention _SWITCH_SPRITE_PATHS documents, so a generator's gear
+        -- (or any other animated-overlay control) reads as "running" only
+        -- when it's actually switched on, not just because the schematic
+        -- itself is in control mode. Static (just c.rotation) otherwise —
+        -- see gdsGui_schematic_update's _overlayAnimAngle. Tinted the same as
+        -- the base icon so the two layers read as one colored object.
+        local isOn = c.detentIndex == c.numDetents - 1
+        local spinDeg = (canvas.mode == "control" and isOn) and math.deg(canvas._overlayAnimAngle or 0) or 0
+        _drawElementSprite(c.overlaySpritePath, cx - rad, cy - rad, rad * 2, rad * 2, r, g, b, a,
+            spinDeg + (c.rotation or 0))
     end
     local posName = (c.positions and c.positions[c.detentIndex + 1]) or tostring(c.detentIndex)
     local text = (c.label or "") .. "\n" .. posName
@@ -2872,6 +3193,8 @@ function gdsGui_schematic_draw(pageName)
 
             love.graphics.setColor(0.10, 0.10, 0.12, 1)
             love.graphics.rectangle("fill", canvas.x, canvas.y, canvas.w, canvas.h)
+            _drawCanvasCornerBackground(canvas)
+            _drawCanvasBackground(canvas)
             if canvas.mode == "design" then _drawGrid(canvas) end
 
             local wirePlans = _computeWirePlans(canvas)
@@ -3084,6 +3407,7 @@ function gdsGui_schematic_pressed(touchId, x, y)
                 defaultPropertyKeys = canvas.pendingPlacement.defaultPropertyKeys,
                 spritePath = canvas.pendingPlacement.spritePath,
                 spritePaths = canvas.pendingPlacement.spritePaths,
+                overlaySpritePath = canvas.pendingPlacement.overlaySpritePath,
             }
             _openPlacementNamePrompt("NAME THIS " .. canvas.pendingPlacement.kind:upper(),
                 _suggestedPlacementName(canvas, canvas.pendingPlacement.label))
@@ -3093,8 +3417,9 @@ function gdsGui_schematic_pressed(touchId, x, y)
 
         if canvas.pendingColorAssignPick then
             -- One-shot pick armed via gdsGui_schematic_armColorAssignPick:
-            -- whatever this tap lands on (element, then wire) gets its
-            -- swatch color picker opened directly; empty space just disarms.
+            -- whatever this tap lands on (element, then wire, then control)
+            -- gets its swatch color picker opened directly; empty space just
+            -- disarms.
             canvas.pendingColorAssignPick = false
             local pickedElem = _hitElement(canvas, x, y)
             if pickedElem then
@@ -3105,6 +3430,12 @@ function gdsGui_schematic_pressed(touchId, x, y)
                 if pickedWire then
                     gdsGui_schematic_openColorPicker(canvas.name, "wire", pickedWire.id,
                         "COLOR: WIRE: " .. pickedWire.id)
+                else
+                    local pickedControl = _hitControl(canvas, x, y)
+                    if pickedControl then
+                        gdsGui_schematic_openColorPicker(canvas.name, "control", pickedControl.id,
+                            "COLOR: " .. (pickedControl.label or pickedControl.id))
+                    end
                 end
             end
             goto continue
@@ -3163,15 +3494,30 @@ function gdsGui_schematic_pressed(touchId, x, y)
             canvas.dragStartX         = x
             canvas.dragStartY         = y
             canvas.dragMoved          = false
-            if not isActiveMoveTarget then canvas.selectionMoveModeActive = false end
+            if not isActiveMoveTarget then
+                canvas.selectionMoveModeActive = false
+                canvas.rotateModeActive = false
+            end
             if isActiveMoveTarget then
                 canvas._pendingDragUndoSnapshot = _snapshotState(canvas)
-                if _ROTATABLE_SHAPES[hitElem.shapeType] then
+                -- Every element is rotatable now (move/rotate applies
+                -- uniformly across every shapeType/system) — a fresh press
+                -- on an already-unlocked selection TOGGLES between the two
+                -- modes rather than always picking one, so repeated taps
+                -- alternate move/rotate/move/rotate... (see the matching
+                -- control branch below, and gdsGui_schematic_released's
+                -- now-redundant-but-harmless confirm of the same flag).
+                -- Set here (press time), not just on a no-drag release, so
+                -- the overlay already matches for the whole gesture if this
+                -- press goes straight into a real drag.
+                if not canvas.rotateModeActive then
                     canvas.dragKind = "rotate"
+                    canvas.rotateModeActive = true
                     local cx, cy = _elementCenter(canvas, hitElem)
                     canvas.rotateGrabAngleOffset = math.atan2(y - cy, x - cx) - math.rad(hitElem.rotation or 0)
                 else
                     canvas.dragKind    = "element"
+                    canvas.rotateModeActive = false
                     local ex, ey = _toPixel(canvas, hitElem.x, hitElem.y)
                     canvas.dragOffsetX = x - ex
                     canvas.dragOffsetY = y - ey
@@ -3193,19 +3539,28 @@ function gdsGui_schematic_pressed(touchId, x, y)
                 canvas.dragStartX        = x
                 canvas.dragStartY        = y
                 canvas.dragMoved         = false
-                if not isActiveMoveTarget then canvas.selectionMoveModeActive = false end
+                if not isActiveMoveTarget then
+                    canvas.selectionMoveModeActive = false
+                    canvas.rotateModeActive = false
+                end
                 if isActiveMoveTarget then
-                    -- Every control is rotatable (unlike elements, where
-                    -- only specific shapeTypes are — see _ROTATABLE_SHAPES
-                    -- above) — pressing an already-active control rotates
-                    -- it instead of moving it, same first-drag-moves/
-                    -- every-later-drag-rotates pattern as a rotatable
-                    -- element (see gdsGui_schematic_update's promotion,
-                    -- which is what unlocks the FIRST, move, drag).
-                    canvas.dragKind = "controlRotate"
+                    -- Every control is rotatable, same as every element now
+                    -- — pressing an already-unlocked control TOGGLES
+                    -- between move/rotate each press, same as the element
+                    -- branch above (see its comment).
                     canvas._pendingDragUndoSnapshot = _snapshotState(canvas)
-                    local cx, cy = _toPixel(canvas, hitCtrl.x, hitCtrl.y)
-                    canvas.rotateGrabAngleOffset = math.atan2(y - cy, x - cx) - math.rad(hitCtrl.rotation or 0)
+                    if not canvas.rotateModeActive then
+                        canvas.dragKind = "controlRotate"
+                        canvas.rotateModeActive = true
+                        local cx, cy = _toPixel(canvas, hitCtrl.x, hitCtrl.y)
+                        canvas.rotateGrabAngleOffset = math.atan2(y - cy, x - cx) - math.rad(hitCtrl.rotation or 0)
+                    else
+                        canvas.dragKind = "control"
+                        canvas.rotateModeActive = false
+                        local cx, cy = _toPixel(canvas, hitCtrl.x, hitCtrl.y)
+                        canvas.dragOffsetX = x - cx
+                        canvas.dragOffsetY = y - cy
+                    end
                 else
                     canvas.dragKind            = "pendingLongPress"
                     canvas.longPressTargetKind = "control"
@@ -3232,7 +3587,10 @@ function gdsGui_schematic_pressed(touchId, x, y)
                     canvas.dragStartX        = x
                     canvas.dragStartY        = y
                     canvas.dragMoved         = false
-                    if not isActiveMoveTarget then canvas.selectionMoveModeActive = false end
+                    if not isActiveMoveTarget then
+                        canvas.selectionMoveModeActive = false
+                        canvas.rotateModeActive = false
+                    end
                     if isActiveMoveTarget then
                         local pivotX, pivotY = _wireMidpoint(canvas, hitWire)
                         if pivotX then
@@ -3253,6 +3611,7 @@ function gdsGui_schematic_pressed(touchId, x, y)
                     canvas.selectedControlId = nil
                     canvas.selectedWireId    = nil
                     canvas.selectionMoveModeActive = false
+                    canvas.rotateModeActive = false
                     -- Empty space: a one-finger drag pans the (possibly zoomed) view.
                     canvas.focusTouchId = touchId
                     canvas.dragKind     = "pan"
@@ -3473,14 +3832,25 @@ function gdsGui_schematic_released(touchId, x, y)
                 end
             elseif canvas.mode == "design" and canvas.dragKind == "element" and
                    canvas.selectedElementId and not canvas.dragMoved then
-                -- A plain tap (no drag) on an element in design mode: open the
-                -- color+delete menu instead of just leaving it selected.
-                gdsGui_schematic_openElementEditMenu(canvas.name, canvas.selectedElementId)
+                -- A plain tap (no drag) once move mode is already unlocked
+                -- (including the very tap that JUST unlocked it via the
+                -- 2-second hold, see gdsGui_schematic_update) no longer
+                -- opens the edit menu — it stays selected in move mode,
+                -- showing the 4-arrow overlay (_drawMoveModeOverlay),
+                -- ready for either an actual drag (moves it) or another
+                -- tap (see the "rotate" branch below, which is what a
+                -- repeat tap on a rotatable element resolves to).
+                canvas.rotateModeActive = false
             elseif canvas.mode == "design" and canvas.dragKind == "rotate" and
                    canvas.selectedElementId and not canvas.dragMoved then
-                -- Same tap-to-edit gesture as a plain element drag: a tap
-                -- with no actual rotation opens the edit menu instead.
-                gdsGui_schematic_openElementEditMenu(canvas.name, canvas.selectedElementId)
+                -- A plain tap here means the user pressed again on an
+                -- already-move-unlocked rotatable element (gdsGui_schematic_
+                -- pressed's isActiveMoveTarget branch is what resolves a
+                -- fresh press straight to "rotate") without dragging —
+                -- switches the overlay from the 4-arrow move hint to the
+                -- ring-arrow rotate hint (_drawRotateModeOverlay) instead of
+                -- opening the edit menu.
+                canvas.rotateModeActive = true
             elseif canvas.mode == "design" and canvas.dragKind == "wire" and
                    canvas.selectedWireId and not canvas.dragMoved then
                 -- Same tap-to-edit gesture as an element, applied to a wire.
@@ -3492,14 +3862,17 @@ function gdsGui_schematic_released(touchId, x, y)
                 gdsGui_schematic_openWireEditMenu(canvas.name, canvas.selectedWireId)
             elseif canvas.mode == "design" and canvas.dragKind == "control" and
                    canvas.selectedControlId and not canvas.dragMoved then
-                -- Same tap-to-edit gesture, applied to a control: lets design
-                -- mode change its position/delete it, not just reposition it.
-                gdsGui_schematic_openControlEditMenu(canvas.name, canvas.selectedControlId)
+                -- Same no-menu move-mode tap as an element above (every
+                -- control is rotatable, so this is only ever the tap that
+                -- just unlocked move mode itself — a repeat tap on an
+                -- already-active control always resolves straight to
+                -- "controlRotate" below instead).
+                canvas.rotateModeActive = false
             elseif canvas.mode == "design" and canvas.dragKind == "controlRotate" and
                    canvas.selectedControlId and not canvas.dragMoved then
-                -- Same tap-to-edit gesture as a plain control drag: a tap
-                -- with no actual rotation opens the edit menu instead.
-                gdsGui_schematic_openControlEditMenu(canvas.name, canvas.selectedControlId)
+                -- Same move->rotate overlay switch as an element's "rotate"
+                -- branch above, instead of opening the edit menu.
+                canvas.rotateModeActive = true
             end
             -- An actual drag (element/rotate/control/controlRotate moved,
             -- not just tapped) settled at its final position/angle here —
@@ -3531,6 +3904,9 @@ end
 function gdsGui_schematic_update(dt)
     local activePageName = _getActivePageName()
     for _, canvas in ipairs(globApp.objects.schematics) do
+        if canvas.page == activePageName and canvas.mode == "control" then
+            canvas._overlayAnimAngle = (canvas._overlayAnimAngle or 0) + dt * _OVERLAY_SPIN_RADPS
+        end
         if canvas.page ~= activePageName then goto continue end
         if canvas.dragKind ~= "pendingLongPress" then goto continue end
         -- The touch already lifted (gdsGui_schematic_released clears
@@ -3550,6 +3926,7 @@ function gdsGui_schematic_update(dt)
         -- already-unlocked target), so the user doesn't have to lift and
         -- press again.
         canvas.selectionMoveModeActive = true
+        canvas.rotateModeActive = false
         gdsGui_haptics_vibrate()
         local touch = canvas.touches[canvas.focusTouchId]
         local x = touch and touch.x or canvas.dragStartX
@@ -3659,6 +4036,12 @@ function gdsGui_schematicGallery_create(name, page, x, y, anchorPoint, wFrac, hF
     gallery.pressStartY   = 0
     gallery.pressStartScrollY = 0
     gallery.moved         = false
+    -- Which tile (1-based index into gallery.items) is currently held down,
+    -- for an item whose thumbnailPressedPath wants a press/release sprite
+    -- swap like a real button (see _drawGalleryTilePreview) — nil whenever
+    -- nothing is held, the held point isn't over a tile, or the touch has
+    -- moved past tap slop into a scroll (see gdsGui_schematicGallery_moved).
+    gallery.pressedTileIndex = nil
     gallery.menu          = nil   -- generic modal list, same shape as the canvas's
     gallery.onSelect      = nil   -- global function name: called (galleryName, itemId) on tap
 
@@ -3808,9 +4191,15 @@ end
 
 -- One tile's preview artwork: an app-supplied thumbnail image if the item
 -- has one (e.g. an aircraft's type icon), else the elements/wires diagram.
-local function _drawGalleryTilePreview(item, tx, ty, tw, th)
-    if item.thumbnailPath then
-        _drawThumbnailImage(item.thumbnailPath, tx, ty, tw, th)
+-- isPressed (optional): true while this exact tile is being held down (see
+-- gallery.pressedTileIndex) — swaps to item.thumbnailPressedPath for that
+-- span, same released/pressed sprite-pair convention a real button uses,
+-- if the item supplied one; falls back to the plain thumbnailPath otherwise
+-- (an item with no pressed variant just doesn't animate on press).
+local function _drawGalleryTilePreview(item, tx, ty, tw, th, isPressed)
+    local path = (isPressed and item.thumbnailPressedPath) or item.thumbnailPath
+    if path then
+        _drawThumbnailImage(path, tx, ty, tw, th)
     else
         _drawMiniDiagram(item.elements, item.wires, item.controls, tx, ty, tw, th)
     end
@@ -3830,6 +4219,7 @@ function gdsGui_schematicGallery_draw(pageName)
             else
                 for i, item in ipairs(gallery.items) do
                     local tx, ty, tw, th = _galleryTileRect(gallery, i)
+                    local isPressed = (i == gallery.pressedTileIndex)
                     if ty + th + _GALLERY_LABEL_H_PX >= gallery.y and ty <= gallery.y + gallery.h then
                         if item.statusLines then
                             -- Thumbnail + status-text row layout (the
@@ -3837,7 +4227,7 @@ function gdsGui_schematicGallery_draw(pageName)
                             -- left, the item's name/timestamp and its list of
                             -- control positions filling the rest of the row.
                             local diagW = th
-                            _drawGalleryTilePreview(item, tx, ty, diagW, th)
+                            _drawGalleryTilePreview(item, tx, ty, diagW, th, isPressed)
                             love.graphics.setColor(1, 1, 0, 1)
                             love.graphics.rectangle("line", tx, ty, diagW, th)
                             love.graphics.setColor(1, 1, 1, 1)
@@ -3845,7 +4235,7 @@ function gdsGui_schematicGallery_draw(pageName)
                             love.graphics.printf(item.name or item.id, textX, ty, textW, "left")
                             love.graphics.printf(table.concat(item.statusLines, "\n"), textX, ty + 18, textW, "left")
                         else
-                            _drawGalleryTilePreview(item, tx, ty, tw, th)
+                            _drawGalleryTilePreview(item, tx, ty, tw, th, isPressed)
                             love.graphics.setColor(1, 1, 0, 1)
                             love.graphics.rectangle("line", tx, ty, tw, th)
                             love.graphics.setColor(1, 1, 1, 1)
@@ -3891,6 +4281,7 @@ function gdsGui_schematicGallery_pressed(touchId, x, y)
         gallery.pressStartY       = y
         gallery.pressStartScrollY = gallery.scrollY
         gallery.moved             = false
+        gallery.pressedTileIndex  = _galleryTileAt(gallery, x, y)
 
         ::continue::
     end
@@ -3904,7 +4295,13 @@ function gdsGui_schematicGallery_moved(touchId, x, y)
         if gallery.focusTouchId ~= touchId then goto continue end
 
         local dy = gallery.pressStartY - y
-        if math.abs(dy) > _GALLERY_TAP_SLOP_PX then gallery.moved = true end
+        if math.abs(dy) > _GALLERY_TAP_SLOP_PX then
+            -- Past tap slop — this is a scroll, not a tap-and-hold on the
+            -- tile; drop the pressed-sprite feedback same as a button would
+            -- un-press once a drag carries the touch off it.
+            gallery.moved = true
+            gallery.pressedTileIndex = nil
+        end
         local maxScroll = _galleryMaxScroll(gallery)
         gallery.scrollY = math.max(0, math.min(maxScroll, gallery.pressStartScrollY + dy))
 
@@ -3932,6 +4329,7 @@ function gdsGui_schematicGallery_released(touchId, x, y)
                 end
             end
             gallery.focusTouchId = nil
+            gallery.pressedTileIndex = nil
         end
         ::continue::
     end
