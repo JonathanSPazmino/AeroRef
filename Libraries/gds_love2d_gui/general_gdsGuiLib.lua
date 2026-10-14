@@ -115,6 +115,12 @@ function gdsGui_general_handleResize()
     for _, obj in ipairs(globApp.objects.rotaryKnobs) do
         if obj.resize and not obj.ownerContainer then obj:resize() end
     end
+    for _, obj in ipairs(globApp.objects.schematics) do
+        if obj.resize then obj:resize() end
+    end
+    for _, obj in ipairs(globApp.objects.schematicGalleries) do
+        if obj.resize then obj:resize() end
+    end
     -- Re-layout all pages that have containers so off-screen pages stay correct.
     local seen = {}
     for _, cont in ipairs(globApp.objects.containers) do
@@ -169,6 +175,9 @@ function gdsGui_update (dt)
 
 	gdsGui_saveLoad_updateProjectAvailability ()
 
+	gdsGui_schematic_update (dt)
+	gdsGui_schematicGallery_update (dt)
+
 	gdsGui_timeControl_updateTrigger (dt)
 
 	gdsGui_page_loadingUpdate (dt)
@@ -205,6 +214,8 @@ function gdsGui_general_draw ()
 	gdsGui_table_draw (activePageName)
 	gdsGui_scrollBar_draw (activePageName)
 	gdsGui_rotaryKnob_draw (activePageName)
+	gdsGui_schematic_draw (activePageName)
+	gdsGui_schematicGallery_draw (activePageName)
 	gdsGui_button_draw (activePageName)
 
 end
@@ -832,6 +843,13 @@ function love.mousereleased ( x, y, button, istouch, presses )
 end
 
 
+function love.wheelmoved ( x, y )
+
+	gdsGui_general_wheelmoved (x, y)
+
+end
+
+
 
 
 function gdsGui_general_isTouchInSafeArea (touchX, touchY)
@@ -867,6 +885,16 @@ end
 
 function gdsGui_general_mousepressed (x, y, button, istouch, presses)
 
+	if gdsGui_textPrompt_isOpen() then
+		gdsGui_textPrompt_pressed("mouse", x, y)
+		return
+	end
+
+	if gdsGui_choiceMenu_isOpen() then
+		gdsGui_choiceMenu_pressed("mouse", x, y)
+		return
+	end
+
 	if istouch == false then
 
 		local buttonName = gdsGui_general_convertButtonNumToString (button)
@@ -885,6 +913,10 @@ gdsGui_button_pressed (x,y,button,istouch) --runs when clicked on created button
 		gdsGui_outputTxtBox_scrollbarPressed("mouse", x, y, button, istouch)
 
 		gdsGui_rotaryKnob_pressed ("mouse", x, y)
+
+		gdsGui_schematic_pressed ("mouse", x, y)
+
+		gdsGui_schematicGallery_pressed ("mouse", x, y)
 
 		-- Mark tables where mouse press started inside the scrollable area.
 		local activePage = gdsGui_page_currentName()
@@ -911,7 +943,26 @@ end
 
 
 function gdsGui_general_mousereleased (x, y, button, istouch, presses)
-	
+
+	-- A prompt/menu already open when this release began had its matching
+	-- press captured by its own _pressed handler (see mousepressed above) —
+	-- this release is what actually fires its button/option, only if it
+	-- lands back on that SAME one (touch-up-inside). One opened mid-handler
+	-- instead (e.g. a button's release callback further down calling
+	-- gdsGui_textPrompt_open) has no such press to resolve and must not let
+	-- the REST of this same release event fall through to table/schematic/
+	-- scrollbar/etc. handlers underneath it against pre-modal page state —
+	-- handled by the second guard further down, right after what might
+	-- open it.
+	if gdsGui_textPrompt_isOpen() then
+		gdsGui_textPrompt_released("mouse", x, y)
+		return
+	end
+	if gdsGui_choiceMenu_isOpen() then
+		gdsGui_choiceMenu_released("mouse", x, y)
+		return
+	end
+
 	if istouch == false then
 
 		local buttonName = gdsGui_general_convertButtonNumToString (button)
@@ -921,20 +972,38 @@ function gdsGui_general_mousereleased (x, y, button, istouch, presses)
 			local calledFunction = (buttonName .. " click")
 			globApp.userInput = calledFunction
 
-			gdsGui_button_released (x, y, 1, istouch, presses)
-		
-			gdsGui_table_rowSelect (x,y,button,istouch)
-
-			gdsGui_table_buttonsReleased (x,y,button,istouch)
-
-			gdsGui_scrollBar_unfocus ("mouse", x,y,button,istouch)
-
-			gdsGui_rotaryKnob_released ("mouse")
-
-			gdsGui_outputTxtBox_touchReleased ("mouse", x, y)
-			gdsGui_table_touchReleasedScroll (x, y)
-			gdsGui_container_touchReleased(x, y)
+			-- Checked first, against whatever page was active when this tap
+			-- started, so a button press that itself triggers a page switch
+			-- (e.g. to the loading page) can't have its same release event
+			-- re-hit-tested against the new page's loading-link hit box.
 			gdsGui_page_loadingTouched (x, y)
+
+			gdsGui_button_released (x, y, 1, istouch, presses)
+
+			-- gdsGui_button_released above may itself have run a callback
+			-- that opened a text prompt or choice menu (e.g.
+			-- schematicHomeNewPressed -> gdsGui_textPrompt_open). The rest
+			-- of this release must not also dispatch to table/schematic/
+			-- scrollbar/etc. handlers against the pre-modal page state.
+			if not (gdsGui_textPrompt_isOpen() or gdsGui_choiceMenu_isOpen()) then
+
+				gdsGui_table_rowSelect (x,y,button,istouch)
+
+				gdsGui_table_buttonsReleased (x,y,button,istouch)
+
+				gdsGui_scrollBar_unfocus ("mouse", x,y,button,istouch)
+
+				gdsGui_rotaryKnob_released ("mouse")
+
+				gdsGui_schematic_released ("mouse", x, y)
+
+				gdsGui_schematicGallery_released ("mouse", x, y)
+
+				gdsGui_outputTxtBox_touchReleased ("mouse", x, y)
+				gdsGui_table_touchReleasedScroll (x, y)
+				gdsGui_container_touchReleased(x, y)
+
+			end
 
 			globApp.userInput = "none"
 
@@ -959,11 +1028,28 @@ function gdsGui_general_mousemoved (x, y, button, istouch, presses)
 	-- button = dx, istouch = dy for this callback (see note above).
 	gdsGui_rotaryKnob_moved ("mouse", x, y, button, istouch)
 
+	gdsGui_schematic_moved ("mouse", x, y)
+
+	gdsGui_schematicGallery_moved ("mouse", x, y)
+
 	-- Pass mouse drag deltas into the output textbox and table scroll systems.
 	-- button = dx, istouch = dy (see note above).
 	gdsGui_outputTxtBox_touchScroll(nil, x, y, button, istouch, nil, nil, nil)
 	gdsGui_table_touchScroll(nil, x, y, button, istouch, nil, nil, nil)
 	gdsGui_container_touchScroll(nil, x, y, button, istouch)
+
+end
+
+-- LÖVE's love.wheelmoved(dx, dy) reports a scroll delta, not a position, so
+-- the cursor location has to be read separately to know which canvas (if
+-- any) is under it.
+function gdsGui_general_wheelmoved (dx, dy)
+
+	if gdsGui_textPrompt_isOpen() then return end
+	if gdsGui_choiceMenu_isOpen() then return end
+
+	local mx, my = love.mouse.getPosition()
+	gdsGui_schematic_wheelZoom (mx, my, dy)
 
 end
 
@@ -974,6 +1060,15 @@ end
 
 function love.textinput(t)
 
+	if gdsGui_textPrompt_isOpen() then
+		gdsGui_textPrompt_textinput (t)
+		return
+	end
+
+	if gdsGui_choiceMenu_isOpen() then
+		return
+	end
+
 	gdsGui_inputTxtBox_textUpdate ("add",t, nil)
 
 end
@@ -981,13 +1076,22 @@ end
 
 function love.keypressed(key, unicode)
 
+	if gdsGui_textPrompt_isOpen() then
+		gdsGui_textPrompt_keypressed (key)
+		return
+	end
+
+	if gdsGui_choiceMenu_isOpen() then
+		return
+	end
+
 	if gdsGui_general_isTextRemoveCommanded (key) == true then
 		gdsGui_inputTxtBox_textUpdate ("remove",nil, key)
 	end
-	
+
 	gdsGui_inputTxtBox_tabToSwitch (key)
 
-end 
+end
 
 function gdsGui_general_isTextRemoveCommanded (key)
 
@@ -1018,6 +1122,16 @@ end
 
 function gdsGui_general_touchpressed (id, x, y, dx, dy, pressure)
 
+	if gdsGui_textPrompt_isOpen() then
+		gdsGui_textPrompt_pressed(id, x, y)
+		return
+	end
+
+	if gdsGui_choiceMenu_isOpen() then
+		gdsGui_choiceMenu_pressed(id, x, y)
+		return
+	end
+
 	local calledFunction = "touch pressed"
 
 	globApp.userInput = calledFunction -- insert code below this line to user glob var
@@ -1031,6 +1145,10 @@ function gdsGui_general_touchpressed (id, x, y, dx, dy, pressure)
 	gdsGui_outputTxtBox_scrollbarPressed(id, x, y, 1, true)
 
 	gdsGui_rotaryKnob_pressed (id, x, y)
+
+	gdsGui_schematic_pressed (id, x, y)
+
+	gdsGui_schematicGallery_pressed (id, x, y)
 
 	gdsGui_table_rowSelect (x,y,1,true)
 
@@ -1061,6 +1179,8 @@ function gdsGui_general_touchmoved (id, x, y, dx, dy, pressure)
 	-- Handle scrollbar and knob drag for this specific touch independently.
 	gdsGui_scrollBar_holdAndDrag (id, x, y, 1, true)
 	gdsGui_rotaryKnob_moved (id, x, y, dx, dy)
+	gdsGui_schematic_moved (id, x, y)
+	gdsGui_schematicGallery_moved (id, x, y)
 
 	for i, tchs in ipairs (touches) do --isolate to first touch only
 
@@ -1088,6 +1208,17 @@ end
 
 function gdsGui_general_touchreleased (id, x, y, dx, dy, pressure)
 
+	-- Same modal guard as gdsGui_general_mousereleased above — see its
+	-- comment.
+	if gdsGui_textPrompt_isOpen() then
+		gdsGui_textPrompt_released(id, x, y)
+		return
+	end
+	if gdsGui_choiceMenu_isOpen() then
+		gdsGui_choiceMenu_released(id, x, y)
+		return
+	end
+
 	local calledFunction = "touch released"
 
 	if globApp.userInput == "touch pressed" then
@@ -1101,10 +1232,14 @@ function gdsGui_general_touchreleased (id, x, y, dx, dy, pressure)
 
 		-- buttons_pressed (x,y,button,istouch) --runs when clicked on created buttons
 
+		-- Checked first, against whatever page was active when this tap
+		-- started, so a button press that itself triggers a page switch
+		-- (e.g. to the loading page) can't have its same release event
+		-- re-hit-tested against the new page's loading-link hit box.
+		gdsGui_page_loadingTouched (x, y)
+
 		gdsGui_button_released (x, y, 1, istouch, presses)		gdsGui_inputTxtBox_pressed (x,y,button,istouch) --runs when clicked or touched on textboxes
 		gdsGui_table_rowSelect (x,y,button,true)
-
-		gdsGui_page_loadingTouched (x, y)
 
 		if x >= .8 * globApp.safeScreenArea.xw and y >= .9 * globApp.safeScreenArea.yh then
 			gdsGui_dev_openByEightTap (x,y,button,istouch) -- opens and closes devPage
@@ -1114,15 +1249,27 @@ function gdsGui_general_touchreleased (id, x, y, dx, dy, pressure)
 
 	globApp.userInput = calledFunction
 
-	gdsGui_table_buttonsReleased (x,y,button,istouch)
+	-- gdsGui_button_released above (inside the "tap" branch) may itself
+	-- have run a callback that opened a text prompt or choice menu — see
+	-- the matching comment in gdsGui_general_mousereleased. The rest of
+	-- this release must not also dispatch against the pre-modal page state.
+	if not (gdsGui_textPrompt_isOpen() or gdsGui_choiceMenu_isOpen()) then
 
-	gdsGui_scrollBar_unfocus (id, x,y,1,true)
+		gdsGui_table_buttonsReleased (x,y,button,istouch)
 
-	gdsGui_rotaryKnob_released (id)
+		gdsGui_scrollBar_unfocus (id, x,y,1,true)
 
-	gdsGui_outputTxtBox_touchReleased (id, x, y)
-	gdsGui_table_touchReleasedScroll (x, y)
-	gdsGui_container_touchReleased(x, y)
+		gdsGui_rotaryKnob_released (id)
+
+		gdsGui_schematic_released (id, x, y)
+
+		gdsGui_schematicGallery_released (id, x, y)
+
+		gdsGui_outputTxtBox_touchReleased (id, x, y)
+		gdsGui_table_touchReleasedScroll (x, y)
+		gdsGui_container_touchReleased(x, y)
+
+	end
 
 	globApp.userInput = "none"
 

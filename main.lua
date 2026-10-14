@@ -9,7 +9,7 @@
 -------------------------------------------------------------------------------
 require("Libraries.gds_love2d_gui.loader_gdsGuiLib")
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.9"
 
 -- Original orientation the app was designed for; used by the GUI library to
 -- establish the reference container width at first finalize (portrait = 1 col).
@@ -21,6 +21,14 @@ gdsGui_page_create(3, "MainMenu",           false, false, globApp.appColor, 12, 
 gdsGui_page_create(4, "TermsAndConditions", false, false, globApp.appColor, 12, 0, {.5, 1, .6, .6, "LT"}, "max")
 gdsGui_page_create(5, "Learn",              false, false, globApp.appColor, 12, 0, {.5, 1, .6, .6, "LT"}, "max")
 gdsGui_page_create(6, "Settings",           false, false, globApp.appColor, 12, 0, {.5, 1, .6, .6, "LT"}, "max")
+gdsGui_page_create(7, "SystemSchematic",    false, false, globApp.appColor, 12, 0, {.5, 1, .6, .6, "LT"}, "max")
+gdsGui_page_create(8, "SchematicPaywall",   false, false, globApp.appColor, 12, 0, {.5, 1, .6, .6, "LT"}, "max")
+gdsGui_page_create(9, "SchematicHome",          false, false, globApp.appColor, 12, 0, {.5, 1, .6, .6, "LT"}, "max")
+gdsGui_page_create(10, "SchematicFullScreen",   false, false, globApp.appColor, 12, 0, {.5, 1, .6, .6, "LT"}, "max")
+gdsGui_page_create(11, "SchematicManageGallery", false, false, globApp.appColor, 12, 0, {.5, 1, .6, .6, "LT"}, "max")
+gdsGui_page_create(12, "AircraftGallery",        false, false, globApp.appColor, 12, 0, {.5, 1, .6, .6, "LT"}, "max")
+gdsGui_page_create(13, "AircraftHome",           false, false, globApp.appColor, 12, 0, {.5, 1, .6, .6, "LT"}, "max")
+gdsGui_page_create(14, "SchematicSnapshots",     false, false, globApp.appColor, 12, 0, {.5, 1, .6, .6, "LT"}, "max")
 
 -------------------------------------------------------------------------------
 -- GLOBAL STATE
@@ -77,18 +85,37 @@ local _ackPushedImg
 -- App settings (persisted across sessions): loaded from appSettings.lua if it exists
 appSettings = {}
 
+-- System Schematic (premium feature): a named collection of AIRCRAFT, each
+-- owning its own named SYSTEMS (schematicStore.aircraft[].systems), each
+-- system its own elements/wires/controls/snapshot-rules. currentAircraftId
+-- tracks which aircraft the user is "inside" (the AircraftHome page);
+-- currentSystemId tracks which of that aircraft's systems is currently
+-- loaded into the live "mainCanvas" (nil when the canvas page hasn't been
+-- opened this session). Loaded/migrated/seeded in love.load(), persisted via
+-- the same table.show()/loadFileContents() round trip as appSettings, into
+-- schematicProjects.lua.
+schematicStore = nil
+
 -------------------------------------------------------------------------------
 -- HELPER FUNCTIONS
 -------------------------------------------------------------------------------
 
 
 -- Syncs all footer nav buttons so the button matching activeDest is PRESSED
--- and all others are RELEASED, across every page that has a footer.
+-- and all others are RELEASED, across every page that has a footer. Any page
+-- inside the System Schematic flow (aircraft home/gallery, the per-aircraft
+-- home, the systems gallery, the canvas itself) keeps the schematic dock
+-- icon pressed.
 local function _navSyncAll(activeDest)
-    for _, pfx in ipairs({"mainMenu", "learn", "settings"}) do
-        gdsGui_button_setState(pfx .. "_navMainMenu", activeDest == "MainMenu" and "pushed" or "released")
-        gdsGui_button_setState(pfx .. "_navLearn",    activeDest == "Learn"    and "pushed" or "released")
-        gdsGui_button_setState(pfx .. "_navSettings", activeDest == "Settings" and "pushed" or "released")
+    local schematicFlow = (activeDest == "SystemSchematic" or activeDest == "SchematicHome"
+        or activeDest == "SchematicManageGallery" or activeDest == "AircraftGallery"
+        or activeDest == "AircraftHome" or activeDest == "SchematicSnapshots")
+    for _, pfx in ipairs({"mainMenu", "schematic", "schematicHome", "schematicManage",
+        "aircraftGallery", "aircraftHome", "schematicSnapshots", "learn", "settings"}) do
+        gdsGui_button_setState(pfx .. "_navMainMenu",  activeDest == "MainMenu" and "pushed" or "released")
+        gdsGui_button_setState(pfx .. "_navSchematic", schematicFlow and "pushed" or "released")
+        gdsGui_button_setState(pfx .. "_navLearn",     activeDest == "Learn"    and "pushed" or "released")
+        gdsGui_button_setState(pfx .. "_navSettings",  activeDest == "Settings" and "pushed" or "released")
     end
 end
 
@@ -203,6 +230,903 @@ end
 
 local function _saveAppSettings()
     love.filesystem.write("appSettings.lua", table.show(appSettings, "appSettings"))
+end
+
+-------------------------------------------------------------------------------
+-- SYSTEM SCHEMATIC HELPERS (premium feature)
+-- Thin aviation-specific wrappers over the generic schematic_gdsGuiLib.lua
+-- primitives, plus the multi-project persistence round trip (schematicProjects.lua).
+-------------------------------------------------------------------------------
+
+-- Catalog for the design-mode "ADD" cascading menu: SYSTEM -> TYPE -> (for
+-- controls with more than one position preset) -> POSITION SET. Aviation
+-- naming lives here, not in the generic schematic_gdsGuiLib.lua module.
+-- connectorColor (per system, not per item): wires are no longer a
+-- placeable catalog item — ADD WIRE on an element's own edit menu is now
+-- the only way to draw one (see gdsGui_schematic_internal_onElementEditChosen)
+-- — but new wires should still come out pre-colored by system rather than
+-- a flat gray, so this is threaded into the canvas instead (see
+-- _openSystemIntoCanvas -> gdsGui_schematic_setDefaultConnectorColor).
+
+-- Shared by every binary (2-position) switch/valve control below: index 1
+-- (the "off"/blocked/non-conducting position, always listed first in that
+-- control's own presets) gets the open/disconnected-looking icon, index 2
+-- (the "on"/flowing/conducting position) gets the closed/connected-looking
+-- one — true for every one of these presets even though the words differ
+-- (a SWITCH's OFF vs a VALVE's CLOSED), since what's actually drawn tracks
+-- MEANING (does current/fluid flow through it), not the position's name. Not
+-- used for MODE SWITCH (AUTO/MANUAL) — that's a mode selector, not a
+-- connected/disconnected state, so these icons wouldn't read correctly
+-- there. A 3-position preset (SWITCH's OFF/ON/STBY) just has no 3rd entry,
+-- falling back to the plain vector icon for STBY only (see
+-- gdsGui_schematic_addControl's spritePaths param).
+local _SWITCH_SPRITE_PATHS = {"Sprites/control_switchOpen.png", "Sprites/control_switchClosed.png"}
+
+local SCHEMATIC_CATALOG = {
+    { system = "ELECTRICAL", connectorColor = {0.85, 0.75, 0.15, 1}, items = {
+        { label = "GENERATOR", kind = "element", shapeType = "rect",
+          defaultProperties = {"VOLTAGE", "CURRENT"}, spritePath = "Sprites/element_generator.png" },
+        { label = "BATTERY",   kind = "element", shapeType = "rect",
+          defaultProperties = {"VOLTAGE", "CURRENT"}, spritePath = "Sprites/element_battery.png" },
+        { label = "BUS",       kind = "element", shapeType = "rect",
+          defaultProperties = {"VOLTAGE", "CURRENT"}, spritePath = "Sprites/element_bus.png" },
+        { label = "DIODE",     kind = "element", shapeType = "diode", spritePath = "Sprites/element_diode.png" },
+        { label = "SWITCH",    kind = "control", presets = { {"OFF", "ON"}, {"OFF", "ON", "STBY"} },
+          spritePaths = _SWITCH_SPRITE_PATHS },
+    }},
+    { system = "HYDRAULIC", connectorColor = {0.15, 0.45, 0.85, 1}, items = {
+        { label = "PUMP",         kind = "element", shapeType = "circle" },
+        { label = "VALVE",        kind = "element", shapeType = "circle" },
+        { label = "RESERVOIR",    kind = "element", shapeType = "circle" },
+        { label = "VALVE SWITCH", kind = "control", presets = { {"CLOSED", "OPEN"} },
+          spritePaths = _SWITCH_SPRITE_PATHS },
+    }},
+    { system = "FUEL", connectorColor = {0.75, 0.35, 0.1, 1}, items = {
+        { label = "FUEL TANK",   kind = "element", shapeType = "circle" },
+        { label = "FUEL PUMP",  kind = "element", shapeType = "circle" },
+        { label = "FUEL SWITCH", kind = "control", presets = { {"OFF", "ON"} }, spritePaths = _SWITCH_SPRITE_PATHS },
+    }},
+    { system = "BLEED AIR", connectorColor = {0.85, 0.5, 0.15, 1}, items = {
+        { label = "BLEED VALVE", kind = "element", shapeType = "circle" },
+        { label = "BLEED SWITCH", kind = "control", presets = { {"OFF", "ON"} }, spritePaths = _SWITCH_SPRITE_PATHS },
+    }},
+    { system = "PRESSURIZATION", connectorColor = {0.55, 0.3, 0.75, 1}, items = {
+        { label = "OUTFLOW VALVE", kind = "element", shapeType = "circle" },
+        { label = "CONTROLLER",    kind = "element", shapeType = "rect",
+          defaultProperties = {"CABIN ALT", "RATE"} },
+        { label = "MODE SWITCH",   kind = "control", presets = { {"AUTO", "MANUAL"} } },
+    }},
+}
+
+-- Every system a user creates is locked to exactly one of these types for
+-- its whole lifetime (see "user can only create one system per type per
+-- aircraft" below) — SCHEMATIC_CATALOG is the single source of truth for
+-- which types exist and what each one's ADD ELEMENT/CONTROL catalog offers.
+local function _findCatalogEntryForType(systemType)
+    for _, sys in ipairs(SCHEMATIC_CATALOG) do
+        if sys.system == systemType then return sys end
+    end
+    return nil
+end
+
+-- System types already used by this aircraft's systems, as a set.
+local function _aircraftSystemTypesInUse(aircraft)
+    local used = {}
+    for _, sys in ipairs(aircraft.systems) do
+        if sys.systemType then used[sys.systemType] = true end
+    end
+    return used
+end
+
+-- Catalog system names not yet used by this aircraft, in catalog order —
+-- what's left to offer in the NEW SYSTEM type picker.
+local function _availableSystemTypesForAircraft(aircraft)
+    local used = _aircraftSystemTypesInUse(aircraft)
+    local available = {}
+    for _, sys in ipairs(SCHEMATIC_CATALOG) do
+        if not used[sys.system] then table.insert(available, sys.system) end
+    end
+    return available
+end
+
+-- "Bleed Air" from "BLEED AIR", for a friendlier default system name.
+local function _titleCase(s)
+    local words = {}
+    for word in s:gmatch("%S+") do
+        table.insert(words, word:sub(1, 1):upper() .. word:sub(2):lower())
+    end
+    return table.concat(words, " ")
+end
+
+-- App-layer state for the in-progress cascading menu / control-select flow
+-- (menu selection and placement itself are handled inside the library; this
+-- only remembers which catalog branch / control a prior menu level chose).
+local _catalogChosenSystem      = nil
+local _catalogChosenControlItem = nil
+local _controlMenuIds           = {}
+local _controlMenuSelectedId    = nil
+local _pendingSnapshotPlan      = nil
+
+-- Which aircraft/system a gallery's open "manage" action menu (or the rename
+-- prompt it leads to) refers to. Two separate trackers since the aircraft
+-- gallery (AircraftGallery) and the systems-within-an-aircraft gallery
+-- (SchematicManageGallery) are different screens with different menus.
+local _manageMenuAircraftId = nil
+local _manageMenuSystemId   = nil
+
+-- Which snapshot (by signature string) the SchematicSnapshots gallery's open
+-- action menu (or the delete-confirm step it leads to) refers to.
+local _snapshotActionTargetSig = nil
+
+-- Control-mode "full screen" viewing: mainCanvas is reassigned onto its own
+-- dedicated page (no header/footer/dock to crowd the view) and resized to
+-- fill it, then handed back to its normal embedded layout on return. The
+-- normal layout is captured once at creation time (see love.load() below)
+-- since schCanvasYFrac/schCanvasHFrac are local to that function.
+local _schematicFullScreen        = false
+local _schematicCanvasNormalLayout = nil
+-- The wider layout the embedded canvas progressively grows into as zoom
+-- increases past 1x (see gdsGui_schematic_setZoomedLayout) — full screen
+-- width, same height as the normal layout. Captured once at creation time
+-- alongside _schematicCanvasNormalLayout for the same reason (schCanvasYFrac/
+-- schCanvasHFrac are local to love.load()), and reapplied by
+-- schematicFullScreenReturnPressed() since schematicFullScreenTogglePressed()
+-- clears it (the full-screen page is already at its maximum, so zooming in
+-- there has nothing further to expand into).
+local _schematicCanvasZoomedLayout = nil
+local _prevSchematicZoomText = nil
+local _schematicZoomFullScreenFont = nil
+
+local function _findSchematicCanvas()
+    for _, c in ipairs(globApp.objects.schematics) do
+        if c.name == "mainCanvas" then return c end
+    end
+    return nil
+end
+
+local function _findAircraft(aircraftId)
+    for _, a in ipairs(schematicStore.aircraft) do
+        if a.id == aircraftId then return a end
+    end
+    return nil
+end
+
+local function _findCurrentAircraft()
+    return schematicStore.currentAircraftId and _findAircraft(schematicStore.currentAircraftId) or nil
+end
+
+-- Aircraft "type" thumbnails offered at creation time (see
+-- schematicNewAircraftConfirmed below) — required so every aircraft tile in
+-- the gallery shows a recognizable icon instead of a blank box. Only the
+-- short key is persisted on the aircraft record (aircraft.thumbnail); the
+-- generic schematicGallery widget just wants an image path (see
+-- _aircraftGalleryItems), not this domain-specific naming.
+local AIRCRAFT_THUMBNAILS = {
+    { key = "helicopter", label = "HELICOPTER", path = "Sprites/aircraftThumb_helicopter.png" },
+    { key = "jet",        label = "JET",        path = "Sprites/aircraftThumb_jet.png" },
+    { key = "propeller",  label = "PROP PLANE",  path = "Sprites/aircraftThumb_propeller.png" },
+}
+
+local function _aircraftThumbnailPath(key)
+    for _, t in ipairs(AIRCRAFT_THUMBNAILS) do
+        if t.key == key then return t.path end
+    end
+    return nil
+end
+
+-- Maps schematicStore.aircraft into the aircraftGallery's item list, adding
+-- a resolved thumbnailPath per item without polluting the persisted aircraft
+-- record with a derived/absolute-ish path.
+local function _aircraftGalleryItems()
+    local items = {}
+    for _, aircraft in ipairs(schematicStore.aircraft) do
+        local item = {}
+        for k, v in pairs(aircraft) do item[k] = v end
+        item.thumbnailPath = _aircraftThumbnailPath(aircraft.thumbnail)
+        table.insert(items, item)
+    end
+    return items
+end
+
+-- Systems are scoped to the current aircraft — a system id only has to be
+-- unique within its own aircraft's systems list.
+local function _findSystem(systemId)
+    local aircraft = _findCurrentAircraft()
+    if not aircraft then return nil end
+    for _, s in ipairs(aircraft.systems) do
+        if s.id == systemId then return s end
+    end
+    return nil
+end
+
+local function _saveSchematicStore()
+    love.filesystem.write("schematicProjects.lua", table.show(schematicStore, "schematicStore"))
+end
+
+-- Set true by every call site below that's about to mutate mainCanvas and
+-- then call _saveCurrentSystem() right away; cleared once that save
+-- actually runs. Lets _saveCurrentSystemIfDirty() (used only by the
+-- defensive "just in case" nav-away saves further down — footer nav, back
+-- buttons, VIEW SNAPSHOTS) skip the deep-copy-the-whole-store-and-rewrite-
+-- the-whole-file work when the edit that would've needed it already saved
+-- moments ago, which — since every mutation path is synchronous and single-
+-- threaded — is always the case in normal use. love.quit()/love.focus(false)
+-- deliberately keep calling the unconditional _saveCurrentSystem() instead
+-- of this, as a last-line-of-defense that can't be defeated by a future
+-- mutation path that forgets to set this flag.
+local _schematicDirty = false
+
+-- Deep-copies a plain data table (arrays/maps of numbers/strings/booleans/
+-- nested tables). Used to keep the live mainCanvas and the persisted
+-- schematicStore record of each system as fully independent tables — never
+-- the SAME table by reference — in both directions. Without this, clearing/
+-- repopulating mainCanvas for one system (table.remove on canvas.elements,
+-- etc. in _clearMainCanvas) would also mutate whichever other system's
+-- stored record last happened to alias that same table, silently wiping it.
+local function _deepCopyTable(t)
+    if type(t) ~= "table" then return t end
+    local copy = {}
+    for k, v in pairs(t) do copy[k] = _deepCopyTable(v) end
+    return copy
+end
+
+-- Pulls the live mainCanvas state back into its system record. Called before
+-- leaving the canvas page (navigating away, or opening a different system).
+-- Deep-copies rather than aliasing (see _deepCopyTable) so this system's
+-- stored data survives mainCanvas later being cleared/reloaded for another
+-- system.
+local function _captureCurrentSystemFromCanvas()
+    if not schematicStore.currentSystemId then return end
+    local sys = _findSystem(schematicStore.currentSystemId)
+    local canvas = _findSchematicCanvas()
+    if not sys or not canvas then return end
+    sys.elements   = _deepCopyTable(canvas.elements)
+    sys.wires      = _deepCopyTable(canvas.wires)
+    sys.controls   = _deepCopyTable(canvas.controls)
+    sys.snapshots  = _deepCopyTable(canvas.snapshots)
+    sys.modifiedAt = os.date("%Y-%m-%d %H:%M:%S")
+end
+
+local function _saveCurrentSystem()
+    _captureCurrentSystemFromCanvas()
+    _saveSchematicStore()
+    _schematicDirty = false
+end
+
+-- Only the defensive nav-away saves scattered below (footer nav, back
+-- buttons, VIEW SNAPSHOTS) call this instead of _saveCurrentSystem()
+-- directly — see _schematicDirty's own comment above for why that's safe.
+local function _saveCurrentSystemIfDirty()
+    if _schematicDirty then _saveCurrentSystem() end
+end
+
+-- Resolved by name via _G[...] from gdsGui_schematic's _notifyChanged, the
+-- same string-callback pattern used for buttons/scrollbars elsewhere in this
+-- app. mainCanvas.onChange is wired to this name in love.load() — fires on
+-- every discrete design-mode edit (drag committed, element/wire/control
+-- added/deleted/renamed, color picked, etc.), so this is the single hot-path
+-- source of _schematicDirty.
+function schematicCanvasChanged()
+    _schematicDirty = true
+    _saveCurrentSystem()
+end
+
+local function _clearMainCanvas()
+    local canvas = _findSchematicCanvas()
+    if not canvas then return end
+    for i = #canvas.elements, 1, -1 do table.remove(canvas.elements, i) end
+    for i = #canvas.wires, 1, -1 do table.remove(canvas.wires, i) end
+    for i = #canvas.controls, 1, -1 do table.remove(canvas.controls, i) end
+    canvas.snapshots = {}
+    canvas.selectedElementId = nil
+end
+
+-- Loads one saved system's data into the live mainCanvas (replacing whatever
+-- is currently there), marks it as the current system, and puts the canvas
+-- into the requested mode. Assumes schematicStore.currentAircraftId is
+-- already set to the system's owning aircraft.
+local function _openSystemIntoCanvas(systemId, mode)
+    local sys = _findSystem(systemId)
+    if not sys then return end
+    -- A leftover undo snapshot could otherwise splice a DIFFERENT system's
+    -- elements/wires/controls back in if "undo" were used right after this.
+    gdsGui_schematic_clearUndo("mainCanvas")
+    _clearMainCanvas()
+    -- A wire drawn via ADD WIRE from here on should still come out
+    -- pre-colored by system (electrical=yellow, hydraulic=blue, ...), same
+    -- as the old catalog connector items used to be, rather than falling
+    -- back to flat gray. nil (a legacy/untyped system with no catalog
+    -- entry) clears it back to that gray default.
+    local catalogEntry = sys.systemType and _findCatalogEntryForType(sys.systemType)
+    gdsGui_schematic_setDefaultConnectorColor("mainCanvas", catalogEntry and catalogEntry.connectorColor)
+    -- Every value handed to the library is deep-copied off of sys's own
+    -- tables (see _deepCopyTable) so mainCanvas never ends up aliasing the
+    -- stored record it was just loaded from.
+    for _, e in ipairs(sys.elements or {}) do
+        gdsGui_schematic_addElement("mainCanvas", e.id, e.shapeType, e.x, e.y, e.w, e.h, e.label,
+            _deepCopyTable(e.defaultColor), _deepCopyTable(e.properties), e.rotation or 0, e.spritePath)
+    end
+    for _, c in ipairs(sys.controls or {}) do
+        gdsGui_schematic_addControl("mainCanvas", c.id, c.x, c.y, _deepCopyTable(c.positions), c.detentIndex,
+            c.label, c.callbackFunc, c.radiusScale, c.spritePaths, c.rotation)
+    end
+    for _, w in ipairs(sys.wires or {}) do
+        gdsGui_schematic_addWire("mainCanvas", w.id, w.fromElementId, w.toElementId, _deepCopyTable(w.defaultColor),
+            w.directionOverride)
+    end
+    local canvas = _findSchematicCanvas()
+    if canvas then canvas.snapshots = _deepCopyTable(sys.snapshots or {}) end
+
+    schematicStore.currentSystemId = systemId
+    local designing = (mode == "design")
+    -- Design/edit mode opens pre-zoomed (see gdsGui_schematic_getEditModeInitialZoom)
+    -- so there's more room to place elements without them crowding; control
+    -- mode keeps the traditional fully-zoomed-out view.
+    gdsGui_schematic_resetView("mainCanvas", designing and gdsGui_schematic_getEditModeInitialZoom() or nil)
+    appSettings.schematicEditMode = designing
+    gdsGui_schematic_setMode("mainCanvas", designing and "design" or "control")
+    gdsGui_button_setState("schematicModeToggle", designing and "pushed" or "released")
+    gdsGui_button_setState("schematicSnapshotBtn", designing and "released" or "deactivated")
+    gdsGui_button_setState("schematicFullScreenToggle", designing and "deactivated" or "released")
+    gdsGui_outputTxtBox_setText("schematic_pageTitle", sys.name)
+    gdsGui_outputTxtBox_setText("schematicSnapshotLabel", "SNAPSHOTS: " .. gdsGui_schematic_countSnapshots("mainCanvas"))
+    _saveSchematicStore()
+end
+
+-- One-time starter system seeded on a fresh install (no prior save and no
+-- old single-design file to migrate): generator -> power line -> pump, gated
+-- by a switch, with one pre-taught snapshot rule (switch ON -> wire green) so
+-- the "logic recreated" behavior is visible immediately without any setup.
+local function _buildDemoSystem()
+    local now = os.date("%Y-%m-%d %H:%M:%S")
+    return {
+        id = "sys_demo", name = "Demo System", createdAt = now, modifiedAt = now,
+        elements = {
+            { id = "gen1", shapeType = "rect", x = 0.15, y = 0.15, w = 0.16, h = 0.10,
+              label = "GEN 1", defaultColor = {0.55, 0.55, 0.55, 1} },
+            { id = "pump1", shapeType = "circle", x = 0.70, y = 0.65, w = 0.14, h = 0.10,
+              label = "PUMP 1", defaultColor = {0.55, 0.55, 0.55, 1} },
+        },
+        wires = {
+            { id = "pwr1", fromElementId = "gen1", toElementId = "pump1", defaultColor = {0.55, 0.55, 0.55, 1} },
+        },
+        controls = {
+            { id = "sw1", x = 0.15, y = 0.55, numDetents = 2, positions = {"OFF", "ON"},
+              detentIndex = 0, label = "PWR SW", callbackFunc = "schematicDemoSwitchChanged" },
+        },
+        snapshots = {
+            ["sw1=1"] = { elements = {}, wires = { pwr1 = {0, 1, 0, 1} }, timestamp = now },
+        },
+    }
+end
+
+-- Control callback (resolved by name via _G[...]): color handling is already
+-- generic in schematic_gdsGuiLib.lua — this hook exists for future side effects.
+function schematicDemoSwitchChanged(detentIndex)
+end
+
+-------------------------------------------------------------------------------
+-- SYSTEM SCHEMATIC — DESIGN-MODE "ADD" CASCADING MENU (SYSTEM > TYPE > POSITIONS)
+-- Each level appends a "RETURN" row so the user can step back up the cascade
+-- instead of only being able to tap outside to cancel out of it entirely.
+-------------------------------------------------------------------------------
+
+local function _openDesignActionsMenu(canvasName)
+    local options = {"ADD ELEMENT/CONTROL", "ASSIGN COLOR", "VIEW SNAPSHOTS"}
+    if gdsGui_schematic_canUndo(canvasName) then table.insert(options, "UNDO LAST ACTION") end
+    table.insert(options, "RESET (CLEAR PAGE)")
+    gdsGui_schematic_openMenu(canvasName, "DESIGN ACTIONS", options, "schematicDesignActionChosen", nil)
+end
+
+-- Full SELECT SYSTEM list — only ever shown for a system with no fixed
+-- systemType (legacy data saved before systems were typed; see _openAddMenu).
+local function _openSystemSelectMenu(canvasName)
+    local names = {}
+    for _, sys in ipairs(SCHEMATIC_CATALOG) do table.insert(names, sys.system) end
+    table.insert(names, "RETURN")
+    gdsGui_schematic_openMenu(canvasName, "SELECT SYSTEM", names, "schematicCatalogSystemChosen", nil)
+end
+
+local function _openTypeMenu(canvasName, sys)
+    local names = {}
+    for _, item in ipairs(sys.items) do table.insert(names, item.label) end
+    table.insert(names, "RETURN")
+    gdsGui_schematic_openMenu(canvasName, sys.system .. ": TYPE", names, "schematicCatalogItemChosen", nil)
+end
+
+-- The catalog entry matching the currently-open system's fixed type, or nil
+-- for a legacy/untyped system (pre-dates "one system type per aircraft").
+local function _currentSystemCatalogEntry()
+    local sys = _findSystem(schematicStore.currentSystemId)
+    return sys and sys.systemType and _findCatalogEntryForType(sys.systemType) or nil
+end
+
+-- ADD ELEMENT/CONTROL entry point: a typed system already knows which
+-- catalog branch it belongs to, so it jumps straight to that TYPE menu
+-- instead of making the user pick a system that's already decided. Only a
+-- legacy/untyped system falls back to the full SELECT SYSTEM list.
+local function _openAddMenu(canvasName)
+    local entry = _currentSystemCatalogEntry()
+    if entry then
+        _catalogChosenSystem = entry
+        _openTypeMenu(canvasName, entry)
+    else
+        _openSystemSelectMenu(canvasName)
+    end
+end
+
+function schematicCatalogSystemChosen(canvasName, index, optionText)
+    if optionText == "RETURN" then
+        _openDesignActionsMenu(canvasName)
+        return
+    end
+    local sys = SCHEMATIC_CATALOG[index]
+    if not sys then return end
+    _catalogChosenSystem = sys
+    _openTypeMenu(canvasName, sys)
+end
+
+function schematicCatalogItemChosen(canvasName, index, optionText)
+    if optionText == "RETURN" then
+        -- A typed system skipped straight past SELECT SYSTEM into this TYPE
+        -- menu (see _openAddMenu), so there's no such list to step back into.
+        if _currentSystemCatalogEntry() then
+            _openDesignActionsMenu(canvasName)
+        else
+            _openSystemSelectMenu(canvasName)
+        end
+        return
+    end
+    local item = _catalogChosenSystem and _catalogChosenSystem.items[index]
+    if not item then return end
+    -- No "connector" kind left in SCHEMATIC_CATALOG — ADD WIRE on an
+    -- element's own edit menu replaced it (see
+    -- gdsGui_schematic_internal_onElementEditChosen).
+    if item.kind == "element" then
+        gdsGui_schematic_armElementPlacement(canvasName, item.shapeType, item.label, nil, item.label,
+            item.defaultProperties, item.spritePath)
+    elseif #item.presets == 1 then
+        gdsGui_schematic_armControlPlacement(canvasName, item.presets[1], item.label, item.callbackFunc, item.label,
+            item.spritePaths)
+    else
+        _catalogChosenControlItem = item
+        local names = {}
+        for _, preset in ipairs(item.presets) do
+            table.insert(names, #preset .. " (" .. table.concat(preset, "/") .. ")")
+        end
+        table.insert(names, "RETURN")
+        gdsGui_schematic_openMenu(canvasName, item.label .. ": POSITIONS", names, "schematicCatalogPresetChosen", nil)
+    end
+end
+
+function schematicCatalogPresetChosen(canvasName, index, optionText)
+    if optionText == "RETURN" then
+        if _catalogChosenSystem then _openTypeMenu(canvasName, _catalogChosenSystem) end
+        return
+    end
+    local item = _catalogChosenControlItem
+    if not item then return end
+    local preset = item.presets[index]
+    gdsGui_schematic_armControlPlacement(canvasName, preset, item.label, item.callbackFunc, item.label,
+        item.spritePaths)
+    _catalogChosenControlItem = nil
+end
+
+-------------------------------------------------------------------------------
+-- SYSTEM SCHEMATIC — CONTROL-MODE "SELECT CONTROL" -> "SELECT POSITION" MENUS
+-- Same "RETURN" convention as the design-mode cascade above.
+-------------------------------------------------------------------------------
+
+local function _openControlActionsMenu(canvasName)
+    local canvas = _findSchematicCanvas()
+    if not canvas or #canvas.controls == 0 then return end
+    gdsGui_schematic_openMenu(canvasName, "CONTROL ACTIONS", {"SELECT CONTROL"}, "schematicControlActionChosen", nil)
+end
+
+local function _openSelectControlMenu(canvasName)
+    local canvas = _findSchematicCanvas()
+    if not canvas then return end
+    _controlMenuIds = {}
+    local names = {}
+    for _, c in ipairs(canvas.controls) do
+        table.insert(_controlMenuIds, c.id)
+        table.insert(names, c.label or c.id)
+    end
+    table.insert(names, "RETURN")
+    gdsGui_schematic_openMenu(canvasName, "SELECT CONTROL", names, "schematicControlChosen", nil)
+end
+
+function schematicControlChosen(canvasName, index, optionText)
+    if optionText == "RETURN" then
+        _openControlActionsMenu(canvasName)
+        return
+    end
+    local controlId = _controlMenuIds[index]
+    if not controlId then return end
+    local canvas = _findSchematicCanvas()
+    local control = canvas and canvas.controls
+    local found = nil
+    if control then
+        for _, c in ipairs(control) do
+            if c.id == controlId then found = c end
+        end
+    end
+    if not found then return end
+    _controlMenuSelectedId = controlId
+    local names = {}
+    for _, p in ipairs(found.positions) do table.insert(names, p) end
+    table.insert(names, "RETURN")
+    gdsGui_schematic_openMenu(canvasName, (found.label or controlId) .. ": POSITION", names,
+        "schematicControlPositionChosen", nil)
+end
+
+function schematicControlPositionChosen(canvasName, index, optionText)
+    if optionText == "RETURN" then
+        _openSelectControlMenu(canvasName)
+        _controlMenuSelectedId = nil
+        return
+    end
+    if not _controlMenuSelectedId then return end
+    gdsGui_schematic_setControlPosition(canvasName, _controlMenuSelectedId, index - 1)
+    _controlMenuSelectedId = nil
+end
+
+-- Single consolidated "ACTIONS" button: design mode offers adding a new
+-- element/control, undoing, and resetting (clearing) the whole page;
+-- control mode offers operating a control. Snapshot capture is its own
+-- dedicated SNAPSHOT button, not part of this menu (see captureSchematicSnapshot).
+function schematicContextButtonPressed()
+    -- A multi-step cascade (e.g. ADD ELEMENT/CONTROL -> ELECTRICAL ->
+    -- SWITCH -> POSITIONS) is itself built out of canvas.menu opens/
+    -- replacements chained from that SAME menu's own onSelect callbacks —
+    -- intended and left alone. This button is an unrelated entry point
+    -- though: opening a brand new top-level menu here while one of those
+    -- cascades is already mid-flight would silently clobber it and orphan
+    -- its tracking locals (see gdsGui_schematic_isMenuOpen).
+    if gdsGui_schematic_isMenuOpen("mainCanvas") then return end
+    local mode = gdsGui_schematic_getMode("mainCanvas")
+    if mode == "design" then
+        _openDesignActionsMenu("mainCanvas")
+    else
+        _openControlActionsMenu("mainCanvas")
+    end
+end
+
+function schematicDesignActionChosen(canvasName, index, optionText)
+    if optionText == "ADD ELEMENT/CONTROL" then
+        _openAddMenu(canvasName)
+    elseif optionText == "ASSIGN COLOR" then
+        -- Non-destructive: the very next tap on an element or wire opens the
+        -- swatch picker for it, setting its pendingColor preview rather than
+        -- permanently overwriting its base defaultColor (see
+        -- gdsGui_schematic_armColorAssignPick).
+        gdsGui_schematic_armColorAssignPick(canvasName)
+    elseif optionText == "VIEW SNAPSHOTS" then
+        schematicViewSnapshotsPressed()
+    elseif optionText == "UNDO LAST ACTION" then
+        gdsGui_schematic_undo(canvasName)
+        _schematicDirty = true
+        _saveCurrentSystem()
+    elseif optionText == "RESET (CLEAR PAGE)" then
+        gdsGui_schematic_openMenu(canvasName, "CLEAR ENTIRE PAGE?",
+            {"CLEAR", "CANCEL"}, "schematicResetConfirmed", nil)
+    end
+end
+
+-- Wipes every element/wire/control/snapshot from the live canvas and persists
+-- the now-blank page to the current system. Irreversible, hence the confirm
+-- (and hence pushing an undo snapshot first, so "UNDO LAST ACTION" can bring
+-- it all back).
+function schematicResetConfirmed(canvasName, index, optionText)
+    if optionText ~= "CLEAR" then return end
+    gdsGui_schematic_pushUndo(canvasName)
+    _clearMainCanvas()
+    _schematicDirty = true
+    _saveCurrentSystem()
+    gdsGui_outputTxtBox_setText("schematicSnapshotLabel", "SNAPSHOTS: 0")
+end
+
+-- Control mode is pure "operate": the only menu action is picking a control
+-- to cycle without having to find it on the (possibly zoomed/panned) canvas.
+-- Color assignment lives in design mode's ACTIONS menu; snapshot capture is
+-- the dedicated SNAPSHOT button (design-mode only).
+function schematicControlActionChosen(canvasName, index, optionText)
+    if optionText == "SELECT CONTROL" then
+        _openSelectControlMenu(canvasName)
+    end
+end
+
+-------------------------------------------------------------------------------
+-- SYSTEM SCHEMATIC — AIRCRAFT HOME (NEW AIRCRAFT / MY AIRCRAFT)
+-- The top landing point for the whole System Schematic flow (SchematicHome).
+-------------------------------------------------------------------------------
+
+-- AircraftHome's header reads "<aircraft name> [SYSTEMS]" so it's clear at a
+-- glance which aircraft's systems the NEW/LOAD buttons below act on.
+local function _aircraftHomeTitle(aircraft)
+    return aircraft.name .. " [SYSTEMS]"
+end
+
+-- Keeps the "MY AIRCRAFT" button in sync with whether there's anything to
+-- open; called whenever SchematicHome is (re)entered and after an aircraft
+-- is deleted.
+local function _refreshSchematicHomeAvailability()
+    gdsGui_button_setState("schematicHomeMyAircraft",
+        (#schematicStore.aircraft > 0) and "released" or "deactivated")
+end
+
+function schematicHomeNewPressed()
+    gdsGui_textPrompt_open("NAME NEW AIRCRAFT", "Aircraft " .. schematicStore.nextAircraftNum, 24,
+        "schematicNewAircraftConfirmed", nil)
+end
+
+-- Holds the just-named aircraft's name while the required thumbnail-type
+-- picker (below) is open; the aircraft record itself isn't created until a
+-- thumbnail is actually chosen, so "require a thumbnail" is enforced simply
+-- by there being no other path to an aircraft record existing.
+local _pendingNewAircraftName = nil
+
+-- A brand-new aircraft has no systems yet, so it lands on AircraftHome (where
+-- the user can create its first system) rather than straight into the canvas.
+-- Name is confirmed first, then the user must pick one of AIRCRAFT_THUMBNAILS
+-- before the record is actually created (see schematicAircraftThumbnailChosen).
+function schematicNewAircraftConfirmed(name)
+    if name == "" then name = "Aircraft " .. schematicStore.nextAircraftNum end
+    _pendingNewAircraftName = name
+    local images = {}
+    for _, t in ipairs(AIRCRAFT_THUMBNAILS) do
+        table.insert(images, { path = t.path, label = t.label })
+    end
+    gdsGui_choiceMenu_openImagePicker("SELECT AIRCRAFT TYPE", images, {"CANCEL"},
+        "schematicAircraftThumbnailChosen", "schematicAircraftThumbnailCancelled")
+end
+
+-- optionText is the chosen image's label (e.g. "HELICOPTER") or "CANCEL".
+-- id is a GDS-format unique serial (gdsGui_saveLoad_createIdNumber, from
+-- saveLoad_gdsGuiLib.lua) rather than a simple incrementing counter, so
+-- aircraft records stay unambiguously identifiable even if saves are merged,
+-- edited by hand, or a counter ever gets out of sync.
+function schematicAircraftThumbnailChosen(optionText)
+    local name = _pendingNewAircraftName
+    _pendingNewAircraftName = nil
+    if optionText == "CANCEL" or not name then return end
+    local chosen
+    for _, t in ipairs(AIRCRAFT_THUMBNAILS) do
+        if t.label == optionText then chosen = t end
+    end
+    if not chosen then return end
+
+    local id = gdsGui_saveLoad_createIdNumber(schematicStore.aircraft, "id", 17)
+    schematicStore.nextAircraftNum = schematicStore.nextAircraftNum + 1
+    local now = os.date("%Y-%m-%d %H:%M:%S")
+    table.insert(schematicStore.aircraft, {
+        id = id, name = name, createdAt = now, modifiedAt = now, systems = {}, thumbnail = chosen.key,
+    })
+    schematicStore.currentAircraftId = id
+    _saveSchematicStore()
+    navGoToAircraftHome()
+end
+
+-- Tapping outside the picker (or CANCEL) aborts the whole "new aircraft"
+-- flow — no record was ever created, so there's nothing to undo.
+function schematicAircraftThumbnailCancelled()
+    _pendingNewAircraftName = nil
+end
+
+-- Single consolidated entry point: opens the aircraft gallery that handles
+-- both opening an aircraft and editing it (rename/delete), chosen per-aircraft
+-- from the action menu in schematicAircraftGallerySelected below.
+function schematicHomeMyAircraftPressed()
+    gdsGui_schematicGallery_setItems("aircraftGallery", _aircraftGalleryItems())
+    _navSyncAll("AircraftGallery")
+    gdsGui_page_switch("LoadingAircraftGallery", 12, 2, false)
+end
+
+-- Tapping an aircraft opens an action menu rather than jumping straight into
+-- it, so the same gallery covers opening, renaming, and deleting.
+function schematicAircraftGallerySelected(galleryName, aircraftId)
+    local aircraft = _findAircraft(aircraftId)
+    if not aircraft then return end
+    _manageMenuAircraftId = aircraftId
+    gdsGui_schematicGallery_openMenu(galleryName, aircraft.name,
+        {"OPEN AIRCRAFT", "RENAME", "DELETE", "CANCEL"},
+        "schematicAircraftActionChosen", nil)
+end
+
+function schematicAircraftActionChosen(galleryName, index, optionText)
+    if optionText == "OPEN AIRCRAFT" then
+        schematicStore.currentAircraftId = _manageMenuAircraftId
+        navGoToAircraftHome()
+    elseif optionText == "RENAME" then
+        local aircraft = _findAircraft(_manageMenuAircraftId)
+        if aircraft then
+            gdsGui_textPrompt_open("RENAME AIRCRAFT", aircraft.name, 24, "schematicAircraftRenameConfirmed", nil)
+        end
+    elseif optionText == "DELETE" then
+        local aircraft = _findAircraft(_manageMenuAircraftId)
+        gdsGui_schematicGallery_openMenu(galleryName, "DELETE \"" .. (aircraft and aircraft.name or "") .. "\"?",
+            {"DELETE", "CANCEL"}, "schematicAircraftDeleteConfirmed", nil)
+    end
+    -- "CANCEL" (or tapping outside): no-op, _manageMenuAircraftId is overwritten next time.
+end
+
+function schematicAircraftRenameConfirmed(newName)
+    local aircraft = _findAircraft(_manageMenuAircraftId)
+    if aircraft and newName ~= "" then
+        aircraft.name = newName
+        _saveSchematicStore()
+        gdsGui_schematicGallery_setItems("aircraftGallery", _aircraftGalleryItems())
+        if schematicStore.currentAircraftId == aircraft.id then
+            gdsGui_outputTxtBox_setText("aircraftHome_pageTitle", _aircraftHomeTitle(aircraft))
+        end
+    end
+    _manageMenuAircraftId = nil
+end
+
+-- Deleting an aircraft cascades to every system it owns (they live only
+-- inside its .systems array — nothing else references them).
+function schematicAircraftDeleteConfirmed(galleryName, index, optionText)
+    if optionText == "DELETE" and _manageMenuAircraftId then
+        for i = #schematicStore.aircraft, 1, -1 do
+            if schematicStore.aircraft[i].id == _manageMenuAircraftId then
+                table.remove(schematicStore.aircraft, i)
+            end
+        end
+        if schematicStore.currentAircraftId == _manageMenuAircraftId then
+            schematicStore.currentAircraftId = nil
+            schematicStore.currentSystemId = nil
+            _clearMainCanvas()
+        end
+        _saveSchematicStore()
+        gdsGui_schematicGallery_setItems("aircraftGallery", _aircraftGalleryItems())
+        _refreshSchematicHomeAvailability()
+    end
+    _manageMenuAircraftId = nil
+end
+
+-------------------------------------------------------------------------------
+-- SYSTEM SCHEMATIC — AIRCRAFT PAGE (NEW SYSTEM / MY SYSTEMS)
+-- Reached by opening an aircraft, either fresh off NEW AIRCRAFT or via the
+-- MY AIRCRAFT gallery's OPEN AIRCRAFT action (see above).
+-------------------------------------------------------------------------------
+
+-- Keeps "MY SYSTEMS" in sync with whether the current aircraft has anything
+-- to open, and "NEW" in sync with whether any system type is still unused on
+-- it (one system per type per aircraft — see _availableSystemTypesForAircraft).
+-- Called whenever AircraftHome is (re)entered and after a system is deleted.
+local function _refreshAircraftHomeAvailability()
+    local aircraft = _findCurrentAircraft()
+    gdsGui_button_setState("aircraftHomeMySystems",
+        (aircraft and #aircraft.systems > 0) and "released" or "deactivated")
+    gdsGui_button_setState("aircraftHomeNewSystem",
+        (aircraft and #_availableSystemTypesForAircraft(aircraft) > 0) and "released" or "deactivated")
+end
+
+-- Lands on AircraftHome for whichever aircraft is current (schematicStore.
+-- currentAircraftId), set by the caller before this runs.
+function navGoToAircraftHome()
+    local aircraft = _findCurrentAircraft()
+    if not aircraft then navGoToSystemSchematic(); return end
+    gdsGui_outputTxtBox_setText("aircraftHome_pageTitle", _aircraftHomeTitle(aircraft))
+    _refreshAircraftHomeAvailability()
+    _navSyncAll("AircraftHome")
+    gdsGui_page_switch("LoadingAircraftHome", 13, 2, false)
+end
+
+-- A system's type is fixed for its whole lifetime and an aircraft can only
+-- have one system per type, so creation starts with a type picker (limited
+-- to types this aircraft doesn't already have) rather than going straight to
+-- naming it.
+function aircraftHomeNewSystemPressed()
+    local aircraft = _findCurrentAircraft()
+    if not aircraft then return end
+    local available = _availableSystemTypesForAircraft(aircraft)
+    if #available == 0 then return end
+    table.insert(available, "CANCEL")
+    gdsGui_choiceMenu_open("SELECT SYSTEM TYPE", available, "schematicSystemTypeChosen", nil)
+end
+
+-- No naming prompt: a new system is always named from its type (e.g.
+-- "Electrical System"), matching the gallery tile/menu label the user just
+-- picked, so creation is a single tap with no text entry step. id is a
+-- GDS-format unique serial (see schematicNewAircraftConfirmed above),
+-- unique within this aircraft's own systems list.
+function schematicSystemTypeChosen(optionText)
+    if optionText == "CANCEL" then return end
+    local aircraft = _findCurrentAircraft()
+    if not aircraft then return end
+    local id = gdsGui_saveLoad_createIdNumber(aircraft.systems, "id", 17)
+    local now = os.date("%Y-%m-%d %H:%M:%S")
+    table.insert(aircraft.systems, {
+        id = id, name = _titleCase(optionText) .. " System", systemType = optionText,
+        createdAt = now, modifiedAt = now,
+        elements = {}, wires = {}, controls = {}, snapshots = {},
+    })
+    _saveSchematicStore()
+    _openSystemIntoCanvas(id, "design")
+    _navSyncAll("SystemSchematic")
+    gdsGui_page_switch("LoadingSchematic", 7, 3, false)
+end
+
+-- Single consolidated entry point: opens the systems gallery that handles
+-- both loading a system (in control or design mode) and editing it (rename/
+-- delete), chosen per-system from the action menu in
+-- schematicSystemGallerySelected below.
+function aircraftHomeMySystemsPressed()
+    local aircraft = _findCurrentAircraft()
+    if not aircraft then return end
+    gdsGui_schematicGallery_setItems("manageGallery", aircraft.systems)
+    _navSyncAll("SchematicManageGallery")
+    gdsGui_page_switch("LoadingSchematicManage", 11, 2, false)
+end
+
+-- Tapping a system opens an action menu rather than jumping straight into
+-- it, so the same gallery covers loading (control mode), editing (design
+-- mode), renaming, and deleting.
+function schematicSystemGallerySelected(galleryName, systemId)
+    local sys = _findSystem(systemId)
+    if not sys then return end
+    _manageMenuSystemId = systemId
+    gdsGui_schematicGallery_openMenu(galleryName, sys.name,
+        {"OPEN IN CONTROL MODE", "OPEN IN DESIGN MODE", "RENAME", "DELETE", "CANCEL"},
+        "schematicSystemActionChosen", nil)
+end
+
+function schematicSystemActionChosen(galleryName, index, optionText)
+    if optionText == "OPEN IN CONTROL MODE" then
+        _openSystemIntoCanvas(_manageMenuSystemId, "control")
+        _navSyncAll("SystemSchematic")
+        gdsGui_page_switch("LoadingSchematic", 7, 3, false)
+    elseif optionText == "OPEN IN DESIGN MODE" then
+        _openSystemIntoCanvas(_manageMenuSystemId, "design")
+        _navSyncAll("SystemSchematic")
+        gdsGui_page_switch("LoadingSchematic", 7, 3, false)
+    elseif optionText == "RENAME" then
+        local sys = _findSystem(_manageMenuSystemId)
+        if sys then
+            gdsGui_textPrompt_open("RENAME SYSTEM", sys.name, 24, "schematicSystemRenameConfirmed", nil)
+        end
+    elseif optionText == "DELETE" then
+        local sys = _findSystem(_manageMenuSystemId)
+        gdsGui_schematicGallery_openMenu(galleryName, "DELETE \"" .. (sys and sys.name or "") .. "\"?",
+            {"DELETE", "CANCEL"}, "schematicSystemDeleteConfirmed", nil)
+    end
+    -- "CANCEL" (or tapping outside): no-op, _manageMenuSystemId is overwritten next time.
+end
+
+function schematicSystemRenameConfirmed(newName)
+    local sys = _findSystem(_manageMenuSystemId)
+    if sys and newName ~= "" then
+        sys.name = newName
+        _saveSchematicStore()
+        local aircraft = _findCurrentAircraft()
+        gdsGui_schematicGallery_setItems("manageGallery", aircraft and aircraft.systems or {})
+        if schematicStore.currentSystemId == sys.id then
+            gdsGui_outputTxtBox_setText("schematic_pageTitle", sys.name)
+        end
+    end
+    _manageMenuSystemId = nil
+end
+
+function schematicSystemDeleteConfirmed(galleryName, index, optionText)
+    if optionText == "DELETE" and _manageMenuSystemId then
+        local aircraft = _findCurrentAircraft()
+        if aircraft then
+            for i = #aircraft.systems, 1, -1 do
+                if aircraft.systems[i].id == _manageMenuSystemId then
+                    table.remove(aircraft.systems, i)
+                end
+            end
+        end
+        if schematicStore.currentSystemId == _manageMenuSystemId then
+            schematicStore.currentSystemId = nil
+            _clearMainCanvas()
+        end
+        _saveSchematicStore()
+        gdsGui_schematicGallery_setItems("manageGallery", aircraft and aircraft.systems or {})
+        _refreshAircraftHomeAvailability()
+    end
+    _manageMenuSystemId = nil
 end
 
 local function _applyTheme(isDark)
@@ -441,10 +1365,56 @@ function love.load()
     -- LOAD SETTINGS EARLY (needed for layout variables below)
     ---------------------------------------------------------------------------
     gdsGui_saveLoad_loadFileContents("appSettings.lua")
-    if appSettings.darkMode       == nil then appSettings.darkMode       = true  end
-    if appSettings.soundEnabled   == nil then appSettings.soundEnabled   = true  end
-    if appSettings.hapticsEnabled == nil then appSettings.hapticsEnabled = true  end
-    if appSettings.fontSize       == nil then appSettings.fontSize       = 12    end
+    if appSettings.darkMode         == nil then appSettings.darkMode         = true  end
+    if appSettings.soundEnabled     == nil then appSettings.soundEnabled     = true  end
+    if appSettings.hapticsEnabled   == nil then appSettings.hapticsEnabled   = true  end
+    if appSettings.fontSize         == nil then appSettings.fontSize         = 12    end
+    -- System Schematic is a paid feature; schematicUnlocked is a placeholder
+    -- entitlement flag (no real store/IAP integration exists in this pure-Lua
+    -- app yet) flipped true by the Simulate Purchase button on the paywall page.
+    if appSettings.schematicUnlocked == nil then appSettings.schematicUnlocked = false end
+    if appSettings.schematicEditMode == nil then appSettings.schematicEditMode = true  end
+
+    -- Loads the aircraft/systems store; migrates a pre-existing single-design
+    -- save (from before projects existed) or a flat project list (from before
+    -- aircraft existed) into one aircraft's systems, or seeds a demo system on
+    -- a genuinely fresh install, so Home's NEW/MY AIRCRAFT galleries are never
+    -- confusingly empty on first run.
+    gdsGui_saveLoad_loadFileContents("schematicProjects.lua")
+    if schematicStore == nil then
+        local migratedSystems = {}
+        gdsGui_saveLoad_loadFileContents("schematicDesign.lua")
+        if schematicDesign and schematicDesign.elements and #schematicDesign.elements > 0 then
+            local now = os.date("%Y-%m-%d %H:%M:%S")
+            table.insert(migratedSystems, {
+                id = "sys_1", name = "My System", createdAt = now, modifiedAt = now,
+                elements = schematicDesign.elements, wires = schematicDesign.wires,
+                controls = schematicDesign.controls or {}, snapshots = schematicDesign.snapshots or {},
+            })
+        else
+            table.insert(migratedSystems, _buildDemoSystem())
+        end
+        local now = os.date("%Y-%m-%d %H:%M:%S")
+        schematicStore = {
+            aircraft = {{ id = "aircraft_1", name = "My Aircraft", createdAt = now, modifiedAt = now,
+                systems = migratedSystems }},
+            currentAircraftId = nil, currentSystemId = nil,
+            nextAircraftNum = 2,
+        }
+        love.filesystem.write("schematicProjects.lua", table.show(schematicStore, "schematicStore"))
+    elseif schematicStore.aircraft == nil then
+        -- Old flat-project-list save (pre-aircraft): wrap it all into one
+        -- aircraft so existing systems aren't lost.
+        local now = os.date("%Y-%m-%d %H:%M:%S")
+        local legacySystems = schematicStore.projects or {}
+        schematicStore = {
+            aircraft = {{ id = "aircraft_1", name = "My Aircraft", createdAt = now, modifiedAt = now,
+                systems = legacySystems }},
+            currentAircraftId = nil, currentSystemId = nil,
+            nextAircraftNum = 2,
+        }
+        love.filesystem.write("schematicProjects.lua", table.show(schematicStore, "schematicStore"))
+    end
 
     -- Scale pixel coordinates from the 320-pt design canvas to the actual container width
     -- (iPhone SE 2nd gen = 375 pt reference; _x/_w return floor'd pixel values).
@@ -513,9 +1483,10 @@ function love.load()
     local footBtnW  = 50
     local footBtnH  = 50
     local footBtnY  = math.floor(pageFootH * 0.50)
-    local footBtnX1 = math.floor(globApp.safeScreenArea.w * (1/6))
-    local footBtnX2 = math.floor(globApp.safeScreenArea.w * (3/6))
-    local footBtnX3 = math.floor(globApp.safeScreenArea.w * (5/6))
+    local footBtnX1 = math.floor(globApp.safeScreenArea.w * (1/8))
+    local footBtnX2 = math.floor(globApp.safeScreenArea.w * (3/8))
+    local footBtnX3 = math.floor(globApp.safeScreenArea.w * (5/8))
+    local footBtnX4 = math.floor(globApp.safeScreenArea.w * (7/8))
 
     -- Creates the shared header + footer for one app page.
     local function createPageHeaderFooter(pageName, titleText, prefix)
@@ -526,7 +1497,7 @@ function love.load()
             math.floor(globApp.safeScreenArea.w * 0.70), math.floor(pageHdrH * 0.5),
             {1, 1, 1, 1}, titleText, 16, prefix .. "_header"
         )
-        -- Footer with 3 navigation buttons: mainMenu | learn | settings
+        -- Footer with 4 navigation buttons: mainMenu | systemSchematic | learn | settings
         gdsGui_pageFooter_create(prefix .. "_footer", pageName, pageFootH, {0.15, 0.15, 0.20, 1})
         gdsGui_button_create(prefix .. "_navMainMenu", pageName, "stickyToggle",
             "Sprites/button_calculator_pressed.png", "Sprites/button_calculator_released.png",
@@ -534,16 +1505,22 @@ function love.load()
             footBtnX1, footBtnY, "CC", footBtnW, footBtnH,
             "navGoToMainMenu", globApp.BUTTON_STATES.RELEASED, false, prefix .. "_footer"
         )
+        gdsGui_button_create(prefix .. "_navSchematic", pageName, "stickyToggle",
+            "Sprites/button_schematic_pressed.png", "Sprites/button_schematic_released.png",
+            "Sprites/button_schematic_deactivated.png",
+            footBtnX2, footBtnY, "CC", footBtnW, footBtnH,
+            "navGoToSystemSchematic", globApp.BUTTON_STATES.RELEASED, false, prefix .. "_footer"
+        )
         gdsGui_button_create(prefix .. "_navLearn", pageName, "stickyToggle",
             "Sprites/button_learn_pressed.png", "Sprites/button_learn_released.png",
             "Sprites/button_learn_deactivated.png",
-            footBtnX2, footBtnY, "CC", footBtnW, footBtnH,
+            footBtnX3, footBtnY, "CC", footBtnW, footBtnH,
             "navGoToLearn", globApp.BUTTON_STATES.RELEASED, false, prefix .. "_footer"
         )
         gdsGui_button_create(prefix .. "_navSettings", pageName, "stickyToggle",
             "Sprites/button_settings_pressed.png", "Sprites/button_settings_released.png",
             "Sprites/button_settings_deactivated.png",
-            footBtnX3, footBtnY, "CC", footBtnW, footBtnH,
+            footBtnX4, footBtnY, "CC", footBtnW, footBtnH,
             "navGoToSettings", globApp.BUTTON_STATES.RELEASED, false, prefix .. "_footer"
         )
     end
@@ -555,6 +1532,37 @@ function love.load()
         math.floor(globApp.safeScreenArea.w * 0.30), _hUTCHdr,
         colorWarning, "0000 UTC", 16, "mainMenu_header"
     )
+    createPageHeaderFooter("SystemSchematic", "SYSTEM SCHEMATIC", "schematic")
+    createPageHeaderFooter("SchematicHome",          "AIRCRAFT",          "schematicHome")
+    createPageHeaderFooter("SchematicManageGallery", "SYSTEMS",           "schematicManage")
+    createPageHeaderFooter("AircraftGallery",        "MY AIRCRAFT",       "aircraftGallery")
+    createPageHeaderFooter("AircraftHome",           "AIRCRAFT",          "aircraftHome")
+    createPageHeaderFooter("SchematicSnapshots",     "SNAPSHOTS",         "schematicSnapshots")
+
+    -- "<" back button on every schematic-flow page EXCEPT Home itself. Needed
+    -- because the dock's schematic icon is a stickyToggle (general_gdsGuiLib.
+    -- lua / buttons_gdsGuiLib.lua): once pressed it ignores all further taps
+    -- until externally reset, so it cannot be tapped again to navigate while
+    -- already inside the schematic flow — these pages need their own
+    -- explicit way back. The canvas and the systems gallery are "inside" the
+    -- current aircraft, so they step back to AircraftHome (one level); the
+    -- aircraft gallery and AircraftHome itself step back to the top
+    -- aircraft picker (SchematicHome).
+    for _, backBtn in ipairs({
+        {page = "SystemSchematic",          prefix = "schematic",       callback = "navBackToAircraftHome"},
+        {page = "SchematicManageGallery",    prefix = "schematicManage", callback = "navBackToAircraftHome"},
+        {page = "AircraftGallery",           prefix = "aircraftGallery", callback = "navGoToSystemSchematic"},
+        {page = "AircraftHome",              prefix = "aircraftHome",    callback = "navGoToSystemSchematic"},
+        {page = "SchematicSnapshots",        prefix = "schematicSnapshots", callback = "navBackToSystemSchematic"},
+    }) do
+        gdsGui_button_create(backBtn.prefix .. "_backBtn", backBtn.page, "pushonoff",
+            "Sprites/button_schematicBack_pressed.png", "Sprites/button_schematicBack_released.png",
+            "Sprites/button_schematicBack_deactivated.png",
+            math.floor(globApp.safeScreenArea.w * 0.08), hdrCY, "CC", 32, 32,
+            backBtn.callback, globApp.BUTTON_STATES.RELEASED, false, backBtn.prefix .. "_header"
+        )
+    end
+
     createPageHeaderFooter("Learn",    "LEARN",     "learn")
     createPageHeaderFooter("Settings", "SETTINGS",  "settings")
 
@@ -905,6 +1913,210 @@ function love.load()
     )
 
     ---------------------------------------------------------------------------
+    -- SYSTEM SCHEMATIC PAGE (premium feature)
+    -- The canvas is NOT container-managed (container_gdsGuiLib.lua only lays
+    -- out button/outputTextBox/scrollBar/rotaryKnob) — it is a standalone
+    -- region sized/positioned the same way the header/footer strips are,
+    -- filling the body between them. Floating control buttons below the
+    -- header are created without a containerName so they draw directly on
+    -- top of the canvas (gdsGui_button_draw runs after gdsGui_schematic_draw).
+    ---------------------------------------------------------------------------
+    local schBtnRowYFrac = (pageHdrH + 16) / globApp.safeScreenArea.h
+    local schLabelYFrac  = (pageHdrH + 16 + 30 + 10) / globApp.safeScreenArea.h
+    local schCanvasYFrac = schLabelYFrac + (24 / globApp.safeScreenArea.h)
+    local schCanvasHFrac = 1 - schCanvasYFrac - (pageFootH / globApp.safeScreenArea.h) - 0.01
+    -- canvas.w = wFrac*safeW, canvas.h = hFrac*safeH, so canvas.w/canvas.h
+    -- only equals the screen's own aspect ratio (safeW/safeH) when
+    -- wFrac == hFrac. Setting wFrac to schCanvasHFrac (instead of the old
+    -- fixed 1.0 = full width) makes the embedded canvas's box the same
+    -- shape as the full-screen page, so going full screen (see
+    -- schematicFullScreenTogglePressed) is a uniform scale-up with no
+    -- stretch — centered horizontally since it's now narrower than the
+    -- full safe width.
+    local schCanvasWFrac = schCanvasHFrac
+    local schCanvasXFrac = (1 - schCanvasWFrac) / 2
+
+    -- 4-button row: MODE | ACTIONS (mode-sensitive: add/reset in design, select
+    -- control in control) | SNAPSHOT | FULL SCREEN. No dedicated wire tool
+    -- button — a wire is drawn via ADD WIRE on an element's own edit menu
+    -- instead (see gdsGui_schematic_internal_onElementEditChosen).
+    -- SNAPSHOT is the only place a snapshot can be captured (design mode
+    -- only, same gating the old DELETE SELECTED button used) — the ACTIONS
+    -- menu no longer offers CAPTURE SNAPSHOT. Per-element/wire deletion is
+    -- handled by tapping the selected element/wire's own edit menu.
+    -- MODE shows the icon for the action a tap performs, not the current mode:
+    -- a steering wheel (tap to go operate/control) while in design, a pencil
+    -- (tap to go edit/design) while in control.
+    gdsGui_button_create("schematicModeToggle", "SystemSchematic", "toggle",
+        "Sprites/button_schematicModeToggle_pressed.png", "Sprites/button_schematicModeToggle_released.png",
+        "Sprites/button_schematicModeToggle_deactivated.png",
+        0.125, schBtnRowYFrac, "CT", 30, 30,
+        "schematicModeToggled", globApp.BUTTON_STATES.PRESSED, true, nil
+    )
+    -- ACTIONS: opens a mode-sensitive menu rather than acting directly, since
+    -- it now covers everything design/control mode can do besides capturing
+    -- a snapshot and deleting a single selected element
+    -- (see schematicContextButtonPressed).
+    gdsGui_button_create("schematicContextButton", "SystemSchematic", "pushonoff",
+        "Sprites/button_menu_pressed.png", "Sprites/button_menu_released.png",
+        "Sprites/button_menu_deactivated.png",
+        0.375, schBtnRowYFrac, "CT", 30, 30,
+        "schematicContextButtonPressed", globApp.BUTTON_STATES.RELEASED, true, nil
+    )
+    -- SNAPSHOT (camera): the sole entry point for capturing a snapshot of
+    -- the current control combination's colors. Design-mode only, same
+    -- enable/disable gating the old DELETE SELECTED button used.
+    gdsGui_button_create("schematicSnapshotBtn", "SystemSchematic", "pushonoff",
+        "Sprites/button_snapshot_pressed.png", "Sprites/button_snapshot_released.png", "Sprites/button_snapshot_deactivated.png",
+        0.625, schBtnRowYFrac, "CT", 30, 30,
+        "captureSchematicSnapshot", globApp.BUTTON_STATES.RELEASED, true, nil
+    )
+    -- FULL SCREEN: viewing-only convenience, so it's only enabled in control
+    -- mode (deactivated in design, same gating pattern as SNAPSHOT in reverse).
+    -- Reuses the library's generic "switch screen size" icon.
+    gdsGui_button_create("schematicFullScreenToggle", "SystemSchematic", "pushonoff",
+        "Libraries/gds_love2d_gui/librarySprites/gdsLoveGUI_switchScreenSizeButton_pushed.png",
+        "Libraries/gds_love2d_gui/librarySprites/gdsLoveGUI_switchScreenSizeButton_released.png",
+        "Libraries/gds_love2d_gui/librarySprites/gdsLoveGUI_switchScreenSizeButton_deactivated.png",
+        0.875, schBtnRowYFrac, "CT", 30, 30,
+        "schematicFullScreenTogglePressed", globApp.BUTTON_STATES.DEACTIVATED, true, nil
+    )
+    -- Narrowed from the old full-width centered box (and anchored off the
+    -- opposite side of center) to leave room for schematicZoomLabel right
+    -- beside it, so the pair reads as one centered row: "SNAPSHOTS: 0  1.0x".
+    gdsGui_outputTxtBox_create("schematicSnapshotLabel", "SystemSchematic", nil,
+        0.48, schLabelYFrac, "RT", _w(150), 20,
+        colorYellow, "SNAPSHOTS: 0", 10, nil
+    )
+    gdsGui_outputTxtBox_create("schematicZoomLabel", "SystemSchematic", nil,
+        0.52, schLabelYFrac, "LT", _w(60), 20,
+        colorYellow, "1.0x", 10, nil
+    )
+    gdsGui_schematic_create("mainCanvas", "SystemSchematic", schCanvasXFrac, schCanvasYFrac, "LT", schCanvasWFrac, schCanvasHFrac)
+    -- Fires on every design-mode edit (add/move/rotate/recolor/rename/
+    -- delete/property change — see _notifyChanged in schematic_gdsGuiLib.lua),
+    -- so in-progress work survives a quit/background without waiting for the
+    -- next page-nav save point.
+    _findSchematicCanvas().onChange = "schematicCanvasChanged"
+    -- Starts empty: the canvas is only ever populated by an explicit NEW
+    -- SYSTEM or OPEN action from the aircraft flow (see _openSystemIntoCanvas above).
+    _schematicCanvasNormalLayout = { x = schCanvasXFrac, y = schCanvasYFrac, anchorPoint = "LT", wFrac = schCanvasWFrac, hFrac = schCanvasHFrac }
+    -- Once zoomed in past 1x, the embedded box progressively grows from the
+    -- screen-aspect-matched box above toward the full header-to-footer
+    -- rectangle (full width, same height — height has ~0 slack to grow, see
+    -- schCanvasHFrac's computation above). The growth is a smooth blend over
+    -- the zoom range (see gdsGui_schematic_setZoomedLayout/_calculateGeometry
+    -- in the library), not a snap, and element/control scaling is kept on a
+    -- fixed basis independent of this box, so widening it never distorts
+    -- their aspect ratio.
+    _schematicCanvasZoomedLayout = { x = 0, y = schCanvasYFrac, anchorPoint = "LT", wFrac = 1.0, hFrac = schCanvasHFrac }
+    gdsGui_schematic_setZoomedLayout("mainCanvas",
+        _schematicCanvasZoomedLayout.x, _schematicCanvasZoomedLayout.y, _schematicCanvasZoomedLayout.anchorPoint,
+        _schematicCanvasZoomedLayout.wFrac, _schematicCanvasZoomedLayout.hFrac)
+
+    -- FULL-SCREEN RETURN BUTTON — the only control on the dedicated full-
+    -- screen page; tapping it hands mainCanvas back to its normal embedded
+    -- layout on SystemSchematic (see schematicFullScreenReturnPressed).
+    gdsGui_button_create("schematicFullScreenReturnBtn", "SchematicFullScreen", "pushonoff",
+        "Libraries/gds_love2d_gui/librarySprites/gdsLoveGUI_returnPrevPageButton_pushed.png",
+        "Libraries/gds_love2d_gui/librarySprites/gdsLoveGUI_returnPrevPageButton_released.png",
+        "Libraries/gds_love2d_gui/librarySprites/gdsLoveGUI_returnPrevPageButton_deactivated.png",
+        0.95, 0.04, "RT", 36, 36,
+        "schematicFullScreenReturnPressed", globApp.BUTTON_STATES.RELEASED, true, nil
+    )
+
+    ---------------------------------------------------------------------------
+    -- SCHEMATIC HOME PAGE (premium feature) — NEW AIRCRAFT / MY AIRCRAFT, the
+    -- landing point for the schematic dock icon once unlocked. Both buttons'
+    -- sprites are native 400x200 (2:1) art; height is derived from width so
+    -- the sprite is scaled uniformly instead of stretched to a mismatched box.
+    -- Reused as-is (same sizing) for AIRCRAFT HOME's NEW SYSTEM / MY SYSTEMS
+    -- pair below — same generic NEW/LOAD sprites, one level deeper.
+    ---------------------------------------------------------------------------
+    local schHomeBtnW = math.floor(_w(220) / 3)
+    local schHomeBtnH = math.floor(schHomeBtnW / 2)
+    gdsGui_button_create("schematicHomeNew", "SchematicHome", "pushonoff",
+        "Sprites/button_schematicHomeNew_pressed.png", "Sprites/button_schematicHomeNew_released.png",
+        "Sprites/button_schematicHomeNew_deactivated.png",
+        0.5, 0.40, "CC", schHomeBtnW, schHomeBtnH,
+        "schematicHomeNewPressed", globApp.BUTTON_STATES.RELEASED, true, nil
+    )
+    -- Single consolidated entry point for every saved aircraft: opening it,
+    -- renaming it, and deleting it are all offered from the per-aircraft
+    -- action menu on AircraftGallery (see schematicAircraftActionChosen).
+    -- Disabled until at least one aircraft exists.
+    gdsGui_button_create("schematicHomeMyAircraft", "SchematicHome", "pushonoff",
+        "Sprites/button_schematicHomeLoad_pressed.png", "Sprites/button_schematicHomeLoad_released.png",
+        "Sprites/button_schematicHomeLoad_deactivated.png",
+        0.5, 0.60, "CC", schHomeBtnW, schHomeBtnH,
+        "schematicHomeMyAircraftPressed",
+        (#schematicStore.aircraft > 0) and globApp.BUTTON_STATES.RELEASED or globApp.BUTTON_STATES.DEACTIVATED,
+        true, nil
+    )
+
+    ---------------------------------------------------------------------------
+    -- AIRCRAFT HOME PAGE — NEW SYSTEM / MY SYSTEMS for whichever aircraft is
+    -- current (schematicStore.currentAircraftId), reached from SchematicHome
+    -- or from AircraftGallery's OPEN AIRCRAFT action.
+    ---------------------------------------------------------------------------
+    gdsGui_button_create("aircraftHomeNewSystem", "AircraftHome", "pushonoff",
+        "Sprites/button_schematicHomeNew_pressed.png", "Sprites/button_schematicHomeNew_released.png",
+        "Sprites/button_schematicHomeNew_deactivated.png",
+        0.5, 0.40, "CC", schHomeBtnW, schHomeBtnH,
+        "aircraftHomeNewSystemPressed", globApp.BUTTON_STATES.RELEASED, true, nil
+    )
+    -- Single consolidated entry point for every saved system on this
+    -- aircraft: opening it (in design or control mode), renaming it, and
+    -- deleting it are all offered from the per-system action menu on
+    -- SchematicManageGallery (see schematicSystemActionChosen). Disabled
+    -- until the current aircraft has at least one system.
+    gdsGui_button_create("aircraftHomeMySystems", "AircraftHome", "pushonoff",
+        "Sprites/button_schematicHomeLoad_pressed.png", "Sprites/button_schematicHomeLoad_released.png",
+        "Sprites/button_schematicHomeLoad_deactivated.png",
+        0.5, 0.60, "CC", schHomeBtnW, schHomeBtnH,
+        "aircraftHomeMySystemsPressed", globApp.BUTTON_STATES.DEACTIVATED, true, nil
+    )
+
+    ---------------------------------------------------------------------------
+    -- SCHEMATIC MANAGE GALLERY PAGE — scrollable grid of mini live-rendered
+    -- diagram previews, one per system on the current aircraft; handles
+    -- opening AND editing.
+    ---------------------------------------------------------------------------
+    local schGalleryYFrac = pageHdrH / globApp.safeScreenArea.h
+    local schGalleryHFrac = 1 - schGalleryYFrac - (pageFootH / globApp.safeScreenArea.h)
+    gdsGui_schematicGallery_create("manageGallery", "SchematicManageGallery", 0, schGalleryYFrac, "LT",
+        1.0, schGalleryHFrac, 2, "NO SYSTEMS YET")
+    gdsGui_schematicGallery_setOnSelect("manageGallery", "schematicSystemGallerySelected")
+
+    ---------------------------------------------------------------------------
+    -- AIRCRAFT GALLERY PAGE — scrollable grid of tiles, one per saved
+    -- aircraft; handles opening AND editing. Reuses the same generic gallery
+    -- widget as SCHEMATIC MANAGE GALLERY above, but an aircraft record has no
+    -- .elements/.wires of its own (only its systems do), so each tile's
+    -- mini-diagram preview area renders blank — just the name label shows.
+    ---------------------------------------------------------------------------
+    gdsGui_schematicGallery_create("aircraftGallery", "AircraftGallery", 0, schGalleryYFrac, "LT",
+        1.0, schGalleryHFrac, 2, "NO AIRCRAFT YET")
+    gdsGui_schematicGallery_setOnSelect("aircraftGallery", "schematicAircraftGallerySelected")
+
+    ---------------------------------------------------------------------------
+    -- SCHEMATIC SNAPSHOTS PAGE — single-column list of every snapshot
+    -- captured on the current system: a mini-diagram thumbnail rendered with
+    -- THAT snapshot's own colors (not the live canvas's), plus the control
+    -- positions it was captured under (see _buildSnapshotGalleryItems).
+    -- Taller single-column rows (1 column, 100px tiles) since each row needs
+    -- room for the status-line list beside the thumbnail, not just a name.
+    ---------------------------------------------------------------------------
+    gdsGui_schematicGallery_create("snapshotsGallery", "SchematicSnapshots", 0, schGalleryYFrac, "LT",
+        1.0, schGalleryHFrac, 1, "NO SNAPSHOTS YET", 100)
+    gdsGui_schematicGallery_setOnSelect("snapshotsGallery", "schematicSnapshotGallerySelected")
+
+    ---------------------------------------------------------------------------
+    -- SCHEMATIC PAYWALL PAGE (premium-feature gate)
+    ---------------------------------------------------------------------------
+    createSchematicPaywallObjects()
+
+    ---------------------------------------------------------------------------
     -- TERMS AND CONDITIONS PAGE
     ---------------------------------------------------------------------------
     createTermsAndConditionsObjects()
@@ -915,6 +2127,13 @@ function love.load()
     gdsGui_container_finalise("MainMenu")
     gdsGui_container_finalise("Learn")
     gdsGui_container_finalise("Settings")
+    gdsGui_container_finalise("SystemSchematic")
+    gdsGui_container_finalise("SchematicHome")
+    gdsGui_container_finalise("SchematicManageGallery")
+    gdsGui_container_finalise("AircraftGallery")
+    gdsGui_container_finalise("AircraftHome")
+    gdsGui_container_finalise("SchematicSnapshots")
+    gdsGui_container_finalise("SchematicPaywall")
     gdsGui_container_finalise("TermsAndConditions")
 
     _applyTheme(appSettings.darkMode)
@@ -922,6 +2141,10 @@ function love.load()
     gdsGui_button_setState("soundToggle",    appSettings.soundEnabled   and "pushed" or "released")
     gdsGui_button_setState("hapticsToggle",  appSettings.hapticsEnabled and "pushed" or "released")
     _applyFontSize(appSettings.fontSize)
+
+    -- mainCanvas starts empty; _openSystemIntoCanvas() sets its mode and the
+    -- dock button states the moment a system is actually opened, so there is
+    -- nothing to initialise here.
 
     _navSyncAll("MainMenu")
 
@@ -1034,6 +2257,20 @@ function love.update(dt)
         _prevLastFlightHours = lastFlightHours
     end
 
+    -- Schematic zoom readout (normal-mode header pair + full-screen corner
+    -- label, drawn separately below) — zoom changes continuously via
+    -- pinch/wheel/drag, not through a discrete callback, so this is polled
+    -- here like the other live readouts above rather than pushed from the
+    -- gesture handlers themselves.
+    local schematicZoom = gdsGui_schematic_getZoom("mainCanvas")
+    if schematicZoom then
+        local zoomText = string.format("%.1fx", schematicZoom)
+        if zoomText ~= _prevSchematicZoomText then
+            _prevSchematicZoomText = zoomText
+            gdsGui_outputTxtBox_setText("schematicZoomLabel", zoomText)
+        end
+    end
+
     -- Unlock T&C agree toggle once user has scrolled to the bottom at least once.
     if not _tcScrolledToBottom and gdsGui_outputTxtBox_hasReachedBottom("tcText") then
         _tcScrolledToBottom = true
@@ -1119,9 +2356,63 @@ end
 function love.draw()
     drawPages()
     gdsGui_draw()
+    drawSchematicZoomFullScreenLabel()
     drawAlarmOverlay()
     gdsGui_page_drawUnsafeAreaOverlay()
     gdsGui_container_drawFixed(gdsGui_page_currentName())
+    -- Drawn last so the schematic's modal menu (catalog/control/color-picker/
+    -- conflict-confirm) renders above the floating chrome buttons.
+    gdsGui_schematic_drawMenuOverlay(gdsGui_page_currentName())
+    gdsGui_schematicGallery_drawMenuOverlay(gdsGui_page_currentName())
+    -- The text-entry prompt and the option-list menu are each a single global
+    -- modal (not page-scoped), drawn above everything else when open. Only
+    -- one of the two is ever open at a time.
+    gdsGui_textPrompt_draw()
+    gdsGui_choiceMenu_draw()
+end
+
+-- Design-mode edits (dragging/adding/deleting elements, wires, controls) only
+-- get written into schematicStore/disk via _saveCurrentSystem(), which until
+-- now only ran on explicit navigation away from the SystemSchematic page
+-- (footer nav, back buttons, snapshot capture). Quitting or backgrounding the
+-- app while still on that page skipped all of those call sites, so whatever
+-- was drawn since the last navigation was silently lost. love.quit() covers
+-- an explicit close; love.focus(false) also covers iOS/Android backgrounding,
+-- where the OS can later kill the suspended app without ever calling love.quit.
+-- Full-screen view (SchematicFullScreen, toggled via
+-- schematicFullScreenTogglePressed) shows/edits the same live mainCanvas as
+-- SystemSchematic, just reassigned to its own page — so it needs the same
+-- save-on-quit/background coverage.
+local function _isOnSchematicPage()
+    local name = gdsGui_page_currentName()
+    return name == "SystemSchematic" or name == "SchematicFullScreen"
+end
+
+function love.quit()
+    if _isOnSchematicPage() then _saveCurrentSystem() end
+end
+
+function love.focus(focused)
+    if not focused and _isOnSchematicPage() then _saveCurrentSystem() end
+end
+
+-- Drawn directly (not as an outputTxtBox widget) and called after gdsGui_draw()
+-- in love.draw() above: gdsGui_draw()'s own outputTxtBox pass runs BEFORE its
+-- schematic-canvas pass (see gdsGui_general_draw's fixed draw order), so a
+-- widget would be painted over by the full-screen canvas. Drawing it here,
+-- afterward, guarantees it's always on top.
+function drawSchematicZoomFullScreenLabel()
+    if gdsGui_page_currentName() ~= "SchematicFullScreen" then return end
+    if not _prevSchematicZoomText then return end
+    local sa = globApp.safeScreenArea
+    local w, h = 70, 20
+    local pos = gdsGui_general_relativePosition("RB", 0.98, 0.98, w, h, sa.x, sa.y, sa.w, sa.h)
+    if not _schematicZoomFullScreenFont then
+        _schematicZoomFullScreenFont = love.graphics.newFont(10)
+    end
+    love.graphics.setFont(_schematicZoomFullScreenFont)
+    love.graphics.setColor(1, 1, 1, 0.3)
+    love.graphics.printf(_prevSchematicZoomText, pos[1], pos[2], w, "right")
 end
 
 -------------------------------------------------------------------------------
@@ -1129,6 +2420,22 @@ end
 -------------------------------------------------------------------------------
 function drawPages()
     gdsGui_page_drawBackground()
+    -- The embedded schematic canvas is narrower than the safe area (see
+    -- love.load()'s schCanvasWFrac), so its left/right margins would
+    -- otherwise show the general app background instead of reading as part
+    -- of the canvas. Paint just those two side strips (130,130,130 — a
+    -- lighter gray than the canvas's own fill, chosen to stand apart from it
+    -- rather than blend in) rather than the whole page, so nothing else on
+    -- this page's backdrop changes.
+    if gdsGui_page_currentName() == "SystemSchematic" then
+        local canvas = _findSchematicCanvas()
+        if canvas then
+            local sa = globApp.safeScreenArea
+            love.graphics.setColor(130 / 255, 130 / 255, 130 / 255, 1)
+            love.graphics.rectangle("fill", sa.x, canvas.y, canvas.x - sa.x, canvas.h)
+            love.graphics.rectangle("fill", canvas.x + canvas.w, canvas.y, (sa.x + sa.w) - (canvas.x + canvas.w), canvas.h)
+        end
+    end
 end
 
 function drawAlarmOverlay()
@@ -1389,6 +2696,53 @@ function fontSizeChanged(pos)
 end
 
 -------------------------------------------------------------------------------
+-- SCHEMATIC PAYWALL PAGE (premium-feature gate)
+-------------------------------------------------------------------------------
+
+function createSchematicPaywallObjects()
+    local thisPageName = "SchematicPaywall"
+    local pageHdrH  = math.floor(globApp.safeScreenArea.h * 0.10)
+    local pageFootH = pageHdrH
+    local hdrCX     = math.floor(globApp.safeScreenArea.w * 0.5)
+    local hdrCY     = math.floor(pageHdrH * 0.5)
+    local footBtnW  = 120
+    local footBtnH  = 48
+    local footBtnY  = math.floor(pageFootH * 0.50)
+    local btnX1     = math.floor(globApp.safeScreenArea.w * (1/3))
+    local btnX2     = math.floor(globApp.safeScreenArea.w * (2/3))
+
+    gdsGui_pageHeader_create("paywall_header", thisPageName, pageHdrH, {0.15, 0.15, 0.20, 1})
+    gdsGui_outputTxtBox_create("paywall_pageTitle", thisPageName, nil,
+        hdrCX, hdrCY, "CC",
+        math.floor(globApp.safeScreenArea.w * 0.90), math.floor(pageHdrH * 0.5),
+        {1, 1, 1, 1}, "PREMIUM FEATURE", 16, "paywall_header"
+    )
+
+    gdsGui_container_create("paywallPanel", thisPageName, "", 0, 0)
+    gdsGui_outputTxtBox_create("paywallBodyText", thisPageName, nil,
+        hdrCX, 20, "CT",
+        math.floor(globApp.safeScreenArea.w * 0.85), 160,
+        {1, 1, 1, 1},
+        "SYSTEM SCHEMATIC is a premium feature.\n\nThis build lets you simulate the purchase to unlock it for testing — no real payment is processed.",
+        14, "paywallPanel"
+    )
+
+    gdsGui_pageFooter_create("paywall_footer", thisPageName, pageFootH, {0.15, 0.15, 0.20, 1})
+    gdsGui_button_create("paywallSimulatePurchase", thisPageName, "pushonoff",
+        "Sprites/button_continue_pressed.png", "Sprites/button_continue_released.png",
+        "Sprites/button_continue_deactivated.png",
+        btnX1, footBtnY, "CC", footBtnW, footBtnH,
+        "simulatePurchaseSchematic", globApp.BUTTON_STATES.RELEASED, true, "paywall_footer"
+    )
+    gdsGui_button_create("paywallCancel", thisPageName, "pushonoff",
+        "Sprites/button_reset_pressed.png", "Sprites/button_reset_released.png",
+        "Sprites/button_reset_deactivated.png",
+        btnX2, footBtnY, "CC", footBtnW, footBtnH,
+        "cancelSchematicPaywall", globApp.BUTTON_STATES.RELEASED, false, "paywall_footer"
+    )
+end
+
+-------------------------------------------------------------------------------
 -- TERMS AND CONDITIONS PAGE
 -------------------------------------------------------------------------------
 
@@ -1471,18 +2825,448 @@ end
 -------------------------------------------------------------------------------
 
 function navGoToMainMenu()
+    if gdsGui_page_currentName() == "SystemSchematic" then _saveCurrentSystemIfDirty() end
     _navSyncAll("MainMenu")
     gdsGui_page_switch("LoadingMainMenu", 3, 3, false)
 end
 
+-- Always lands on the top aircraft-picker (SchematicHome), whether this is
+-- the first visit this session or the user is leaving the canvas to switch
+-- aircraft/systems — never straight back into whatever was last open on the
+-- canvas. Used by the footer dock icon (from anywhere outside the flow) and
+-- by the back buttons on AircraftGallery/AircraftHome, which are already one
+-- level below this.
+function navGoToSystemSchematic()
+    if gdsGui_page_currentName() == "SystemSchematic" then _saveCurrentSystemIfDirty() end
+    if not appSettings.schematicUnlocked then
+        gdsGui_page_switch("LoadingPaywall", 8, 2, false)
+        return
+    end
+    _refreshSchematicHomeAvailability()
+    _navSyncAll("SchematicHome")
+    gdsGui_page_switch("LoadingSchematicHome", 9, 2, false)
+end
+
+-- Steps back one level (not all the way to the top aircraft picker) from the
+-- canvas or the systems gallery — both are "inside" the current aircraft, so
+-- the natural way back is AircraftHome, keeping the user's aircraft context
+-- instead of dropping them back to MY AIRCRAFT every time.
+function navBackToAircraftHome()
+    if gdsGui_page_currentName() == "SystemSchematic" then _saveCurrentSystemIfDirty() end
+    navGoToAircraftHome()
+end
+
 function navGoToLearn()
+    if gdsGui_page_currentName() == "SystemSchematic" then _saveCurrentSystemIfDirty() end
     _navSyncAll("Learn")
     gdsGui_page_switch("LoadingLearn", 5, 3, false)
 end
 
 function navGoToSettings()
+    if gdsGui_page_currentName() == "SystemSchematic" then _saveCurrentSystemIfDirty() end
     _navSyncAll("Settings")
     gdsGui_page_switch("LoadingSettings", 6, 3, false)
+end
+
+-------------------------------------------------------------------------------
+-- SCHEMATIC PAYWALL CALLBACKS
+-------------------------------------------------------------------------------
+
+-- Sets the placeholder entitlement flag. Separated from simulatePurchaseSchematic()
+-- (which also navigates) so the flag-setting logic itself is directly unit-testable.
+function unlockSchematicFeature()
+    appSettings.schematicUnlocked = true
+    _saveAppSettings()
+    return appSettings.schematicUnlocked
+end
+
+-- Exercises unlockSchematicFeature() without permanently flipping the real
+-- paywall entitlement on this install: unlockSchematicFeature() itself
+-- persists appSettings.schematicUnlocked to disk, so a bare call from a
+-- unit test (which can run any time developer mode's dev panel re-runs the
+-- suite) would silently and permanently unlock the paid feature. This
+-- restores whatever the flag was before the test ran, then re-persists
+-- that original value.
+function unlockSchematicFeatureTest()
+    local prior = appSettings.schematicUnlocked
+    local result = unlockSchematicFeature()
+    appSettings.schematicUnlocked = prior
+    _saveAppSettings()
+    return result
+end
+
+function simulatePurchaseSchematic()
+    unlockSchematicFeature()
+    _refreshSchematicHomeAvailability()
+    _navSyncAll("SchematicHome")
+    gdsGui_page_switch("LoadingSchematicHome", 9, 2, false)
+end
+
+function cancelSchematicPaywall()
+    gdsGui_page_switch("LoadingMainMenu", 3, 3, false)
+end
+
+-------------------------------------------------------------------------------
+-- SYSTEM SCHEMATIC PAGE CALLBACKS
+-------------------------------------------------------------------------------
+
+function schematicModeToggled(newState)
+    local designing = (newState == globApp.BUTTON_STATES.PRESSED)
+    appSettings.schematicEditMode = designing
+    gdsGui_schematic_setMode("mainCanvas", designing and "design" or "control")
+    gdsGui_button_setState("schematicSnapshotBtn", designing and "released" or "deactivated")
+    gdsGui_button_setState("schematicFullScreenToggle", designing and "deactivated" or "released")
+    _saveAppSettings()
+end
+
+-- Control-mode "full screen": re-homes the live mainCanvas object onto its
+-- own dock-free page, rather than duplicating canvas data onto a second
+-- object — same canvas, same elements/wires/controls, just reassigned page +
+-- geometry until the user returns. Covers the full-screen page's entire
+-- safe area with no margin: the embedded view's box already has the same
+-- aspect ratio as the full screen (schCanvasWFrac == schCanvasHFrac in
+-- love.load(), so canvas.w/canvas.h == safeW/safeH there too), so expanding
+-- it to 100%/100% here is a uniform scale-up with no stretch, not a shape
+-- change.
+function schematicFullScreenTogglePressed()
+    if _schematicFullScreen then return end
+    local canvas = _findSchematicCanvas()
+    if not canvas or not _schematicCanvasNormalLayout then return end
+    _schematicFullScreen = true
+    canvas.page = "SchematicFullScreen"
+
+    canvas.original = { x = 0, y = 0, anchorPoint = "LT", wFrac = 1, hFrac = 1 }
+    -- Already at its maximum here, so there's nothing further for zooming
+    -- in to expand into — without this, zooming in while full-screen would
+    -- wrongly fall back to the embedded page's (now stale) zoomed layout.
+    gdsGui_schematic_clearZoomedLayout("mainCanvas")
+    canvas:resize()
+    globApp.currentPageIndex = 10
+end
+
+function schematicFullScreenReturnPressed()
+    if not _schematicFullScreen then return end
+    local canvas = _findSchematicCanvas()
+    if not canvas then return end
+    _schematicFullScreen = false
+    canvas.page = "SystemSchematic"
+    if _schematicCanvasNormalLayout then canvas.original = _schematicCanvasNormalLayout end
+    if _schematicCanvasZoomedLayout then
+        gdsGui_schematic_setZoomedLayout("mainCanvas",
+            _schematicCanvasZoomedLayout.x, _schematicCanvasZoomedLayout.y, _schematicCanvasZoomedLayout.anchorPoint,
+            _schematicCanvasZoomedLayout.wFrac, _schematicCanvasZoomedLayout.hFrac)
+    end
+    canvas:resize()
+    globApp.currentPageIndex = 7
+end
+
+-- Captures the current control-position combination's element/wire colors as
+-- a snapshot rule. If a snapshot already exists for this exact combination
+-- with DIFFERENT colors, that's a contradiction: prompt before overwriting.
+function captureSchematicSnapshot()
+    -- Same guard as schematicContextButtonPressed above: don't clobber an
+    -- in-progress ADD ELEMENT/CONTROL cascade (or any other open canvas
+    -- menu) by opening the conflict-confirm menu out from under it.
+    if gdsGui_schematic_isMenuOpen("mainCanvas") then return end
+    local plan = gdsGui_schematic_prepareSnapshot("mainCanvas")
+    if plan.hasConflict then
+        _pendingSnapshotPlan = plan
+        gdsGui_schematic_openMenu("mainCanvas", "CONFLICTS WITH EXISTING SNAPSHOT",
+            {"OVERWRITE", "CANCEL"}, "schematicSnapshotConflictResolved", "schematicSnapshotConflictResolved")
+    else
+        gdsGui_schematic_commitSnapshot("mainCanvas", plan)
+        gdsGui_outputTxtBox_setText("schematicSnapshotLabel", "SNAPSHOTS: " .. gdsGui_schematic_countSnapshots("mainCanvas"))
+        _schematicDirty = true
+        _saveCurrentSystem()
+        if appSettings.hapticsEnabled and love.system.vibrate then love.system.vibrate(0.1) end
+        if appSettings.soundEnabled and singleChimeSound then love.audio.play(singleChimeSound) end
+    end
+end
+
+-- Shared onSelect/onCancel for the conflict-confirm menu: cancel (tap outside,
+-- or the CANCEL row) calls this with no selected option, which falls through
+-- without committing.
+function schematicSnapshotConflictResolved(canvasName, index, optionText)
+    if optionText == "OVERWRITE" and _pendingSnapshotPlan then
+        gdsGui_schematic_commitSnapshot(canvasName, _pendingSnapshotPlan)
+        gdsGui_outputTxtBox_setText("schematicSnapshotLabel", "SNAPSHOTS: " .. gdsGui_schematic_countSnapshots(canvasName))
+        _schematicDirty = true
+        _saveCurrentSystem()
+    end
+    _pendingSnapshotPlan = nil
+end
+
+-------------------------------------------------------------------------------
+-- SYSTEM SCHEMATIC — SNAPSHOTS LIST PAGE
+-- Read-only view of every snapshot captured on the current system: a
+-- thumbnail rendered with that snapshot's own colors, and a text list of the
+-- control positions it was captured under. Reached from design mode's
+-- ACTIONS menu (VIEW SNAPSHOTS).
+-------------------------------------------------------------------------------
+
+-- One gallery item per captured snapshot. Reuses the live canvas's current
+-- elements/wires for position/shape (a snapshot has no geometry of its own,
+-- only colors), with each entity's color overridden to what THAT snapshot
+-- recorded — falling back to the live defaultColor for anything added after
+-- it was captured, so the thumbnail never just goes blank for those.
+local function _buildSnapshotGalleryItems()
+    local canvas = _findSchematicCanvas()
+    local items = {}
+    if not canvas then return items end
+
+    local controlById = {}
+    for _, c in ipairs(canvas.controls) do controlById[c.id] = c end
+
+    local signatures = {}
+    for sig in pairs(canvas.snapshots) do table.insert(signatures, sig) end
+    table.sort(signatures)
+
+    for _, sig in ipairs(signatures) do
+        local snap = canvas.snapshots[sig]
+
+        local elements = {}
+        for _, e in ipairs(canvas.elements) do
+            local copy = _deepCopyTable(e)
+            copy.defaultColor = (snap.elements and snap.elements[e.id]) or e.defaultColor
+            table.insert(elements, copy)
+        end
+        local wires = {}
+        for _, w in ipairs(canvas.wires) do
+            local copy = _deepCopyTable(w)
+            copy.defaultColor = (snap.wires and snap.wires[w.id]) or w.defaultColor
+            table.insert(wires, copy)
+        end
+
+        -- Decode "id=detentIndex,id2=detentIndex2" (gdsGui_schematic_buildSignature)
+        -- back into readable "LABEL: POSITION" rows.
+        local statusLines = {}
+        if sig == "" then
+            table.insert(statusLines, "(NO CONTROLS)")
+        else
+            for part in sig:gmatch("[^,]+") do
+                local id, detentStr = part:match("^(.-)=(%d+)$")
+                local detentIndex = tonumber(detentStr)
+                local ctrl = id and controlById[id]
+                local posName = ctrl and ctrl.positions and detentIndex and ctrl.positions[detentIndex + 1]
+                table.insert(statusLines,
+                    (ctrl and (ctrl.label or id) or (id or part)) .. ": " .. (posName or tostring(detentIndex)))
+            end
+        end
+
+        table.insert(items, {
+            id = sig, name = snap.timestamp or sig,
+            elements = elements, wires = wires, controls = canvas.controls,
+            statusLines = statusLines,
+        })
+    end
+    return items
+end
+
+function schematicViewSnapshotsPressed()
+    if gdsGui_page_currentName() == "SystemSchematic" then _saveCurrentSystemIfDirty() end
+    gdsGui_schematicGallery_setItems("snapshotsGallery", _buildSnapshotGalleryItems())
+    _navSyncAll("SchematicSnapshots")
+    gdsGui_page_switch("LoadingSchematicSnapshots", 14, 2, false)
+end
+
+function navBackToSystemSchematic()
+    _navSyncAll("SystemSchematic")
+    gdsGui_page_switch("LoadingSchematic", 7, 3, false)
+end
+
+-- Sets every control named in a signature string ("id=detentIndex,...",
+-- gdsGui_schematic_buildSignature's format) to that recorded position —
+-- used by EDIT below to "jump" the live canvas back to the exact control
+-- combination a snapshot was captured under, so its colors resolve on the
+-- canvas and the user can tap an element/wire to recolor it, then use the
+-- SNAPSHOT button to recapture.
+local function _applySnapshotControlPositions(canvasName, signature)
+    if signature == "" then return end
+    for part in signature:gmatch("[^,]+") do
+        local id, detentStr = part:match("^(.-)=(%d+)$")
+        if id and detentStr then
+            gdsGui_schematic_setControlPosition(canvasName, id, tonumber(detentStr))
+        end
+    end
+end
+
+-- Tapping a snapshot tile opens a small EDIT/DELETE action menu, same
+-- cascading-menu convention as the aircraft/system galleries above.
+function schematicSnapshotGallerySelected(galleryName, snapshotSig)
+    _snapshotActionTargetSig = snapshotSig
+    gdsGui_schematicGallery_openMenu(galleryName, "SNAPSHOT ACTIONS",
+        {"EDIT (LOAD CONTROLS)", "DELETE", "CANCEL"}, "schematicSnapshotActionChosen", nil)
+end
+
+function schematicSnapshotActionChosen(galleryName, index, optionText)
+    if optionText == "EDIT (LOAD CONTROLS)" then
+        local canvas = _findSchematicCanvas()
+        if canvas and _snapshotActionTargetSig then
+            _applySnapshotControlPositions(canvas.name, _snapshotActionTargetSig)
+        end
+        navBackToSystemSchematic()
+    elseif optionText == "DELETE" then
+        gdsGui_schematicGallery_openMenu(galleryName, "DELETE THIS SNAPSHOT?",
+            {"DELETE", "CANCEL"}, "schematicSnapshotDeleteConfirmed", nil)
+    end
+    -- "CANCEL" (or tapping outside): no-op, _snapshotActionTargetSig is overwritten next time.
+end
+
+function schematicSnapshotDeleteConfirmed(galleryName, index, optionText)
+    if optionText == "DELETE" and _snapshotActionTargetSig then
+        gdsGui_schematic_removeSnapshot("mainCanvas", _snapshotActionTargetSig)
+        gdsGui_outputTxtBox_setText("schematicSnapshotLabel", "SNAPSHOTS: " .. gdsGui_schematic_countSnapshots("mainCanvas"))
+        _schematicDirty = true
+        _saveCurrentSystem()
+        gdsGui_schematicGallery_setItems("snapshotsGallery", _buildSnapshotGalleryItems())
+    end
+    _snapshotActionTargetSig = nil
+end
+
+-------------------------------------------------------------------------------
+-- SYSTEM SCHEMATIC TEST HELPERS
+-- Each builds its own throwaway canvas so these are independent of the real
+-- "mainCanvas" built in love.load(). Return values are kept to primitives
+-- (numbers/strings/booleans) to match this app's existing test-harness
+-- convention of comparing flattened values, not tables, by equality.
+-------------------------------------------------------------------------------
+
+function schematicCascadeDeleteTest()
+    gdsGui_schematic_delete("unitTestCanvas")
+    gdsGui_schematic_create("unitTestCanvas", "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_addElement("unitTestCanvas", "e1", "rect", 0, 0, 0.1, 0.1, "A", {1, 1, 1, 1})
+    gdsGui_schematic_addElement("unitTestCanvas", "e2", "rect", 0.5, 0.5, 0.1, 0.1, "B", {1, 1, 1, 1})
+    gdsGui_schematic_addWire("unitTestCanvas", "w1", "e1", "e2", {1, 1, 1, 1})
+    gdsGui_schematic_removeElement("unitTestCanvas", "e1")
+    for _, c in ipairs(globApp.objects.schematics) do
+        if c.name == "unitTestCanvas" then return #c.wires end
+    end
+    return -1
+end
+
+-- A wire's resolved color comes from its OWN snapshot entry, independent of
+-- the colors of the elements it connects.
+function schematicResolveColorIndependenceTest()
+    gdsGui_schematic_delete("unitTestCanvas2")
+    gdsGui_schematic_create("unitTestCanvas2", "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_addElement("unitTestCanvas2", "eA", "rect", 0, 0, 0.1, 0.1, "A", {1, 0, 0, 1})
+    gdsGui_schematic_addElement("unitTestCanvas2", "eB", "rect", 0.5, 0.5, 0.1, 0.1, "B", {0, 0, 1, 1})
+    gdsGui_schematic_addWire("unitTestCanvas2", "wAB", "eA", "eB", {0, 0, 0, 1})
+    gdsGui_schematic_commitSnapshot("unitTestCanvas2", { signature = "", elements = {}, wires = { wAB = {0, 1, 0, 1} } })
+    local _, g = gdsGui_schematic_resolveColor("unitTestCanvas2", "wire", "wAB")
+    return g
+end
+
+function schematicPrepareSnapshotShapeTest()
+    gdsGui_schematic_delete("unitTestCanvas3")
+    gdsGui_schematic_create("unitTestCanvas3", "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_addElement("unitTestCanvas3", "e1", "rect", 0, 0, 0.1, 0.1, "A", {0.2, 0.3, 0.4, 1})
+    local plan = gdsGui_schematic_prepareSnapshot("unitTestCanvas3")
+    local c = plan.elements["e1"]
+    if plan.signature == "" and c and c[1] == 0.2 and c[2] == 0.3 and c[3] == 0.4 and c[4] == 1
+       and plan.wires["e1"] == nil and plan.hasConflict == false then
+        return "pass"
+    end
+    return "fail"
+end
+
+-- Re-capturing the exact same control combination's snapshot with a
+-- different resolved color must surface as a conflict (plan.hasConflict),
+-- so the app prompts to OVERWRITE/CANCEL instead of silently clobbering
+-- what was previously recorded (see captureSchematicSnapshot).
+function schematicPrepareSnapshotConflictTest()
+    gdsGui_schematic_delete("unitTestCanvas8")
+    gdsGui_schematic_create("unitTestCanvas8", "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_addElement("unitTestCanvas8", "e1", "rect", 0, 0, 0.1, 0.1, "A", {1, 0, 0, 1})
+    gdsGui_schematic_commitSnapshot("unitTestCanvas8", { signature = "", elements = { e1 = {1, 0, 0, 1} }, wires = {} })
+    gdsGui_schematic_setPendingColor("unitTestCanvas8", "element", "e1", {0, 0, 1, 1})
+    local plan = gdsGui_schematic_prepareSnapshot("unitTestCanvas8")
+    if plan.hasConflict then return "pass" end
+    return "fail"
+end
+
+-- Adding a new control after a snapshot was captured changes the live
+-- signature (the new control joins it), orphaning the old snapshot key —
+-- re-capturing under the same conditions for the controls that already
+-- existed must replace that orphan rather than leave it behind alongside a
+-- disconnected new entry (see _matchingSnapshotKeys in schematic_gdsGuiLib.lua).
+function schematicSnapshotMigratesOnControlAddedTest()
+    gdsGui_schematic_delete("unitTestCanvas9")
+    gdsGui_schematic_create("unitTestCanvas9", "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_addElement("unitTestCanvas9", "e1", "rect", 0, 0, 0.1, 0.1, "A", {0.55, 0.55, 0.55, 1})
+    gdsGui_schematic_addControl("unitTestCanvas9", "c1", 0, 0, {"OFF", "ON"}, 0, "C1", nil)
+    gdsGui_schematic_commitSnapshot("unitTestCanvas9", { signature = "c1=0", elements = { e1 = {1, 0, 0, 1} }, wires = {} })
+    gdsGui_schematic_addControl("unitTestCanvas9", "c2", 0, 0, {"OFF", "ON"}, 0, "C2", nil)
+    local plan = gdsGui_schematic_prepareSnapshot("unitTestCanvas9")
+    gdsGui_schematic_commitSnapshot("unitTestCanvas9", plan)
+    for _, c in ipairs(globApp.objects.schematics) do
+        if c.name == "unitTestCanvas9" then
+            if c.snapshots["c1=0"] == nil and c.snapshots["c1=0,c2=0"] ~= nil then return "pass" end
+            return "fail"
+        end
+    end
+    return "fail"
+end
+
+-- Same migration, the other direction: removing a control shrinks the
+-- signature, so the old (now-unreachable) wider-signature snapshot must be
+-- replaced by the new capture under the narrower one.
+function schematicSnapshotMigratesOnControlRemovedTest()
+    gdsGui_schematic_delete("unitTestCanvas10")
+    gdsGui_schematic_create("unitTestCanvas10", "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_addElement("unitTestCanvas10", "e1", "rect", 0, 0, 0.1, 0.1, "A", {0.55, 0.55, 0.55, 1})
+    gdsGui_schematic_addControl("unitTestCanvas10", "c1", 0, 0, {"OFF", "ON"}, 0, "C1", nil)
+    gdsGui_schematic_addControl("unitTestCanvas10", "c2", 0, 0, {"OFF", "ON"}, 0, "C2", nil)
+    gdsGui_schematic_commitSnapshot("unitTestCanvas10", { signature = "c1=0,c2=0", elements = { e1 = {1, 0, 0, 1} }, wires = {} })
+    gdsGui_schematic_removeControl("unitTestCanvas10", "c2")
+    local plan = gdsGui_schematic_prepareSnapshot("unitTestCanvas10")
+    gdsGui_schematic_commitSnapshot("unitTestCanvas10", plan)
+    for _, c in ipairs(globApp.objects.schematics) do
+        if c.name == "unitTestCanvas10" then
+            if c.snapshots["c1=0,c2=0"] == nil and c.snapshots["c1=0"] ~= nil then return "pass" end
+            return "fail"
+        end
+    end
+    return "fail"
+end
+
+function schematicModeToggleTest()
+    gdsGui_schematic_delete("unitTestCanvas4")
+    gdsGui_schematic_create("unitTestCanvas4", "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_setMode("unitTestCanvas4", "control")
+    return gdsGui_schematic_getMode("unitTestCanvas4")
+end
+
+-- No snapshot exists yet for the current (no-control) signature, so the
+-- element must fall back to its own default color.
+function schematicResolveColorFallbackTest()
+    gdsGui_schematic_delete("unitTestCanvas5")
+    gdsGui_schematic_create("unitTestCanvas5", "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_addElement("unitTestCanvas5", "e1", "rect", 0, 0, 0.1, 0.1, "A", {0.2, 0.3, 0.4, 1})
+    local r = gdsGui_schematic_resolveColor("unitTestCanvas5", "element", "e1")
+    return r
+end
+
+-- A snapshot captured for the control's current detent must be replayed the
+-- next time that same combination is active — "the logic recreated".
+function schematicResolveColorSnapshotMatchTest()
+    gdsGui_schematic_delete("unitTestCanvas6")
+    gdsGui_schematic_create("unitTestCanvas6", "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_addElement("unitTestCanvas6", "e1", "rect", 0, 0, 0.1, 0.1, "A", {0.55, 0.55, 0.55, 1})
+    gdsGui_schematic_addControl("unitTestCanvas6", "c1", 0, 0, {"OFF", "ON"}, 0, "C1", nil)
+    gdsGui_schematic_commitSnapshot("unitTestCanvas6", { signature = "c1=0", elements = { e1 = {1, 0, 0, 1} }, wires = {} })
+    local r = gdsGui_schematic_resolveColor("unitTestCanvas6", "element", "e1")
+    return r
+end
+
+-- A live color-picker override takes priority over any matching snapshot.
+function schematicPendingColorOverrideTest()
+    gdsGui_schematic_delete("unitTestCanvas7")
+    gdsGui_schematic_create("unitTestCanvas7", "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_addElement("unitTestCanvas7", "e1", "rect", 0, 0, 0.1, 0.1, "A", {0.55, 0.55, 0.55, 1})
+    gdsGui_schematic_setPendingColor("unitTestCanvas7", "element", "e1", {0, 1, 1, 1})
+    local r = gdsGui_schematic_resolveColor("unitTestCanvas7", "element", "e1")
+    return r
 end
 
 -------------------------------------------------------------------------------
@@ -1698,8 +3482,89 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcParameters"]={1},
         ["funcExpctOutput"]={16}}
 
+    --------------------------------------------------------------------------
+    --  SYSTEM SCHEMATIC (premium feature)
+    --------------------------------------------------------------------------
+    gdsGui_dev_testExecute {["id"]="schematic_buildSignature_sortsByControlId",
+        ["funcName"]={"gdsGui_schematic_buildSignature"},
+        ["funcParameters"]={ {{id="b",detentIndex=1},{id="a",detentIndex=0}} },
+        ["funcExpctOutput"]={"a=0,b=1"}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_buildSignature_empty",
+        ["funcName"]={"gdsGui_schematic_buildSignature"},
+        ["funcParameters"]={ {} },
+        ["funcExpctOutput"]={""}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_colorsDiffer_sameColors_noConflict",
+        ["funcName"]={"gdsGui_schematic_colorsDiffer"},
+        ["funcParameters"]={ {elements={e1={1,0,0,1}}, wires={}}, {elements={e1={1,0,0,1}}, wires={}} },
+        ["funcExpctOutput"]={false}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_colorsDiffer_differentColors_detectsConflict",
+        ["funcName"]={"gdsGui_schematic_colorsDiffer"},
+        ["funcParameters"]={ {elements={e1={1,0,0,1}}, wires={}}, {elements={e1={0,1,0,1}}, wires={}} },
+        ["funcExpctOutput"]={true}}
+
+    -- NOTE: funcParameters always carries one harmless dummy value even for
+    -- zero-argument functions — gdsGui_dev_testCreate() builds its call string
+    -- from #funcParameters and a bare "(,true)" is a Lua syntax error when
+    -- that count is 0. Lua ignores the extra argument on the real function.
+    gdsGui_dev_testExecute {["id"]="schematic_addWire_cascadeDeleteOnElementRemoval",
+        ["funcName"]={"schematicCascadeDeleteTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={0}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_wireColor_independentOfEndpoints",
+        ["funcName"]={"schematicResolveColorIndependenceTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_prepareSnapshot_shape",
+        ["funcName"]={"schematicPrepareSnapshotShapeTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"pass"}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_prepareSnapshot_flagsConflictOnOverwrite",
+        ["funcName"]={"schematicPrepareSnapshotConflictTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"pass"}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_snapshot_migratesOnControlAdded",
+        ["funcName"]={"schematicSnapshotMigratesOnControlAddedTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"pass"}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_snapshot_migratesOnControlRemoved",
+        ["funcName"]={"schematicSnapshotMigratesOnControlRemovedTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"pass"}}
+
+    gdsGui_dev_testExecute {["id"]="schematicModeToggled_switchesLibraryMode",
+        ["funcName"]={"schematicModeToggleTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"control"}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_resolveColor_fallsBackToDefaultWhenNoSnapshot",
+        ["funcName"]={"schematicResolveColorFallbackTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={0.2}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_resolveColor_usesMatchingSnapshot",
+        ["funcName"]={"schematicResolveColorSnapshotMatchTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_resolveColor_pendingOverrideWinsOverSnapshot",
+        ["funcName"]={"schematicPendingColorOverrideTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={0}}
+
+    gdsGui_dev_testExecute {["id"]="unlockSchematicFeature_setsEntitlementFlag",
+        ["funcName"]={"unlockSchematicFeatureTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={true}}
+
 end)
 
 -- Build the unit-test table widget now that both "gui" and "app" suites are registered.
 gdsGui_dev_createUnitTestObjects()
-
