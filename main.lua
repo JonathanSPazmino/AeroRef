@@ -9,7 +9,7 @@
 -------------------------------------------------------------------------------
 require("Libraries.gds_love2d_gui.loader_gdsGuiLib")
 
-APP_VERSION = "1.0.9"
+APP_VERSION = "1.0.11"
 
 -- Original orientation the app was designed for; used by the GUI library to
 -- establish the reference container width at first finalize (portrait = 1 col).
@@ -364,6 +364,15 @@ local _schematicCanvasNormalLayout = nil
 local _schematicCanvasZoomedLayout = nil
 local _prevSchematicZoomText = nil
 local _schematicZoomFullScreenFont = nil
+
+-- Sentinels for the combination-readout poll in love.update() below (see
+-- "Schematic combination readout") — same dirty-flag-rendering convention as
+-- _prevSchematicZoomText above: only pushes a widget update when the
+-- underlying value actually changed.
+local _prevSchematicCombText        = nil
+local _prevSchematicCombHasSnapshot = nil
+local _prevSchematicCombCanCycle    = nil
+local _prevSchematicSnapshotCount   = nil
 
 local function _findSchematicCanvas()
     for _, c in ipairs(globApp.objects.schematics) do
@@ -1983,6 +1992,28 @@ function love.load()
         0.875, schBtnRowYFrac, "CT", 30, 30,
         "schematicFullScreenTogglePressed", globApp.BUTTON_STATES.DEACTIVATED, true, nil
     )
+    -- COMBINATION PREV/NEXT — design-mode-only, fixed at the left/right
+    -- middle of the screen (containerName nil, so like every other floating
+    -- schematic chrome button they're positioned straight off safeScreenArea
+    -- and never move with the canvas's own pan/zoom). Each press walks the
+    -- control-position combination counter one step (see
+    -- gdsGui_schematic_stepCombination) — deactivated whenever there's
+    -- nothing to cycle (control mode, or fewer than 2 total combinations),
+    -- see the per-frame poll in love.update() below.
+    gdsGui_button_create("schematicCombPrevBtn", "SystemSchematic", "pushonoff",
+        "Sprites/button_schematicCombPrev_pressed.png",
+        "Sprites/button_schematicCombPrev_released.png",
+        "Sprites/button_schematicCombPrev_deactivated.png",
+        0.03, 0.5, "LC", 32, 32,
+        "schematicCombPrevPressed", globApp.BUTTON_STATES.DEACTIVATED, true, nil
+    )
+    gdsGui_button_create("schematicCombNextBtn", "SystemSchematic", "pushonoff",
+        "Sprites/button_schematicCombNext_pressed.png",
+        "Sprites/button_schematicCombNext_released.png",
+        "Sprites/button_schematicCombNext_deactivated.png",
+        0.97, 0.5, "RC", 32, 32,
+        "schematicCombNextPressed", globApp.BUTTON_STATES.DEACTIVATED, true, nil
+    )
     -- Narrowed from the old full-width centered box (and anchored off the
     -- opposite side of center) to leave room for schematicZoomLabel right
     -- beside it, so the pair reads as one centered row: "SNAPSHOTS: 0  1.0x".
@@ -1993,6 +2024,26 @@ function love.load()
     gdsGui_outputTxtBox_create("schematicZoomLabel", "SystemSchematic", nil,
         0.52, schLabelYFrac, "LT", _w(60), 20,
         colorYellow, "1.0x", 10, nil
+    )
+    -- COMBINATION readout — [current/total] of every possible control-
+    -- position combination, plus a checkmark that's green once a snapshot
+    -- has been captured for whichever combination is currently showing
+    -- (gray/empty otherwise). Sits right of schematicZoomLabel, same row.
+    gdsGui_outputTxtBox_create("schematicCombLabel", "SystemSchematic", nil,
+        0.72, schLabelYFrac, "LT", _w(46), 20,
+        colorYellow, "[1/1]", 10, nil
+    )
+    -- fontSize 10 (not 1) despite this box showing no text of its own: love's
+    -- font is global draw state, and outputTxtBox_draw sets it per box
+    -- (including text-less ones) — being the last outputTxtBox on this page,
+    -- a tiny fontSize here would otherwise leak into gdsGui_schematic_draw's
+    -- own element/control label text right after, shrinking it to the point
+    -- of illegibility (see schematicZoomLabel/schematicCombLabel above, which
+    -- this matches).
+    gdsGui_outputTxtBox_create("schematicCombCheckIcon", "SystemSchematic",
+        "Sprites/icon_schematicCombSnapshot_empty.png",
+        0.985, schLabelYFrac, "RT", _w(16), _w(16),
+        {1, 1, 1, 1}, "", 10, nil
     )
     gdsGui_schematic_create("mainCanvas", "SystemSchematic", schCanvasXFrac, schCanvasYFrac, "LT", schCanvasWFrac, schCanvasHFrac)
     gdsGui_schematic_setBackgroundImage("mainCanvas", "Sprites/bg_schematicCanvas.png")
@@ -2250,6 +2301,47 @@ function love.update(dt)
         if zoomText ~= _prevSchematicZoomText then
             _prevSchematicZoomText = zoomText
             gdsGui_outputTxtBox_setText("schematicZoomLabel", zoomText)
+        end
+    end
+
+    -- Schematic combination readout ([current/total] + snapshot checkmark,
+    -- PREV/NEXT button activation) — polled for the same reason the zoom
+    -- readout above is: the combination a control-mode tap/cycle lands on
+    -- changes outside of any callback this app layer owns, so there's no
+    -- single discrete event to push from. gdsGui_schematic_isMenuOpen also
+    -- guards against polling mid-placement, where canvas.controls can be in
+    -- a transient state.
+    if _findSchematicCanvas() and not gdsGui_schematic_isMenuOpen("mainCanvas") then
+        local combIndex = gdsGui_schematic_getCombinationIndex("mainCanvas")
+        local combTotal = gdsGui_schematic_getCombinationTotal("mainCanvas")
+        local combText = string.format("[%d/%d]", combIndex, combTotal)
+        if combText ~= _prevSchematicCombText then
+            _prevSchematicCombText = combText
+            gdsGui_outputTxtBox_setText("schematicCombLabel", combText)
+        end
+
+        local hasSnap = gdsGui_schematic_hasSnapshot("mainCanvas", gdsGui_schematic_computeSignature("mainCanvas"))
+        if hasSnap ~= _prevSchematicCombHasSnapshot then
+            _prevSchematicCombHasSnapshot = hasSnap
+            gdsGui_outputTxtBox_setBgSprite("schematicCombCheckIcon",
+                hasSnap and "Sprites/icon_schematicCombSnapshot_taken.png" or "Sprites/icon_schematicCombSnapshot_empty.png")
+        end
+
+        -- Only pushed on change (not every frame) so a mid-press PRESSED
+        -- sprite isn't stomped back to RELEASED by this poll before the
+        -- button library gets a chance to draw it.
+        local canCycle = combTotal > 1 and gdsGui_schematic_getMode("mainCanvas") == "design"
+        if canCycle ~= _prevSchematicCombCanCycle then
+            _prevSchematicCombCanCycle = canCycle
+            local state = canCycle and "released" or "deactivated"
+            gdsGui_button_setState("schematicCombPrevBtn", state)
+            gdsGui_button_setState("schematicCombNextBtn", state)
+        end
+
+        local snapCount = gdsGui_schematic_countSnapshots("mainCanvas")
+        if snapCount ~= _prevSchematicSnapshotCount then
+            _prevSchematicSnapshotCount = snapCount
+            gdsGui_outputTxtBox_setText("schematicSnapshotLabel", "SNAPSHOTS: " .. snapCount)
         end
     end
 
@@ -2975,6 +3067,30 @@ function schematicSnapshotConflictResolved(canvasName, index, optionText)
         _saveCurrentSystem()
     end
     _pendingSnapshotPlan = nil
+end
+
+-- COMBINATION PREV/NEXT — steps to the next/previous control-position
+-- combination (gdsGui_schematic_stepCombination), which also resets every
+-- element/wire/control to the selectable gray color. Same "don't clobber an
+-- in-progress canvas menu" guard as captureSchematicSnapshot above; the
+-- buttons themselves are only active in design mode with 2+ combinations to
+-- begin with (see the per-frame poll in love.update() below), but a guard
+-- here too costs nothing and covers a press already in flight when a menu
+-- opens.
+function schematicCombPrevPressed()
+    if gdsGui_schematic_isMenuOpen("mainCanvas") then return end
+    gdsGui_schematic_pushUndo("mainCanvas")
+    gdsGui_schematic_stepCombination("mainCanvas", -1)
+    _schematicDirty = true
+    _saveCurrentSystem()
+end
+
+function schematicCombNextPressed()
+    if gdsGui_schematic_isMenuOpen("mainCanvas") then return end
+    gdsGui_schematic_pushUndo("mainCanvas")
+    gdsGui_schematic_stepCombination("mainCanvas", 1)
+    _schematicDirty = true
+    _saveCurrentSystem()
 end
 
 -------------------------------------------------------------------------------

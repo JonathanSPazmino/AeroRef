@@ -309,12 +309,20 @@ function gdsGui_schematic_placementNameConfirmed(name)
         gdsGui_schematic_addElement(pending.canvasName, pending.newId, pending.shapeType,
             pending.fracX, pending.fracY, _ELEMENT_DEFAULT_W_FRAC, _ELEMENT_DEFAULT_H_FRAC,
             trimmed, pending.defaultColor, properties, nil, pending.spritePath)
+        -- A new element changes the cast of what a captured snapshot colors,
+        -- so every existing snapshot (keyed to the old cast) is wiped rather
+        -- than left stale — see the CONTROL-POSITION COMBINATION CYCLING
+        -- section below for the matching combination-count side effect.
+        canvas.snapshots = {}
         _notifyChanged(canvas)
     else
         _pushUndo(canvas)
         gdsGui_schematic_addControl(pending.canvasName, pending.newId, pending.fracX, pending.fracY,
             pending.positions, 0, trimmed, pending.callbackFunc, 1 / _EDIT_MODE_INITIAL_ZOOM, pending.spritePaths,
             nil, pending.overlaySpritePath)
+        -- New control = new combinations to cycle through, so old snapshots
+        -- (captured under the old control set) no longer mean anything.
+        canvas.snapshots = {}
         _notifyChanged(canvas)
     end
     _pendingNamedPlacement = nil
@@ -773,6 +781,15 @@ function gdsGui_schematic_setMode(canvasName, mode)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     canvas.mode = mode
+    -- pendingColor is a design-mode-only preview (see resolveColor) — left
+    -- set (e.g. the gray placeholder gdsGui_schematic_resetColorsToDefault
+    -- leaves on an uncaptured combination, or a picked-but-never-captured
+    -- color) it would otherwise leak into control mode, where resolveColor
+    -- checks it BEFORE the signature-matched snapshot and so masks every
+    -- snapshot cycled to with that stale preview instead of replaying it.
+    for _, e in ipairs(canvas.elements) do e.pendingColor = nil end
+    for _, w in ipairs(canvas.wires) do w.pendingColor = nil end
+    for _, c in ipairs(canvas.controls) do c.pendingColor = nil end
     canvas.wireToolActive = false
     canvas.wireTool.fromId = nil
     canvas.wireTool.color = nil
@@ -1527,6 +1544,14 @@ function gdsGui_schematic_internal_onElementEditChosen(canvasName, index)
         if el then
             _pushUndo(canvas)
             el.defaultColor = entry.color
+            -- Also set pendingColor (not just the permanent defaultColor):
+            -- gdsGui_schematic_resetColorsToDefault leaves every entity's
+            -- pendingColor forced to gray after a combination change, and
+            -- resolveColor checks pendingColor BEFORE defaultColor, so
+            -- without this the pick would silently stay masked by that gray
+            -- placeholder instead of showing immediately like ASSIGN COLOR's
+            -- preview does.
+            el.pendingColor = entry.color
             _notifyChanged(canvas)
         end
     end
@@ -1555,6 +1580,7 @@ function gdsGui_schematic_internal_onElementDeleteConfirmed(canvasName, index, o
     if optionText == "DELETE" and elementId then
         _pushUndo(canvas)
         gdsGui_schematic_removeElement(canvasName, elementId)
+        canvas.snapshots = {}
         _notifyChanged(canvas)
     end
 end
@@ -1661,6 +1687,10 @@ function gdsGui_schematic_internal_onWireEditChosen(canvasName, index)
         if w then
             _pushUndo(canvas)
             w.defaultColor = entry.color
+            -- See the matching comment in onElementEditChosen above: without
+            -- also setting pendingColor, a forced-gray placeholder left by
+            -- gdsGui_schematic_resetColorsToDefault would mask this pick.
+            w.pendingColor = entry.color
             _notifyChanged(canvas)
         end
     end
@@ -1689,6 +1719,7 @@ function gdsGui_schematic_internal_onWireDeleteConfirmed(canvasName, index, opti
     if optionText == "DELETE" and wireId then
         _pushUndo(canvas)
         gdsGui_schematic_removeWire(canvasName, wireId)
+        canvas.snapshots = {}
         _notifyChanged(canvas)
     end
 end
@@ -1733,6 +1764,11 @@ function gdsGui_schematic_internal_onControlEditChosen(canvasName, index, option
             if ctrl then
                 _pushUndo(canvas)
                 ctrl.defaultColor = entry.color
+                -- See the matching comment in onElementEditChosen above:
+                -- without also setting pendingColor, a forced-gray
+                -- placeholder left by gdsGui_schematic_resetColorsToDefault
+                -- would mask this pick.
+                ctrl.pendingColor = entry.color
                 _notifyChanged(canvas)
             end
         end
@@ -1796,6 +1832,7 @@ function gdsGui_schematic_internal_onControlDeleteConfirmed(canvasName, index, o
     if optionText == "DELETE" and controlId then
         _pushUndo(canvas)
         gdsGui_schematic_removeControl(canvasName, controlId)
+        canvas.snapshots = {}
         _notifyChanged(canvas)
     end
 end
@@ -2016,25 +2053,17 @@ function gdsGui_schematic_resolveColor(canvasName, targetKind, targetId)
 end
 
 -- Like resolveColor above, but this is the one actually drawn on the canvas
--- (_drawElement/_drawWire below) — snapshot playback only ever applies in
--- CONTROL (operate) mode. In DESIGN mode, repositioning a control to set up
--- a capture target must never itself change what's shown (a pendingColor
--- preview from ASSIGN COLOR still shows); only an explicit CAPTURE SNAPSHOT
--- changes the picture. gdsGui_schematic_prepareSnapshot still calls the full
--- resolveColor above directly, so a recapture correctly preserves every
--- other element/wire's previously-captured color for this signature.
+-- (_drawElement/_drawWire below). Used to skip the snapshot lookup entirely
+-- in DESIGN mode so repositioning a control to set up a capture target
+-- couldn't silently replay a different combination's snapshot. That's now
+-- handled upstream instead — gdsGui_schematic_stepCombination (the only way
+-- a control's position changes in design mode) force-resets every pendingColor
+-- to gray the instant the combination changes, via resetColorsToDefault — so
+-- deferring to the full resolveColor here is safe, and necessary: once
+-- commitSnapshot bakes a pick in (clearing pendingColor), this needs to fall
+-- through to the snapshot it just wrote, not all the way to bare defaultColor,
+-- or the canvas would look like the capture silently reverted.
 function gdsGui_schematic_resolveDisplayColor(canvasName, targetKind, targetId)
-    local canvas = _findCanvas(canvasName)
-    if canvas and canvas.mode == "design" then
-        local target = _findByKind(canvas, targetKind, targetId)
-        if not target then return _DEFAULT_COLOR[1], _DEFAULT_COLOR[2], _DEFAULT_COLOR[3], _DEFAULT_COLOR[4] end
-        if target.pendingColor then
-            local c = target.pendingColor
-            return c[1], c[2], c[3], c[4]
-        end
-        local dc = target.defaultColor or _DEFAULT_COLOR
-        return dc[1], dc[2], dc[3], dc[4]
-    end
     return gdsGui_schematic_resolveColor(canvasName, targetKind, targetId)
 end
 
@@ -2189,6 +2218,93 @@ end
 function gdsGui_schematic_removeAllSnapshots(canvasName)
     local canvas = _findCanvas(canvasName)
     if canvas then canvas.snapshots = {} end
+end
+
+function gdsGui_schematic_hasSnapshot(canvasName, signature)
+    local canvas = _findCanvas(canvasName)
+    return canvas ~= nil and canvas.snapshots[signature] ~= nil
+end
+
+--------------------------------------------------------------------------------
+-- PUBLIC API — CONTROL-POSITION COMBINATION CYCLING (app-layer PREV/NEXT
+-- arrows). A "combination" is one assignment of every control's detentIndex
+-- — the same thing a snapshot's signature (gdsGui_schematic_computeSignature
+-- above) encodes — so walking every combination is just a mixed-radix
+-- counter over canvas.controls, sorted by id (the same canonical order
+-- gdsGui_schematic_buildSignature uses so the two stay in lockstep), one
+-- control's numDetents per digit. Total combinations is the product of every
+-- control's numDetents — 1 when there are no controls (a single, trivial
+-- combination).
+--------------------------------------------------------------------------------
+
+local function _sortedControls(canvas)
+    local sorted = {}
+    for _, c in ipairs(canvas.controls) do table.insert(sorted, c) end
+    table.sort(sorted, function(a, b) return a.id < b.id end)
+    return sorted
+end
+
+function gdsGui_schematic_getCombinationTotal(canvasName)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return 1 end
+    local total = 1
+    for _, c in ipairs(canvas.controls) do total = total * c.numDetents end
+    return total
+end
+
+-- 1-based index of the combination the controls' CURRENT positions
+-- represent, out of gdsGui_schematic_getCombinationTotal(canvasName).
+function gdsGui_schematic_getCombinationIndex(canvasName)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return 1 end
+    local idx = 0
+    for _, c in ipairs(_sortedControls(canvas)) do
+        idx = idx * c.numDetents + c.detentIndex
+    end
+    return idx + 1
+end
+
+-- Sets every element/wire/control's pendingColor to the flat default gray —
+-- the same "nothing captured yet" look a brand-new entity starts with (see
+-- resolveColor's pendingColor-first priority) — so a freshly-cycled-to
+-- combination always presents a blank slate instead of silently replaying
+-- whatever a previously captured snapshot for it looked like.
+function gdsGui_schematic_resetColorsToDefault(canvasName)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return end
+    for _, e in ipairs(canvas.elements) do e.pendingColor = { _DEFAULT_COLOR[1], _DEFAULT_COLOR[2], _DEFAULT_COLOR[3], _DEFAULT_COLOR[4] } end
+    for _, w in ipairs(canvas.wires) do w.pendingColor = { _DEFAULT_COLOR[1], _DEFAULT_COLOR[2], _DEFAULT_COLOR[3], _DEFAULT_COLOR[4] } end
+    for _, c in ipairs(canvas.controls) do c.pendingColor = { _DEFAULT_COLOR[1], _DEFAULT_COLOR[2], _DEFAULT_COLOR[3], _DEFAULT_COLOR[4] } end
+end
+
+-- Advances (direction = 1) or retreats (direction = -1) to the next/previous
+-- combination, wrapping at both ends, then resets every entity to the
+-- selectable gray color (see gdsGui_schematic_resetColorsToDefault above) —
+-- whether or not a snapshot already exists for the combination landed on;
+-- the app layer's checkmark readout (driven by gdsGui_schematic_hasSnapshot)
+-- is how the user learns that without the colors being silently replayed
+-- here. Returns the new 1-based index and the total, so the caller can
+-- update its header readout without a second pass over canvas.controls.
+function gdsGui_schematic_stepCombination(canvasName, direction)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return 1, 1 end
+    local sorted = _sortedControls(canvas)
+
+    local total = 1
+    for _, c in ipairs(sorted) do total = total * c.numDetents end
+
+    local idx = 0
+    for _, c in ipairs(sorted) do idx = idx * c.numDetents + c.detentIndex end
+    idx = (idx + direction) % total
+
+    for i = #sorted, 1, -1 do
+        local c = sorted[i]
+        c.detentIndex = idx % c.numDetents
+        idx = math.floor(idx / c.numDetents)
+    end
+
+    gdsGui_schematic_resetColorsToDefault(canvasName)
+    return gdsGui_schematic_getCombinationIndex(canvasName), total
 end
 
 --------------------------------------------------------------------------------
@@ -3805,6 +3921,7 @@ function gdsGui_schematic_released(touchId, x, y)
                     gdsGui_schematic_addWire(canvas.name, _uniqueWireId(canvas, baseId),
                         canvas.wireTool.fromId, toElem.id,
                         canvas.wireTool.color or canvas.defaultConnectorColor or _DEFAULT_COLOR)
+                    canvas.snapshots = {}
                     _notifyChanged(canvas)
                 end
                 -- A catalog-armed connector is one-shot: disarm it once this

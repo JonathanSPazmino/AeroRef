@@ -710,6 +710,31 @@ function gdsGui_outputTxtBox_setText(name, text)
 	end
 end
 
+-- Swaps a textbox's background image after creation (e.g. toggling a status
+-- icon) — same lookup-by-name pattern as setText/setFontSize above. Caches
+-- loaded images by path so repeatedly flipping between a small fixed set of
+-- icons (the common case) doesn't reload the file each time.
+local _bgSpriteCache = {}
+local function _loadBgSprite(path)
+	if not _bgSpriteCache[path] then
+		_bgSpriteCache[path] = love.graphics.newImage(path)
+	end
+	return _bgSpriteCache[path]
+end
+
+function gdsGui_outputTxtBox_setBgSprite(name, path)
+	for _, box in ipairs(globApp.objects.outputTextBox) do
+		if box.name == name then
+			box.bgSprite.sprite = _loadBgSprite(path)
+			box.bgSprite.width  = box.origTotalWidth / box.bgSprite.sprite:getWidth()
+			box.bgSprite.height = box.frame.height / box.bgSprite.sprite:getHeight()
+			box.bgSprite.x = box.frame.x
+			box.bgSprite.y = box.frame.y
+			break
+		end
+	end
+end
+
 function gdsGui_outputTxtBox_setFontSize(name, newSize)
 	for _, box in ipairs(globApp.objects.outputTextBox) do
 		if box.name == name then
