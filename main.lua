@@ -420,6 +420,7 @@ local function _schematicCombControlsChanged(canvas)
 end
 local _prevSchematicSnapshotCount   = nil
 local _prevSchematicPaintActive     = nil
+local _prevSchematicAddBtnEnabled   = nil
 
 local function _findSchematicCanvas()
     for _, c in ipairs(globApp.objects.schematics) do
@@ -2526,6 +2527,19 @@ function love.update(dt)
             gdsGui_button_setState("schematicPaintBtn", "released")
         end
         _prevSchematicPaintActive = paintActive
+
+        -- schematicAddBtn (the "+" dock button) is likewise deactivated while
+        -- the brush is armed — starting the ADD cascade mid-stroke would
+        -- abandon the paint. Left alone in control mode, where the button is
+        -- already hidden/deactivated by the mode-switch code (see
+        -- _loadSchematicSystem and schematicModeTogglePressed).
+        if not isControlMode then
+            local addEnabled = not paintActive
+            if addEnabled ~= _prevSchematicAddBtnEnabled then
+                _prevSchematicAddBtnEnabled = addEnabled
+                gdsGui_button_setState("schematicAddBtn", addEnabled and "released" or "deactivated")
+            end
+        end
 
         -- Only pushed on change (not every frame) so a mid-press PRESSED
         -- sprite isn't stomped back to RELEASED by this poll before the

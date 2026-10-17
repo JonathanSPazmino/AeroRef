@@ -63,7 +63,7 @@ local _ELEMENT_DEFAULT_H_FRAC = 0.05
 local _PINCH_MIN_DIST_PX      = 1      -- guards against a near-zero divisor right as a pinch begins
 local _WIRE_WIDTH_PX         = 2 / 3   -- half of the previous 4/3px width
 local _WIRE_CROSS_HOP_RADIUS_PX = 2.5   -- radius of the little arc hop drawn where a wire crosses an unrelated one
-local _WIRE_PARALLEL_GAP_PX     = 5   -- spacing between adjacent lanes when 2+ wires' paths overlap (fully or partially)
+local _WIRE_PARALLEL_GAP_PX     = _WIRE_WIDTH_PX * 3   -- spacing between adjacent lanes when 2+ wires' paths overlap (fully or partially) — 3x the connector's own line width
 local _WIRE_PARALLEL_STUB_PX    = 8   -- unsplit length kept right at each anchor before a parallel lane's offset begins
 local _CONNECTOR_RELEASE_SLOP_PX = 16  -- forgiveness margin for "which element did the wire-drag land on", since exact-rectangle precision is unreliable on a touchscreen
 local _CONNECTOR_TARGET_RADIUS_PX = 9  -- drawn radius of the green "valid connection point" reticle shown at each element's center while a wire is being dragged
@@ -2995,6 +2995,15 @@ local function _segmentPerp(y1, y2)
     return -1, 0
 end
 
+-- Unit travel direction of an axis-aligned segment (+1/-1 along whichever
+-- axis it runs on) — used below to derive each bend segment's own SAFE
+-- perpendicular lane direction, as opposed to _segmentPerp's single
+-- canvas-wide convention.
+local function _segDir(seg)
+    if seg[2] == seg[4] then return (seg[3] > seg[1]) and 1 or -1, 0 end
+    return 0, (seg[4] > seg[2]) and 1 or -1
+end
+
 -- Do two perpendicular (one horizontal, one vertical) segments cross at a
 -- point strictly inside both — i.e. a true mid-path crossing, not merely
 -- touching at one of their own endpoints (a shared anchor or bend corner)?
@@ -3065,7 +3074,6 @@ local function _drawSegmentWithHopsAndOffset(x1, y1, x2, y2, hopDistances, offse
     if horiz then dirX, dirY = (x2 > x1) and 1 or -1, 0
     else          dirX, dirY = 0, (y2 > y1) and 1 or -1 end
     local length = horiz and math.abs(x2 - x1) or math.abs(y2 - y1)
-    local perpX, perpY = _segmentPerp(y1, y2)
     offsetRanges = offsetRanges or {}
 
     local function offsetAt(d)
@@ -3074,7 +3082,7 @@ local function _drawSegmentWithHopsAndOffset(x1, y1, x2, y2, hopDistances, offse
         if stubEnd and d > length - stubPx then return 0, 0 end
         for _, r in ipairs(offsetRanges) do
             if d >= r.lo - 0.01 and d <= r.hi + 0.01 then
-                return perpX * r.offset, perpY * r.offset
+                return r.offX, r.offY
             end
         end
         return 0, 0
@@ -3309,13 +3317,13 @@ end
 -- — kept in sync with that function's offsetAt() so a wire hit-tests exactly
 -- where it's actually drawn, lane offset included.
 local function _offsetAtDistance(d, length, offsetRanges, stubPx, stubStart, stubEnd)
-    if not offsetRanges or #offsetRanges == 0 then return 0 end
-    if stubStart and d < stubPx then return 0 end
-    if stubEnd and d > length - stubPx then return 0 end
+    if not offsetRanges or #offsetRanges == 0 then return 0, 0 end
+    if stubStart and d < stubPx then return 0, 0 end
+    if stubEnd and d > length - stubPx then return 0, 0 end
     for _, r in ipairs(offsetRanges) do
-        if d >= r.lo - 0.01 and d <= r.hi + 0.01 then return r.offset end
+        if d >= r.lo - 0.01 and d <= r.hi + 0.01 then return r.offX, r.offY end
     end
-    return 0
+    return 0, 0
 end
 
 local function _computeWirePlans(canvas)
@@ -3335,6 +3343,7 @@ local function _computeWirePlans(canvas)
             local x1, y1 = _anchorCenter(canvas, fromE)
             local x2, y2 = _anchorCenter(canvas, toE)
             local segments = _clampedOrthogonalSegments(canvas, fromE, x1, y1, toE, x2, y2, _wireForceAxis(w))
+            local numSegs = #segments
             plans[w.id] = { segments = segments, hopDistances = {}, offsetRanges = {} }
             for segIdx, seg in ipairs(segments) do
                 local horiz = (seg[2] == seg[4])
@@ -3344,8 +3353,52 @@ local function _computeWirePlans(canvas)
                 if hiAbs - loAbs > 0.01 then
                     local key = (horiz and "H:" or "V:") .. _roundPx(horiz and seg[2] or seg[1])
                     lineGroups[key] = lineGroups[key] or {}
+                    -- Where this segment DIVERGES from a shared bundle, used
+                    -- below to rank parallel lanes by real position instead
+                    -- of arbitrary creation order (see the sweep's sort).
+                    -- _clampedOrthogonalSegments always walks a wire's
+                    -- segments from fromAnchor toward toAnchor, so segment 1
+                    -- of a multi-segment plan starts AT a real anchor (the
+                    -- shared/bundled end) and ends at a bend — divergence is
+                    -- at its end. The last segment ends AT a real anchor
+                    -- instead — divergence is at its start. A single-segment
+                    -- (direct) wire is both at once; the "end" convention
+                    -- wins, same as any other non-final segment.
+                    local divergeCoord
+                    -- The lane direction that's actually safe for THIS
+                    -- segment — i.e. won't, at any offset magnitude, drift
+                    -- into the corridor swept out by the wire's OWN other
+                    -- segment on the far side of the bend (see the sweep's
+                    -- offset computation below for why a fixed canvas-wide
+                    -- convention like _segmentPerp can't guarantee that).
+                    -- A segment with a NEXT segment (bends away afterward)
+                    -- is safe opposite the direction that next segment
+                    -- travels in — moving that way instead would walk this
+                    -- segment's lane straight toward where the next one
+                    -- sweeps. A segment with only a PREVIOUS one (it's the
+                    -- last leg, bent into FROM that previous segment) is
+                    -- safe in that previous segment's own travel direction
+                    -- — continuing past the bend instead of doubling back
+                    -- toward where that leg came from. A single-segment
+                    -- (direct, no bend) wire has neither, so there's no
+                    -- corridor to avoid — kept on the old fixed convention.
+                    local safeDirX, safeDirY
+                    if segIdx == numSegs then
+                        divergeCoord = horiz and seg[1] or seg[2]
+                        if numSegs > 1 then
+                            safeDirX, safeDirY = _segDir(segments[segIdx - 1])
+                        else
+                            safeDirX, safeDirY = _segmentPerp(seg[2], seg[4])
+                        end
+                    else
+                        divergeCoord = horiz and seg[3] or seg[4]
+                        local ndx, ndy = _segDir(segments[segIdx + 1])
+                        safeDirX, safeDirY = -ndx, -ndy
+                    end
                     table.insert(lineGroups[key], {
                         wireId = w.id, order = order, seg = seg, segIdx = segIdx, loAbs = loAbs, hiAbs = hiAbs,
+                        divergeCoord = divergeCoord, numSegs = numSegs,
+                        safeDirX = safeDirX, safeDirY = safeDirY,
                     })
                 end
             end
@@ -3354,8 +3407,8 @@ local function _computeWirePlans(canvas)
 
     -- Sweep each line's entries: break it into sub-ranges at every entry's
     -- own start/end, then for each sub-range rank whichever entries actually
-    -- cover it (by canvas.wires creation order, for a deterministic lane
-    -- assignment every wire in the group agrees on) and evenly space them.
+    -- cover it (by divergeCoord, so lane order matches each wire's real
+    -- bend/anchor position — see its computation above) and evenly space them.
     for _, entries in pairs(lineGroups) do
         if #entries > 1 then
             local breakpoints = {}
@@ -3379,16 +3432,57 @@ local function _computeWirePlans(canvas)
                 end
                 local n = #active
                 if n > 1 then
-                    table.sort(active, function(x, y) return x.order < y.order end)
+                    -- Ranked by where each wire actually diverges (its real
+                    -- bend/anchor position), not by draw/creation order, so
+                    -- a wire that's the "leftmost"/"outermost" of the bundle
+                    -- stays on that same side all the way to its own bend
+                    -- instead of being assigned an arbitrary lane that forces
+                    -- it to cross the others on the way out. Ties (same
+                    -- divergeCoord, e.g. two wires bending at the exact same
+                    -- point) fall back to creation order for determinism.
+                    table.sort(active, function(x, y)
+                        if x.divergeCoord ~= y.divergeCoord then return x.divergeCoord < y.divergeCoord end
+                        return x.order < y.order
+                    end)
+                    -- A bend segment (part of a wire with more than one
+                    -- segment) can't use the old symmetric split-around-
+                    -- center offset — half the lanes would land on the
+                    -- "positive" side of center, which for a bend segment is
+                    -- exactly the direction its OWN other segment sweeps
+                    -- through, walking that lane straight across the other
+                    -- segment's corridor right where the two would
+                    -- otherwise meet cleanly (the crossing this whole
+                    -- function exists to avoid). Instead every bend lane is
+                    -- pushed the same safe way (see safeDirX/Y above), by a
+                    -- one-sided, zero-based magnitude — lane 1 sits exactly
+                    -- on the true unshifted path (the "inside" of the turn,
+                    -- shortest route) and each lane after it is pushed
+                    -- further out (the "outside", a longer route), nesting
+                    -- without ever crossing. A plain straight overlap (every
+                    -- active entry single-segment, no bend involved) keeps
+                    -- the old centered split instead — nothing to avoid
+                    -- there, and it reads better centered on the true line.
+                    local hasBend = false
+                    for _, e in ipairs(active) do
+                        if e.numSegs > 1 then hasBend = true break end
+                    end
                     for k, e in ipairs(active) do
-                        local offset = (k - (n + 1) / 2) * _WIRE_PARALLEL_GAP_PX * canvas.zoom
+                        local offX, offY
+                        if hasBend then
+                            local mag = (k - 1) * _WIRE_PARALLEL_GAP_PX * canvas.zoom
+                            offX, offY = e.safeDirX * mag, e.safeDirY * mag
+                        else
+                            local mag = (k - (n + 1) / 2) * _WIRE_PARALLEL_GAP_PX * canvas.zoom
+                            local perpX, perpY = _segmentPerp(e.seg[2], e.seg[4])
+                            offX, offY = perpX * mag, perpY * mag
+                        end
                         local ax, ay = _pointOnLine(e.seg, a)
                         local bx, by = _pointOnLine(e.seg, b)
                         local dA, dB = _distAlongSegment(e.seg, ax, ay), _distAlongSegment(e.seg, bx, by)
                         local lo, hi = math.min(dA, dB), math.max(dA, dB)
                         local ranges = plans[e.wireId].offsetRanges
                         ranges[e.segIdx] = ranges[e.segIdx] or {}
-                        table.insert(ranges[e.segIdx], { lo = lo, hi = hi, offset = offset })
+                        table.insert(ranges[e.segIdx], { lo = lo, hi = hi, offX = offX, offY = offY })
                     end
                 end
             end
@@ -3447,7 +3541,6 @@ local function _wireOffsetPieces(canvas, w, plan)
         if horiz then dirX, dirY = (x2 > x1) and 1 or -1, 0
         else          dirX, dirY = 0, (y2 > y1) and 1 or -1 end
         local length = horiz and math.abs(x2 - x1) or math.abs(y2 - y1)
-        local perpX, perpY = _segmentPerp(y1, y2)
         local offsetRanges = plan.offsetRanges[idx] or {}
         local stubStart, stubEnd = (idx == 1), (idx == n)
 
@@ -3466,8 +3559,8 @@ local function _wireOffsetPieces(canvas, w, plan)
         cuts = dedup
 
         local function pointAt(d)
-            local off = _offsetAtDistance(d, length, offsetRanges, stubPx, stubStart, stubEnd)
-            return x1 + dirX * d + perpX * off, y1 + dirY * d + perpY * off
+            local offX, offY = _offsetAtDistance(d, length, offsetRanges, stubPx, stubStart, stubEnd)
+            return x1 + dirX * d + offX, y1 + dirY * d + offY
         end
 
         for i = 1, #cuts - 1 do
