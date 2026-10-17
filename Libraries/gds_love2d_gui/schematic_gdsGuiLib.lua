@@ -42,9 +42,14 @@ globApp.objects.schematics = {}
 --------------------------------------------------------------------------------
 
 local _CONTROL_RADIUS_FRAC   = 0.045   -- control hit/draw radius, as a fraction of min(canvas.contentW, canvas.contentH)
-local _GRID_SPACING_PX       = 6  -- world units between grid lines; also the element/control placement snap pitch (see _snapToGrid)
+local _GRID_SPACING_PX       = 3  -- world units between grid lines; also the element/control placement snap pitch (see _snapToGrid)
 local _MIN_ZOOM               = 1      -- fully zoomed out: the whole canvas box fits exactly in the viewport
-local _MAX_ZOOM               = 4
+local _MAX_ZOOM               = 6
+-- Element/control labels are invisible from _MIN_ZOOM through
+-- _LABEL_FADE_START_ZOOM (zoomed out, symbols are small and crowded —
+-- labels would just be clutter), then fade in linearly as zoom climbs from
+-- there up to _MAX_ZOOM, reaching fully opaque only once fully zoomed in.
+local _LABEL_FADE_START_ZOOM   = 4
 -- Design/edit mode opens pre-zoomed to 2x (see gdsGui_schematic_resetView's
 -- caller in main.lua) so the design surface reachable by panning is twice
 -- the area of a single viewport-full, giving more room for elements. Pixel
@@ -57,7 +62,7 @@ local _ELEMENT_DEFAULT_W_FRAC = 0.07
 local _ELEMENT_DEFAULT_H_FRAC = 0.05
 local _PINCH_MIN_DIST_PX      = 1      -- guards against a near-zero divisor right as a pinch begins
 local _WIRE_WIDTH_PX         = 2 / 3   -- half of the previous 4/3px width
-local _WIRE_CROSS_HOP_RADIUS_PX = 5   -- radius of the little arc hop drawn where a wire crosses an unrelated one
+local _WIRE_CROSS_HOP_RADIUS_PX = 2.5   -- radius of the little arc hop drawn where a wire crosses an unrelated one
 local _WIRE_PARALLEL_GAP_PX     = 5   -- spacing between adjacent lanes when 2+ wires' paths overlap (fully or partially)
 local _WIRE_PARALLEL_STUB_PX    = 8   -- unsplit length kept right at each anchor before a parallel lane's offset begins
 local _CONNECTOR_RELEASE_SLOP_PX = 16  -- forgiveness margin for "which element did the wire-drag land on", since exact-rectangle precision is unreliable on a touchscreen
@@ -66,8 +71,11 @@ local _CONNECTOR_SNAP_COLOR  = {0.25, 0.95, 0.35, 1}
 local _DEFAULT_COLOR         = {0.75, 0.75, 0.75, 1}   -- light gray, matches the palette's LIGHT GRAY swatch
 local _MENU_ROW_H            = 32
 local _MENU_WIDTH_FRAC       = 0.8
+local _MENU_OPACITY          = 0.85 -- all modal menu panels render 15% transparent
 local _ELEMENT_TAP_SLOP_PX   = 6   -- max press->release movement still counted as a tap, not a drag
-local _LONG_PRESS_SECONDS    = 2.0 -- how long a held (not-yet-moved) press on an element/control/wire takes to unlock move/rotate/direction mode — see gdsGui_schematic_update
+local _LONG_PRESS_SECONDS    = 1.3 -- how long a held (not-yet-moved) press on an element/control/wire takes to unlock move/rotate/direction mode — see gdsGui_schematic_update
+local _CONFIRM_HOLD_SECONDS  = 2   -- how long an explicitly-marked (isConfirm=true) confirm menu's action row must be held before it fires — see _markConfirmMenu/_pollMenuHoldToConfirm
+local _CONFIRM_HOLD_MAX_DT   = 0.1 -- per-frame cap when accumulating the hold above — stops one stalled/slow frame (GC pause, app resume) from satisfying the whole hold instantly
 local _WIRE_TAP_SLOP_PX      = 10  -- max distance from a wire's drawn line still counted as tapping it
 local _SWATCH_ROW_H_PX       = 64  -- height of the single row of color squares in a swatch picker
 local _SWATCH_GAP_PX         = 8
@@ -284,6 +292,35 @@ local function _openPlacementNamePrompt(title, initialText)
         "gdsGui_schematic_placementNameConfirmed", "gdsGui_schematic_placementNameCancelled")
 end
 
+-- Finalizes a validated placement (pending.kind == "element" | "control"):
+-- creates the element/control and wipes every existing snapshot, since
+-- either kind of addition changes the "cast" a snapshot colors (for a
+-- control, also the total number of combinations — see the CONTROL-POSITION
+-- COMBINATION CYCLING section below). Split out of
+-- gdsGui_schematic_placementNameConfirmed so the snapshot-wipe confirm step
+-- there can defer actually running this until the user confirms.
+local function _commitNamedPlacement(canvas, pending, trimmed)
+    if pending.kind == "element" then
+        _pushUndo(canvas)
+        local properties = {}
+        for _, key in ipairs(pending.defaultPropertyKeys or {}) do
+            table.insert(properties, { key = key, value = "" })
+        end
+        gdsGui_schematic_addElement(pending.canvasName, pending.newId, pending.shapeType,
+            pending.fracX, pending.fracY, _ELEMENT_DEFAULT_W_FRAC, _ELEMENT_DEFAULT_H_FRAC,
+            trimmed, pending.defaultColor, properties, nil, pending.spritePath)
+        canvas.snapshots = {}
+        _notifyChanged(canvas)
+    else
+        _pushUndo(canvas)
+        gdsGui_schematic_addControl(pending.canvasName, pending.newId, pending.fracX, pending.fracY,
+            pending.positions, 0, trimmed, pending.callbackFunc, 1 / _EDIT_MODE_INITIAL_ZOOM, pending.spritePaths,
+            nil, pending.overlaySpritePath)
+        canvas.snapshots = {}
+        _notifyChanged(canvas)
+    end
+end
+
 -- Resolved by name via _G[...] from textPrompt_gdsGuiLib.lua, like every other
 -- string-registered callback in this library.
 function gdsGui_schematic_placementNameConfirmed(name)
@@ -300,36 +337,40 @@ function gdsGui_schematic_placementNameConfirmed(name)
         _openPlacementNamePrompt("NAME TAKEN, TRY AGAIN", trimmed)
         return
     end
-    if pending.kind == "element" then
-        _pushUndo(canvas)
-        local properties = {}
-        for _, key in ipairs(pending.defaultPropertyKeys or {}) do
-            table.insert(properties, { key = key, value = "" })
-        end
-        gdsGui_schematic_addElement(pending.canvasName, pending.newId, pending.shapeType,
-            pending.fracX, pending.fracY, _ELEMENT_DEFAULT_W_FRAC, _ELEMENT_DEFAULT_H_FRAC,
-            trimmed, pending.defaultColor, properties, nil, pending.spritePath)
-        -- A new element changes the cast of what a captured snapshot colors,
-        -- so every existing snapshot (keyed to the old cast) is wiped rather
-        -- than left stale — see the CONTROL-POSITION COMBINATION CYCLING
-        -- section below for the matching combination-count side effect.
-        canvas.snapshots = {}
-        _notifyChanged(canvas)
-    else
-        _pushUndo(canvas)
-        gdsGui_schematic_addControl(pending.canvasName, pending.newId, pending.fracX, pending.fracY,
-            pending.positions, 0, trimmed, pending.callbackFunc, 1 / _EDIT_MODE_INITIAL_ZOOM, pending.spritePaths,
-            nil, pending.overlaySpritePath)
-        -- New control = new combinations to cycle through, so old snapshots
-        -- (captured under the old control set) no longer mean anything.
-        canvas.snapshots = {}
-        _notifyChanged(canvas)
+    -- _commitNamedPlacement unconditionally wipes every snapshot — worth an
+    -- explicit "are you sure" only when there's actually something to lose.
+    local snapshotCount = gdsGui_schematic_countSnapshots(pending.canvasName)
+    if snapshotCount > 0 then
+        pending.confirmedName = trimmed
+        gdsGui_schematic_openMenu(pending.canvasName,
+            "ADDING A NEW " .. pending.kind:upper() .. " WILL DELETE ALL " ..
+            snapshotCount .. " SNAPSHOT(S). CONTINUE?",
+            {"CONTINUE", "CANCEL"},
+            "gdsGui_schematic_internal_onPlacementSnapshotWipeConfirmed",
+            "gdsGui_schematic_internal_onPlacementSnapshotWipeConfirmed", true)
+        return
     end
+    _commitNamedPlacement(canvas, pending, trimmed)
     _pendingNamedPlacement = nil
 end
 
 function gdsGui_schematic_placementNameCancelled()
     _pendingNamedPlacement = nil
+end
+
+-- Shared onSelect/onCancel for the snapshot-wipe confirm menu above: both
+-- CONTINUE and CANCEL land here (distinguished by optionText), as does
+-- tapping outside (optionText is nil — treated the same as CANCEL, i.e. the
+-- placement is abandoned rather than silently falling back to the text
+-- prompt).
+function gdsGui_schematic_internal_onPlacementSnapshotWipeConfirmed(canvasName, index, optionText)
+    local pending = _pendingNamedPlacement
+    _pendingNamedPlacement = nil
+    if not pending or pending.canvasName ~= canvasName then return end
+    if optionText == "CONTINUE" then
+        local canvas = _findCanvas(canvasName)
+        if canvas then _commitNamedPlacement(canvas, pending, pending.confirmedName) end
+    end
 end
 
 -- Keeps canvas.panX/panY inside the range that still leaves the zoomed
@@ -667,6 +708,9 @@ function gdsGui_schematic_create(name, page, x, y, anchorPoint, wFrac, hFrac)
     canvas.pendingConnectorColor = nil  -- armed "draw next wire" from the catalog, independent of wireToolActive/the dock toggle; disarms after one connector
     canvas.pendingColorAssignPick = false  -- armed "tap an element or wire to assign its snapshot color"; disarms after one pick
     canvas.pendingWireFromId = nil  -- armed via ADD WIRE in the element edit menu: elementId the next press-drag-release starts a wire from, with no need to land that press on an anchor; disarms after one drag
+    canvas.paintMode = nil  -- { color = {r,g,b,a} | nil } while the PAINT brush is armed; see gdsGui_schematic_armPaintMode. Unlike the pending* one-shot fields above, stays armed across any number of taps.
+    canvas._paintTarget = nil  -- {kind, id} of whatever a "paint" drag's press landed on, between press and release
+    canvas._paintButtonName = nil  -- name of the app's PAINT dock button, set via gdsGui_schematic_setPaintButtonName; the swatch palette cascades from it
     canvas._placementCounter = 0
     canvas._colorPickTarget     = nil  -- {kind="element"|"wire", id=...} while the color-picker menu is open
     canvas._elementEditTargetId = nil  -- elementId while the design-mode edit (color+properties+delete) menu is open
@@ -797,6 +841,8 @@ function gdsGui_schematic_setMode(canvasName, mode)
     canvas.pendingConnectorColor = nil
     canvas.pendingColorAssignPick = false
     canvas.pendingWireFromId = nil
+    canvas.paintMode = nil
+    canvas._paintTarget = nil
     canvas.menu = nil
     canvas.touches = {}
     canvas.pinch = nil
@@ -848,29 +894,27 @@ function gdsGui_schematic_undo(canvasName)
     canvas.selectedWireId    = nil
 end
 
--- Resets the pan/zoom view to centered, at either the fully-zoomed-out level
--- or an explicit startZoom (e.g. _EDIT_MODE_INITIAL_ZOOM — see its definition
--- above for why design mode opens pre-zoomed). Called whenever a project is
+-- Resets the pan/zoom view to a given startZoom (or _MIN_ZOOM, fully zoomed
+-- out, if omitted), vertically centered. Called whenever a project is
 -- (re)loaded into the canvas so each one opens at a known view rather than
 -- wherever the previous project's view was left.
--- The zoom level design/edit mode should open at (see _EDIT_MODE_INITIAL_ZOOM
--- above). Exposed so the app layer's mode-dependent gdsGui_schematic_resetView
--- call doesn't hardcode a number that has to stay in sync with the halved
--- _ELEMENT_DEFAULT_*_FRAC compensation.
-function gdsGui_schematic_getEditModeInitialZoom()
-    return _EDIT_MODE_INITIAL_ZOOM
-end
-
 function gdsGui_schematic_resetView(canvasName, startZoom)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     canvas.zoom = math.max(_MIN_ZOOM, math.min(_MAX_ZOOM, startZoom or _MIN_ZOOM))
     -- The new zoom may change the viewport box size (see
     -- gdsGui_schematic_setZoomedLayout) — recompute before resetting pan so
-    -- panX/panY=0 lines up with the resulting box.
+    -- panX/panY line up with the resulting box.
     _calculateGeometry(canvas)
     canvas.panX = 0
-    canvas.panY = 0
+    -- canvas.h stays fixed across zoom levels (only width grows to track
+    -- zoom — see _schematicCanvasZoomedLayout in main.lua), so once zoom
+    -- exceeds _MIN_ZOOM the content's world height overflows the viewport.
+    -- Center that overflow top/bottom instead of pinning the content's top
+    -- edge to the viewport's, so opening a system lands on its vertical
+    -- middle rather than whatever happened to be placed highest.
+    canvas.panY = (canvas.h - canvas.contentH * canvas.zoom) / 2
+    _clampPan(canvas)
 end
 
 -- defaultColor (optional): color to stamp on the next connector drawn while
@@ -1223,7 +1267,49 @@ function gdsGui_schematic_cancelPlacement(canvasName)
         canvas.pendingConnectorColor = nil
         canvas.pendingColorAssignPick = false
         canvas.pendingWireFromId = nil
+        canvas.paintMode = nil
     end
+end
+
+--------------------------------------------------------------------------------
+-- PUBLIC API — PAINT MODE (brush button): a sticky, multi-tap alternative to
+-- the one-shot pending-pick field above. Once armed, a plain tap (no drag)
+-- on an element/wire/control immediately paints it with whatever color is
+-- currently loaded, instead of opening its edit menu — replacing that menu's
+-- own embedded color-swatch row (see gdsGui_schematic_openElementEditMenu and
+-- its wire/control siblings, which no longer offer one). Stays armed across
+-- any number of paints until explicitly disarmed via the brush button again
+-- (gdsGui_schematic_disarmPaintMode) — a miss (empty canvas space) is just a
+-- no-op, see gdsGui_schematic_pressed — never one-shot, unlike
+-- pendingColorAssignPick above.
+--------------------------------------------------------------------------------
+
+function gdsGui_schematic_armPaintMode(canvasName)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return end
+    gdsGui_schematic_cancelPlacement(canvasName)
+    canvas.paintMode = { color = nil }
+    canvas.selectedElementId = nil
+    canvas.selectedControlId = nil
+    canvas.selectedWireId = nil
+end
+
+function gdsGui_schematic_disarmPaintMode(canvasName)
+    local canvas = _findCanvas(canvasName)
+    if canvas then canvas.paintMode = nil end
+end
+
+function gdsGui_schematic_isPaintModeActive(canvasName)
+    local canvas = _findCanvas(canvasName)
+    return canvas ~= nil and canvas.paintMode ~= nil
+end
+
+-- Tells the swatch palette which app button to cascade from (see
+-- _paintPaletteGeometry) — the app registers its own PAINT dock button's
+-- name here once, typically right after creating it.
+function gdsGui_schematic_setPaintButtonName(canvasName, buttonName)
+    local canvas = _findCanvas(canvasName)
+    if canvas then canvas._paintButtonName = buttonName end
 end
 
 function gdsGui_schematic_isPlacementArmed(canvasName)
@@ -1238,13 +1324,34 @@ end
 -- pickers, the built-in color picker, and snapshot-conflict confirmation.
 --------------------------------------------------------------------------------
 
+-- Called only when the caller explicitly passes isConfirm=true (a
+-- destructive action — DELETE, CLEAR, OVERWRITE, CONTINUE, DELETE ALL).
+-- Tag the menu so its action row (below) requires a sustained
+-- _CONFIRM_HOLD_SECONDS press instead of a plain tap, guarding against an
+-- accidental tap triggering something destructive, and fold a hint about
+-- that into the title so the user isn't left holding a button with no idea
+-- why it isn't responding — see _pollMenuHoldToConfirm for where the hold
+-- is actually timed. Deliberately not inferred from menu shape (e.g. "two
+-- options, second is CANCEL") — a future non-destructive binary menu with
+-- that same shape must not be silently gated behind a hold.
+local function _markConfirmMenu(menu, isConfirm)
+    if not isConfirm then return end
+    menu.confirmIndex = 1
+    if menu.title then
+        menu.title = menu.title .. " (PRESS & HOLD \"" .. menu.options[1] ..
+            "\" " .. _CONFIRM_HOLD_SECONDS .. "S TO CONFIRM)"
+    end
+end
+
 -- onSelectFunc(canvasName, index, optionText) and onCancelFunc(canvasName) are
 -- global function names (strings), resolved via _G[...] like every other
--- string-named callback in this library.
-function gdsGui_schematic_openMenu(canvasName, title, options, onSelectFunc, onCancelFunc)
+-- string-named callback in this library. isConfirm (optional) marks this a
+-- destructive confirm/cancel gate — see _markConfirmMenu.
+function gdsGui_schematic_openMenu(canvasName, title, options, onSelectFunc, onCancelFunc, isConfirm)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     canvas.menu = { title = title, options = options, onSelect = onSelectFunc, onCancel = onCancelFunc }
+    _markConfirmMenu(canvas.menu, isConfirm)
 end
 
 function gdsGui_schematic_closeMenu(canvasName)
@@ -1257,6 +1364,26 @@ function gdsGui_schematic_isMenuOpen(canvasName)
     return canvas ~= nil and canvas.menu ~= nil
 end
 
+-- Measures how tall the title row needs to be so a long, wrapped title (e.g.
+-- the "ADDING A NEW ELEMENT WILL DELETE ALL N SNAPSHOT(S)..." confirm
+-- warning, longer still once _markConfirmMenu appends its "PRESS & HOLD"
+-- suffix) doesn't bleed into the option rows below it. Previously a fixed
+-- _MENU_ROW_H regardless of how many lines the title actually wrapped to.
+-- Uses love.graphics.getFont() — the same ambient font _drawMenuBox's own
+-- printf call below renders the title with (this file never calls setFont
+-- itself, see its module header) — and the same wrap width (mw, no extra
+-- padding) that printf wraps against, so the measured height always matches
+-- what's actually drawn.
+local _TITLE_VPAD = 16 -- 8px top inset (matches rowY + 8 below) + 8px bottom
+
+local function _titleHeight(mw, title)
+    if not title then return 0 end
+    local font = love.graphics.getFont()
+    local _, lines = font:getWrap(title, mw)
+    local numLines = math.max(1, #lines)
+    return math.max(_MENU_ROW_H, numLines * font:getHeight() + _TITLE_VPAD)
+end
+
 -- Generalized over any owner with .x/.y/.w/.h (schematic canvas or gallery)
 -- so both widget types can share one modal-menu implementation below.
 -- A menu is normally a plain vertical list of text rows (menu.options). When
@@ -1267,7 +1394,7 @@ end
 -- still indexes into that one combined list.
 local function _menuGeometry(owner, menu)
     local w = owner.w * _MENU_WIDTH_FRAC
-    local titleH = menu.title and _MENU_ROW_H or 0
+    local titleH = _titleHeight(w, menu.title)
     local bodyH
     if menu.isSwatchPicker then
         bodyH = _SWATCH_ROW_H_PX + #menu.extraOptions * _MENU_ROW_H
@@ -1276,7 +1403,19 @@ local function _menuGeometry(owner, menu)
     end
     local h = titleH + bodyH + 10
     local x = owner.x + (owner.w - w) / 2
-    local y = owner.y + math.max(0, (owner.h - h) / 2)
+    local y
+    if menu.isSwatchPicker then
+        -- The selected-item color picker is anchored in the bottom third of
+        -- the canvas/gallery area (rather than dead-center) so it sits below
+        -- the item being edited instead of covering it; clamped back inside
+        -- owner bounds in case the band is shorter than the menu itself.
+        local bandY = owner.y + owner.h * 2 / 3
+        local bandH = owner.h / 3
+        y = bandY + (bandH - h) / 2
+        y = math.max(owner.y, math.min(y, owner.y + owner.h - h))
+    else
+        y = owner.y + math.max(0, (owner.h - h) / 2)
+    end
     return x, y, w, h, titleH
 end
 
@@ -1336,6 +1475,11 @@ local function _handleMenuPress(owner, touchId, px, py)
     if owner.menu._pressedTouchId ~= nil and owner.menu._pressedTouchId ~= touchId then return end
     owner.menu._pressedHit     = _menuRowAt(owner, owner.menu, px, py)
     owner.menu._pressedTouchId = touchId
+    -- Fresh press, fresh hold timer — see _pollMenuHoldToConfirm, which is
+    -- what actually fires a confirmIndex row once this reaches
+    -- _CONFIRM_HOLD_SECONDS; harmless to reset here even for a non-confirm
+    -- menu, since nothing ever reads it without menu.confirmIndex set.
+    owner.menu._holdElapsed    = 0
 end
 
 -- Shared release-dispatch pairing with _handleMenuPress above. A second
@@ -1354,12 +1498,43 @@ local function _handleMenuRelease(owner, touchId, px, py)
         local cb = menu.onCancel
         owner.menu = nil
         if cb and _G[cb] then _G[cb](owner.name) end
+    elseif pressedHit == menu.confirmIndex then
+        -- A confirm menu's action row (see _markConfirmMenu) only ever
+        -- fires via a sustained hold, timed by _pollMenuHoldToConfirm — a
+        -- plain tap-release here, however deliberate it looked, is just an
+        -- abandoned attempt. The menu stays open so the user can try again.
+        return
     elseif type(pressedHit) == "number" then
         local opt = menu.options[pressedHit]
         local cb = menu.onSelect
         owner.menu = nil
         if cb and _G[cb] then _G[cb](owner.name, pressedHit, opt) end
     end
+end
+
+-- Polled every frame (from gdsGui_schematic_update/gdsGui_schematicGallery_update)
+-- against any owner currently showing a menu: if that menu is a confirm menu
+-- (menu.confirmIndex set — see _markConfirmMenu) and its action row is
+-- currently being held down, accumulates the hold and fires onSelect the
+-- instant it crosses _CONFIRM_HOLD_SECONDS — the same action a completed
+-- tap-release would fire on any ordinary menu row, just gated behind a
+-- deliberate hold instead of an easy-to-land-by-accident tap. Firing on
+-- elapsed time rather than waiting for release is deliberate: a destructive
+-- confirm should commit the moment the hold requirement is actually met, not
+-- one more gesture after it.
+local function _pollMenuHoldToConfirm(owner, dt)
+    local menu = owner.menu
+    if not menu or not menu.confirmIndex then return end
+    if menu._pressedTouchId == nil or menu._pressedHit ~= menu.confirmIndex then
+        menu._holdElapsed = 0
+        return
+    end
+    menu._holdElapsed = (menu._holdElapsed or 0) + math.min(dt, _CONFIRM_HOLD_MAX_DT)
+    if menu._holdElapsed < _CONFIRM_HOLD_SECONDS then return end
+    local opt = menu.options[menu.confirmIndex]
+    local cb = menu.onSelect
+    owner.menu = nil
+    if cb and _G[cb] then _G[cb](owner.name, menu.confirmIndex, opt) end
 end
 
 -- One text menu row, highlighted red when it's the destructive "DELETE"
@@ -1385,14 +1560,14 @@ local function _drawMenuBox(owner, menu)
     love.graphics.rectangle("fill", owner.x, owner.y, owner.w, owner.h)
 
     local mx, my, mw, mh, titleH = _menuGeometry(owner, menu)
-    love.graphics.setColor(0.15, 0.15, 0.18, 1)
+    love.graphics.setColor(0.15, 0.15, 0.18, _MENU_OPACITY)
     love.graphics.rectangle("fill", mx, my, mw, mh)
     love.graphics.setColor(1, 1, 0, 1)
     love.graphics.rectangle("line", mx, my, mw, mh)
 
     local rowY = my
     if menu.title then
-        love.graphics.setColor(0.25, 0.25, 0.25, 1)
+        love.graphics.setColor(0.25, 0.25, 0.25, _MENU_OPACITY)
         love.graphics.rectangle("fill", mx, rowY, mw, titleH)
         love.graphics.setColor(1, 1, 1, 1)
         love.graphics.printf(menu.title, mx, rowY + 8, mw, "center")
@@ -1478,11 +1653,116 @@ function gdsGui_schematic_internal_onColorPickCancelled(canvasName)
 end
 
 --------------------------------------------------------------------------------
--- PUBLIC API — DESIGN-MODE ELEMENT EDIT MENU (color + delete, opened by a
--- plain tap on an element while in design mode; a drag still repositions it
--- instead). Sets the element's base defaultColor directly — unlike the
--- control-mode color picker above, there's no signature/snapshot involved
--- here, just the element's permanent appearance when no snapshot overrides it.
+-- PAINT MODE — vertical swatch palette (see the PUBLIC API block above) and
+-- the press/release handling further down that uses it. Reuses
+-- _COLOR_PALETTE, the same 5 named colors the old per-item edit-menu swatch
+-- row and the control-mode color picker both draw from.
+--------------------------------------------------------------------------------
+
+local _PAINT_SWATCH_SIZE_PX   = 34
+local _PAINT_SWATCH_GAP_PX    = 8
+local _PAINT_PALETTE_INSET_PX = 12
+
+-- Finds the app-registered PAINT button (see gdsGui_schematic_
+-- setPaintButtonName) by name, or nil if none was ever registered.
+local function _findButton(name)
+    if not name then return nil end
+    for _, b in ipairs(globApp.objects.buttons) do
+        if b.name == name then return b end
+    end
+    return nil
+end
+
+-- Cascades downward directly from the PAINT button itself (left edge
+-- aligned, starting just below it) so the palette reads as "opened out of"
+-- the button that armed it, rather than as an unrelated panel elsewhere on
+-- the canvas — a fixed screen-space stack independent of pan/zoom, same
+-- convention as the modal menu box (_menuGeometry), so it stays put and
+-- legible regardless of what's underneath it. Falls back to the canvas's own
+-- left edge, vertically centered, if the app never registered a button name.
+local function _paintPaletteGeometry(canvas)
+    local n = #_COLOR_PALETTE
+    local totalH = n * _PAINT_SWATCH_SIZE_PX + (n - 1) * _PAINT_SWATCH_GAP_PX
+    local btn = _findButton(canvas._paintButtonName)
+    if btn then
+        local x = btn.myx
+        local y = btn.myMaxy + _PAINT_SWATCH_GAP_PX
+        -- Keep the whole stack on-canvas even if the button sits close to
+        -- the bottom edge, rather than letting it run off into nothing.
+        local maxY = canvas.y + canvas.h - totalH - _PAINT_PALETTE_INSET_PX
+        if y > maxY then y = maxY end
+        return x, y, _PAINT_SWATCH_SIZE_PX, totalH
+    end
+    local x = canvas.x + _PAINT_PALETTE_INSET_PX
+    local y = canvas.y + (canvas.h - totalH) / 2
+    return x, y, _PAINT_SWATCH_SIZE_PX, totalH
+end
+
+local function _paintSwatchRect(canvas, index)
+    local x, y, size = _paintPaletteGeometry(canvas)
+    return x, y + (index - 1) * (size + _PAINT_SWATCH_GAP_PX), size, size
+end
+
+-- Returns the 1-based _COLOR_PALETTE index tapped, "panel" if the tap landed
+-- inside the palette's bounding box but between swatches (still consumed —
+-- only a tap that misses the panel ENTIRELY counts as "elsewhere" and exits
+-- paint mode, see gdsGui_schematic_pressed), or nil if it missed outright.
+local function _paintPaletteHit(canvas, px, py)
+    local x, y, size, totalH = _paintPaletteGeometry(canvas)
+    if px < x or px > x + size or py < y or py > y + totalH then return nil end
+    for i = 1, #_COLOR_PALETTE do
+        local sx, sy, sw, sh = _paintSwatchRect(canvas, i)
+        if py >= sy and py < sy + sh then return i end
+    end
+    return "panel"
+end
+
+-- Applies a paint-mode color pick to an element/wire/control's base
+-- defaultColor — the same permanent-appearance semantics the removed
+-- per-item edit-menu color swatches used (see gdsGui_schematic_
+-- internal_onElementEditChosen's own comment on why pendingColor is also
+-- set: without it, a forced-gray placeholder left by
+-- gdsGui_schematic_resetColorsToDefault would mask the pick until the next
+-- combination change).
+local function _applyPaint(canvas, targetKind, targetId, color)
+    local target = _findByKind(canvas, targetKind, targetId)
+    if not target then return end
+    _pushUndo(canvas)
+    target.defaultColor = color
+    target.pendingColor = color
+    _notifyChanged(canvas)
+end
+
+-- Drawn alongside the modal-menu overlay (gdsGui_schematic_drawMenuOverlay,
+-- see its own comment on why that's called LAST in the app's love.draw,
+-- after the floating chrome buttons) so the palette renders on top of
+-- everything — but unlike a modal, canvas items underneath stay tappable.
+function gdsGui_schematic_drawPaintOverlay(pageName)
+    for _, canvas in ipairs(globApp.objects.schematics) do
+        if canvas.page == pageName and canvas.paintMode then
+            local activeColor = canvas.paintMode.color
+            for i, entry in ipairs(_COLOR_PALETTE) do
+                local sx, sy, sw, sh = _paintSwatchRect(canvas, i)
+                love.graphics.setColor(entry.color[1], entry.color[2], entry.color[3], entry.color[4] or 1)
+                love.graphics.rectangle("fill", sx, sy, sw, sh)
+                local isActive = activeColor and activeColor[1] == entry.color[1] and
+                    activeColor[2] == entry.color[2] and activeColor[3] == entry.color[3]
+                love.graphics.setColor(1, 1, 1, 1)
+                love.graphics.setLineWidth(isActive and 3 or 1)
+                love.graphics.rectangle("line", sx, sy, sw, sh)
+                love.graphics.setLineWidth(1)
+            end
+        end
+    end
+    love.graphics.setColor(1, 1, 1, 1)
+end
+
+--------------------------------------------------------------------------------
+-- PUBLIC API — DESIGN-MODE ELEMENT EDIT MENU (delete + wire/rename/
+-- properties, opened by a plain tap on an element while in design mode; a
+-- drag still repositions it instead). No longer offers a color swatch row —
+-- that's now PAINT MODE's job (see its own PUBLIC API block above), which
+-- replaces this and its wire/control siblings' embedded color pickers.
 --------------------------------------------------------------------------------
 
 function gdsGui_schematic_openElementEditMenu(canvasName, elementId)
@@ -1491,16 +1771,15 @@ function gdsGui_schematic_openElementEditMenu(canvasName, elementId)
     local el = _findElement(canvas, elementId)
     if not el then return end
     canvas._elementEditTargetId = elementId
-    _openSwatchColorMenu(canvasName, el.label or elementId, {"ADD WIRE", "RENAME", "PROPERTIES", "DELETE"},
+    gdsGui_schematic_openMenu(canvasName, el.label or elementId, {"ADD WIRE", "RENAME", "PROPERTIES", "DELETE"},
         "gdsGui_schematic_internal_onElementEditChosen", "gdsGui_schematic_internal_onElementEditCancelled")
 end
 
-function gdsGui_schematic_internal_onElementEditChosen(canvasName, index)
+function gdsGui_schematic_internal_onElementEditChosen(canvasName, index, optionText)
     local canvas = _findCanvas(canvasName)
     if not canvas or not canvas._elementEditTargetId then return end
     local elementId = canvas._elementEditTargetId
-    local nColors = #_COLOR_PALETTE
-    if index == nColors + 1 then
+    if optionText == "ADD WIRE" then
         -- ADD WIRE tapped: arm a one-shot wire-drag whose fixed start is
         -- this element (see canvas.pendingWireFromId in
         -- gdsGui_schematic_pressed) — keeps it selected (highlighted)
@@ -1515,46 +1794,29 @@ function gdsGui_schematic_internal_onElementEditChosen(canvasName, index)
         gdsGui_schematic_cancelPlacement(canvasName)
         canvas.pendingWireFromId = elementId
         return
-    elseif index == nColors + 2 then
+    elseif optionText == "RENAME" then
         -- RENAME tapped: hand off to the rename prompt, keeping the element
         -- selected while that flow is in progress.
         canvas._elementEditTargetId = nil
         _openElementRenamePrompt(canvasName, elementId)
         return
-    elseif index == nColors + 3 then
+    elseif optionText == "PROPERTIES" then
         -- PROPERTIES tapped: hand off to the properties submenu, keeping the
         -- element selected while that flow is in progress.
         canvas._elementEditTargetId = nil
         _openPropertiesMenu(canvasName, elementId)
         return
-    elseif index == nColors + 4 then
+    elseif optionText == "DELETE" then
         -- DELETE tapped: confirm before actually removing it. Keep
         -- _elementEditTargetId set — the confirm/cancel handler below clears it.
         local el = _findElement(canvas, elementId)
         gdsGui_schematic_openMenu(canvasName, "DELETE \"" .. (el and (el.label or elementId) or elementId) .. "\"?",
             {"DELETE", "CANCEL"}, "gdsGui_schematic_internal_onElementDeleteConfirmed",
-            "gdsGui_schematic_internal_onElementDeleteConfirmed")
+            "gdsGui_schematic_internal_onElementDeleteConfirmed", true)
         return
     end
     canvas._elementEditTargetId = nil
     canvas.selectedElementId = nil
-    local entry = _COLOR_PALETTE[index]
-    if entry then
-        local el = _findElement(canvas, elementId)
-        if el then
-            _pushUndo(canvas)
-            el.defaultColor = entry.color
-            -- Also set pendingColor (not just the permanent defaultColor):
-            -- gdsGui_schematic_resetColorsToDefault leaves every entity's
-            -- pendingColor forced to gray after a combination change, and
-            -- resolveColor checks pendingColor BEFORE defaultColor, so
-            -- without this the pick would silently stay masked by that gray
-            -- placeholder instead of showing immediately like ASSIGN COLOR's
-            -- preview does.
-            el.pendingColor = entry.color
-            _notifyChanged(canvas)
-        end
-    end
 end
 
 -- Tapping outside the edit menu (or outside the confirm/properties menus it
@@ -1650,10 +1912,9 @@ function gdsGui_schematic_elementRenameCancelled()
 end
 
 --------------------------------------------------------------------------------
--- PUBLIC API — DESIGN-MODE WIRE EDIT MENU (color + delete, opened by a plain
--- tap on a wire while in design mode). Mirrors the element edit menu above,
--- minus PROPERTIES (wires carry no key/value list) — same base defaultColor
--- semantics otherwise.
+-- PUBLIC API — DESIGN-MODE WIRE EDIT MENU (delete, opened by a plain tap on
+-- a wire while in design mode). No longer offers a color swatch row — see
+-- the matching comment on the element edit menu above.
 --------------------------------------------------------------------------------
 
 function gdsGui_schematic_openWireEditMenu(canvasName, wireId)
@@ -1662,38 +1923,24 @@ function gdsGui_schematic_openWireEditMenu(canvasName, wireId)
     local w = _findWire(canvas, wireId)
     if not w then return end
     canvas._wireEditTargetId = wireId
-    _openSwatchColorMenu(canvasName, "WIRE: " .. wireId, {"DELETE"},
+    gdsGui_schematic_openMenu(canvasName, "WIRE: " .. wireId, {"DELETE"},
         "gdsGui_schematic_internal_onWireEditChosen", "gdsGui_schematic_internal_onWireEditCancelled")
 end
 
-function gdsGui_schematic_internal_onWireEditChosen(canvasName, index)
+function gdsGui_schematic_internal_onWireEditChosen(canvasName, index, optionText)
     local canvas = _findCanvas(canvasName)
     if not canvas or not canvas._wireEditTargetId then return end
     local wireId = canvas._wireEditTargetId
-    local nColors = #_COLOR_PALETTE
-    if index == nColors + 1 then
+    if optionText == "DELETE" then
         -- DELETE tapped: confirm before actually removing it. Keep
         -- _wireEditTargetId set — the confirm/cancel handler below clears it.
         gdsGui_schematic_openMenu(canvasName, "DELETE \"WIRE: " .. wireId .. "\"?",
             {"DELETE", "CANCEL"}, "gdsGui_schematic_internal_onWireDeleteConfirmed",
-            "gdsGui_schematic_internal_onWireDeleteConfirmed")
+            "gdsGui_schematic_internal_onWireDeleteConfirmed", true)
         return
     end
     canvas._wireEditTargetId = nil
     canvas.selectedWireId = nil
-    local entry = _COLOR_PALETTE[index]
-    if entry then
-        local w = _findWire(canvas, wireId)
-        if w then
-            _pushUndo(canvas)
-            w.defaultColor = entry.color
-            -- See the matching comment in onElementEditChosen above: without
-            -- also setting pendingColor, a forced-gray placeholder left by
-            -- gdsGui_schematic_resetColorsToDefault would mask this pick.
-            w.pendingColor = entry.color
-            _notifyChanged(canvas)
-        end
-    end
 end
 
 -- Tapping outside the edit menu (or outside the confirm step it leads to)
@@ -1725,14 +1972,14 @@ function gdsGui_schematic_internal_onWireDeleteConfirmed(canvasName, index, opti
 end
 
 --------------------------------------------------------------------------------
--- PUBLIC API — DESIGN-MODE CONTROL EDIT MENU (color + position + delete,
--- opened by a plain tap on a control while in design mode; a drag still
--- repositions it instead, same tap-vs-drag gesture as the element/wire edit
--- menus above). A swatch picker like those two, with the control's named
--- positions and DELETE as extraOptions below the color row — sets the
--- control's base defaultColor directly, same "no signature/snapshot
--- involved, just the permanent appearance when no snapshot overrides it"
--- semantics as an element/wire's own edit-menu color option.
+-- PUBLIC API — DESIGN-MODE CONTROL EDIT MENU (position + delete, opened by a
+-- plain tap on a control while in design mode; a drag still repositions it
+-- instead, same tap-vs-drag gesture as the element/wire edit menus above).
+-- No longer offers a color swatch row — see the matching comment on the
+-- element edit menu above. ADD WIRE always leads (index 1) and DELETE always
+-- trails (index #positions + 2), checked by INDEX rather than optionText so
+-- a control whose own position happens to be named "ADD WIRE" or "DELETE"
+-- can't collide with them.
 --------------------------------------------------------------------------------
 
 function gdsGui_schematic_openControlEditMenu(canvasName, controlId)
@@ -1741,10 +1988,10 @@ function gdsGui_schematic_openControlEditMenu(canvasName, controlId)
     local ctrl = _findControl(canvas, controlId)
     if not ctrl then return end
     canvas._controlEditTargetId = controlId
-    local extraOptions = {"ADD WIRE"}
-    for _, p in ipairs(ctrl.positions) do table.insert(extraOptions, p) end
-    table.insert(extraOptions, "DELETE")
-    _openSwatchColorMenu(canvasName, ctrl.label or controlId, extraOptions,
+    local options = {"ADD WIRE"}
+    for _, p in ipairs(ctrl.positions) do table.insert(options, p) end
+    table.insert(options, "DELETE")
+    gdsGui_schematic_openMenu(canvasName, ctrl.label or controlId, options,
         "gdsGui_schematic_internal_onControlEditChosen", "gdsGui_schematic_internal_onControlEditCancelled")
 end
 
@@ -1752,29 +1999,9 @@ function gdsGui_schematic_internal_onControlEditChosen(canvasName, index, option
     local canvas = _findCanvas(canvasName)
     if not canvas or not canvas._controlEditTargetId then return end
     local controlId = canvas._controlEditTargetId
-    local nColors = #_COLOR_PALETTE
-    if index <= nColors then
-        -- Color swatch tapped: set the control's base defaultColor, same as
-        -- an element/wire's own edit-menu color pick.
-        canvas._controlEditTargetId = nil
-        canvas.selectedControlId = nil
-        local entry = _COLOR_PALETTE[index]
-        if entry then
-            local ctrl = _findControl(canvas, controlId)
-            if ctrl then
-                _pushUndo(canvas)
-                ctrl.defaultColor = entry.color
-                -- See the matching comment in onElementEditChosen above:
-                -- without also setting pendingColor, a forced-gray
-                -- placeholder left by gdsGui_schematic_resetColorsToDefault
-                -- would mask this pick.
-                ctrl.pendingColor = entry.color
-                _notifyChanged(canvas)
-            end
-        end
-        return
-    end
-    if optionText == "ADD WIRE" then
+    local ctrl = _findControl(canvas, controlId)
+    local nPositions = ctrl and #ctrl.positions or 0
+    if index == 1 then
         -- ADD WIRE tapped: arm a one-shot wire-drag whose fixed start is
         -- this control, same "stay armed, no need to land on an anchor
         -- next press" convention as an element's own ADD WIRE (see
@@ -1784,14 +2011,12 @@ function gdsGui_schematic_internal_onControlEditChosen(canvasName, index, option
         gdsGui_schematic_cancelPlacement(canvasName)
         canvas.pendingWireFromId = controlId
         return
-    end
-    if optionText == "DELETE" then
+    elseif index == nPositions + 2 then
         -- DELETE tapped: confirm before actually removing it. Keep
         -- _controlEditTargetId set — the confirm/cancel handler below clears it.
-        local ctrl = _findControl(canvas, controlId)
         gdsGui_schematic_openMenu(canvasName, "DELETE \"" .. (ctrl and (ctrl.label or controlId) or controlId) .. "\"?",
             {"DELETE", "CANCEL"}, "gdsGui_schematic_internal_onControlDeleteConfirmed",
-            "gdsGui_schematic_internal_onControlDeleteConfirmed")
+            "gdsGui_schematic_internal_onControlDeleteConfirmed", true)
         return
     end
     canvas._controlEditTargetId = nil
@@ -1801,11 +2026,10 @@ function gdsGui_schematic_internal_onControlEditChosen(canvasName, index, option
     -- cycles a position on every tap (gdsGui_schematic_pressed), which is
     -- deliberately NOT undoable (same as any other instrument interaction).
     -- This design-mode edit-menu path is a genuine edit though, same as
-    -- every sibling mutation here (rename, delete, color pick, move).
-    -- Offset by one extra slot versus before: extraOptions now leads with
-    -- ADD WIRE, so a position's 0-based index is index - nColors - 2.
+    -- every sibling mutation here (rename, delete, move). A position's
+    -- 0-based index is index - 2 (ADD WIRE occupies index 1).
     _pushUndo(canvas)
-    gdsGui_schematic_setControlPosition(canvasName, controlId, index - nColors - 2)
+    gdsGui_schematic_setControlPosition(canvasName, controlId, index - 2)
     _notifyChanged(canvas)
 end
 
@@ -2277,13 +2501,39 @@ function gdsGui_schematic_resetColorsToDefault(canvasName)
     for _, c in ipairs(canvas.controls) do c.pendingColor = { _DEFAULT_COLOR[1], _DEFAULT_COLOR[2], _DEFAULT_COLOR[3], _DEFAULT_COLOR[4] } end
 end
 
+-- Seeds every element/wire/control's pendingColor from `snapshot` instead of
+-- gray — same "always an explicit pendingColor, never a bare default" shape
+-- resetColorsToDefault keeps (so resolveColor's pendingColor-first priority
+-- still wins), just replaying what was actually captured for this
+-- combination. An entity the snapshot doesn't cover (added since capture, or
+-- an older snapshot missing the newer .controls bucket) falls back to gray,
+-- same as a never-captured entity would.
+local function _applySnapshotAsPending(canvas, snapshot)
+    for _, e in ipairs(canvas.elements) do
+        local c = snapshot.elements and snapshot.elements[e.id]
+        e.pendingColor = c and { c[1], c[2], c[3], c[4] }
+            or { _DEFAULT_COLOR[1], _DEFAULT_COLOR[2], _DEFAULT_COLOR[3], _DEFAULT_COLOR[4] }
+    end
+    for _, w in ipairs(canvas.wires) do
+        local c = snapshot.wires and snapshot.wires[w.id]
+        w.pendingColor = c and { c[1], c[2], c[3], c[4] }
+            or { _DEFAULT_COLOR[1], _DEFAULT_COLOR[2], _DEFAULT_COLOR[3], _DEFAULT_COLOR[4] }
+    end
+    for _, ctl in ipairs(canvas.controls) do
+        local c = snapshot.controls and snapshot.controls[ctl.id]
+        ctl.pendingColor = c and { c[1], c[2], c[3], c[4] }
+            or { _DEFAULT_COLOR[1], _DEFAULT_COLOR[2], _DEFAULT_COLOR[3], _DEFAULT_COLOR[4] }
+    end
+end
+
 -- Advances (direction = 1) or retreats (direction = -1) to the next/previous
--- combination, wrapping at both ends, then resets every entity to the
--- selectable gray color (see gdsGui_schematic_resetColorsToDefault above) —
--- whether or not a snapshot already exists for the combination landed on;
--- the app layer's checkmark readout (driven by gdsGui_schematic_hasSnapshot)
--- is how the user learns that without the colors being silently replayed
--- here. Returns the new 1-based index and the total, so the caller can
+-- combination, wrapping at both ends, then either replays the snapshot
+-- already captured for the landed-on combination (so the user can tweak it
+-- further, same as just having captured it) or, if none exists yet, resets
+-- every entity to the selectable gray color (see
+-- gdsGui_schematic_resetColorsToDefault above). The app layer's checkmark
+-- readout (driven by gdsGui_schematic_hasSnapshot) still reflects which case
+-- happened. Returns the new 1-based index and the total, so the caller can
 -- update its header readout without a second pass over canvas.controls.
 function gdsGui_schematic_stepCombination(canvasName, direction)
     local canvas = _findCanvas(canvasName)
@@ -2303,7 +2553,12 @@ function gdsGui_schematic_stepCombination(canvasName, direction)
         idx = math.floor(idx / c.numDetents)
     end
 
-    gdsGui_schematic_resetColorsToDefault(canvasName)
+    local snap = canvas.snapshots[gdsGui_schematic_computeSignature(canvasName)]
+    if snap then
+        _applySnapshotAsPending(canvas, snap)
+    else
+        gdsGui_schematic_resetColorsToDefault(canvasName)
+    end
     return gdsGui_schematic_getCombinationIndex(canvasName), total
 end
 
@@ -2397,6 +2652,7 @@ end
 -- WITH the content, instead of staying pinned to the viewport like a fixed
 -- wallpaper (canvas.w/h are clamped viewport sizes, not the true content
 -- extent, so they're the wrong basis for this — see _calculateGeometry).
+local _CANVAS_BG_OPACITY = 0.35  -- shared by the main backdrop and the corner images below
 local function _drawCanvasBackground(canvas)
     if not canvas.backgroundImagePath then return end
     local image = _loadElementSprite(canvas.backgroundImagePath)
@@ -2407,7 +2663,7 @@ local function _drawCanvasBackground(canvas)
     local px = canvas.x + canvas.panX
     local py = canvas.y + canvas.panY + worldY * canvas.zoom
     local scale = worldScale * canvas.zoom
-    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.setColor(1, 1, 1, _CANVAS_BG_OPACITY)
     love.graphics.draw(image, px, py, 0, scale, scale)
 end
 
@@ -2434,7 +2690,7 @@ local function _drawCornerImage(canvas, path, alignRight, alignTop, sizeMul)
     local px = canvas.x + canvas.panX + worldX * canvas.zoom
     local py = canvas.y + canvas.panY + worldY * canvas.zoom
     local scale = worldScale * canvas.zoom
-    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.setColor(1, 1, 1, _CANVAS_BG_OPACITY)
     love.graphics.draw(image, px, py, 0, scale, scale)
 end
 
@@ -2518,6 +2774,13 @@ local function _drawRotateModeOverlay(cx, cy, radius, zoom)
         tipX - tanX * headSize * 0.4 - normX * headSize * 0.5, tipY - tanY * headSize * 0.4 - normY * headSize * 0.5)
 end
 
+-- 0 from _MIN_ZOOM through _LABEL_FADE_START_ZOOM, then linearly up to 1 at
+-- _MAX_ZOOM — see _LABEL_FADE_START_ZOOM's comment for why labels fade in
+-- as zoom grows.
+local function _labelAlphaForZoom(zoom)
+    return math.max(0, math.min(1, (zoom - _LABEL_FADE_START_ZOOM) / (_MAX_ZOOM - _LABEL_FADE_START_ZOOM)))
+end
+
 local function _drawElement(canvas, e)
     local ex, ey, ew, eh = _elementPixelRect(canvas, e)
     local r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "element", e.id)
@@ -2580,7 +2843,7 @@ local function _drawElement(canvas, e)
         end
     end
     if e.label then
-        love.graphics.setColor(1, 1, 1, 1)
+        love.graphics.setColor(1, 1, 1, _labelAlphaForZoom(canvas.zoom))
         if e.shapeType == "diode" or e.spritePath then
             -- A diode has no filled body to back the label against (just
             -- thin lines), and at a 90/270 rotation those lines run right
@@ -2958,25 +3221,74 @@ end
 -- that's simultaneously in an overlap group AND crosses some unrelated
 -- third wire still gets both treatments correctly (see
 -- _drawSegmentWithHopsAndOffset).
--- Cheap O(n) fingerprint of everything _computeWirePlans' result depends on
--- (every anchor's position/rotation, the wire list itself, and the view
--- transform), so gdsGui_schematic_draw can skip the expensive O(wires^2 *
--- segments^2) crossing/parallel-lane analysis below on frames where nothing
--- actually changed (the common case: a canvas just sitting on screen).
-local function _wirePlansSignature(canvas)
-    local parts = {}
-    for _, e in ipairs(canvas.elements) do
-        parts[#parts + 1] = e.id .. ":" .. e.x .. "," .. e.y .. "," .. e.rotation
+-- Detects whether anything _computeWirePlans' result depends on (every
+-- anchor's position/rotation, the wire list itself, and the view transform)
+-- changed since the last call, so gdsGui_schematic_draw can skip the
+-- expensive O(wires^2 * segments^2) crossing/parallel-lane analysis below on
+-- frames where nothing actually changed (the common case: a canvas just
+-- sitting on screen). Compares live values directly against scalars cached
+-- in canvas._wpSig (reused across frames, mutated in place) rather than
+-- rebuilding and comparing a signature string every frame — every dependency
+-- is still scanned every single call (so a mid-drag position change is still
+-- caught the instant it happens), this just avoids the table/string
+-- allocation that scan used to cost on the common "nothing changed" case.
+-- Correct across any mutation path (add/remove/undo/reload/...) without
+-- having to hook each one individually, since it only ever compares values,
+-- never relies on being told something changed.
+local function _wirePlansChanged(canvas)
+    local sig = canvas._wpSig
+    if not sig then
+        sig = { elements = {}, controls = {}, wires = {} }
+        canvas._wpSig = sig
     end
-    for _, c in ipairs(canvas.controls) do
-        parts[#parts + 1] = c.id .. ":" .. c.x .. "," .. c.y
+    local changed = false
+
+    if sig.zoom ~= canvas.zoom or sig.panX ~= canvas.panX or sig.panY ~= canvas.panY
+       or sig.w ~= canvas.w or sig.h ~= canvas.h then
+        changed = true
+        sig.zoom, sig.panX, sig.panY, sig.w, sig.h =
+            canvas.zoom, canvas.panX, canvas.panY, canvas.w, canvas.h
     end
-    for _, w in ipairs(canvas.wires) do
-        parts[#parts + 1] = w.id .. ":" .. w.fromElementId .. ">" .. w.toElementId .. ":" .. (w.directionOverride or "")
+
+    local elems = sig.elements
+    if #elems ~= #canvas.elements then changed = true end
+    for i, e in ipairs(canvas.elements) do
+        local se = elems[i]
+        if not se then se = {}; elems[i] = se end
+        if se.id ~= e.id or se.x ~= e.x or se.y ~= e.y or se.rotation ~= e.rotation then
+            changed = true
+            se.id, se.x, se.y, se.rotation = e.id, e.x, e.y, e.rotation
+        end
     end
-    parts[#parts + 1] = canvas.zoom .. "," .. canvas.panX .. "," .. canvas.panY
-        .. "," .. canvas.w .. "," .. canvas.h
-    return table.concat(parts, "|")
+    for i = #canvas.elements + 1, #elems do elems[i] = nil end
+
+    local ctrls = sig.controls
+    if #ctrls ~= #canvas.controls then changed = true end
+    for i, c in ipairs(canvas.controls) do
+        local sc = ctrls[i]
+        if not sc then sc = {}; ctrls[i] = sc end
+        if sc.id ~= c.id or sc.x ~= c.x or sc.y ~= c.y then
+            changed = true
+            sc.id, sc.x, sc.y = c.id, c.x, c.y
+        end
+    end
+    for i = #canvas.controls + 1, #ctrls do ctrls[i] = nil end
+
+    local wires = sig.wires
+    if #wires ~= #canvas.wires then changed = true end
+    for i, w in ipairs(canvas.wires) do
+        local sw = wires[i]
+        if not sw then sw = {}; wires[i] = sw end
+        if sw.id ~= w.id or sw.fromElementId ~= w.fromElementId or sw.toElementId ~= w.toElementId
+           or sw.directionOverride ~= w.directionOverride then
+            changed = true
+            sw.id, sw.fromElementId, sw.toElementId, sw.directionOverride =
+                w.id, w.fromElementId, w.toElementId, w.directionOverride
+        end
+    end
+    for i = #canvas.wires + 1, #wires do wires[i] = nil end
+
+    return changed
 end
 
 -- Collapses a wire's user-set directionOverride (0/90/180/270, see
@@ -3007,8 +3319,8 @@ local function _offsetAtDistance(d, length, offsetRanges, stubPx, stubStart, stu
 end
 
 local function _computeWirePlans(canvas)
-    local sig = _wirePlansSignature(canvas)
-    if canvas._wirePlansCache and canvas._wirePlansSig == sig then
+    local changed = _wirePlansChanged(canvas)
+    if canvas._wirePlansCache and not changed then
         return canvas._wirePlansCache
     end
 
@@ -3105,7 +3417,6 @@ local function _computeWirePlans(canvas)
         end
     end
 
-    canvas._wirePlansSig   = sig
     canvas._wirePlansCache = plans
     return plans
 end
@@ -3271,7 +3582,7 @@ local function _drawControl(canvas, c)
     end
     local posName = (c.positions and c.positions[c.detentIndex + 1]) or tostring(c.detentIndex)
     local text = (c.label or "") .. "\n" .. posName
-    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.setColor(1, 1, 1, _labelAlphaForZoom(canvas.zoom))
     love.graphics.printf(text, cx - rad * 2, cy + rad + 2, rad * 4, "center")
 end
 
@@ -3457,6 +3768,28 @@ end
 -- scrollBar_gdsGuiLib.lua / rotaryKnobs_gdsGuiLib.lua to free, unclamped 2D drag)
 --------------------------------------------------------------------------------
 
+-- True if (px,py) lands on a visible, active floating chrome button for this
+-- page (ADD/PAINT/SNAPSHOT/etc. — any button with no owner container, since
+-- those dock directly over the canvas rather than inside a page container).
+-- gdsGui_general_mousepressed/_touchpressed call gdsGui_button_pressed and
+-- gdsGui_schematic_pressed back-to-back for the SAME press with no
+-- "consumed" signal between them, so a dock button that sits geometrically
+-- inside the canvas's own x/y/w/h box (every floating button here does) is
+-- also seen by the canvas as a tap on itself. That's harmless for a plain
+-- selection/pan tap, but PAINT MODE treats any miss as empty canvas space
+-- (which pans the view — see just below) and would otherwise immediately
+-- start panning the instant the PAINT button that just armed it is tapped —
+-- this guard is what stops that.
+local function _hitsFloatingButton(pageName, px, py)
+    for _, b in ipairs(globApp.objects.buttons) do
+        if b.page == pageName and not b.hidden and b.state ~= globApp.BUTTON_STATES.DEACTIVATED and
+           not b.ownerContainer and px >= b.myx and px <= b.myMaxx and py >= b.myy and py <= b.myMaxy then
+            return true
+        end
+    end
+    return false
+end
+
 function gdsGui_schematic_pressed(touchId, x, y)
     local activePageName = _getActivePageName()
     for _, canvas in ipairs(globApp.objects.schematics) do
@@ -3471,6 +3804,13 @@ function gdsGui_schematic_pressed(touchId, x, y)
         end
 
         if x < canvas.x or x > canvas.x + canvas.w or y < canvas.y or y > canvas.y + canvas.h then goto continue end
+
+        -- A floating dock button (ADD/PAINT/SNAPSHOT/...) geometrically
+        -- overlaps the canvas it floats on top of — let the button own this
+        -- tap entirely rather than also treating it as a canvas tap (see
+        -- _hitsFloatingButton's own comment for why this matters for PAINT
+        -- MODE specifically).
+        if _hitsFloatingButton(activePageName, x, y) then goto continue end
 
         -- Track every finger down inside this canvas regardless of what the
         -- first one is already doing, so a second one lands as a pinch.
@@ -3553,6 +3893,48 @@ function gdsGui_schematic_pressed(touchId, x, y)
                             "COLOR: " .. (pickedControl.label or pickedControl.id))
                     end
                 end
+            end
+            goto continue
+        end
+
+        if canvas.paintMode then
+            local hit = _paintPaletteHit(canvas, x, y)
+            if hit == "panel" then
+                goto continue -- missed every swatch but still inside the palette panel; consumed, no-op
+            elseif hit then
+                canvas.paintMode.color = _COLOR_PALETTE[hit].color
+                goto continue
+            end
+            -- Not the palette — see if the tap landed on a paintable target.
+            -- Deliberately its own dragKind ("paint"), untouched by the
+            -- ordinary selection/move/rotate machinery below: a held-and-
+            -- dragged press never paints (see gdsGui_schematic_moved/
+            -- _released, which only commit the paint on an unmoved release),
+            -- and nothing here sets canvas.selectedElementId/etc. either, so
+            -- paint mode never leaves a stray selection behind.
+            local target, targetKind = _hitElement(canvas, x, y), "element"
+            if not target then target, targetKind = _hitWire(canvas, x, y), "wire" end
+            if not target then target, targetKind = _hitControl(canvas, x, y), "control" end
+            if target then
+                canvas.focusTouchId = touchId
+                canvas.dragKind     = "paint"
+                canvas.dragStartX   = x
+                canvas.dragStartY   = y
+                canvas.dragMoved    = false
+                canvas._paintTarget = { kind = targetKind, id = target.id }
+            else
+                -- A miss (empty canvas space) pans the view, same as the
+                -- ordinary design-mode miss case further down — paint mode
+                -- shouldn't trap you unable to move around the canvas.
+                -- Paint mode itself only exits via the PAINT button
+                -- (gdsGui_schematic_disarmPaintMode), not by tapping
+                -- elsewhere; a tap-without-drag here just pans in place.
+                canvas.focusTouchId = touchId
+                canvas.dragKind     = "pan"
+                canvas.dragStartX   = x
+                canvas.dragStartY   = y
+                canvas.panStartX    = canvas.panX
+                canvas.panStartY    = canvas.panY
             end
             goto continue
         end
@@ -3770,6 +4152,17 @@ function gdsGui_schematic_moved(touchId, x, y)
         if canvas.wireTool.fromId then
             canvas.wireTool.curX = x
             canvas.wireTool.curY = y
+        elseif canvas.dragKind == "paint" then
+            -- Moved too far to count as a tap — cancels the pending paint
+            -- outright (gdsGui_schematic_released below only applies it when
+            -- dragMoved is still false), same slop-triggered cancel as
+            -- "pendingLongPress" just below, with no drag/move side effect
+            -- of its own either.
+            if not canvas.dragMoved and
+               (math.abs(x - canvas.dragStartX) > _ELEMENT_TAP_SLOP_PX or
+                math.abs(y - canvas.dragStartY) > _ELEMENT_TAP_SLOP_PX) then
+                canvas.dragMoved = true
+            end
         elseif canvas.dragKind == "pendingLongPress" then
             -- Moved too far before the hold reached _LONG_PRESS_SECONDS —
             -- cancel it outright (gdsGui_schematic_update below won't
@@ -3880,6 +4273,32 @@ function gdsGui_schematic_moved(touchId, x, y)
     end
 end
 
+-- Set while the "add a new connector will delete all snapshots" confirm
+-- menu is open after a wire-drag release lands on a valid target anchor;
+-- holds everything gdsGui_schematic_internal_onWireCreateConfirmed needs to
+-- actually create the wire if the user confirms. Only one wire-drag can be
+-- in flight at a time, same shape as _pendingNamedPlacement above.
+local _pendingWireCreation = nil
+
+-- Shared onSelect/onCancel for the snapshot-wipe confirm menu above: both
+-- CONTINUE and CANCEL land here (distinguished by optionText), as does
+-- tapping outside (optionText is nil — treated the same as CANCEL, i.e. the
+-- connector is simply never created).
+function gdsGui_schematic_internal_onWireCreateConfirmed(canvasName, index, optionText)
+    local pending = _pendingWireCreation
+    _pendingWireCreation = nil
+    if not pending or pending.canvasName ~= canvasName then return end
+    if optionText == "CONTINUE" then
+        local canvas = _findCanvas(canvasName)
+        if not canvas then return end
+        local baseId = pending.fromId .. "_to_" .. pending.toId
+        gdsGui_schematic_addWire(canvasName, _uniqueWireId(canvas, baseId),
+            pending.fromId, pending.toId, pending.color)
+        canvas.snapshots = {}
+        _notifyChanged(canvas)
+    end
+end
+
 function gdsGui_schematic_released(touchId, x, y)
     local activePageName = _getActivePageName()
     for _, canvas in ipairs(globApp.objects.schematics) do
@@ -3909,20 +4328,46 @@ function gdsGui_schematic_released(touchId, x, y)
             goto continue
         end
         if canvas.focusTouchId == touchId then
-            if canvas.wireTool.fromId then
+            if canvas.dragKind == "paint" then
+                -- Only a clean tap (never crossed the slop threshold —
+                -- gdsGui_schematic_moved) actually paints; a tap that turned
+                -- into a drag/pan gesture applies nothing, matching every
+                -- other tap-vs-drag gesture in this file.
+                if not canvas.dragMoved and canvas.paintMode and canvas.paintMode.color and canvas._paintTarget then
+                    _applyPaint(canvas, canvas._paintTarget.kind, canvas._paintTarget.id, canvas.paintMode.color)
+                end
+                canvas._paintTarget = nil
+            elseif canvas.wireTool.fromId then
                 local toElem = _connectorSnapTarget(canvas)
                 if toElem then
-                    local baseId = canvas.wireTool.fromId .. "_to_" .. toElem.id
                     -- wireTool.color: an explicit per-gesture override (set
                     -- only by a still-armed gdsGui_schematic_armConnectorPlacement
                     -- color, nil for ADD WIRE). defaultConnectorColor: the
                     -- per-canvas fallback ADD WIRE actually relies on — see
                     -- gdsGui_schematic_setDefaultConnectorColor.
-                    gdsGui_schematic_addWire(canvas.name, _uniqueWireId(canvas, baseId),
-                        canvas.wireTool.fromId, toElem.id,
-                        canvas.wireTool.color or canvas.defaultConnectorColor or _DEFAULT_COLOR)
-                    canvas.snapshots = {}
-                    _notifyChanged(canvas)
+                    local pendingColor = canvas.wireTool.color or canvas.defaultConnectorColor or _DEFAULT_COLOR
+                    -- A new connector wipes every existing snapshot (same as
+                    -- a new element/control — see _commitNamedPlacement)
+                    -- — worth an explicit "are you sure" only when there's
+                    -- actually something to lose.
+                    local snapshotCount = gdsGui_schematic_countSnapshots(canvas.name)
+                    if snapshotCount > 0 then
+                        _pendingWireCreation = {
+                            canvasName = canvas.name, fromId = canvas.wireTool.fromId,
+                            toId = toElem.id, color = pendingColor,
+                        }
+                        gdsGui_schematic_openMenu(canvas.name,
+                            "ADDING A NEW CONNECTOR WILL DELETE ALL " .. snapshotCount .. " SNAPSHOT(S). CONTINUE?",
+                            {"CONTINUE", "CANCEL"},
+                            "gdsGui_schematic_internal_onWireCreateConfirmed",
+                            "gdsGui_schematic_internal_onWireCreateConfirmed", true)
+                    else
+                        local baseId = canvas.wireTool.fromId .. "_to_" .. toElem.id
+                        gdsGui_schematic_addWire(canvas.name, _uniqueWireId(canvas, baseId),
+                            canvas.wireTool.fromId, toElem.id, pendingColor)
+                        canvas.snapshots = {}
+                        _notifyChanged(canvas)
+                    end
                 end
                 -- A catalog-armed connector is one-shot: disarm it once this
                 -- gesture resolves, whether or not it actually hit a second
@@ -4025,6 +4470,7 @@ function gdsGui_schematic_update(dt)
             canvas._overlayAnimAngle = (canvas._overlayAnimAngle or 0) + dt * _OVERLAY_SPIN_RADPS
         end
         if canvas.page ~= activePageName then goto continue end
+        _pollMenuHoldToConfirm(canvas, dt)
         if canvas.dragKind ~= "pendingLongPress" then goto continue end
         -- The touch already lifted (gdsGui_schematic_released clears
         -- dragKind on release, so this is only a same-frame-ordering
@@ -4183,10 +4629,11 @@ function gdsGui_schematicGallery_setOnSelect(galleryName, callbackFuncName)
     if gallery then gallery.onSelect = callbackFuncName end
 end
 
-function gdsGui_schematicGallery_openMenu(galleryName, title, options, onSelectFunc, onCancelFunc)
+function gdsGui_schematicGallery_openMenu(galleryName, title, options, onSelectFunc, onCancelFunc, isConfirm)
     local gallery = _findGallery(galleryName)
     if not gallery then return end
     gallery.menu = { title = title, options = options, onSelect = onSelectFunc, onCancel = onCancelFunc }
+    _markConfirmMenu(gallery.menu, isConfirm)
 end
 
 function gdsGui_schematicGallery_closeMenu(galleryName)
@@ -4453,5 +4900,12 @@ function gdsGui_schematicGallery_released(touchId, x, y)
 end
 
 function gdsGui_schematicGallery_update(dt)
-    -- No per-frame physics (scroll is directly position-driven); no-op for now.
+    -- No per-frame physics (scroll is directly position-driven) beyond
+    -- timing a held confirm-menu action row (see _pollMenuHoldToConfirm).
+    local activePageName = _getActivePageName()
+    for _, gallery in ipairs(globApp.objects.schematicGalleries) do
+        if gallery.page == activePageName then
+            _pollMenuHoldToConfirm(gallery, dt)
+        end
+    end
 end

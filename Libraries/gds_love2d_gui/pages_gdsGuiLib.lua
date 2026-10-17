@@ -376,6 +376,16 @@ function gdsGui_page_switch (myName, myToPg, myMinTime_secs, testMode, myProgres
 
 	if toPageExists == true then
 
+		-- Paid/unlocked builds set this to skip the artificial loading-page
+		-- wait entirely (see globApp.skipPageLoadingScreens) and land on the
+		-- destination page immediately, instead of parking on the loading
+		-- page (index 2) for myMinTime_secs first.
+		if globApp.skipPageLoadingScreens == true then
+			globApp.currentPageIndex = myToPg
+			globApp.pageChanged = false
+			return
+		end
+
 		local initialPage = globApp.currentPageIndex
 
 		local timerName =  ("load:".. globApp.currentPageIndex .. "/".. myToPg)

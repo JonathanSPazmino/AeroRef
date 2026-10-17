@@ -1381,6 +1381,7 @@ end
 		globApp.OperatingSystem  = love.system.getOS( ) --[["OS X", "Windows", "Linux", "Android" or "iOS"]]
 		globApp.fourDevTap = false
 		globApp.devTapCounter = 0
+		globApp.skipPageLoadingScreens = false --[[when true, gdsGui_page_switch lands on the destination page immediately instead of parking on the loading page for its minimum-time wait]]
 		globApp.minWindowWidth = 230 --[[defines minimum app width]]
 		globApp.minWindowHeight = 230 --[[defines minimum app height]]
 		globApp.maxWindowWidth = 1920

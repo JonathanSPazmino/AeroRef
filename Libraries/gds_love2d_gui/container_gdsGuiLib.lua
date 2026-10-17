@@ -820,6 +820,7 @@ local function _setClip(clip)
 end
 
 local function _drawWidget(obj, clip)
+    if obj.hidden then return end
     local ot = obj.objectType
 
     if ot == "button" then
@@ -908,6 +909,7 @@ end
 -- ---------------------------------------------------------------------------
 
 local function _isTouchOnWidget(obj, x, y)
+    if obj.hidden then return false end
     local ot = obj.objectType
     if ot == "button" then
         if obj.state == globApp.BUTTON_STATES.DEACTIVATED then return false end

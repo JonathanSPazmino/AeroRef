@@ -101,6 +101,7 @@ function gdsGui_button_create(label, page, buttonType, imgPressed, imgReleased, 
     newButton.state = initialState
     newButton.callbackFunc = callbackFunc
     newButton.hapticEnabled = (hapticEnabled == true)
+    newButton.hidden = false
 
     -- The new resize method for this object
     function newButton:resize()
@@ -144,7 +145,7 @@ end
 function gdsGui_button_draw(pageName)
     love.graphics.setColor(1, 1, 1, 1)
     for _, button in ipairs(globApp.objects.buttons) do
-        if button.page == pageName and not button.ownerContainer then
+        if button.page == pageName and not button.ownerContainer and not button.hidden then
             local imageToDraw = button.images[button.state]
             if imageToDraw then
                 love.graphics.draw(imageToDraw, button.myx, button.myy, 0, button.factorWidth, button.factorHeight)
@@ -168,7 +169,7 @@ function gdsGui_button_pressed(x, y, button, istouch)
     local activePageName = _getActivePageName()
 
     for _, p in ipairs(globApp.objects.buttons) do
-        if p.page == activePageName and p.state ~= globApp.BUTTON_STATES.DEACTIVATED and _isPressed(p, x, y) and
+        if p.page == activePageName and not p.hidden and p.state ~= globApp.BUTTON_STATES.DEACTIVATED and _isPressed(p, x, y) and
            (not p.ownerContainer or gdsGui_container_isTouchInOwnerContainer(p, x, y)) then
             if p.type == "toggle" then
                 if p.state == globApp.BUTTON_STATES.RELEASED then
@@ -236,6 +237,20 @@ function gdsGui_button_setState(buttonName, state)
         if b.name == buttonName then
             b.state = targetState
             b.deactivated = (targetState == globApp.BUTTON_STATES.DEACTIVATED)
+            return
+        end
+    end
+end
+
+--[[
+    Shows or fully hides a button by name — unlike the DEACTIVATED state
+    (still drawn, just unresponsive), a hidden button is skipped entirely by
+    both drawing and press handling.
+]]
+function gdsGui_button_setHidden(buttonName, hidden)
+    for _, b in ipairs(globApp.objects.buttons) do
+        if b.name == buttonName then
+            b.hidden = hidden
             return
         end
     end
