@@ -1171,7 +1171,7 @@ end
 
 function gdsGui_general_touchmoved (id, x, y, dx, dy, pressure)
 
-	touches = love.touch.getTouches()
+	local touches = love.touch.getTouches()
 
 	local calledFunction = "slide"
 	local slideSensitivity=3
@@ -1186,7 +1186,7 @@ function gdsGui_general_touchmoved (id, x, y, dx, dy, pressure)
 
 	for i, tchs in ipairs (touches) do --isolate to first touch only
 
-		if i == 1 then
+		if i == 1 and tchs == id then
 
 			if globApp.userInput == "touch pressed" and ((dx > slideSensitivityPixelsPositive or dx < slideSensitivityPixelsNegative) or (dy > slideSensitivityPixelsPositive or dy < slideSensitivityPixelsNegative )) then
 
@@ -1194,11 +1194,11 @@ function gdsGui_general_touchmoved (id, x, y, dx, dy, pressure)
 
 			end
 
-			gdsGui_button_released (x, y, 1, istouch, presses)
+			gdsGui_button_released (x, y, 1, true)
 
-			gdsGui_table_touchScroll (id, x, y, dx, dy, pressure, button, istouch)
+			gdsGui_table_touchScroll (id, x, y, dx, dy, pressure, nil, true)
 
-			gdsGui_outputTxtBox_touchScroll (id, x, y, dx, dy, pressure, button, istouch)
+			gdsGui_outputTxtBox_touchScroll (id, x, y, dx, dy, pressure, nil, true)
 			gdsGui_container_touchScroll(id, x, y, dx, dy)
 
 		end

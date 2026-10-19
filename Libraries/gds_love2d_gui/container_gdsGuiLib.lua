@@ -1502,6 +1502,11 @@ function gdsGui_container_relayoutPage(pageName)
         local minOff = math.min(0, bodyArea.height - contentH)
         if state.scroll.offsetY < minOff then state.scroll.offsetY = minOff end
         if state.scroll.offsetY > 0 then state.scroll.offsetY = 0 end
+        -- Same reset _layoutPage's own resize branch does — a font-size
+        -- change mid-bounce/coast would otherwise leave stale velocity/phase
+        -- driving the spring-damper against content that just moved.
+        state.scroll.velocityY = 0
+        state.scroll.phase     = "idle"
     end
 end
 

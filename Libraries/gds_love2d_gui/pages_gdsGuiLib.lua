@@ -6,6 +6,12 @@ This code is called by main.lua
 
 pages = {}
 
+-- Gives each gdsGui_page_switch call's deferred "land on the destination
+-- page" trigger its own global function name (see changePgto's call site
+-- below) so two switches overlapping in flight can't clobber each other's
+-- destination.
+local _changePgtoCounter = 0
+
 function gdsGui_page_create (myIndex, myName, myLockStatus, myDisplayStatus, myBgColor, myFontSize, myInitPosition, my_width_height_x_y_anchorPoint, myInitMode, testMode)
 
 	local winWidth = globApp.safeScreenArea.w
@@ -394,9 +400,12 @@ function gdsGui_page_switch (myName, myToPg, myMinTime_secs, testMode, myProgres
 
 		gdsGui_page_loadingCreate (myName, myToPg, myMinTime_secs, initialPage, testMode, myProgressBarColor)
 
-		gdsGui_timeControl_createTrigger (timerName,  { myMinTime_secs, myMinTime_secs+.001}, {"gdsGui_page_loadingDelete","changePgto"})
+		_changePgtoCounter = _changePgtoCounter + 1
+		local changeFuncName = "changePgto_" .. _changePgtoCounter
 
-		function changePgto ()
+		gdsGui_timeControl_createTrigger (timerName,  { myMinTime_secs, myMinTime_secs+.001}, {"gdsGui_page_loadingDelete", changeFuncName})
+
+		_G[changeFuncName] = function ()
 			if globApp.fourDevTap == false then
 				globApp.currentPageIndex = myToPg
 			elseif globApp.fourDevTap == true then
@@ -406,6 +415,7 @@ function gdsGui_page_switch (myName, myToPg, myMinTime_secs, testMode, myProgres
 			end
 
 			globApp.pageChanged = false
+			_G[changeFuncName] = nil
 		end
 		if initialPage ~= myToPg then
 			globApp.pageChanged = true
@@ -474,7 +484,7 @@ function gdsGui_page_isActive (pageIndex)
 
 	--[[Takes page index and returns true if page index matches current page index]]
 
-	myResult = false
+	local myResult = false
 
 	if pageIndex == globApp.currentPageIndex then
 

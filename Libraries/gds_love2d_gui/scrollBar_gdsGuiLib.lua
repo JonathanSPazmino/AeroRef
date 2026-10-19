@@ -614,6 +614,7 @@ function gdsGui_scrollBar_holdAndDrag (id, x,y,button,istouch, devMode)
 		-- Only drag the scrollbar that was originally focused by this touch/mouse interaction.
 		if sb.focusTouchId ~= id then goto continue end
 
+		local totalPositionSpan
 		if sb.orientation == "vertical" then
 			totalPositionSpan = sb.frame.height - sb.bar.height
 		elseif sb.orientation == "horizontal" then

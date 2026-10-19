@@ -9,7 +9,7 @@
 -------------------------------------------------------------------------------
 require("Libraries.gds_love2d_gui.loader_gdsGuiLib")
 
-APP_VERSION = "1.0.18"
+APP_VERSION = "1.0.19"
 
 -- Original orientation the app was designed for; used by the GUI library to
 -- establish the reference container width at first finalize (portrait = 1 col).
@@ -706,7 +706,7 @@ local function _openSystemIntoCanvas(systemId, mode)
     for _, c in ipairs(sys.controls or {}) do
         gdsGui_schematic_addControl("mainCanvas", c.id, c.x, c.y, _deepCopyTable(c.positions), c.detentIndex,
             c.label, c.callbackFunc, c.radiusScale, c.spritePaths, c.rotation, c.overlaySpritePath,
-            _deepCopyTable(c.defaultColor))
+            _deepCopyTable(c.defaultColor), c.colorDarkenMul)
     end
     for _, w in ipairs(sys.wires or {}) do
         gdsGui_schematic_addWire("mainCanvas", w.id, w.fromElementId, w.toElementId, _deepCopyTable(w.defaultColor),

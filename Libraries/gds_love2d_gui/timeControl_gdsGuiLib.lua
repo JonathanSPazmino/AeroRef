@@ -75,7 +75,7 @@ function gdsGui_timeControl_updateTrigger (dt)
 		
 				if t.currentTime >= intv and t.intervalFunctionCalls[j] ~= 0 then
 
-					getfenv()[t.intervalFunctionCalls[j]]()
+					_G[t.intervalFunctionCalls[j]]()
 
 					-- print (t.name .. "/"..t.intervalFunctionCalls[j] .. " ... At " .. t.currentTime  .. " was executed!")
 
@@ -93,7 +93,7 @@ function gdsGui_timeControl_updateTrigger (dt)
 
 					if t.currentTime >= intv and t.intervalFunctionCalls[j-1] ~= 0 then
 
-						getfenv()[t.intervalFunctionCalls[j-1]]()
+						_G[t.intervalFunctionCalls[j-1]]()
 
 						-- print (t.name .. "/"..t.intervalFunctionCalls[j - 1] .. " ... At " .. t.currentTime .. " ".. " was executed!/" .. " intCount :".. #t.intervals .. "/j: " .. j)
 
@@ -109,31 +109,27 @@ function gdsGui_timeControl_updateTrigger (dt)
 
 			for j, intv in ipairs(t.intervals) do
 
-				for j, intv in ipairs(t.intervals) do
-		
-					if t.currentTime >= intv and t.intervalFunctionCalls[j] ~= 0 then
+				if t.currentTime >= intv and t.intervalFunctionCalls[j] ~= 0 then
 
-						if j == #t.intervals then
+					if j == #t.intervals then
 
-							for k=j, #t.intervalFunctionCalls, 1 do
+						for k=j, #t.intervalFunctionCalls, 1 do
 
-								getfenv()[t.intervalFunctionCalls[k]]()
+							_G[t.intervalFunctionCalls[k]]()
 
-								-- print (t.name .. "/"..t.intervalFunctionCalls[k] .. " ... At " .. t.currentTime  .. " was executed!")
+							-- print (t.name .. "/"..t.intervalFunctionCalls[k] .. " ... At " .. t.currentTime  .. " was executed!")
 
-								t.intervalFunctionCalls[k] = 0
+							t.intervalFunctionCalls[k] = 0
 
-							end
-
-						elseif j~= #t.intervals then
-							
-							getfenv()[t.intervalFunctionCalls[j]]()
-
-							-- print (t.name .. "/"..t.intervalFunctionCalls[j] .. " ... At " .. t.currentTime  .. " was executed!")
-							
-							t.intervalFunctionCalls[j] = 0
-						
 						end
+
+					elseif j~= #t.intervals then
+
+						_G[t.intervalFunctionCalls[j]]()
+
+						-- print (t.name .. "/"..t.intervalFunctionCalls[j] .. " ... At " .. t.currentTime  .. " was executed!")
+
+						t.intervalFunctionCalls[j] = 0
 
 					end
 

@@ -1247,6 +1247,7 @@ function gdsGui_schematic_removeControl(canvasName, id)
             table.remove(canvas.wires, i)
         end
     end
+    if canvas.selectedControlId == id then canvas.selectedControlId = nil end
     _pruneUnreachableSnapshots(canvas)
 end
 
@@ -3849,10 +3850,10 @@ local function _wirePlansChanged(canvas)
     local changed = false
 
     if sig.zoom ~= canvas.zoom or sig.panX ~= canvas.panX or sig.panY ~= canvas.panY
-       or sig.w ~= canvas.w or sig.h ~= canvas.h then
+       or sig.w ~= canvas.w or sig.h ~= canvas.h or sig.x ~= canvas.x or sig.y ~= canvas.y then
         changed = true
-        sig.zoom, sig.panX, sig.panY, sig.w, sig.h =
-            canvas.zoom, canvas.panX, canvas.panY, canvas.w, canvas.h
+        sig.zoom, sig.panX, sig.panY, sig.w, sig.h, sig.x, sig.y =
+            canvas.zoom, canvas.panX, canvas.panY, canvas.w, canvas.h, canvas.x, canvas.y
     end
 
     local elems = sig.elements

@@ -993,7 +993,7 @@ function gdsGui_table_rowSelect (x,y,button,istouch)
 				spreadSheetExist = true
 			end
 
-			totalRows = tbls.rowsCount
+			local totalRows = tbls.rowsCount
 			totalCollums = tbls.collumnsCount
 
 		end

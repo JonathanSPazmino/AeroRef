@@ -208,9 +208,15 @@ function gdsGui_button_released(x, y, button, istouch)
 
     local activePageName = _getActivePageName()
     for _, p in ipairs(globApp.objects.buttons) do
-        if p.page == activePageName and p.type == "pushonoff" then
-            if p.state == globApp.BUTTON_STATES.PRESSED then
-                p.state = globApp.BUTTON_STATES.RELEASED
+        if p.page == activePageName and p.type == "pushonoff" and p.state == globApp.BUTTON_STATES.PRESSED then
+            p.state = globApp.BUTTON_STATES.RELEASED
+            -- Only fire the callback if this release is actually over the
+            -- button that was pressed (standard touch-up-inside semantics) —
+            -- otherwise a drag-off-and-release cancels it, and a release
+            -- elsewhere on the page can't fire an unrelated still-pressed
+            -- button (e.g. the other finger of a two-button multi-touch).
+            if not p.hidden and _isPressed(p, x, y) and
+               (not p.ownerContainer or gdsGui_container_isTouchInOwnerContainer(p, x, y)) then
                 _executeCallback(p)
             end
         end

@@ -404,7 +404,19 @@ function table.show(tbl, varName, baseIndent)
 
     local function encodeValue(v)
         local vt = type(v)
-        if vt == "number" or vt == "boolean" then
+        if vt == "number" then
+            -- tostring() on these yields "inf"/"-inf"/"nan" — not valid Lua
+            -- numeral literals, so load()ing them back would resolve as an
+            -- undefined global (silently nil) instead of round-tripping.
+            if v ~= v then
+                return "(0/0)"
+            elseif v == math.huge then
+                return "math.huge"
+            elseif v == -math.huge then
+                return "-math.huge"
+            end
+            return tostring(v)
+        elseif vt == "boolean" then
             return tostring(v)
         elseif vt == "function" then
             local di = debug.getinfo(v, "S")

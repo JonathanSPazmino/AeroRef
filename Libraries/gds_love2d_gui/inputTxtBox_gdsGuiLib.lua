@@ -164,11 +164,11 @@ function gdsGui_inputTxtBox_create (txtBxId, page, tblTextSpecs, theme_focus, th
 
 		nitb.userGuideBox.textMarginSpaces = 0.25
 
-		maxDefaultTextLineCount = gdsGui_findMaxNumOfLinesNeeded (nitb.textFont, nitb.frame.width, nitb.defaultText)
-		actualDefaultTextFontHeight = gdsGui_general_returnFontInfo (nitb.textFont, "height")
+		local maxDefaultTextLineCount = gdsGui_findMaxNumOfLinesNeeded (nitb.textFont, nitb.frame.width, nitb.defaultText)
+		local actualDefaultTextFontHeight = gdsGui_general_returnFontInfo (nitb.textFont, "height")
 
 		--adds all lines height
-		totalTextHeight = (actualDefaultTextFontHeight * maxDefaultTextLineCount)
+		local totalTextHeight = (actualDefaultTextFontHeight * maxDefaultTextLineCount)
 		--adjusts for margines spacer:
 		totalTextHeight = totalTextHeight + (totalTextHeight * (nitb.userGuideBox.textMarginSpaces * 2))
 
@@ -258,11 +258,11 @@ function gdsGui_inputTxtBox_update(txtBxId,anchorPoint, myx, myy, myWidth, myHei
 			updTxtBx.myMaxx = updTxtBx.frame.x + updTxtBx.frame.width --[[for button click detection]]
 			updTxtBx.myMaxy = updTxtBx.frame.y + updTxtBx.frame.height--[[for button click detection]]
 
-			maxDefaultTextLineCount = gdsGui_findMaxNumOfLinesNeeded (updTxtBx.textFont, updTxtBx.frame.width, updTxtBx.defaultText)
-			actualDefaultTextFontHeight = gdsGui_general_returnFontInfo (updTxtBx.textFont, "height")
+			local maxDefaultTextLineCount = gdsGui_findMaxNumOfLinesNeeded (updTxtBx.textFont, updTxtBx.frame.width, updTxtBx.defaultText)
+			local actualDefaultTextFontHeight = gdsGui_general_returnFontInfo (updTxtBx.textFont, "height")
 
 			--adds all lines height
-			totalTextHeight = (actualDefaultTextFontHeight * maxDefaultTextLineCount)
+			local totalTextHeight = (actualDefaultTextFontHeight * maxDefaultTextLineCount)
 			--adjusts for margines spacer:
 			totalTextHeight = totalTextHeight + (totalTextHeight * (updTxtBx.userGuideBox.textMarginSpaces * 2))
 
