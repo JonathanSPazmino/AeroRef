@@ -746,6 +746,46 @@ function gdsGui_outputTxtBox_setFontSize(name, newSize)
 	end
 end
 
+-- Fonts created by gdsGui_outputTxtBox_setFontSizeToFit's shrink loop below,
+-- keyed by point size, so repeated/overlapping calls (e.g. two boxes shrinking
+-- through the same size range) reuse the same Font object instead of each
+-- candidate size allocating its own, same lazy-load-once pattern as
+-- _bgSpriteCache above.
+local _fitFontCache = {}
+local function _loadFitFont(size)
+	if not _fitFontCache[size] then
+		_fitFontCache[size] = love.graphics.newFont(size)
+	end
+	return _fitFontCache[size]
+end
+
+-- Like gdsGui_outputTxtBox_setFontSize, but for text whose length isn't
+-- fixed ahead of time (e.g. a page title showing a user-renameable name) —
+-- shrinks the font a point at a time, starting from requestedSize, until
+-- the current text fits on one line within the box's own single-line width
+-- budget (tb.text.width, set at create time) instead of being left to wrap
+-- or overflow out of its fixed-height frame. Never shrinks below minSize,
+-- so an extreme name still renders (if tightly) rather than vanishing.
+-- Returns the size actually applied, or nil if no box matched.
+function gdsGui_outputTxtBox_setFontSizeToFit(name, requestedSize, minSize)
+	minSize = minSize or 8
+	for _, box in ipairs(globApp.objects.outputTextBox) do
+		if box.name == name then
+			local size = requestedSize
+			local font = _loadFitFont(size)
+			while size > minSize and font:getWidth(box.text.text or "") > box.text.width do
+				size = size - 1
+				font = _loadFitFont(size)
+			end
+			box.text.font     = font
+			box.text.height   = gdsGui_general_returnFontInfo(font, "height")
+			box.text.lastText = nil
+			return size
+		end
+	end
+	return nil
+end
+
 -- Returns true once the named textbox has been scrolled to near its bottom
 -- at least once (or if its content fits the frame without any scrolling).
 function gdsGui_outputTxtBox_hasReachedBottom(name)

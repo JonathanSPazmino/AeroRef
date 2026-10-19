@@ -9,7 +9,7 @@
 -------------------------------------------------------------------------------
 require("Libraries.gds_love2d_gui.loader_gdsGuiLib")
 
-APP_VERSION = "1.0.14"
+APP_VERSION = "1.0.18"
 
 -- Original orientation the app was designed for; used by the GUI library to
 -- establish the reference container width at first finalize (portrait = 1 col).
@@ -141,6 +141,8 @@ local _THEME_DARK = {
     border      = {0.35, 0.35, 0.35, 1},
     text        = {1.00, 1.00, 1.00, 1},
     progressBar = {1.00, 1.00, 0.00, 1},
+    canvasBg    = {0.10, 0.10, 0.12, 1},
+    canvasGrid  = {1.00, 1.00, 1.00, 0.06},
 }
 local _THEME_LIGHT = {
     app         = {0.88, 0.88, 0.88, 1},
@@ -149,6 +151,8 @@ local _THEME_LIGHT = {
     border      = {0.55, 0.55, 0.55, 1},
     text        = {0.05, 0.10, 0.25, 1},
     progressBar = {0.05, 0.10, 0.40, 1},
+    canvasBg    = {0.80, 0.80, 0.83, 1},
+    canvasGrid  = {0.00, 0.00, 0.00, 0.08},
 }
 
 -- Learn textbox segment data (text + subtitle flag; colors resolved per theme).
@@ -278,15 +282,29 @@ local _GENERATOR_OVERLAY_SPRITE_PATH = "Sprites/control_generatorGear.png"
 
 local SCHEMATIC_CATALOG = {
     { system = "ELECTRICAL", connectorColor = {0.85, 0.75, 0.15, 1}, items = {
+        -- colorDarkenMul 0.8 * 0.85: matches schematic_gdsGuiLib.lua's
+        -- _ELEMENT_DARKEN (the blanket darken every element, BATTERY
+        -- included, already gets) so the GENERATOR housing reads exactly
+        -- as dark as BATTERY's own sprite instead of staying undarkened
+        -- like every other control.
         { label = "GENERATOR", kind = "control", presets = { {"OFF", "ON"} },
-          spritePaths = _GENERATOR_SPRITE_PATHS, overlaySpritePath = _GENERATOR_OVERLAY_SPRITE_PATH },
-        { label = "BATTERY",   kind = "element", shapeType = "rect",
+          spritePaths = _GENERATOR_SPRITE_PATHS, overlaySpritePath = _GENERATOR_OVERLAY_SPRITE_PATH,
+          colorDarkenMul = 0.8 * 0.85 },
+        -- matchControlSize: same on-screen footprint as a freshly-placed
+        -- GENERATOR control (see gdsGui_schematic_armElementPlacement's own
+        -- comment for the exact formula), rather than the shared default
+        -- element size every other rect/circle item here still uses.
+        { label = "BATTERY",   kind = "element", shapeType = "rect", matchControlSize = true,
           defaultProperties = {"VOLTAGE", "CURRENT"}, spritePath = "Sprites/element_battery.png" },
         { label = "BUS",       kind = "element", shapeType = "rect",
           defaultProperties = {"VOLTAGE", "CURRENT"}, spritePath = "Sprites/element_bus.png" },
-        { label = "DIODE",     kind = "element", shapeType = "diode", spritePath = "Sprites/element_diode.png" },
+        -- sizeMul 7/30: the diode symbol reads oversized at the shared
+        -- default element size (1/3), shrunk a further 30% on top of that.
+        { label = "DIODE",     kind = "element", shapeType = "diode", spritePath = "Sprites/element_diode.png",
+          sizeMul = 7 / 30 },
+        -- radiusMul 0.7: shrunk 30% from the shared default control size.
         { label = "SWITCH",    kind = "control", presets = { {"OFF", "ON"}, {"OFF", "ON", "STBY"} },
-          spritePaths = _SWITCH_SPRITE_PATHS },
+          spritePaths = _SWITCH_SPRITE_PATHS, radiusMul = 0.7 },
     }},
     { system = "HYDRAULIC", connectorColor = {0.15, 0.45, 0.85, 1}, items = {
         { label = "PUMP",         kind = "element", shapeType = "circle" },
@@ -421,6 +439,7 @@ end
 local _prevSchematicSnapshotCount   = nil
 local _prevSchematicPaintActive     = nil
 local _prevSchematicAddBtnEnabled   = nil
+local _prevSchematicAnnunciatorPanelOpen = nil
 
 local function _findSchematicCanvas()
     for _, c in ipairs(globApp.objects.schematics) do
@@ -597,11 +616,12 @@ local function _captureCurrentSystemFromCanvas()
     local sys = _findSystem(schematicStore.currentSystemId)
     local canvas = _findSchematicCanvas()
     if not sys or not canvas then return end
-    sys.elements   = _deepCopyTable(canvas.elements)
-    sys.wires      = _deepCopyTable(canvas.wires)
-    sys.controls   = _deepCopyTable(canvas.controls)
-    sys.snapshots  = _deepCopyTable(canvas.snapshots)
-    sys.modifiedAt = os.date("%Y-%m-%d %H:%M:%S")
+    sys.elements      = _deepCopyTable(canvas.elements)
+    sys.wires         = _deepCopyTable(canvas.wires)
+    sys.controls      = _deepCopyTable(canvas.controls)
+    sys.annunciators  = _deepCopyTable(canvas.annunciators)
+    sys.snapshots     = _deepCopyTable(canvas.snapshots)
+    sys.modifiedAt    = os.date("%Y-%m-%d %H:%M:%S")
 end
 
 local function _saveCurrentSystem()
@@ -653,6 +673,7 @@ local function _clearMainCanvas()
     for i = #canvas.elements, 1, -1 do table.remove(canvas.elements, i) end
     for i = #canvas.wires, 1, -1 do table.remove(canvas.wires, i) end
     for i = #canvas.controls, 1, -1 do table.remove(canvas.controls, i) end
+    for i = #canvas.annunciators, 1, -1 do table.remove(canvas.annunciators, i) end
     canvas.snapshots = {}
     canvas.selectedElementId = nil
 end
@@ -691,6 +712,9 @@ local function _openSystemIntoCanvas(systemId, mode)
         gdsGui_schematic_addWire("mainCanvas", w.id, w.fromElementId, w.toElementId, _deepCopyTable(w.defaultColor),
             w.directionOverride)
     end
+    for _, a in ipairs(sys.annunciators or {}) do
+        gdsGui_schematic_addAnnunciator("mainCanvas", a.id, a.label, _deepCopyTable(a.color), a.active)
+    end
     local canvas = _findSchematicCanvas()
     if canvas then canvas.snapshots = _deepCopyTable(sys.snapshots or {}) end
 
@@ -711,8 +735,16 @@ local function _openSystemIntoCanvas(systemId, mode)
     gdsGui_button_setHidden("schematicAddBtn", not designing)
     gdsGui_button_setState("schematicPaintBtn", designing and "released" or "deactivated")
     gdsGui_button_setHidden("schematicPaintBtn", not designing)
+    gdsGui_button_setState("schematicAnnunciatorBtn", designing and "released" or "deactivated")
+    gdsGui_button_setHidden("schematicAnnunciatorBtn", not designing)
     gdsGui_button_setState("schematicFullScreenToggle", designing and "deactivated" or "released")
+    -- setFontSizeToFit (not a plain setText) since sys.name's length varies
+    -- per system — refitting on every load keeps a long name from wrapping/
+    -- overflowing at the user's current global font size (see
+    -- _applyFontSize, which only re-fits on a FONT SIZE change, not a
+    -- system switch).
     gdsGui_outputTxtBox_setText("schematic_pageTitle", sys.name)
+    gdsGui_outputTxtBox_setFontSizeToFit("schematic_pageTitle", appSettings.fontSize, 10)
     gdsGui_outputTxtBox_setText("schematicSnapshotLabel", "SNAPSHOTS: " .. gdsGui_schematic_countSnapshots("mainCanvas"))
     _saveSchematicStore()
 end
@@ -751,8 +783,11 @@ end
 
 -------------------------------------------------------------------------------
 -- SYSTEM SCHEMATIC — DESIGN-MODE "ADD" CASCADING MENU (SYSTEM > TYPE > POSITIONS)
--- Each level appends a "RETURN" row so the user can step back up the cascade
--- instead of only being able to tap outside to cancel out of it entirely.
+-- SELECT SYSTEM and POSITIONS each append a "RETURN" row so the user can step
+-- back up the cascade instead of only being able to tap outside to cancel out
+-- of it entirely. TYPE (the menu the "+" dock button actually opens for every
+-- typed system) appends "ANNUNCIATOR" in that spot instead — see
+-- _openTypeMenu's own comment for why it no longer needs a RETURN row.
 -------------------------------------------------------------------------------
 
 local function _openDesignActionsMenu(canvasName)
@@ -780,10 +815,17 @@ local function _openSystemSelectMenu(canvasName)
     gdsGui_schematic_openMenu(canvasName, "SELECT SYSTEM", names, "schematicCatalogSystemChosen", nil)
 end
 
+-- ANNUNCIATOR is appended after every system's own items instead of a
+-- RETURN row (RETURN's old spot) — it's a catalog-wide item, not nested
+-- under any one system (see gdsGui_schematic_armAnnunciatorCreation), so it
+-- shows the same regardless of which system's TYPE menu this is. There's
+-- still a way back up: the dedicated ACTIONS button (schematicContextButtonPressed)
+-- reaches _openDesignActionsMenu directly now, so this cascade no longer
+-- needs its own RETURN row to get there.
 local function _openTypeMenu(canvasName, sys)
     local names = {}
     for _, item in ipairs(sys.items) do table.insert(names, item.label) end
-    table.insert(names, "RETURN")
+    table.insert(names, "ANNUNCIATOR")
     gdsGui_schematic_openMenu(canvasName, sys.system .. ": TYPE", names, "schematicCatalogItemChosen", nil)
 end
 
@@ -820,14 +862,10 @@ function schematicCatalogSystemChosen(canvasName, index, optionText)
 end
 
 function schematicCatalogItemChosen(canvasName, index, optionText)
-    if optionText == "RETURN" then
-        -- A typed system skipped straight past SELECT SYSTEM into this TYPE
-        -- menu (see _openAddMenu), so there's no such list to step back into.
-        if _currentSystemCatalogEntry() then
-            _openDesignActionsMenu(canvasName)
-        else
-            _openSystemSelectMenu(canvasName)
-        end
+    -- Catalog-wide, not one of _catalogChosenSystem.items (see _openTypeMenu)
+    -- — jumps straight to the name prompt instead of arming a tap-to-place.
+    if optionText == "ANNUNCIATOR" then
+        gdsGui_schematic_armAnnunciatorCreation(canvasName)
         return
     end
     local item = _catalogChosenSystem and _catalogChosenSystem.items[index]
@@ -837,10 +875,10 @@ function schematicCatalogItemChosen(canvasName, index, optionText)
     -- gdsGui_schematic_internal_onElementEditChosen).
     if item.kind == "element" then
         gdsGui_schematic_armElementPlacement(canvasName, item.shapeType, item.label, nil, item.label,
-            item.defaultProperties, item.spritePath)
+            item.defaultProperties, item.spritePath, item.sizeMul, item.matchControlSize)
     elseif #item.presets == 1 then
         gdsGui_schematic_armControlPlacement(canvasName, item.presets[1], item.label, item.callbackFunc, item.label,
-            item.spritePaths, item.overlaySpritePath)
+            item.spritePaths, item.overlaySpritePath, item.radiusMul, item.colorDarkenMul)
     else
         _catalogChosenControlItem = item
         local names = {}
@@ -861,7 +899,7 @@ function schematicCatalogPresetChosen(canvasName, index, optionText)
     if not item then return end
     local preset = item.presets[index]
     gdsGui_schematic_armControlPlacement(canvasName, preset, item.label, item.callbackFunc, item.label,
-        item.spritePaths, item.overlaySpritePath)
+        item.spritePaths, item.overlaySpritePath, item.radiusMul, item.colorDarkenMul)
     _catalogChosenControlItem = nil
 end
 
@@ -955,6 +993,16 @@ function schematicPaintBtnPressed(newState)
     else
         gdsGui_schematic_disarmPaintMode("mainCanvas")
     end
+end
+
+-- Dedicated annunciator dock button (schematicAnnunciatorBtn, just below
+-- PAINT): same sticky-toggle convention as schematicPaintBtnPressed above —
+-- newState reflects which way it was just switched, and love.update's poll
+-- (see _prevSchematicAnnunciatorPanelOpen) corrects it back to "released" if
+-- the panel ever closes some other way (mode switch, or PAINT/ADD taking
+-- over via gdsGui_schematic_cancelPlacement).
+function schematicAnnunciatorBtnPressed(newState)
+    gdsGui_schematic_setAnnunciatorPanelOpen("mainCanvas", newState == globApp.BUTTON_STATES.PRESSED)
 end
 
 -- Single consolidated "ACTIONS" button: design mode offers clearing the
@@ -1215,7 +1263,7 @@ function schematicSystemGallerySelected(galleryName, systemId)
     table.insert(aircraft.systems, {
         id = id, name = _titleCase(systemId) .. " System", systemType = systemId,
         createdAt = now, modifiedAt = now,
-        elements = {}, wires = {}, controls = {}, snapshots = {},
+        elements = {}, wires = {}, controls = {}, annunciators = {}, snapshots = {},
     })
     _saveSchematicStore()
     _openSystemIntoCanvas(id, "design")
@@ -1263,8 +1311,19 @@ end
 local function _applyTheme(isDark)
     local t = isDark and _THEME_DARK or _THEME_LIGHT
     for i = 1, 4 do globApp.appColor[i] = t.app[i] end
+    -- Read by schematic_gdsGuiLib.lua to darken palette-sourced colors
+    -- (brush/swatch-picker swatches and anything drawn with one) in WHITE
+    -- MODE, where they'd otherwise read as washed out against the light
+    -- canvas backdrop.
+    globApp.themeIsDark           = isDark
     globApp.themeTextColor        = { t.text[1],        t.text[2],        t.text[3],        t.text[4] }
     globApp.themeProgressBarColor = { t.progressBar[1], t.progressBar[2], t.progressBar[3], t.progressBar[4] }
+    -- Read by schematic_gdsGuiLib.lua's canvas fill/grid draw so the System
+    -- Schematic page (previously hardcoded to a fixed dark backdrop
+    -- regardless of this toggle) follows DARK/WHITE MODE same as every
+    -- other page.
+    globApp.themeCanvasBgColor   = { t.canvasBg[1],   t.canvasBg[2],   t.canvasBg[3],   t.canvasBg[4] }
+    globApp.themeCanvasGridColor = { t.canvasGrid[1], t.canvasGrid[2], t.canvasGrid[3], t.canvasGrid[4] }
     for _, cont in ipairs(globApp.objects.containers) do
         cont.bgColor     = { t.bg[1],     t.bg[2],     t.bg[3],     t.bg[4] }
         cont.headerColor = { t.header[1], t.header[2], t.header[3], t.header[4] }
@@ -1308,14 +1367,23 @@ local function _applyFontSize(fontSize)
         -- learn page content
         "timerLearnContent", "windLearnContent", "calcLearnContent",
         "dutyLearnContent", "settingsLearnContent",
-        -- page header titles (all pages)
+        -- page header titles (all pages) — schematic_pageTitle is handled
+        -- separately below: unlike every other page's title, its text is a
+        -- user-renameable system name of arbitrary length, so it needs the
+        -- shrink-to-fit variant instead of a flat setFontSize (see
+        -- gdsGui_outputTxtBox_setFontSizeToFit's comment).
         "mainMenu_pageTitle", "learn_pageTitle", "settings_pageTitle", "tc_pageTitle",
+        "schematicHome_pageTitle", "schematicManage_pageTitle",
+        "aircraftGallery_pageTitle",
         -- terms and conditions body
         "tcText",
+        -- system schematic page readouts
+        "schematicSnapshotLabel", "schematicZoomLabel", "schematicCombLabel",
     }
     for _, name in ipairs(names) do
         gdsGui_outputTxtBox_setFontSize(name, fontSize)
     end
+    gdsGui_outputTxtBox_setFontSizeToFit("schematic_pageTitle", fontSize, 10)
     gdsGui_outputTxtBox_setFontSize("dutyWarningBox", math.max(8, fontSize - 2))
     gdsGui_outputTxtBox_setText("fontSizeLabel", "FONT SIZE: " .. fontSize .. "pt")
     for _, sb in ipairs(globApp.objects.scrollBars) do
@@ -2145,6 +2213,18 @@ function love.load()
         0.97, schCanvasYFrac + (36 + 10) / globApp.safeScreenArea.h, "RT", 36, 36,
         "schematicPaintBtnPressed", globApp.BUTTON_STATES.RELEASED, true, nil
     )
+    -- ANNUNCIATOR: docked directly below PAINT, same floating-chrome
+    -- convention and sticky "toggle" type (stays open across any number of
+    -- row taps, same as PAINT staying armed — see
+    -- schematicAnnunciatorBtnPressed/gdsGui_schematic_setAnnunciatorPanelOpen).
+    -- Design-mode only, same enable/disable gating SNAPSHOT/ADD/PAINT use.
+    gdsGui_button_create("schematicAnnunciatorBtn", "SystemSchematic", "toggle",
+        "Sprites/button_schematicAnnunciator_pressed.png",
+        "Sprites/button_schematicAnnunciator_released.png",
+        "Sprites/button_schematicAnnunciator_deactivated.png",
+        0.97, schCanvasYFrac + 2 * (36 + 10) / globApp.safeScreenArea.h, "RT", 36, 36,
+        "schematicAnnunciatorBtnPressed", globApp.BUTTON_STATES.RELEASED, true, nil
+    )
     -- COMBINATION PREV/NEXT — design-mode-only, fixed at the left/right
     -- middle of the screen (containerName nil, so like every other floating
     -- schematic chrome button they're positioned straight off safeScreenArea
@@ -2208,6 +2288,10 @@ function love.load()
     -- itself (see _paintPaletteGeometry in schematic_gdsGuiLib.lua) instead
     -- of floating at an unrelated spot on the canvas.
     gdsGui_schematic_setPaintButtonName("mainCanvas", "schematicPaintBtn")
+    -- Same convention for the annunciator management panel, cascading
+    -- leftward out of its own dock button — see
+    -- _annunciatorPanelGeometry in schematic_gdsGuiLib.lua.
+    gdsGui_schematic_setAnnunciatorButtonName("mainCanvas", "schematicAnnunciatorBtn")
     gdsGui_schematic_setBackgroundImage("mainCanvas", "Sprites/bg_schematicCanvas.png")
     gdsGui_schematic_setCornerBackgroundImage("mainCanvas", "Sprites/bg_schematicCanvasCorner.png")
     gdsGui_schematic_setCornerRightBackgroundImage("mainCanvas", "Sprites/bg_schematicCanvasCornerRight.png")
@@ -2528,6 +2612,18 @@ function love.update(dt)
         end
         _prevSchematicPaintActive = paintActive
 
+        -- Same stuck-toggle correction as schematicPaintBtn just above:
+        -- schematicAnnunciatorBtn shows PRESSED the instant the user taps it
+        -- (schematicAnnunciatorBtnPressed arms it directly), so this only
+        -- needs to catch the panel closing some OTHER way — a mode switch,
+        -- or armPaintMode/an ADD placement closing it via
+        -- gdsGui_schematic_cancelPlacement (see gdsGui_schematic_setAnnunciatorPanelOpen).
+        local annunciatorPanelOpen = gdsGui_schematic_isAnnunciatorPanelOpen("mainCanvas")
+        if not annunciatorPanelOpen and _prevSchematicAnnunciatorPanelOpen then
+            gdsGui_button_setState("schematicAnnunciatorBtn", "released")
+        end
+        _prevSchematicAnnunciatorPanelOpen = annunciatorPanelOpen
+
         -- schematicAddBtn (the "+" dock button) is likewise deactivated while
         -- the brush is armed — starting the ADD cascade mid-stroke would
         -- abandon the paint. Left alone in control mode, where the button is
@@ -2657,6 +2753,9 @@ function love.draw()
     -- palette isn't modal — canvas items underneath stay tappable while it's
     -- showing (see gdsGui_schematic_armPaintMode).
     gdsGui_schematic_drawPaintOverlay(gdsGui_page_currentName())
+    -- Same reasoning as PAINT's palette above — a non-modal slide-out panel,
+    -- not a dimmed modal like the menu overlay.
+    gdsGui_schematic_drawAnnunciatorPanelOverlay(gdsGui_page_currentName())
     gdsGui_schematicGallery_drawMenuOverlay(gdsGui_page_currentName())
     -- The text-entry prompt and the option-list menu are each a single global
     -- modal (not page-scoped), drawn above everything else when open. Only
@@ -3257,6 +3356,8 @@ function schematicModeToggled(newState)
     gdsGui_button_setHidden("schematicAddBtn", not designing)
     gdsGui_button_setState("schematicPaintBtn", designing and "released" or "deactivated")
     gdsGui_button_setHidden("schematicPaintBtn", not designing)
+    gdsGui_button_setState("schematicAnnunciatorBtn", designing and "released" or "deactivated")
+    gdsGui_button_setHidden("schematicAnnunciatorBtn", not designing)
     gdsGui_button_setState("schematicFullScreenToggle", designing and "deactivated" or "released")
     _saveAppSettings()
 end

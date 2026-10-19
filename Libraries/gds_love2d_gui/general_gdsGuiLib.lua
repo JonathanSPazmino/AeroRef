@@ -955,10 +955,12 @@ function gdsGui_general_mousereleased (x, y, button, istouch, presses)
 	-- handled by the second guard further down, right after what might
 	-- open it.
 	if gdsGui_textPrompt_isOpen() then
+		gdsGui_schematic_clearTouch("mouse")
 		gdsGui_textPrompt_released("mouse", x, y)
 		return
 	end
 	if gdsGui_choiceMenu_isOpen() then
+		gdsGui_schematic_clearTouch("mouse")
 		gdsGui_choiceMenu_released("mouse", x, y)
 		return
 	end
@@ -1211,10 +1213,12 @@ function gdsGui_general_touchreleased (id, x, y, dx, dy, pressure)
 	-- Same modal guard as gdsGui_general_mousereleased above — see its
 	-- comment.
 	if gdsGui_textPrompt_isOpen() then
+		gdsGui_schematic_clearTouch(id)
 		gdsGui_textPrompt_released(id, x, y)
 		return
 	end
 	if gdsGui_choiceMenu_isOpen() then
+		gdsGui_schematic_clearTouch(id)
 		gdsGui_choiceMenu_released(id, x, y)
 		return
 	end

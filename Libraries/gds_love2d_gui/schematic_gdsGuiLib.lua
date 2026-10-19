@@ -69,6 +69,21 @@ local _CONNECTOR_RELEASE_SLOP_PX = 16  -- forgiveness margin for "which element 
 local _CONNECTOR_TARGET_RADIUS_PX = 9  -- drawn radius of the green "valid connection point" reticle shown at each element's center while a wire is being dragged
 local _CONNECTOR_SNAP_COLOR  = {0.25, 0.95, 0.35, 1}
 local _DEFAULT_COLOR         = {0.75, 0.75, 0.75, 1}   -- light gray, matches the palette's LIGHT GRAY swatch
+
+-- In WHITE MODE (globApp.themeIsDark == false, set by the app layer's
+-- dark/light toggle), every palette-sourced color — the paint-brush/swatch-
+-- picker swatch previews, plus every element/wire/control actually showing
+-- one, default gray included — reads as washed out against the light
+-- canvas backdrop, so it's darkened by this factor before being drawn.
+-- Dark mode (also the default when the app layer never sets the flag at
+-- all) leaves colors untouched.
+local _LIGHT_MODE_COLOR_DARKEN = 0.6
+local function _themedPaletteColor(r, g, b, a)
+    if globApp.themeIsDark == false then
+        return r * _LIGHT_MODE_COLOR_DARKEN, g * _LIGHT_MODE_COLOR_DARKEN, b * _LIGHT_MODE_COLOR_DARKEN, a
+    end
+    return r, g, b, a
+end
 local _MENU_ROW_H            = 32
 local _MENU_WIDTH_FRAC       = 0.8
 local _MENU_OPACITY          = 0.85 -- all modal menu panels render 15% transparent
@@ -94,6 +109,21 @@ local _COLOR_PALETTE = {
     {name = "GREEN",      color = {0, 1, 0, 1}},
     {name = "LIGHT BLUE", color = {0.4, 0.8, 1, 1}},
     {name = "YELLOW",     color = {1, 1, 0, 1}},
+}
+
+-- Fixed 4-color set for annunciators (see the ANNUNCIATORS section below) —
+-- the standard caution/warning palette real annunciator panels use, kept
+-- separate from the generic 5-color _COLOR_PALETTE above since an
+-- annunciator's color is a meaningful status indicator (not just a free
+-- paint choice) and the app asks for exactly 4 options. Order here IS the
+-- readout's display rank (red on top, down to white — see
+-- _annunciatorColorRank/_sortedActiveAnnunciatorsForDisplay further down),
+-- so it also determines the order the color-pick menu itself lists them in.
+local _ANNUNCIATOR_COLORS = {
+    {name = "RED",    color = {0.95, 0.15, 0.15, 1}},
+    {name = "YELLOW", color = {1, 0.9, 0, 1}},
+    {name = "GREEN",  color = {0.15, 0.85, 0.3, 1}},
+    {name = "WHITE",  color = {1, 1, 1, 1}},
 }
 
 --------------------------------------------------------------------------------
@@ -205,15 +235,20 @@ end
 -- gdsGui_schematic_internal_onElementEditChosen above that point.
 local _openPropertiesMenu
 local _openElementRenamePrompt
+-- Forward-declared like the two above: defined further down (PUBLIC API —
+-- ANNUNCIATORS) once _openSwatchColorMenu exists, but referenced by
+-- gdsGui_schematic_placementNameConfirmed well before that point.
+local _openAnnunciatorColorMenu
 
 local _UNDO_STACK_MAX = 20
 
 local function _snapshotState(canvas)
     return {
-        elements  = _deepCopy(canvas.elements),
-        wires     = _deepCopy(canvas.wires),
-        controls  = _deepCopy(canvas.controls),
-        snapshots = _deepCopy(canvas.snapshots),
+        elements     = _deepCopy(canvas.elements),
+        wires        = _deepCopy(canvas.wires),
+        controls     = _deepCopy(canvas.controls),
+        annunciators = _deepCopy(canvas.annunciators),
+        snapshots    = _deepCopy(canvas.snapshots),
     }
 end
 
@@ -260,6 +295,11 @@ local function _labelInUse(canvas, label, excludeKind, excludeId)
             return true
         end
     end
+    for _, a in ipairs(canvas.annunciators) do
+        if a.label and a.label:lower() == needle and not (excludeKind == "annunciator" and a.id == excludeId) then
+            return true
+        end
+    end
     return false
 end
 
@@ -273,7 +313,7 @@ end
 local function _suggestedPlacementName(canvas, typeLabel)
     local pattern = "^" .. typeLabel:gsub("[%(%)%.%%%+%-%*%?%[%]%^%$]", "%%%1") .. "_(%d+)$"
     local maxN = 0
-    for _, list in ipairs({canvas.elements, canvas.controls}) do
+    for _, list in ipairs({canvas.elements, canvas.controls, canvas.annunciators}) do
         for _, item in ipairs(list) do
             local n = item.label and item.label:match(pattern)
             if n then maxN = math.max(maxN, tonumber(n)) end
@@ -299,6 +339,28 @@ end
 -- COMBINATION CYCLING section below). Split out of
 -- gdsGui_schematic_placementNameConfirmed so the snapshot-wipe confirm step
 -- there can defer actually running this until the user confirms.
+-- Computes wFrac/hFrac for a pending "element" placement the same way
+-- _commitNamedPlacement builds the real element below, so grid-snapping
+-- (which runs before the element exists, at the initial-tap call site) uses
+-- the element's true footprint instead of the shared default size.
+local function _pendingElementSizeFrac(canvas, pending)
+    if pending.matchControlSize then
+        -- Same on-screen footprint as a GENERATOR-style control: a
+        -- control's own diameter in content units is
+        -- canvas.controlRadius * 2 * radiusScale, and the design-mode
+        -- placement flow always arms a freshly-placed control at
+        -- radiusScale = 1/_EDIT_MODE_INITIAL_ZOOM = 0.5 (see
+        -- gdsGui_schematic_armControlPlacement's call site), so that
+        -- diameter simplifies to exactly canvas.controlRadius. Dividing
+        -- by contentW/contentH (not a precomputed static fraction)
+        -- keeps this exact regardless of the live window's current
+        -- size/aspect ratio, including a later resize.
+        return canvas.controlRadius / canvas.contentW, canvas.controlRadius / canvas.contentH
+    end
+    local sizeMul = pending.sizeMul or 1
+    return _ELEMENT_DEFAULT_W_FRAC * sizeMul, _ELEMENT_DEFAULT_H_FRAC * sizeMul
+end
+
 local function _commitNamedPlacement(canvas, pending, trimmed)
     if pending.kind == "element" then
         _pushUndo(canvas)
@@ -306,16 +368,18 @@ local function _commitNamedPlacement(canvas, pending, trimmed)
         for _, key in ipairs(pending.defaultPropertyKeys or {}) do
             table.insert(properties, { key = key, value = "" })
         end
+        local wFrac, hFrac = _pendingElementSizeFrac(canvas, pending)
         gdsGui_schematic_addElement(pending.canvasName, pending.newId, pending.shapeType,
-            pending.fracX, pending.fracY, _ELEMENT_DEFAULT_W_FRAC, _ELEMENT_DEFAULT_H_FRAC,
+            pending.fracX, pending.fracY, wFrac, hFrac,
             trimmed, pending.defaultColor, properties, nil, pending.spritePath)
         canvas.snapshots = {}
         _notifyChanged(canvas)
     else
         _pushUndo(canvas)
         gdsGui_schematic_addControl(pending.canvasName, pending.newId, pending.fracX, pending.fracY,
-            pending.positions, 0, trimmed, pending.callbackFunc, 1 / _EDIT_MODE_INITIAL_ZOOM, pending.spritePaths,
-            nil, pending.overlaySpritePath)
+            pending.positions, 0, trimmed, pending.callbackFunc,
+            (1 / _EDIT_MODE_INITIAL_ZOOM) * (pending.radiusMul or 1), pending.spritePaths,
+            nil, pending.overlaySpritePath, nil, pending.colorDarkenMul)
         canvas.snapshots = {}
         _notifyChanged(canvas)
     end
@@ -337,6 +401,15 @@ function gdsGui_schematic_placementNameConfirmed(name)
         _openPlacementNamePrompt("NAME TAKEN, TRY AGAIN", trimmed)
         return
     end
+    -- An annunciator has no position to place and doesn't participate in
+    -- control-combination snapshots (see the ANNUNCIATORS section below) —
+    -- name confirmed, so the only step left is picking its color, never the
+    -- snapshot-wipe confirm the element/control path below needs.
+    if pending.kind == "annunciator" then
+        pending.confirmedName = trimmed
+        _openAnnunciatorColorMenu(pending.canvasName)
+        return
+    end
     -- _commitNamedPlacement unconditionally wipes every snapshot — worth an
     -- explicit "are you sure" only when there's actually something to lose.
     local snapshotCount = gdsGui_schematic_countSnapshots(pending.canvasName)
@@ -356,6 +429,22 @@ end
 
 function gdsGui_schematic_placementNameCancelled()
     _pendingNamedPlacement = nil
+end
+
+-- Entry point for the catalog's "ANNUNCIATOR" row (main.lua's
+-- schematicCatalogItemChosen — see the app-layer ADD cascade). Unlike every
+-- other catalog item, an annunciator has no canvas position to tap for: it
+-- always renders in the fixed, alphabetically-stacked top-left corner (see
+-- _drawAnnunciators further down), so there's no pendingPlacement/tap-to-
+-- place step — choosing it jumps straight to the name prompt, reusing the
+-- very same gdsGui_schematic_placementNameConfirmed/_Cancelled pair every
+-- other placement's name prompt uses (branched there by pending.kind).
+function gdsGui_schematic_armAnnunciatorCreation(canvasName)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return end
+    gdsGui_schematic_cancelPlacement(canvasName)
+    _pendingNamedPlacement = { canvasName = canvasName, kind = "annunciator" }
+    _openPlacementNamePrompt("NAME THIS ANNUNCIATOR", _suggestedPlacementName(canvas, "ANNUNCIATOR"))
 end
 
 -- Shared onSelect/onCancel for the snapshot-wipe confirm menu above: both
@@ -658,6 +747,7 @@ function gdsGui_schematic_create(name, page, x, y, anchorPoint, wFrac, hFrac)
     canvas.elements   = {}
     canvas.wires      = {}
     canvas.controls   = {}
+    canvas.annunciators = {}  -- {id, label, color, active} — see the ANNUNCIATORS section below; drawn top-left of the canvas like another element, managed via the slide-out panel
     canvas.snapshots  = {}   -- keyed by signature string -> {elements={id=color}, wires={id=color}, timestamp}
     canvas.selectedElementId = nil
     canvas.selectedControlId = nil
@@ -711,6 +801,21 @@ function gdsGui_schematic_create(name, page, x, y, anchorPoint, wFrac, hFrac)
     canvas.paintMode = nil  -- { color = {r,g,b,a} | nil } while the PAINT brush is armed; see gdsGui_schematic_armPaintMode. Unlike the pending* one-shot fields above, stays armed across any number of taps.
     canvas._paintTarget = nil  -- {kind, id} of whatever a "paint" drag's press landed on, between press and release
     canvas._paintButtonName = nil  -- name of the app's PAINT dock button, set via gdsGui_schematic_setPaintButtonName; the swatch palette cascades from it
+    -- ANNUNCIATOR management panel (slide-out list, cascades left out of the
+    -- app's ANNUNCIATOR dock button — see gdsGui_schematic_setAnnunciatorButtonName
+    -- and the ANNUNCIATORS section below). annunciatorPanelOpen is the sticky
+    -- toggle (parallel to paintMode staying armed across taps); the rest
+    -- track a single in-flight press on the panel itself (tap a row to
+    -- toggle it, drag to scroll) the same tap-vs-drag-slop way every other
+    -- gesture in this file does.
+    canvas.annunciatorPanelOpen         = false
+    canvas.annunciatorPanelScroll       = 0
+    canvas._annunciatorButtonName       = nil
+    canvas._annunciatorPanelTouchId     = nil
+    canvas._annunciatorPanelPressedHit  = nil
+    canvas._annunciatorPanelDragStartY  = nil
+    canvas._annunciatorPanelDragStartScroll = nil
+    canvas._annunciatorPanelMoved       = false
     canvas._placementCounter = 0
     canvas._colorPickTarget     = nil  -- {kind="element"|"wire", id=...} while the color-picker menu is open
     canvas._elementEditTargetId = nil  -- elementId while the design-mode edit (color+properties+delete) menu is open
@@ -764,6 +869,8 @@ function gdsGui_schematic_create(name, page, x, y, anchorPoint, wFrac, hFrac)
         self._pendingDragUndoSnapshot = nil
         self.touches = {}
         self.pinch = nil
+        self._annunciatorPanelTouchId = nil
+        self._annunciatorPanelMoved = false
         _calculateGeometry(self)
     end
 
@@ -843,6 +950,9 @@ function gdsGui_schematic_setMode(canvasName, mode)
     canvas.pendingWireFromId = nil
     canvas.paintMode = nil
     canvas._paintTarget = nil
+    canvas.annunciatorPanelOpen = false
+    canvas._annunciatorPanelTouchId = nil
+    canvas._annunciatorPanelMoved = false
     canvas.menu = nil
     canvas.touches = {}
     canvas.pinch = nil
@@ -885,10 +995,11 @@ function gdsGui_schematic_undo(canvasName)
     local canvas = _findCanvas(canvasName)
     if not canvas or #canvas._undoStack == 0 then return end
     local snapshot = table.remove(canvas._undoStack)
-    canvas.elements  = snapshot.elements
-    canvas.wires     = snapshot.wires
-    canvas.controls  = snapshot.controls
-    canvas.snapshots = snapshot.snapshots
+    canvas.elements     = snapshot.elements
+    canvas.wires        = snapshot.wires
+    canvas.controls     = snapshot.controls
+    canvas.annunciators = snapshot.annunciators or {}
+    canvas.snapshots    = snapshot.snapshots
     canvas.selectedElementId = nil
     canvas.selectedControlId = nil
     canvas.selectedWireId    = nil
@@ -1061,7 +1172,12 @@ end
 -- control's base tint, same ASSIGN COLOR/design-mode-edit-menu/snapshot
 -- machinery as an element or wire's own defaultColor — see
 -- gdsGui_schematic_resolveDisplayColor and _drawControl.
-function gdsGui_schematic_addControl(canvasName, id, x, y, positions, initialDetentIndex, label, callbackFunc, radiusScale, spritePaths, rotation, overlaySpritePath, defaultColor)
+-- colorDarkenMul (optional, defaults to 1): flat multiplier on this
+-- control's own resolved r/g/b at draw time, same idea as _drawElement's
+-- _ELEMENT_DARKEN but per-instance instead of blanket — e.g. a GENERATOR
+-- control whose housing should read as dark as a BATTERY element's own
+-- (blanket-darkened) sprite.
+function gdsGui_schematic_addControl(canvasName, id, x, y, positions, initialDetentIndex, label, callbackFunc, radiusScale, spritePaths, rotation, overlaySpritePath, defaultColor, colorDarkenMul)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     local numDetents = math.max(2, #positions)
@@ -1071,6 +1187,7 @@ function gdsGui_schematic_addControl(canvasName, id, x, y, positions, initialDet
         label = label, callbackFunc = callbackFunc, radiusScale = radiusScale or 1,
         spritePaths = spritePaths, rotation = rotation or 0, overlaySpritePath = overlaySpritePath,
         defaultColor = defaultColor or _DEFAULT_COLOR, pendingColor = nil,
+        colorDarkenMul = colorDarkenMul or 1,
     })
     _resyncPlacementCounter(canvas, id)
 end
@@ -1157,7 +1274,16 @@ end
 -- catalog item the app layer knows is electrical — ready for the user to fill
 -- in via the design-mode element edit menu's PROPERTIES option. spritePath
 -- (optional): see gdsGui_schematic_addElement — threaded through unchanged.
-function gdsGui_schematic_armElementPlacement(canvasName, shapeType, label, defaultColor, idPrefix, defaultPropertyKeys, spritePath)
+-- sizeMul (optional, defaults to 1): multiplies _ELEMENT_DEFAULT_W_FRAC/
+-- H_FRAC for this placement only — the element equivalent of a control's own
+-- per-instance radiusScale, e.g. a DIODE catalog item whose symbol reads too
+-- large at the shared default element size. Ignored when matchControlSize
+-- is set.
+-- matchControlSize (optional, defaults to false): sizes this element to
+-- exactly match a freshly-placed GENERATOR-style control's own on-screen
+-- diameter instead of any sizeMul of the default — see
+-- _commitNamedPlacement's own comment for the exact formula.
+function gdsGui_schematic_armElementPlacement(canvasName, shapeType, label, defaultColor, idPrefix, defaultPropertyKeys, spritePath, sizeMul, matchControlSize)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     -- At most one of pendingPlacement/pendingConnectorColor/
@@ -1169,18 +1295,24 @@ function gdsGui_schematic_armElementPlacement(canvasName, shapeType, label, defa
     gdsGui_schematic_cancelPlacement(canvasName)
     canvas.pendingPlacement = { kind = "element", shapeType = shapeType, label = label,
         defaultColor = defaultColor, idPrefix = idPrefix or label, defaultPropertyKeys = defaultPropertyKeys,
-        spritePath = spritePath }
+        spritePath = spritePath, sizeMul = sizeMul, matchControlSize = matchControlSize }
 end
 
 -- spritePaths, overlaySpritePath (both optional): see
 -- gdsGui_schematic_addControl — threaded through unchanged.
-function gdsGui_schematic_armControlPlacement(canvasName, positions, label, callbackFunc, idPrefix, spritePaths, overlaySpritePath)
+-- radiusMul (optional, defaults to 1): multiplies the design-mode placement
+-- radiusScale for this placement only — the control equivalent of an
+-- element's own per-instance sizeMul, e.g. a SWITCH catalog item whose icon
+-- reads too large at the shared default control size.
+-- colorDarkenMul (optional, defaults to 1): see gdsGui_schematic_addControl
+-- — threaded through unchanged.
+function gdsGui_schematic_armControlPlacement(canvasName, positions, label, callbackFunc, idPrefix, spritePaths, overlaySpritePath, radiusMul, colorDarkenMul)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     gdsGui_schematic_cancelPlacement(canvasName)
     canvas.pendingPlacement = { kind = "control", positions = positions, label = label,
         callbackFunc = callbackFunc, idPrefix = idPrefix or label, spritePaths = spritePaths,
-        overlaySpritePath = overlaySpritePath }
+        overlaySpritePath = overlaySpritePath, radiusMul = radiusMul, colorDarkenMul = colorDarkenMul }
 end
 
 -- Arms a one-shot "draw the next wire/pipe/etc." gesture: tap one element,
@@ -1268,6 +1400,7 @@ function gdsGui_schematic_cancelPlacement(canvasName)
         canvas.pendingColorAssignPick = false
         canvas.pendingWireFromId = nil
         canvas.paintMode = nil
+        canvas.annunciatorPanelOpen = false
     end
 end
 
@@ -1350,6 +1483,12 @@ end
 function gdsGui_schematic_openMenu(canvasName, title, options, onSelectFunc, onCancelFunc, isConfirm)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
+    -- A menu always takes priority over the annunciator panel (see
+    -- gdsGui_schematic_pressed, which checks canvas.menu first) — close the
+    -- panel here too so it doesn't keep drawing underneath/behind the menu
+    -- it's no longer receiving input for (e.g. the ADD "+" button opening
+    -- the catalog cascade while the panel happens to be open).
+    canvas.annunciatorPanelOpen = false
     canvas.menu = { title = title, options = options, onSelect = onSelectFunc, onCancel = onCancelFunc }
     _markConfirmMenu(canvas.menu, isConfirm)
 end
@@ -1539,8 +1678,13 @@ end
 
 -- One text menu row, highlighted red when it's the destructive "DELETE"
 -- option (wherever it appears: the design-mode element-edit menu, a project's
--- manage-action menu, or either one's delete-confirm step).
-local function _drawMenuTextRow(mx, mw, rowY, opt)
+-- manage-action menu, or either one's delete-confirm step). holdFrac
+-- (optional, 0-1): while this row is the confirm-gated action AND is
+-- currently being held down (see _pollMenuHoldToConfirm), draws a
+-- left-to-right loading-bar overlay across it so the user can see how much
+-- longer the hold needs to last instead of just waiting blind — reaching
+-- the row's full width exactly when the hold is about to fire.
+local function _drawMenuTextRow(mx, mw, rowY, opt, holdFrac)
     if opt == "DELETE" then
         love.graphics.setColor(0.75, 0.15, 0.15, 1)
         love.graphics.rectangle("fill", mx + 4, rowY + 2, mw - 8, _MENU_ROW_H - 4)
@@ -1552,6 +1696,13 @@ local function _drawMenuTextRow(mx, mw, rowY, opt)
         love.graphics.setColor(1, 1, 1, 1)
     end
     love.graphics.printf(opt, mx, rowY + 8, mw, "center")
+    if holdFrac and holdFrac > 0 then
+        love.graphics.setColor(1, 1, 1, 0.45)
+        love.graphics.rectangle("fill", mx + 4, rowY + 2, (mw - 8) * math.min(1, holdFrac), _MENU_ROW_H - 4)
+        love.graphics.setColor(1, 1, 1, 1)
+        love.graphics.rectangle("line", mx + 4, rowY + 2, mw - 8, _MENU_ROW_H - 4)
+        love.graphics.printf(opt, mx, rowY + 8, mw, "center")
+    end
 end
 
 -- Shared modal-menu box drawing for any owner with a .menu.
@@ -1574,25 +1725,35 @@ local function _drawMenuBox(owner, menu)
         rowY = rowY + titleH
     end
 
+    -- Which row (by combined options index — same indexing menu.confirmIndex
+    -- itself uses, swatches included) is the confirm action currently being
+    -- held down, and how far through _CONFIRM_HOLD_SECONDS that hold is —
+    -- see _drawMenuTextRow's own comment for why.
+    local holdIndex, holdFrac
+    if menu.confirmIndex and menu._pressedTouchId ~= nil and menu._pressedHit == menu.confirmIndex then
+        holdIndex = menu.confirmIndex
+        holdFrac = (menu._holdElapsed or 0) / _CONFIRM_HOLD_SECONDS
+    end
+
     if menu.isSwatchPicker then
         local n = #menu.swatchColors
         local _, firstSize = _swatchRect(mx, mw, n, 1)
         local sy = rowY + (_SWATCH_ROW_H_PX - firstSize) / 2
         for i, c in ipairs(menu.swatchColors) do
             local sx, size = _swatchRect(mx, mw, n, i)
-            love.graphics.setColor(c[1], c[2], c[3], c[4] or 1)
+            love.graphics.setColor(_themedPaletteColor(c[1], c[2], c[3], c[4] or 1))
             love.graphics.rectangle("fill", sx, sy, size, size)
             love.graphics.setColor(1, 1, 1, 1)
             love.graphics.rectangle("line", sx, sy, size, size)
         end
         rowY = rowY + _SWATCH_ROW_H_PX
-        for _, opt in ipairs(menu.extraOptions) do
-            _drawMenuTextRow(mx, mw, rowY, opt)
+        for j, opt in ipairs(menu.extraOptions) do
+            _drawMenuTextRow(mx, mw, rowY, opt, (n + j == holdIndex) and holdFrac or nil)
             rowY = rowY + _MENU_ROW_H
         end
     else
-        for _, opt in ipairs(menu.options) do
-            _drawMenuTextRow(mx, mw, rowY, opt)
+        for i, opt in ipairs(menu.options) do
+            _drawMenuTextRow(mx, mw, rowY, opt, (i == holdIndex) and holdFrac or nil)
             rowY = rowY + _MENU_ROW_H
         end
     end
@@ -1607,11 +1768,11 @@ end
 -- hit-testing/selection still indexes into one combined array.
 --------------------------------------------------------------------------------
 
-local function _openSwatchColorMenu(canvasName, title, extraOptions, onSelectFunc, onCancelFunc)
+local function _openSwatchColorMenu(canvasName, title, extraOptions, onSelectFunc, onCancelFunc, palette)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     local options, swatchColors = {}, {}
-    for _, entry in ipairs(_COLOR_PALETTE) do
+    for _, entry in ipairs(palette or _COLOR_PALETTE) do
         table.insert(options, entry.name)
         table.insert(swatchColors, entry.color)
     end
@@ -1743,8 +1904,13 @@ function gdsGui_schematic_drawPaintOverlay(pageName)
             local activeColor = canvas.paintMode.color
             for i, entry in ipairs(_COLOR_PALETTE) do
                 local sx, sy, sw, sh = _paintSwatchRect(canvas, i)
-                love.graphics.setColor(entry.color[1], entry.color[2], entry.color[3], entry.color[4] or 1)
+                love.graphics.setColor(_themedPaletteColor(entry.color[1], entry.color[2], entry.color[3], entry.color[4] or 1))
                 love.graphics.rectangle("fill", sx, sy, sw, sh)
+                -- Compared against the raw (undarkened) entry.color, same as
+                -- activeColor itself (canvas.paintMode.color is set straight
+                -- from a palette entry, never the themed display variant) —
+                -- the "is this swatch the active brush" check, unlike the
+                -- fill color just above, isn't a themed draw.
                 local isActive = activeColor and activeColor[1] == entry.color[1] and
                     activeColor[2] == entry.color[2] and activeColor[3] == entry.color[3]
                 love.graphics.setColor(1, 1, 1, 1)
@@ -1754,6 +1920,378 @@ function gdsGui_schematic_drawPaintOverlay(pageName)
             end
         end
     end
+    love.graphics.setColor(1, 1, 1, 1)
+end
+
+--------------------------------------------------------------------------------
+-- ANNUNCIATORS — a catalog-wide "element" (see main.lua's ADD cascade, which
+-- offers it alongside every system's own items rather than nested under one)
+-- with no canvas position of its own: named and colored once at creation
+-- (gdsGui_schematic_armAnnunciatorCreation above), then only ever toggled
+-- active/inactive afterward via the slide-out management panel below. Every
+-- active one lists alphabetically, by name, in its own color, in a black
+-- readout screen pinned to the content's own top-left world corner — a
+-- fixed base footprint that grows/shrinks with canvas.zoom exactly like any
+-- other element (_drawAnnunciators, see its own comment); an inactive one
+-- simply isn't listed.
+--------------------------------------------------------------------------------
+
+local function _findAnnunciator(canvas, id)
+    for _, a in ipairs(canvas.annunciators) do
+        if a.id == id then return a end
+    end
+    return nil
+end
+
+-- Every annunciator on this canvas, alphabetically by label — shared by the
+-- management panel (all of them, active or not) and the on-canvas stack
+-- (_drawAnnunciators, active-only — see its own filter).
+local function _sortedAnnunciators(canvas)
+    local list = {}
+    for _, a in ipairs(canvas.annunciators) do table.insert(list, a) end
+    table.sort(list, function(a, b) return (a.label or ""):lower() < (b.label or ""):lower() end)
+    return list
+end
+
+-- Finishes what gdsGui_schematic_armAnnunciatorCreation above started: name
+-- already confirmed (pending.confirmedName), now pick one of the fixed 4
+-- annunciator colors. Reuses the same generic swatch-picker menu machinery
+-- element/wire/control color-picking uses (_openSwatchColorMenu), just with
+-- _ANNUNCIATOR_COLORS in place of the default _COLOR_PALETTE.
+_openAnnunciatorColorMenu = function(canvasName)
+    _openSwatchColorMenu(canvasName, "ANNUNCIATOR COLOR", {},
+        "gdsGui_schematic_internal_onAnnunciatorColorChosen",
+        "gdsGui_schematic_internal_onAnnunciatorColorCancelled", _ANNUNCIATOR_COLORS)
+end
+
+function gdsGui_schematic_internal_onAnnunciatorColorChosen(canvasName, index)
+    local pending = _pendingNamedPlacement
+    _pendingNamedPlacement = nil
+    if not pending or pending.canvasName ~= canvasName or pending.kind ~= "annunciator" then return end
+    local entry = _ANNUNCIATOR_COLORS[index]
+    if not entry then return end
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return end
+    _pushUndo(canvas)
+    canvas._placementCounter = canvas._placementCounter + 1
+    local newId = "ANNUNCIATOR_" .. canvas._placementCounter
+    table.insert(canvas.annunciators,
+        { id = newId, label = pending.confirmedName, color = entry.color, active = true })
+    _notifyChanged(canvas)
+end
+
+function gdsGui_schematic_internal_onAnnunciatorColorCancelled(canvasName)
+    -- Tapping outside the color menu abandons the whole creation, same as
+    -- cancelling the name prompt itself — there's no partial "named but
+    -- uncolored" annunciator left lying around.
+    local pending = _pendingNamedPlacement
+    if pending and pending.canvasName == canvasName and pending.kind == "annunciator" then
+        _pendingNamedPlacement = nil
+    end
+end
+
+-- Restores one annunciator exactly as saved (app-layer load — see main.lua's
+-- _openSystemIntoCanvas, parallel to gdsGui_schematic_addElement/addControl).
+-- The creation flow above (gdsGui_schematic_internal_onAnnunciatorColorChosen)
+-- builds its own entry inline rather than calling this, since it also needs
+-- to mint a fresh id via _placementCounter instead of restoring a saved one.
+function gdsGui_schematic_addAnnunciator(canvasName, id, label, color, active)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return end
+    _resyncPlacementCounter(canvas, id)
+    table.insert(canvas.annunciators, { id = id, label = label, color = color, active = (active ~= false) })
+end
+
+-- Toggled by a tap on its row in the management panel (see
+-- _handleAnnunciatorPanelRelease below) — not undoable (matches every other
+-- plain status flip in this file, e.g. cycling a control in control mode),
+-- but still persisted (_notifyChanged) so it survives navigating away.
+function gdsGui_schematic_setAnnunciatorActive(canvasName, id, active)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return end
+    local a = _findAnnunciator(canvas, id)
+    if not a then return end
+    a.active = active
+    _notifyChanged(canvas)
+end
+
+-- Tells the management panel which app button to cascade (leftward) from —
+-- same one-time registration convention as gdsGui_schematic_setPaintButtonName.
+function gdsGui_schematic_setAnnunciatorButtonName(canvasName, buttonName)
+    local canvas = _findCanvas(canvasName)
+    if canvas then canvas._annunciatorButtonName = buttonName end
+end
+
+function gdsGui_schematic_setAnnunciatorPanelOpen(canvasName, open)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return end
+    if open then
+        -- Only one of paint mode / a catalog placement / this panel is ever
+        -- active at a time — same discipline gdsGui_schematic_armPaintMode
+        -- already follows via this same call.
+        gdsGui_schematic_cancelPlacement(canvasName)
+        canvas.menu = nil
+    end
+    canvas.annunciatorPanelOpen = open
+    canvas.annunciatorPanelScroll = 0
+end
+
+function gdsGui_schematic_isAnnunciatorPanelOpen(canvasName)
+    local canvas = _findCanvas(canvasName)
+    return canvas ~= nil and canvas.annunciatorPanelOpen == true
+end
+
+local _ANNUNCIATOR_ROW_H_PX    = 32
+local _ANNUNCIATOR_SWATCH_PX   = 16
+local _ANNUNCIATOR_PANEL_W_PX  = 170
+local _ANNUNCIATOR_PANEL_GAP_PX = 8
+local _ANNUNCIATOR_PANEL_MAX_VISIBLE_ROWS = 6
+
+-- Cascades LEFTWARD out of the ANNUNCIATOR dock button (mirrors
+-- _paintPaletteGeometry's downward cascade from the PAINT button), capped at
+-- _ANNUNCIATOR_PANEL_MAX_VISIBLE_ROWS tall regardless of how many
+-- annunciators exist — the drag-to-scroll handling further down is what
+-- brings the rest into view, so a long list never eats the whole canvas (the
+-- "make the list scrollable" requirement). Returns the sorted list alongside
+-- the geometry since every caller needs both together.
+local function _annunciatorPanelGeometry(canvas)
+    local list = _sortedAnnunciators(canvas)
+    local n = #list
+    local visibleRows = math.max(1, math.min(n, _ANNUNCIATOR_PANEL_MAX_VISIBLE_ROWS))
+    local headerH = _ANNUNCIATOR_ROW_H_PX
+    local bodyH = visibleRows * _ANNUNCIATOR_ROW_H_PX
+    local w, h = _ANNUNCIATOR_PANEL_W_PX, headerH + bodyH
+    local btn = _findButton(canvas._annunciatorButtonName)
+    local x, y
+    if btn then
+        x = btn.myx - _ANNUNCIATOR_PANEL_GAP_PX - w
+        y = btn.myy
+        local maxY = canvas.y + canvas.h - h
+        if y > maxY then y = maxY end
+        if y < canvas.y then y = canvas.y end
+    else
+        x = canvas.x + canvas.w - w - _ANNUNCIATOR_PANEL_GAP_PX
+        y = canvas.y + _ANNUNCIATOR_PANEL_GAP_PX
+    end
+    return x, y, w, h, headerH, bodyH, list
+end
+
+local function _annunciatorMaxScroll(list, bodyH)
+    return math.max(0, #list * _ANNUNCIATOR_ROW_H_PX - bodyH)
+end
+
+-- Returns "outside" (tap missed the panel box entirely), "header", a 1-based
+-- index into the sorted list (a row — may be scrolled fully/partially out of
+-- the visible body; callers check against bodyH themselves), or nil (inside
+-- the box, below the last row, on no row at all).
+local function _annunciatorRowAt(canvas, px, py)
+    local x, y, w, h, headerH, bodyH, list = _annunciatorPanelGeometry(canvas)
+    if px < x or px > x + w or py < y or py > y + h then return "outside" end
+    if py < y + headerH then return "header" end
+    local scroll = canvas.annunciatorPanelScroll or 0
+    local rowIdx = math.floor((py - y - headerH + scroll) / _ANNUNCIATOR_ROW_H_PX) + 1
+    if rowIdx >= 1 and rowIdx <= #list then return rowIdx end
+    return nil
+end
+
+-- Press/move/release for the panel: a plain tap on a row toggles it; a
+-- vertical drag scrolls the list — same tap-vs-drag _ELEMENT_TAP_SLOP_PX
+-- distinction, and the same "only the first finger down is tracked" rule,
+-- every other gesture/menu in this file uses. Called from
+-- gdsGui_schematic_pressed/_moved/_released while canvas.annunciatorPanelOpen,
+-- at the same priority canvas.menu gets (a tap anywhere on the canvas while
+-- the panel is open is consumed here, never falls through to normal
+-- selection/pan — the panel is effectively a lightweight modal, closed only
+-- by pressing the ANNUNCIATOR dock button again).
+local function _handleAnnunciatorPanelPress(canvas, touchId, px, py)
+    if canvas._annunciatorPanelTouchId ~= nil and canvas._annunciatorPanelTouchId ~= touchId then return end
+    canvas._annunciatorPanelTouchId    = touchId
+    canvas._annunciatorPanelPressedHit = _annunciatorRowAt(canvas, px, py)
+    canvas._annunciatorPanelDragStartY = py
+    canvas._annunciatorPanelDragStartScroll = canvas.annunciatorPanelScroll or 0
+    canvas._annunciatorPanelMoved = false
+end
+
+local function _handleAnnunciatorPanelMove(canvas, touchId, px, py)
+    if canvas._annunciatorPanelTouchId ~= touchId then return end
+    local dy = py - canvas._annunciatorPanelDragStartY
+    if not canvas._annunciatorPanelMoved and
+       math.abs(dy) <= _ELEMENT_TAP_SLOP_PX then return end
+    canvas._annunciatorPanelMoved = true
+    local _, _, _, _, _, bodyH, list = _annunciatorPanelGeometry(canvas)
+    local maxScroll = _annunciatorMaxScroll(list, bodyH)
+    canvas.annunciatorPanelScroll =
+        math.max(0, math.min(maxScroll, canvas._annunciatorPanelDragStartScroll - dy))
+end
+
+local function _handleAnnunciatorPanelRelease(canvas, touchId, px, py)
+    if canvas._annunciatorPanelTouchId ~= touchId then return end
+    local pressedHit = canvas._annunciatorPanelPressedHit
+    local moved       = canvas._annunciatorPanelMoved
+    canvas._annunciatorPanelTouchId    = nil
+    canvas._annunciatorPanelPressedHit = nil
+    canvas._annunciatorPanelMoved      = false
+    if moved or type(pressedHit) ~= "number" then return end
+    if _annunciatorRowAt(canvas, px, py) ~= pressedHit then return end
+    local list = _sortedAnnunciators(canvas)
+    local a = list[pressedHit]
+    if a then gdsGui_schematic_setAnnunciatorActive(canvas.name, a.id, not a.active) end
+end
+
+-- Drawn alongside the paint palette / modal menu overlay (see
+-- gdsGui_schematic_drawPaintOverlay's own comment on draw-last ordering) so
+-- the panel renders on top of the canvas content underneath it.
+local function _drawAnnunciatorPanel(canvas)
+    local x, y, w, h, headerH, bodyH, list = _annunciatorPanelGeometry(canvas)
+    love.graphics.setColor(0.12, 0.12, 0.14, 0.95)
+    love.graphics.rectangle("fill", x, y, w, h)
+    love.graphics.setColor(1, 1, 0, 1)
+    love.graphics.rectangle("line", x, y, w, h)
+
+    love.graphics.setFont(globApp.appFont or love.graphics.getFont())
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.printf("ANNUNCIATORS", x, y + (headerH - 14) / 2, w, "center")
+    love.graphics.setColor(1, 1, 1, 0.3)
+    love.graphics.line(x + 2, y + headerH, x + w - 2, y + headerH)
+
+    love.graphics.setScissor(x, y + headerH, w, bodyH)
+    local scroll = canvas.annunciatorPanelScroll or 0
+    for i, a in ipairs(list) do
+        local rowY = y + headerH + (i - 1) * _ANNUNCIATOR_ROW_H_PX - scroll
+        if rowY + _ANNUNCIATOR_ROW_H_PX > y + headerH and rowY < y + headerH + bodyH then
+            local swX = x + 10
+            local swY = rowY + (_ANNUNCIATOR_ROW_H_PX - _ANNUNCIATOR_SWATCH_PX) / 2
+            if a.active then
+                love.graphics.setColor(_themedPaletteColor(a.color[1], a.color[2], a.color[3], a.color[4] or 1))
+                love.graphics.rectangle("fill", swX, swY, _ANNUNCIATOR_SWATCH_PX, _ANNUNCIATOR_SWATCH_PX)
+                love.graphics.setColor(1, 1, 1, 1)
+                love.graphics.rectangle("line", swX, swY, _ANNUNCIATOR_SWATCH_PX, _ANNUNCIATOR_SWATCH_PX)
+                love.graphics.setColor(1, 1, 1, 1)
+            else
+                -- Grayed out: no fill, dim outline, dim label — matches the
+                -- "deactivated annunciators are grayed out" requirement.
+                love.graphics.setColor(0.4, 0.4, 0.4, 1)
+                love.graphics.rectangle("line", swX, swY, _ANNUNCIATOR_SWATCH_PX, _ANNUNCIATOR_SWATCH_PX)
+                love.graphics.setColor(0.55, 0.55, 0.55, 1)
+            end
+            love.graphics.printf(a.label or a.id, swX + _ANNUNCIATOR_SWATCH_PX + 8,
+                rowY + (_ANNUNCIATOR_ROW_H_PX - 14) / 2, w - (_ANNUNCIATOR_SWATCH_PX + 26), "left")
+        end
+    end
+    love.graphics.setScissor()
+    love.graphics.setColor(1, 1, 1, 1)
+end
+
+function gdsGui_schematic_drawAnnunciatorPanelOverlay(pageName)
+    for _, canvas in ipairs(globApp.objects.schematics) do
+        if canvas.page == pageName and canvas.annunciatorPanelOpen then
+            _drawAnnunciatorPanel(canvas)
+        end
+    end
+end
+
+-- Annunciator readout: one black screen anchored at the content's own
+-- top-left world corner (_toPixel — same positioning every element/control
+-- uses), with a fixed BASE footprint (_ANNUNCIATOR_READOUT_W/H_FRAC, fixed
+-- fractions of contentW/H) that then scales with canvas.zoom exactly like
+-- any other element/control — e.g. a GENERATOR control's own on-screen size
+-- is likewise "a fixed base radius * canvas.zoom". So it pans and grows/
+-- shrinks with the rest of the content, not a screen-space HUD. UNLIKE every
+-- element's own label (which never scales with zoom — see _drawElement),
+-- the text here DOES scale with it, via a graphics scale transform rather
+-- than a new Font object per size: capped at 1x the configured app font size
+-- (globApp.appFont), reached exactly at _MAX_ZOOM, and shrinking as the user
+-- zooms out from there — it never grows past that cap.
+local _ANNUNCIATOR_READOUT_W_FRAC = 0.30
+local _ANNUNCIATOR_READOUT_H_FRAC = 0.16
+local _ANNUNCIATOR_READOUT_MARGIN_FRAC = 0.02
+local _ANNUNCIATOR_READOUT_PAD_PX = 6
+local _ANNUNCIATOR_READOUT_ROW_GAP_PX = 2
+local _ANNUNCIATOR_READOUT_COL_GAP_PX = 6
+
+-- Which _ANNUNCIATOR_COLORS slot a given annunciator's stored color matches
+-- (array order there IS the rank — see its own comment), or one past the end
+-- for a color that somehow doesn't match any entry (never happens via the
+-- normal creation flow, which always copies a color straight out of that
+-- same table — just a safe fallback). Floating-point == is safe here since
+-- a.color is never arithmetically derived, only ever copied unmodified from
+-- one of these exact table entries at creation/load time.
+local function _annunciatorColorRank(a)
+    for i, entry in ipairs(_ANNUNCIATOR_COLORS) do
+        if a.color and a.color[1] == entry.color[1] and a.color[2] == entry.color[2]
+           and a.color[3] == entry.color[3] then
+            return i
+        end
+    end
+    return #_ANNUNCIATOR_COLORS + 1
+end
+
+-- Every ACTIVE annunciator, ranked red/yellow/green/white (per
+-- _annunciatorColorRank) and alphabetically within each color — the
+-- readout's own display order, distinct from _sortedAnnunciators (plain
+-- alphabetical, used for the management panel and name-collision checks).
+local function _sortedActiveAnnunciatorsForDisplay(canvas)
+    local list = {}
+    for _, a in ipairs(canvas.annunciators) do
+        if a.active then table.insert(list, a) end
+    end
+    table.sort(list, function(x, y)
+        local rx, ry = _annunciatorColorRank(x), _annunciatorColorRank(y)
+        if rx ~= ry then return rx < ry end
+        return (x.label or ""):lower() < (y.label or ""):lower()
+    end)
+    return list
+end
+
+local function _drawAnnunciators(canvas)
+    local active = _sortedActiveAnnunciatorsForDisplay(canvas)
+    if #active == 0 then return end
+    local font = globApp.appFont or love.graphics.getFont()
+    love.graphics.setFont(font)
+    local textScale = math.min(1, canvas.zoom / _MAX_ZOOM)
+    local rowH = (font:getHeight() + _ANNUNCIATOR_READOUT_ROW_GAP_PX) * textScale
+
+    local x, y = _toPixel(canvas, _ANNUNCIATOR_READOUT_MARGIN_FRAC, _ANNUNCIATOR_READOUT_MARGIN_FRAC)
+    local w = _ANNUNCIATOR_READOUT_W_FRAC * canvas.contentW * canvas.zoom
+    local h = _ANNUNCIATOR_READOUT_H_FRAC * canvas.contentH * canvas.zoom
+
+    love.graphics.setColor(0, 0, 0, 1)
+    love.graphics.rectangle("fill", x, y, w, h)
+    love.graphics.setColor(1, 1, 1, 0.5)
+    love.graphics.rectangle("line", x, y, w, h)
+
+    -- How many whole rows fit vertically at the current (zoom-scaled) box
+    -- height/font size — the left column fills up to this many (ranked
+    -- order) before a second (right) column starts taking the overflow;
+    -- anything past 2x this many is left clipped by the scissor below, same
+    -- "zooming in reveals more" behavior as before, just across 2 columns.
+    local rowsPerCol = math.max(0, math.floor((h - 2 * _ANNUNCIATOR_READOUT_PAD_PX) / rowH))
+    local colW = (w - _ANNUNCIATOR_READOUT_PAD_PX * 2 - _ANNUNCIATOR_READOUT_COL_GAP_PX) / 2
+
+    love.graphics.setScissor(x, y, w, h)
+    for i, a in ipairs(active) do
+        local col = (i - 1 < rowsPerCol) and 0 or 1
+        local rowInCol = (col == 0) and (i - 1) or (i - 1 - rowsPerCol)
+        if rowInCol < rowsPerCol then
+            local colX = x + _ANNUNCIATOR_READOUT_PAD_PX + col * (colW + _ANNUNCIATOR_READOUT_COL_GAP_PX)
+            local rowY = y + _ANNUNCIATOR_READOUT_PAD_PX + rowInCol * rowH
+            local r, g, b, al = a.color[1], a.color[2], a.color[3], a.color[4] or 1
+            love.graphics.setColor(r, g, b, al)
+            -- Scale transform (not a resized Font) so the text grows/shrinks
+            -- with zoom the way the box itself does — the wrap width passed
+            -- to printf is in the scaled coordinate space, so it must be
+            -- divided back out by textScale to still cover this column's own
+            -- unscaled on-screen width colW. Left-aligned (not centered) so
+            -- two columns read as two columns rather than two staggered
+            -- center lines.
+            love.graphics.push()
+            love.graphics.translate(colX, rowY)
+            love.graphics.scale(textScale, textScale)
+            love.graphics.printf(a.label or a.id, 0, 0, colW / textScale, "left")
+            love.graphics.pop()
+        end
+    end
+    love.graphics.setScissor()
     love.graphics.setColor(1, 1, 1, 1)
 end
 
@@ -2288,7 +2826,8 @@ end
 -- through to the snapshot it just wrote, not all the way to bare defaultColor,
 -- or the canvas would look like the capture silently reverted.
 function gdsGui_schematic_resolveDisplayColor(canvasName, targetKind, targetId)
-    return gdsGui_schematic_resolveColor(canvasName, targetKind, targetId)
+    local r, g, b, a = gdsGui_schematic_resolveColor(canvasName, targetKind, targetId)
+    return _themedPaletteColor(r, g, b, a)
 end
 
 -- Existing snapshot keys whose captured control conditions agree with
@@ -2572,7 +3111,12 @@ end
 -- zoomed out, exactly like physical units would. This keeps a position
 -- that's on-grid at one zoom level on-grid at every zoom level.
 local function _drawGrid(canvas)
-    love.graphics.setColor(1, 1, 1, 0.06)
+    -- globApp.themeCanvasGridColor (set by the app layer's dark/light mode
+    -- toggle, if it sets one at all) lets the grid stay readable against
+    -- either canvas backdrop; a plain GUI-library consumer that never sets
+    -- it still gets the original faint-white-on-dark look.
+    local g = globApp.themeCanvasGridColor or {1, 1, 1, 0.06}
+    love.graphics.setColor(g[1], g[2], g[3], g[4])
     local spacing = _GRID_SPACING_PX
     local x0, y0, x1, y1 = canvas.x, canvas.y, canvas.x + canvas.w, canvas.y + canvas.h
 
@@ -2653,6 +3197,21 @@ end
 -- wallpaper (canvas.w/h are clamped viewport sizes, not the true content
 -- extent, so they're the wrong basis for this — see _calculateGeometry).
 local _CANVAS_BG_OPACITY = 0.35  -- shared by the main backdrop and the corner images below
+
+-- These background/corner watermarks (the airplane/schematic-canvas artwork
+-- set via gdsGui_schematic_setBackground*Image below) are a near-white tint
+-- meant to barely show against a DARK canvas — on the light canvas backdrop
+-- that same tint goes invisible outright, so in WHITE MODE
+-- (globApp.themeIsDark == false) they're tinted dark gray instead of white.
+local _BG_LIGHT_MODE_TINT = {0.25, 0.25, 0.25}
+local function _drawTintedImage(image, px, py, scale, r, g, b, a)
+    if globApp.themeIsDark == false then
+        r, g, b = _BG_LIGHT_MODE_TINT[1], _BG_LIGHT_MODE_TINT[2], _BG_LIGHT_MODE_TINT[3]
+    end
+    love.graphics.setColor(r, g, b, a)
+    love.graphics.draw(image, px, py, 0, scale, scale)
+end
+
 local function _drawCanvasBackground(canvas)
     if not canvas.backgroundImagePath then return end
     local image = _loadElementSprite(canvas.backgroundImagePath)
@@ -2663,8 +3222,7 @@ local function _drawCanvasBackground(canvas)
     local px = canvas.x + canvas.panX
     local py = canvas.y + canvas.panY + worldY * canvas.zoom
     local scale = worldScale * canvas.zoom
-    love.graphics.setColor(1, 1, 1, _CANVAS_BG_OPACITY)
-    love.graphics.draw(image, px, py, 0, scale, scale)
+    _drawTintedImage(image, px, py, scale, 1, 1, 1, _CANVAS_BG_OPACITY)
 end
 
 -- Draws canvas.cornerBackgroundImagePath / cornerRightBackgroundImagePath /
@@ -2690,8 +3248,7 @@ local function _drawCornerImage(canvas, path, alignRight, alignTop, sizeMul)
     local px = canvas.x + canvas.panX + worldX * canvas.zoom
     local py = canvas.y + canvas.panY + worldY * canvas.zoom
     local scale = worldScale * canvas.zoom
-    love.graphics.setColor(1, 1, 1, _CANVAS_BG_OPACITY)
-    love.graphics.draw(image, px, py, 0, scale, scale)
+    _drawTintedImage(image, px, py, scale, 1, 1, 1, _CANVAS_BG_OPACITY)
 end
 
 local function _drawCanvasCornerBackground(canvas)
@@ -2781,9 +3338,25 @@ local function _labelAlphaForZoom(zoom)
     return math.max(0, math.min(1, (zoom - _LABEL_FADE_START_ZOOM) / (_MAX_ZOOM - _LABEL_FADE_START_ZOOM)))
 end
 
-local function _drawElement(canvas, e)
+-- One common selection-ring radius for every element's ring (so selecting a
+-- DIODE vs. a BUS doesn't flash two different ring sizes), pinned to the
+-- same size a GENERATOR control's own selection ring uses — i.e. a control
+-- placed with no radiusMul override, whose stored radiusScale is always
+-- exactly 1/_EDIT_MODE_INITIAL_ZOOM (baked in at placement-commit time; see
+-- _commitNamedPlacement) — rather than derived from any element's own size.
+local function _commonElementSelectionRadius(canvas)
+    return canvas.controlRadius * canvas.zoom * (1 / _EDIT_MODE_INITIAL_ZOOM) + 4
+end
+
+-- Flat darken on top of whatever gdsGui_schematic_resolveDisplayColor
+-- already returns (including its own light-mode adjustment, if any) —
+-- elements only, not wires/controls. 0.8 * 0.85: an initial 20% darken,
+-- then a further 15% on top of that.
+local _ELEMENT_DARKEN = 0.8 * 0.85
+local function _drawElement(canvas, e, commonSelRad)
     local ex, ey, ew, eh = _elementPixelRect(canvas, e)
     local r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "element", e.id)
+    r, g, b = r * _ELEMENT_DARKEN, g * _ELEMENT_DARKEN, b * _ELEMENT_DARKEN
     love.graphics.setColor(r, g, b, a)
     if e.spritePath then
         _drawElementSprite(e.spritePath, ex, ey, ew, eh, r, g, b, a, e.rotation)
@@ -2827,7 +3400,16 @@ local function _drawElement(canvas, e)
         else
             love.graphics.setColor(1, 1, 0, 1)
         end
-        love.graphics.rectangle("line", ex - 3, ey - 3, ew + 6, eh + 6)
+        -- Same circular selection ring as a control's own (see
+        -- _drawControl's matching "circle", cx, cy, rad + 4" line) instead
+        -- of a rectangle hugging the box — one consistent "this is
+        -- selected" shape for every anchor kind, element or control alike.
+        -- Radius is shared across every element on this canvas (see
+        -- _commonElementSelectionRadius above) rather than each element's
+        -- own half-diagonal, so the ring doesn't visibly change size as
+        -- selection moves between a small DIODE and a large BUS.
+        local selCx, selCy = ex + ew / 2, ey + eh / 2
+        love.graphics.circle("line", selCx, selCy, commonSelRad)
         if canvas.selectionMoveModeActive then
             -- Mutually exclusive, not both at once: every further tap on
             -- the active target toggles between them (see
@@ -2835,7 +3417,12 @@ local function _drawElement(canvas, e)
             -- than opening the edit menu. Every element is rotatable now,
             -- same as every control.
             if canvas.rotateModeActive then
-                local ringBase = math.sqrt((ew / 2) ^ 2 + (eh / 2) ^ 2) + 3
+                -- commonSelRad - 1: same offset the old per-element formula
+                -- used between its own ringBase and selRad (diag+3 vs.
+                -- diag+4), kept here so the rotate arc still nests just
+                -- outside the (now shared-size) selection ring above
+                -- instead of landing inside it for a smaller element.
+                local ringBase = commonSelRad - 1
                 _drawRotateModeOverlay(ex + ew / 2, ey + eh / 2, ringBase, canvas.zoom)
             else
                 _drawMoveModeOverlay(ex + ew / 2, ey + eh / 2, ew / 2 + 3, eh / 2 + 3, canvas.zoom)
@@ -2843,7 +3430,17 @@ local function _drawElement(canvas, e)
         end
     end
     if e.label then
-        love.graphics.setColor(1, 1, 1, _labelAlphaForZoom(canvas.zoom))
+        local tc = globApp.themeTextColor or {1, 1, 1, 1}
+        love.graphics.setColor(tc[1], tc[2], tc[3], _labelAlphaForZoom(canvas.zoom))
+        -- Explicit, not ambient: outputTxtBox_gdsGuiLib.lua's own draw pass
+        -- (gdsGui_outputTxtBox_draw, runs immediately before this one every
+        -- frame — see gdsGui_general_draw) leaves love.graphics' font set to
+        -- whatever its own LAST textbox used, which has nothing to do with
+        -- the app's global font-size setting. globApp.appFont (set by the
+        -- app layer's FONT SIZE control, if it sets one at all) is what
+        -- actually tracks that setting — falling back to the ambient font
+        -- so the GUI library still draws something without it.
+        love.graphics.setFont(globApp.appFont or love.graphics.getFont())
         if e.shapeType == "diode" or e.spritePath then
             -- A diode has no filled body to back the label against (just
             -- thin lines), and at a 90/270 rotation those lines run right
@@ -3423,6 +4020,46 @@ local function _computeWirePlans(canvas)
             end
             breakpoints = dedup
 
+            -- Decided once for the WHOLE shared line, not re-derived per
+            -- sub-range below: if every sub-range instead asked "does
+            -- whichever subset happens to be active HERE include a bend",
+            -- a dead-straight wire bundled with one bent wire over only
+            -- PART of its length would flip from the one-sided formula
+            -- (while the bent wire is still present) to the centered one
+            -- (once it drops out) — two formulas with unrelated offset
+            -- scales, so the straight wire's own lane visibly jumped
+            -- sideways exactly where the bent wire's span ended, even
+            -- though the straight wire itself never changed. One decision
+            -- for the whole group keeps every entry on a single formula
+            -- for its entire run.
+            local hasBend = false
+            for _, e in ipairs(entries) do
+                if e.numSegs > 1 then hasBend = true break end
+            end
+            -- Same reasoning for the one-sided formula's lane rank: fixed
+            -- once across every entry sharing this line, not recomputed
+            -- from whichever subset is active in a given sub-range, so a
+            -- wire's lane doesn't shift just because some OTHER wire's
+            -- (possibly unrelated) span happens to start or end nearby.
+            -- Ranked by where each wire actually diverges (its real
+            -- bend/anchor position), not by draw/creation order, so a wire
+            -- that's the "leftmost"/"outermost" of the bundle stays on that
+            -- same side all the way to its own bend instead of being
+            -- assigned an arbitrary lane that forces it to cross the others
+            -- on the way out. Ties (same divergeCoord, e.g. two wires
+            -- bending at the exact same point) fall back to creation order
+            -- for determinism.
+            local globalRank = {}
+            if hasBend then
+                local ranked = {}
+                for _, e in ipairs(entries) do table.insert(ranked, e) end
+                table.sort(ranked, function(x, y)
+                    if x.divergeCoord ~= y.divergeCoord then return x.divergeCoord < y.divergeCoord end
+                    return x.order < y.order
+                end)
+                for rank, e in ipairs(ranked) do globalRank[e] = rank end
+            end
+
             for bi = 1, #breakpoints - 1 do
                 local a, b = breakpoints[bi], breakpoints[bi + 1]
                 local mid = (a + b) / 2
@@ -3432,14 +4069,6 @@ local function _computeWirePlans(canvas)
                 end
                 local n = #active
                 if n > 1 then
-                    -- Ranked by where each wire actually diverges (its real
-                    -- bend/anchor position), not by draw/creation order, so
-                    -- a wire that's the "leftmost"/"outermost" of the bundle
-                    -- stays on that same side all the way to its own bend
-                    -- instead of being assigned an arbitrary lane that forces
-                    -- it to cross the others on the way out. Ties (same
-                    -- divergeCoord, e.g. two wires bending at the exact same
-                    -- point) fall back to creation order for determinism.
                     table.sort(active, function(x, y)
                         if x.divergeCoord ~= y.divergeCoord then return x.divergeCoord < y.divergeCoord end
                         return x.order < y.order
@@ -3462,14 +4091,10 @@ local function _computeWirePlans(canvas)
                     -- active entry single-segment, no bend involved) keeps
                     -- the old centered split instead — nothing to avoid
                     -- there, and it reads better centered on the true line.
-                    local hasBend = false
-                    for _, e in ipairs(active) do
-                        if e.numSegs > 1 then hasBend = true break end
-                    end
                     for k, e in ipairs(active) do
                         local offX, offY
                         if hasBend then
-                            local mag = (k - 1) * _WIRE_PARALLEL_GAP_PX * canvas.zoom
+                            local mag = (globalRank[e] - 1) * _WIRE_PARALLEL_GAP_PX * canvas.zoom
                             offX, offY = e.safeDirX * mag, e.safeDirY * mag
                         else
                             local mag = (k - (n + 1) / 2) * _WIRE_PARALLEL_GAP_PX * canvas.zoom
@@ -3643,6 +4268,8 @@ local function _drawControl(canvas, c)
     -- gdsGui_schematic_resolveDisplayColor and ASSIGN COLOR/the design-mode
     -- edit menu's swatch picker below.
     local r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "control", c.id)
+    local darkenMul = c.colorDarkenMul or 1
+    r, g, b = r * darkenMul, g * darkenMul, b * darkenMul
     local spritePath = c.spritePaths and c.spritePaths[c.detentIndex + 1]
     if spritePath then
         _drawElementSprite(spritePath, cx - rad, cy - rad, rad * 2, rad * 2, r, g, b, a, c.rotation)
@@ -3675,7 +4302,12 @@ local function _drawControl(canvas, c)
     end
     local posName = (c.positions and c.positions[c.detentIndex + 1]) or tostring(c.detentIndex)
     local text = (c.label or "") .. "\n" .. posName
-    love.graphics.setColor(1, 1, 1, _labelAlphaForZoom(canvas.zoom))
+    local tc = globApp.themeTextColor or {1, 1, 1, 1}
+    love.graphics.setColor(tc[1], tc[2], tc[3], _labelAlphaForZoom(canvas.zoom))
+    -- See _drawElement's matching comment just above its own label draw —
+    -- same reason this can't rely on whatever font outputTxtBox's draw pass
+    -- last left active.
+    love.graphics.setFont(globApp.appFont or love.graphics.getFont())
     love.graphics.printf(text, cx - rad * 2, cy + rad + 2, rad * 4, "center")
 end
 
@@ -3711,7 +4343,11 @@ function gdsGui_schematic_draw(pageName)
         if canvas.page == pageName then
             love.graphics.setScissor(canvas.x, canvas.y, canvas.w, canvas.h)
 
-            love.graphics.setColor(0.10, 0.10, 0.12, 1)
+            -- globApp.themeCanvasBgColor (set by the app layer's dark/light
+            -- mode toggle, if it sets one at all) — see _drawGrid's own
+            -- fallback comment just below for why this isn't just hardcoded.
+            local canvasBg = globApp.themeCanvasBgColor or {0.10, 0.10, 0.12, 1}
+            love.graphics.setColor(canvasBg[1], canvasBg[2], canvasBg[3], canvasBg[4])
             love.graphics.rectangle("fill", canvas.x, canvas.y, canvas.w, canvas.h)
             _drawCanvasCornerBackground(canvas)
             _drawCanvasBackground(canvas)
@@ -3719,8 +4355,10 @@ function gdsGui_schematic_draw(pageName)
 
             local wirePlans = _computeWirePlans(canvas)
             for _, w in ipairs(canvas.wires) do _drawWire(canvas, w, wirePlans[w.id]) end
-            for _, e in ipairs(canvas.elements) do _drawElement(canvas, e) end
+            local commonSelRad = _commonElementSelectionRadius(canvas)
+            for _, e in ipairs(canvas.elements) do _drawElement(canvas, e, commonSelRad) end
             for _, c in ipairs(canvas.controls) do _drawControl(canvas, c) end
+            _drawAnnunciators(canvas)
 
             if canvas.wireTool.fromId then
                 local fromE = _findAnchor(canvas, canvas.wireTool.fromId)
@@ -3905,6 +4543,13 @@ function gdsGui_schematic_pressed(touchId, x, y)
         -- MODE specifically).
         if _hitsFloatingButton(activePageName, x, y) then goto continue end
 
+        -- Same "takes priority, consumes the tap" treatment as canvas.menu
+        -- above — see _handleAnnunciatorPanelPress's own comment for why.
+        if canvas.annunciatorPanelOpen then
+            _handleAnnunciatorPanelPress(canvas, touchId, x, y)
+            goto continue
+        end
+
         -- Track every finger down inside this canvas regardless of what the
         -- first one is already doing, so a second one lands as a pinch.
         canvas.touches[touchId] = { x = x, y = y }
@@ -3941,8 +4586,8 @@ function gdsGui_schematic_pressed(touchId, x, y)
         if canvas.pendingPlacement then
             local fracX, fracY = _toFraction(canvas, x, y)
             if canvas.pendingPlacement.kind == "element" then
-                fracX, fracY = _snapElementToGrid(canvas, fracX, fracY,
-                    _ELEMENT_DEFAULT_W_FRAC, _ELEMENT_DEFAULT_H_FRAC)
+                local wFrac, hFrac = _pendingElementSizeFrac(canvas, canvas.pendingPlacement)
+                fracX, fracY = _snapElementToGrid(canvas, fracX, fracY, wFrac, hFrac)
             else
                 fracX, fracY = _snapToGrid(canvas, fracX, fracY)
             end
@@ -3957,6 +4602,8 @@ function gdsGui_schematic_pressed(touchId, x, y)
                 spritePath = canvas.pendingPlacement.spritePath,
                 spritePaths = canvas.pendingPlacement.spritePaths,
                 overlaySpritePath = canvas.pendingPlacement.overlaySpritePath,
+                sizeMul = canvas.pendingPlacement.sizeMul,
+                matchControlSize = canvas.pendingPlacement.matchControlSize,
             }
             _openPlacementNamePrompt("NAME THIS " .. canvas.pendingPlacement.kind:upper(),
                 _suggestedPlacementName(canvas, canvas.pendingPlacement.label))
@@ -4229,6 +4876,10 @@ function gdsGui_schematic_moved(touchId, x, y)
         -- _released below didn't.
         if canvas.page ~= activePageName then goto continue end
         if canvas.menu then goto continue end
+        if canvas.annunciatorPanelOpen then
+            _handleAnnunciatorPanelMove(canvas, touchId, x, y)
+            goto continue
+        end
 
         if canvas.touches[touchId] then
             canvas.touches[touchId].x = x
@@ -4392,6 +5043,35 @@ function gdsGui_schematic_internal_onWireCreateConfirmed(canvasName, index, opti
     end
 end
 
+-- A press that lands on empty canvas space while a catalog placement is
+-- armed (canvas.pendingPlacement) synchronously opens the "NAME THIS
+-- ELEMENT/CONTROL" textPrompt right there inside gdsGui_schematic_pressed —
+-- see that function's pendingPlacement branch. That same press already
+-- tracked this finger in canvas.touches (every finger down inside the
+-- canvas is tracked up front, regardless of what it lands on, so a second
+-- one can be recognized as a pinch). But gdsGui_general_touchreleased/
+-- _mousereleased special-case an open textPrompt/choiceMenu by routing the
+-- matching release ENTIRELY to that modal instead of to
+-- gdsGui_schematic_released below — which is the only place that ever
+-- clears canvas.touches[touchId]. Left uncleared, that entry is a
+-- permanent ghost finger: the next real single-touch tap on this canvas
+-- makes _touchCount(canvas.touches) read 2, so gdsGui_schematic_pressed
+-- mistakes it for the START of a two-finger pinch instead of a normal
+-- select/drag — and sliding that one real finger past the stationary
+-- ghost continuously changes the measured pinch distance, i.e. "zoom"
+-- with only one finger down. Called by both general_gdsGuiLib handlers
+-- right before they hand a release off to textPrompt/choiceMenu, so this
+-- bookkeeping runs no matter which modal ends up owning the release.
+function gdsGui_schematic_clearTouch(touchId)
+    local activePageName = _getActivePageName()
+    for _, canvas in ipairs(globApp.objects.schematics) do
+        if canvas.page ~= activePageName then goto continue end
+        canvas.touches[touchId] = nil
+        _endPinchIfBelowTwo(canvas)
+        ::continue::
+    end
+end
+
 function gdsGui_schematic_released(touchId, x, y)
     local activePageName = _getActivePageName()
     for _, canvas in ipairs(globApp.objects.schematics) do
@@ -4418,6 +5098,10 @@ function gdsGui_schematic_released(touchId, x, y)
                 canvas._pendingDragUndoSnapshot = nil
             end
             _handleMenuRelease(canvas, touchId, x, y)
+            goto continue
+        end
+        if canvas.annunciatorPanelOpen then
+            _handleAnnunciatorPanelRelease(canvas, touchId, x, y)
             goto continue
         end
         if canvas.focusTouchId == touchId then
@@ -4773,12 +5457,27 @@ local function _loadGalleryImage(path)
     return _galleryImageCache[path]
 end
 
+-- Gallery thumbnails/mini-diagrams render slightly darker than the main
+-- canvas (same 0.02-per-channel offset the original hardcoded shades used:
+-- 0.10,0.10,0.12 canvas vs 0.08,0.08,0.10 thumbnail) so tiles read as
+-- distinct from the canvas/backdrop behind them instead of blending in.
+local function _thumbnailBgColor()
+    local canvasBg = globApp.themeCanvasBgColor or {0.10, 0.10, 0.12, 1}
+    return {
+        math.max(0, canvasBg[1] - 0.02),
+        math.max(0, canvasBg[2] - 0.02),
+        math.max(0, canvasBg[3] - 0.02),
+        canvasBg[4],
+    }
+end
+
 -- Draws a plain image (e.g. an app-supplied aircraft-type thumbnail) scaled
 -- to fit inside (tx,ty,tw,th), letterboxed to preserve aspect ratio. The
 -- library has no idea what the image depicts — it's just an item.thumbnailPath
 -- string the app layer resolved, same arm's-length relationship as item.name.
 local function _drawThumbnailImage(path, tx, ty, tw, th)
-    love.graphics.setColor(0.08, 0.08, 0.10, 1)
+    local bg = _thumbnailBgColor()
+    love.graphics.setColor(bg[1], bg[2], bg[3], bg[4])
     love.graphics.rectangle("fill", tx, ty, tw, th)
     local image = _loadGalleryImage(path)
     local iw, ih = image:getDimensions()
@@ -4794,7 +5493,8 @@ end
 -- arbitrary (tx,ty,tw,th) rect. Always uses each entity's defaultColor (no
 -- snapshot/signature resolution — a gallery tile has no "live" control state).
 local function _drawMiniDiagram(elements, wires, controls, tx, ty, tw, th)
-    love.graphics.setColor(0.08, 0.08, 0.10, 1)
+    local bg = _thumbnailBgColor()
+    love.graphics.setColor(bg[1], bg[2], bg[3], bg[4])
     love.graphics.rectangle("fill", tx, ty, tw, th)
 
     local function toPixel(fx, fy) return tx + fx * tw, ty + fy * th end
@@ -4866,7 +5566,8 @@ function gdsGui_schematicGallery_draw(pageName)
     for _, gallery in ipairs(globApp.objects.schematicGalleries) do
         if gallery.page == pageName then
             love.graphics.setScissor(gallery.x, gallery.y, gallery.w, gallery.h)
-            love.graphics.setColor(0.10, 0.10, 0.12, 1)
+            local galleryBg = globApp.themeCanvasBgColor or {0.10, 0.10, 0.12, 1}
+            love.graphics.setColor(galleryBg[1], galleryBg[2], galleryBg[3], galleryBg[4])
             love.graphics.rectangle("fill", gallery.x, gallery.y, gallery.w, gallery.h)
 
             if #gallery.items == 0 then
