@@ -77,9 +77,19 @@ local _DEFAULT_COLOR         = {0.75, 0.75, 0.75, 1}   -- light gray, matches th
 -- canvas backdrop, so it's darkened by this factor before being drawn.
 -- Dark mode (also the default when the app layer never sets the flag at
 -- all) leaves colors untouched.
+-- The default gray (_DEFAULT_COLOR, the palette's LIGHT GRAY) is the one
+-- exception: it's stored as a single value but drawn as a fixed per-theme
+-- shade instead — 150/150/150 in dark mode, 50/50/50 in white mode — so
+-- every unpainted element/wire/control (and the gray swatch itself) reads
+-- the same against either canvas backdrop.
 local _LIGHT_MODE_COLOR_DARKEN = 0.6
 local function _themedPaletteColor(r, g, b, a)
-    if globApp.themeIsDark == false then
+    local isLight = globApp.themeIsDark == false
+    if r == _DEFAULT_COLOR[1] and g == _DEFAULT_COLOR[2] and b == _DEFAULT_COLOR[3] then
+        local gray = (isLight and 50 or 150) / 255
+        return gray, gray, gray, a
+    end
+    if isLight then
         return r * _LIGHT_MODE_COLOR_DARKEN, g * _LIGHT_MODE_COLOR_DARKEN, b * _LIGHT_MODE_COLOR_DARKEN, a
     end
     return r, g, b, a
@@ -144,6 +154,31 @@ local function _findCanvas(canvasName)
         if c.name == canvasName then return c end
     end
     return nil
+end
+
+-- Finds an app-registered dock button (PAINT/ANNUNCIATOR/menu anchor — see
+-- gdsGui_schematic_setPaintButtonName and its siblings) by name, or nil if
+-- none was ever registered.
+local function _findButton(name)
+    if not name then return nil end
+    for _, b in ipairs(globApp.objects.buttons) do
+        if b.name == name then return b end
+    end
+    return nil
+end
+
+-- Gap between a dock tool's button column and the popup (menu, paint
+-- palette, annunciator panel) it opens to its left, top-aligned with the
+-- canvas's own top edge — see _toolPopupOrigin.
+local _TOOL_POPUP_GAP_PX = 8
+
+-- Right edge x and top y a dock tool's popup of width w opens at: just left
+-- of that tool's button, flush with the canvas's top edge. Every tool popup
+-- (ADD's catalog menus, the paint palette, the annunciator panel) shares
+-- this one origin so they all read as opening out of the same spot.
+local function _toolPopupOrigin(canvas, btn, w)
+    local x = math.max(canvas.x, btn.myx - _TOOL_POPUP_GAP_PX - w)
+    return x, canvas.y
 end
 
 local function _findElement(canvas, id)
@@ -309,7 +344,7 @@ local function _labelInUse(canvas, label, excludeKind, excludeId)
 end
 
 -- Suggests "TYPE_N" for the "name this element/control" prompt, where TYPE is
--- the catalog label (e.g. "GENERATOR") and N is one past the highest
+-- the short type name the app passed as the placement label (e.g. "BATT") and N is one past the highest
 -- "TYPE_<n>" name already on the canvas — the LAST element of that type's
 -- number, plus 1, not a running total. So deleting some back down still
 -- resumes after the highest survivor rather than reusing a freed number, and
@@ -449,7 +484,7 @@ function gdsGui_schematic_armAnnunciatorCreation(canvasName)
     if not canvas then return end
     gdsGui_schematic_cancelPlacement(canvasName)
     _pendingNamedPlacement = { canvasName = canvasName, kind = "annunciator" }
-    _openPlacementNamePrompt("NAME THIS ANNUNCIATOR", _suggestedPlacementName(canvas, "ANNUNCIATOR"))
+    _openPlacementNamePrompt("NAME THIS ANNUNCIATOR", _suggestedPlacementName(canvas, "ANNC"))
 end
 
 -- Shared onSelect/onCancel for the snapshot-wipe confirm menu above: both
@@ -1186,10 +1221,8 @@ end
 -- machinery as an element or wire's own defaultColor — see
 -- gdsGui_schematic_resolveDisplayColor and _drawControl.
 -- colorDarkenMul (optional, defaults to 1): flat multiplier on this
--- control's own resolved r/g/b at draw time, same idea as _drawElement's
--- _ELEMENT_DARKEN but per-instance instead of blanket — e.g. a GENERATOR
--- control whose housing should read as dark as a BATTERY element's own
--- (blanket-darkened) sprite.
+-- control's own resolved r/g/b at draw time, for a control whose icon
+-- should read darker than its assigned color.
 function gdsGui_schematic_addControl(canvasName, id, x, y, positions, initialDetentIndex, label, callbackFunc, radiusScale, spritePaths, rotation, overlaySpritePath, defaultColor, colorDarkenMul)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
@@ -1426,8 +1459,8 @@ end
 -- own embedded color-swatch row (see gdsGui_schematic_openElementEditMenu and
 -- its wire/control siblings, which no longer offer one). Stays armed across
 -- any number of paints until explicitly disarmed via the brush button again
--- (gdsGui_schematic_disarmPaintMode) — a miss (empty canvas space) is just a
--- no-op, see gdsGui_schematic_pressed — never one-shot, unlike
+-- (gdsGui_schematic_disarmPaintMode) or a tap on empty canvas space (see
+-- gdsGui_schematic_pressed) — never one-shot on a hit, unlike
 -- pendingColorAssignPick above.
 --------------------------------------------------------------------------------
 
@@ -1499,8 +1532,10 @@ end
 -- global function names (strings), resolved via _G[...] like every other
 -- string-named callback in this library. confirmIndex (optional, 1-based
 -- into options) marks that row a destructive hold-to-confirm gate instead of
--- a plain tap — see _markConfirmMenu.
-function gdsGui_schematic_openMenu(canvasName, title, options, onSelectFunc, onCancelFunc, confirmIndex)
+-- a plain tap — see _markConfirmMenu. widthFrac (optional) overrides the
+-- menu box's width as a fraction of the canvas width (default
+-- _MENU_WIDTH_FRAC).
+function gdsGui_schematic_openMenu(canvasName, title, options, onSelectFunc, onCancelFunc, confirmIndex, widthFrac)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     -- A menu always takes priority over the annunciator panel (see
@@ -1509,8 +1544,21 @@ function gdsGui_schematic_openMenu(canvasName, title, options, onSelectFunc, onC
     -- it's no longer receiving input for (e.g. the ADD "+" button opening
     -- the catalog cascade while the panel happens to be open).
     canvas.annunciatorPanelOpen = false
-    canvas.menu = { title = title, options = options, onSelect = onSelectFunc, onCancel = onCancelFunc }
+    canvas.menu = { title = title, options = options, onSelect = onSelectFunc, onCancel = onCancelFunc,
+        anchorButtonName = canvas._menuAnchorButtonName, widthFrac = widthFrac }
     _markConfirmMenu(canvas.menu, confirmIndex)
+end
+
+-- While set, every menu this canvas opens (openMenu and the swatch pickers)
+-- is pinned just left of the named dock button at the canvas's top edge
+-- (see _toolPopupOrigin) instead of centered — the app sets this for as
+-- long as a dock tool whose flow is made of menus (e.g. ADD's catalog
+-- cascade) is active, and clears it (nil) once that tool is deactivated.
+function gdsGui_schematic_setMenuAnchorButton(canvasName, buttonName)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return end
+    canvas._menuAnchorButtonName = buttonName
+    if canvas.menu then canvas.menu.anchorButtonName = buttonName end
 end
 
 function gdsGui_schematic_closeMenu(canvasName)
@@ -1552,7 +1600,7 @@ end
 -- extra-option count must equal #menu.options, since hit-testing/selection
 -- still indexes into that one combined list.
 local function _menuGeometry(owner, menu)
-    local w = owner.w * _MENU_WIDTH_FRAC
+    local w = owner.w * (menu.widthFrac or _MENU_WIDTH_FRAC)
     local titleH = _titleHeight(w, menu.title)
     local bodyH
     if menu.isSwatchPicker then
@@ -1563,7 +1611,13 @@ local function _menuGeometry(owner, menu)
     local h = titleH + bodyH + 10
     local x = owner.x + (owner.w - w) / 2
     local y
-    if menu.isSwatchPicker then
+    local anchorBtn = menu.anchorButtonName and _findButton(menu.anchorButtonName)
+    if anchorBtn then
+        -- Opened by a dock tool (see gdsGui_schematic_setMenuAnchorButton):
+        -- pinned just left of that tool's button at the canvas's top edge
+        -- instead of centered.
+        x, y = _toolPopupOrigin(owner, anchorBtn, w)
+    elseif menu.isSwatchPicker then
         -- The selected-item color picker is anchored in the bottom third of
         -- the canvas/gallery area (rather than dead-center) so it sits below
         -- the item being edited instead of covering it; clamped back inside
@@ -1800,6 +1854,7 @@ local function _openSwatchColorMenu(canvasName, title, extraOptions, onSelectFun
     canvas.menu = {
         title = title, options = options, onSelect = onSelectFunc, onCancel = onCancelFunc,
         isSwatchPicker = true, swatchColors = swatchColors, extraOptions = extraOptions or {},
+        anchorButtonName = canvas._menuAnchorButtonName,
     }
 end
 
@@ -1842,22 +1897,11 @@ end
 
 local _PAINT_SWATCH_SIZE_PX   = 34
 local _PAINT_SWATCH_GAP_PX    = 8
-local _PAINT_PALETTE_INSET_PX = 12
 
--- Finds the app-registered PAINT button (see gdsGui_schematic_
--- setPaintButtonName) by name, or nil if none was ever registered.
-local function _findButton(name)
-    if not name then return nil end
-    for _, b in ipairs(globApp.objects.buttons) do
-        if b.name == name then return b end
-    end
-    return nil
-end
-
--- Cascades downward directly from the PAINT button itself (left edge
--- aligned, starting just below it) so the palette reads as "opened out of"
--- the button that armed it, rather than as an unrelated panel elsewhere on
--- the canvas — a fixed screen-space stack independent of pan/zoom, same
+-- Opens just left of the PAINT button, top-aligned with the canvas (the
+-- shared dock-tool popup origin, see _toolPopupOrigin) so the palette reads
+-- as "opened out of" the button that armed it, rather than as an unrelated
+-- panel elsewhere on the canvas — a fixed screen-space stack independent of pan/zoom, same
 -- convention as the modal menu box (_menuGeometry), so it stays put and
 -- legible regardless of what's underneath it. Falls back to the canvas's own
 -- left edge, vertically centered, if the app never registered a button name.
@@ -1866,15 +1910,10 @@ local function _paintPaletteGeometry(canvas)
     local totalH = n * _PAINT_SWATCH_SIZE_PX + (n - 1) * _PAINT_SWATCH_GAP_PX
     local btn = _findButton(canvas._paintButtonName)
     if btn then
-        local x = btn.myx
-        local y = btn.myMaxy + _PAINT_SWATCH_GAP_PX
-        -- Keep the whole stack on-canvas even if the button sits close to
-        -- the bottom edge, rather than letting it run off into nothing.
-        local maxY = canvas.y + canvas.h - totalH - _PAINT_PALETTE_INSET_PX
-        if y > maxY then y = maxY end
+        local x, y = _toolPopupOrigin(canvas, btn, _PAINT_SWATCH_SIZE_PX)
         return x, y, _PAINT_SWATCH_SIZE_PX, totalH
     end
-    local x = canvas.x + _PAINT_PALETTE_INSET_PX
+    local x = canvas.x + _TOOL_POPUP_GAP_PX
     local y = canvas.y + (canvas.h - totalH) / 2
     return x, y, _PAINT_SWATCH_SIZE_PX, totalH
 end
@@ -2076,11 +2115,10 @@ end
 local _ANNUNCIATOR_ROW_H_PX    = 32
 local _ANNUNCIATOR_SWATCH_PX   = 16
 local _ANNUNCIATOR_PANEL_W_PX  = 170
-local _ANNUNCIATOR_PANEL_GAP_PX = 8
 local _ANNUNCIATOR_PANEL_MAX_VISIBLE_ROWS = 6
 
--- Cascades LEFTWARD out of the ANNUNCIATOR dock button (mirrors
--- _paintPaletteGeometry's downward cascade from the PAINT button), capped at
+-- Opens just left of the ANNUNCIATOR dock button at the canvas's top edge
+-- (the shared dock-tool popup origin, see _toolPopupOrigin), capped at
 -- _ANNUNCIATOR_PANEL_MAX_VISIBLE_ROWS tall regardless of how many
 -- annunciators exist — the drag-to-scroll handling further down is what
 -- brings the rest into view, so a long list never eats the whole canvas (the
@@ -2096,14 +2134,10 @@ local function _annunciatorPanelGeometry(canvas)
     local btn = _findButton(canvas._annunciatorButtonName)
     local x, y
     if btn then
-        x = btn.myx - _ANNUNCIATOR_PANEL_GAP_PX - w
-        y = btn.myy
-        local maxY = canvas.y + canvas.h - h
-        if y > maxY then y = maxY end
-        if y < canvas.y then y = canvas.y end
+        x, y = _toolPopupOrigin(canvas, btn, w)
     else
-        x = canvas.x + canvas.w - w - _ANNUNCIATOR_PANEL_GAP_PX
-        y = canvas.y + _ANNUNCIATOR_PANEL_GAP_PX
+        x = canvas.x + canvas.w - w - _TOOL_POPUP_GAP_PX
+        y = canvas.y + _TOOL_POPUP_GAP_PX
     end
     return x, y, w, h, headerH, bodyH, list
 end
@@ -2139,8 +2173,9 @@ end
 -- while canvas.annunciatorPanelOpen,
 -- at the same priority canvas.menu gets (a tap anywhere on the canvas while
 -- the panel is open is consumed here, never falls through to normal
--- selection/pan — the panel is effectively a lightweight modal, closed only
--- by pressing the ANNUNCIATOR dock button again).
+-- selection/pan — the panel is effectively a lightweight modal, closed by
+-- pressing the ANNUNCIATOR dock button again or tapping empty canvas space
+-- outside it).
 local function _handleAnnunciatorPanelPress(canvas, touchId, px, py)
     if canvas._annunciatorPanelTouchId ~= nil and canvas._annunciatorPanelTouchId ~= touchId then return end
     canvas._annunciatorPanelTouchId    = touchId
@@ -3514,15 +3549,11 @@ local function _commonElementSelectionRadius(canvas)
     return canvas.controlRadius * canvas.zoom * (1 / _EDIT_MODE_INITIAL_ZOOM) + 4
 end
 
--- Flat darken on top of whatever gdsGui_schematic_resolveDisplayColor
--- already returns (including its own light-mode adjustment, if any) —
--- elements only, not wires/controls. 0.8 * 0.85: an initial 20% darken,
--- then a further 15% on top of that.
-local _ELEMENT_DARKEN = 0.8 * 0.85
 local function _drawElement(canvas, e, commonSelRad)
     local ex, ey, ew, eh = _elementPixelRect(canvas, e)
+    -- Drawn exactly as resolved (no extra darken), so an element shows the
+    -- same palette color — default gray included — as a wire or control.
     local r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "element", e.id)
-    r, g, b = r * _ELEMENT_DARKEN, g * _ELEMENT_DARKEN, b * _ELEMENT_DARKEN
     love.graphics.setColor(r, g, b, a)
     if e.spritePath then
         _drawElementSprite(e.spritePath, ex, ey, ew, eh, r, g, b, a, e.rotation)
@@ -3651,8 +3682,91 @@ end
 -- filled body reaching its bounding box (see _anchorEdgePoint below), and a
 -- nil anchor (the live wire-drag preview's loose cursor/finger end) reports
 -- 0 too, since there's no shape there to clear.
+--
+-- A sprite-drawn anchor (an element's spritePath, or a control's current-
+-- detent spritePaths entry plus any overlaySpritePath) is the exception: its
+-- image is letterboxed into the box (see _drawElementSprite) and the art
+-- itself rarely fills the image edge to edge, so the box edge can sit well
+-- outside what's actually drawn. Wires clamp to the art's visible extent
+-- instead, measured from the image's own opaque pixels — so a padded image
+-- needs no hand-cropping for wires to meet it.
+--
+-- Returns minX, maxX, minY, maxY — the visible art's extent relative to the
+-- anchor's center, in screen pixels, after its rotation — or nil when the
+-- anchor isn't sprite-drawn. The opaque-pixel scan runs once per image path
+-- and is cached as 0-1 fractions of that image.
+local _spriteArtExtents
+do
+    local boundsCache = {}
+    local function contentBounds(path)
+        local cached = boundsCache[path]
+        if cached ~= nil then return cached or nil end
+        local ok, data = pcall(love.image.newImageData, path)
+        if not ok then boundsCache[path] = false; return nil end
+        local w, h = data:getDimensions()
+        local x0, y0, x1, y1 = w, h, -1, -1
+        for y = 0, h - 1 do
+            for x = 0, w - 1 do
+                local _, _, _, a = data:getPixel(x, y)
+                if a > 0.1 then
+                    if x < x0 then x0 = x end
+                    if x > x1 then x1 = x end
+                    if y < y0 then y0 = y end
+                    if y > y1 then y1 = y end
+                end
+            end
+        end
+        local b = (x1 >= 0) and { l = x0 / w, r = (x1 + 1) / w, t = y0 / h, b = (y1 + 1) / h, w = w, h = h } or false
+        boundsCache[path] = b
+        return b or nil
+    end
+
+    _spriteArtExtents = function(canvas, anchor)
+        local paths, boxW, boxH
+        if anchor.w then
+            if not anchor.spritePath then return nil end
+            paths = { anchor.spritePath }
+            local _, _, ew, eh = _elementPixelRect(canvas, anchor)
+            boxW, boxH = ew, eh
+        else
+            local base = anchor.spritePaths and anchor.spritePaths[(anchor.detentIndex or 0) + 1]
+            if not base then return nil end
+            paths = { base, anchor.overlaySpritePath }
+            local rad = canvas.controlRadius * canvas.zoom * (anchor.radiusScale or 1)
+            boxW, boxH = rad * 2, rad * 2
+        end
+        local minX, maxX, minY, maxY
+        local rot = math.rad(anchor.rotation or 0)
+        local cosR, sinR = math.cos(rot), math.sin(rot)
+        for _, path in ipairs(paths) do
+            local b = contentBounds(path)
+            if b then
+                -- Same fit-not-fill letterbox scale _drawElementSprite uses.
+                local scale = math.min(boxW / b.w, boxH / b.h)
+                local dw, dh = b.w * scale, b.h * scale
+                local l, r = (b.l - 0.5) * dw, (b.r - 0.5) * dw
+                local t, bt = (b.t - 0.5) * dh, (b.b - 0.5) * dh
+                for _, corner in ipairs({ {l, t}, {r, t}, {l, bt}, {r, bt} }) do
+                    local px = corner[1] * cosR - corner[2] * sinR
+                    local py = corner[1] * sinR + corner[2] * cosR
+                    minX = math.min(minX or px, px); maxX = math.max(maxX or px, px)
+                    minY = math.min(minY or py, py); maxY = math.max(maxY or py, py)
+                end
+            end
+        end
+        if not minX then return nil end
+        return minX, maxX, minY, maxY
+    end
+end
+
 local function _anchorHalfExtent(canvas, anchor, axis)
-    if not anchor or anchor.shapeType == "diode" then return 0 end
+    if not anchor then return 0 end
+    local minX, maxX, minY, maxY = _spriteArtExtents(canvas, anchor)
+    if minX then
+        if axis == "x" then return math.max(-minX, maxX) end
+        return math.max(-minY, maxY)
+    end
+    if anchor.shapeType == "diode" then return 0 end
     if anchor.w then
         local _, _, ew, eh = _elementPixelRect(canvas, anchor)
         return (axis == "x") and (ew / 2) or (eh / 2)
@@ -3661,7 +3775,17 @@ local function _anchorHalfExtent(canvas, anchor, axis)
 end
 
 local function _anchorEdgePoint(canvas, anchor, cx, cy, axis, sign)
-    if anchor and anchor.shapeType == "diode" then return cx, cy end
+    if anchor then
+        -- Per-side, not symmetric: art that sits off-center in its image
+        -- (e.g. a switch's lever swinging to one side of its terminals)
+        -- reaches further on one side than the other.
+        local minX, maxX, minY, maxY = _spriteArtExtents(canvas, anchor)
+        if minX then
+            if axis == "x" then return cx + ((sign > 0) and maxX or minX), cy end
+            return cx, cy + ((sign > 0) and maxY or minY)
+        end
+        if anchor.shapeType == "diode" then return cx, cy end
+    end
     local half = _anchorHalfExtent(canvas, anchor, axis)
     if axis == "x" then
         return cx + sign * half, cy
@@ -4692,6 +4816,14 @@ function gdsGui_schematic_pressed(touchId, x, y)
     for _, canvas in ipairs(globApp.objects.schematics) do
         if canvas.page ~= activePageName then goto continue end
 
+        -- A press a button already handled (see globApp.buttonPressConsumed
+        -- in buttons_gdsGuiLib.lua) never reaches the canvas — checked even
+        -- before the modal menu below, since a dock tool button (e.g. ADD)
+        -- can open that very menu in its own press callback, and this same
+        -- press would otherwise be recorded as an "outside" tap that
+        -- cancels it on release.
+        if globApp.buttonPressConsumed then goto continue end
+
         -- A modal menu always takes priority and consumes the tap. Only
         -- records what it landed on — gdsGui_schematic_released below is
         -- what actually fires onSelect/onCancel.
@@ -4712,7 +4844,16 @@ function gdsGui_schematic_pressed(touchId, x, y)
         -- Same "takes priority, consumes the tap" treatment as canvas.menu
         -- above — see _handleAnnunciatorPanelPress's own comment for why.
         if canvas.annunciatorPanelOpen then
-            _handleAnnunciatorPanelPress(canvas, touchId, x, y)
+            -- A tap outside the panel on empty canvas space (no element/
+            -- wire/control drawn there) closes it, same as toggling the
+            -- ANNUNCIATOR button off — the app layer's poll restores the
+            -- dock. Anything else is still consumed by the panel.
+            if _annunciatorRowAt(canvas, x, y) == "outside" and canvas.mode == "design"
+               and not (_hitElement(canvas, x, y) or _hitWire(canvas, x, y) or _hitControl(canvas, x, y)) then
+                canvas.annunciatorPanelOpen = false
+            else
+                _handleAnnunciatorPanelPress(canvas, touchId, x, y)
+            end
             goto continue
         end
 
@@ -4829,18 +4970,11 @@ function gdsGui_schematic_pressed(touchId, x, y)
                 canvas.dragMoved    = false
                 canvas._paintTarget = { kind = targetKind, id = target.id }
             else
-                -- A miss (empty canvas space) pans the view, same as the
-                -- ordinary design-mode miss case further down — paint mode
-                -- shouldn't trap you unable to move around the canvas.
-                -- Paint mode itself only exits via the PAINT button
-                -- (gdsGui_schematic_disarmPaintMode), not by tapping
-                -- elsewhere; a tap-without-drag here just pans in place.
-                canvas.focusTouchId = touchId
-                canvas.dragKind     = "pan"
-                canvas.dragStartX   = x
-                canvas.dragStartY   = y
-                canvas.panStartX    = canvas.panX
-                canvas.panStartY    = canvas.panY
+                -- A miss (empty canvas space, no item drawn there) exits
+                -- paint mode — the app layer's per-frame poll then releases
+                -- the PAINT button and restores its dock (see main.lua's
+                -- _exitSchematicTool). Consumed, so it doesn't also pan.
+                canvas.paintMode = nil
             end
             goto continue
         end

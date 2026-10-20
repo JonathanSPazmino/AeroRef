@@ -267,12 +267,10 @@ end
 -- Catalog for the design-mode "ADD" cascading menu: SYSTEM -> TYPE -> (for
 -- controls with more than one position preset) -> POSITION SET. Aviation
 -- naming lives here, not in the generic schematic_gdsGuiLib.lua module.
--- connectorColor (per system, not per item): wires are no longer a
--- placeable catalog item — ADD WIRE on an element's own edit menu is now
--- the only way to draw one (see gdsGui_schematic_internal_onElementEditChosen)
--- — but new wires should still come out pre-colored by system rather than
--- a flat gray, so this is threaded into the canvas instead (see
--- _openSystemIntoCanvas -> gdsGui_schematic_setDefaultConnectorColor).
+-- Every element, wire and control starts out the palette's LIGHT GRAY (the
+-- library's own default, themed for dark/white mode at draw time) — no
+-- per-system wire color, so a fresh schematic reads as one uniform gray until
+-- it's painted.
 
 -- Shared by every binary (2-position) switch/valve control below: index 1
 -- (the "off"/blocked/non-conducting position, always listed first in that
@@ -295,53 +293,50 @@ local _SWITCH_SPRITE_PATHS = {"Sprites/control_switchOpen.png", "Sprites/control
 local _GENERATOR_SPRITE_PATHS = {"Sprites/control_generatorHousing.png", "Sprites/control_generatorHousing.png"}
 local _GENERATOR_OVERLAY_SPRITE_PATH = "Sprites/control_generatorGear.png"
 
+-- abbrev: the short (up to 4-letter) name the "NAME THIS ..." prompt
+-- suggests for a newly placed item, as ABBREV_N (e.g. BATT_1) — see
+-- schematicCatalogItemChosen/_suggestedPlacementName.
 local SCHEMATIC_CATALOG = {
-    { system = "ELECTRICAL", connectorColor = {0.85, 0.75, 0.15, 1}, items = {
-        -- colorDarkenMul 0.8 * 0.85: matches schematic_gdsGuiLib.lua's
-        -- _ELEMENT_DARKEN (the blanket darken every element, BATTERY
-        -- included, already gets) so the GENERATOR housing reads exactly
-        -- as dark as BATTERY's own sprite instead of staying undarkened
-        -- like every other control.
-        { label = "GENERATOR", kind = "control", presets = { {"OFF", "ON"} },
-          spritePaths = _GENERATOR_SPRITE_PATHS, overlaySpritePath = _GENERATOR_OVERLAY_SPRITE_PATH,
-          colorDarkenMul = 0.8 * 0.85 },
+    { system = "ELECTRICAL", items = {
+        { label = "GENERATOR", abbrev = "GENR", kind = "control", presets = { {"OFF", "ON"} },
+          spritePaths = _GENERATOR_SPRITE_PATHS, overlaySpritePath = _GENERATOR_OVERLAY_SPRITE_PATH },
         -- matchControlSize: same on-screen footprint as a freshly-placed
         -- GENERATOR control (see gdsGui_schematic_armElementPlacement's own
         -- comment for the exact formula), rather than the shared default
         -- element size every other rect/circle item here still uses.
-        { label = "BATTERY",   kind = "element", shapeType = "rect", matchControlSize = true,
+        { label = "BATTERY", abbrev = "BATT",   kind = "element", shapeType = "rect", matchControlSize = true,
           defaultProperties = {"VOLTAGE", "CURRENT"}, spritePath = "Sprites/element_battery.png" },
-        { label = "BUS",       kind = "element", shapeType = "rect",
+        { label = "BUS", abbrev = "BUS",       kind = "element", shapeType = "rect",
           defaultProperties = {"VOLTAGE", "CURRENT"}, spritePath = "Sprites/element_bus.png" },
         -- sizeMul 7/30: the diode symbol reads oversized at the shared
         -- default element size (1/3), shrunk a further 30% on top of that.
-        { label = "DIODE",     kind = "element", shapeType = "diode", spritePath = "Sprites/element_diode.png",
+        { label = "DIODE", abbrev = "DIOD",     kind = "element", shapeType = "diode", spritePath = "Sprites/element_diode.png",
           sizeMul = 7 / 30 },
         -- radiusMul 0.7: shrunk 30% from the shared default control size.
-        { label = "SWITCH",    kind = "control", presets = { {"OFF", "ON"}, {"OFF", "ON", "STBY"} },
+        { label = "SWITCH", abbrev = "SWCH",    kind = "control", presets = { {"OFF", "ON"}, {"OFF", "ON", "STBY"} },
           spritePaths = _SWITCH_SPRITE_PATHS, radiusMul = 0.7 },
     }},
-    { system = "HYDRAULIC", connectorColor = {0.15, 0.45, 0.85, 1}, items = {
-        { label = "PUMP",         kind = "element", shapeType = "circle" },
-        { label = "VALVE",        kind = "element", shapeType = "circle" },
-        { label = "RESERVOIR",    kind = "element", shapeType = "circle" },
-        { label = "VALVE SWITCH", kind = "control", presets = { {"CLOSED", "OPEN"} },
+    { system = "HYDRAULIC", items = {
+        { label = "PUMP", abbrev = "PUMP",         kind = "element", shapeType = "circle" },
+        { label = "VALVE", abbrev = "VALV",        kind = "element", shapeType = "circle" },
+        { label = "RESERVOIR", abbrev = "RSVR",    kind = "element", shapeType = "circle" },
+        { label = "VALVE SWITCH", abbrev = "VSWT", kind = "control", presets = { {"CLOSED", "OPEN"} },
           spritePaths = _SWITCH_SPRITE_PATHS },
     }},
-    { system = "FUEL", connectorColor = {0.75, 0.35, 0.1, 1}, items = {
-        { label = "FUEL TANK",   kind = "element", shapeType = "circle" },
-        { label = "FUEL PUMP",  kind = "element", shapeType = "circle" },
-        { label = "FUEL SWITCH", kind = "control", presets = { {"OFF", "ON"} }, spritePaths = _SWITCH_SPRITE_PATHS },
+    { system = "FUEL", items = {
+        { label = "FUEL TANK", abbrev = "FTNK",   kind = "element", shapeType = "circle" },
+        { label = "FUEL PUMP", abbrev = "FPMP",  kind = "element", shapeType = "circle" },
+        { label = "FUEL SWITCH", abbrev = "FSWT", kind = "control", presets = { {"OFF", "ON"} }, spritePaths = _SWITCH_SPRITE_PATHS },
     }},
-    { system = "BLEED AIR", connectorColor = {0.85, 0.5, 0.15, 1}, items = {
-        { label = "BLEED VALVE", kind = "element", shapeType = "circle" },
-        { label = "BLEED SWITCH", kind = "control", presets = { {"OFF", "ON"} }, spritePaths = _SWITCH_SPRITE_PATHS },
+    { system = "BLEED AIR", items = {
+        { label = "BLEED VALVE", abbrev = "BVLV", kind = "element", shapeType = "circle" },
+        { label = "BLEED SWITCH", abbrev = "BSWT", kind = "control", presets = { {"OFF", "ON"} }, spritePaths = _SWITCH_SPRITE_PATHS },
     }},
-    { system = "PRESSURIZATION", connectorColor = {0.55, 0.3, 0.75, 1}, items = {
-        { label = "OUTFLOW VALVE", kind = "element", shapeType = "circle" },
-        { label = "CONTROLLER",    kind = "element", shapeType = "rect",
+    { system = "PRESSURIZATION", items = {
+        { label = "OUTFLOW VALVE", abbrev = "OFVL", kind = "element", shapeType = "circle" },
+        { label = "CONTROLLER", abbrev = "CTLR",    kind = "element", shapeType = "rect",
           defaultProperties = {"CABIN ALT", "RATE"} },
-        { label = "MODE SWITCH",   kind = "control", presets = { {"AUTO", "MANUAL"} } },
+        { label = "MODE SWITCH", abbrev = "MSWT",   kind = "control", presets = { {"AUTO", "MANUAL"} } },
     }},
 }
 
@@ -399,6 +394,21 @@ local _schematicCanvasNormalLayout = nil
 -- clears it (the full-screen page is already at its maximum, so zooming in
 -- there has nothing further to expand into).
 local _schematicCanvasZoomedLayout = nil
+
+-- Floating tool dock at the canvas's top-right (ADD / PAINT / ANNUNCIATOR,
+-- top to bottom). x and each button's normal y (0-1 of the safe area) are
+-- captured once at creation in love.load() for the same reason as
+-- _schematicCanvasNormalLayout above. While one tool is active
+-- (_activeSchematicTool, see _enterSchematicTool), that tool's button moves
+-- up to the top slot and the others are hidden until it's deactivated.
+local _SCHEMATIC_DOCK_TOOLS = {
+    add         = "schematicAddBtn",
+    paint       = "schematicPaintBtn",
+    annunciator = "schematicAnnunciatorBtn",
+}
+local _schematicDockX      = nil
+local _schematicDockSlotY  = {}   -- button name -> normal y
+local _activeSchematicTool = nil  -- nil | "add" | "paint" | "annunciator"
 local _prevSchematicZoomText = nil
 local _schematicZoomFullScreenFont = nil
 
@@ -1171,13 +1181,6 @@ local function _openSystemIntoCanvas(systemId, mode)
     -- elements/wires/controls back in if "undo" were used right after this.
     gdsGui_schematic_clearUndo("mainCanvas")
     _clearMainCanvas()
-    -- A wire drawn via ADD WIRE from here on should still come out
-    -- pre-colored by system (electrical=yellow, hydraulic=blue, ...), same
-    -- as the old catalog connector items used to be, rather than falling
-    -- back to flat gray. nil (a legacy/untyped system with no catalog
-    -- entry) clears it back to that gray default.
-    local catalogEntry = sys.systemType and _findCatalogEntryForType(sys.systemType)
-    gdsGui_schematic_setDefaultConnectorColor("mainCanvas", catalogEntry and catalogEntry.connectorColor)
     -- Every value handed to the library is deep-copied off of sys's own
     -- tables (see _deepCopyTable) so mainCanvas never ends up aliasing the
     -- stored record it was just loaded from.
@@ -1188,7 +1191,7 @@ local function _openSystemIntoCanvas(systemId, mode)
     for _, c in ipairs(sys.controls or {}) do
         gdsGui_schematic_addControl("mainCanvas", c.id, c.x, c.y, _deepCopyTable(c.positions), c.detentIndex,
             c.label, c.callbackFunc, c.radiusScale, c.spritePaths, c.rotation, c.overlaySpritePath,
-            _deepCopyTable(c.defaultColor), c.colorDarkenMul)
+            _deepCopyTable(c.defaultColor))
     end
     for _, w in ipairs(sys.wires or {}) do
         gdsGui_schematic_addWire("mainCanvas", w.id, w.fromElementId, w.toElementId, _deepCopyTable(w.defaultColor),
@@ -1311,7 +1314,9 @@ local function _openTypeMenu(canvasName, sys)
     local names = {}
     for _, item in ipairs(sys.items) do table.insert(names, item.label) end
     table.insert(names, "ANNUNCIATOR")
-    gdsGui_schematic_openMenu(canvasName, sys.system .. ": TYPE", names, "schematicCatalogItemChosen", nil)
+    -- Half the default menu width (0.8 of the canvas) — a short list of
+    -- single-word item names doesn't need the full-width box.
+    gdsGui_schematic_openMenu(canvasName, "ADD:", names, "schematicCatalogItemChosen", nil, nil, 0.4)
 end
 
 -- The catalog entry matching the currently-open system's fixed type, or nil
@@ -1359,10 +1364,10 @@ function schematicCatalogItemChosen(canvasName, index, optionText)
     -- element's own edit menu replaced it (see
     -- gdsGui_schematic_internal_onElementEditChosen).
     if item.kind == "element" then
-        gdsGui_schematic_armElementPlacement(canvasName, item.shapeType, item.label, nil, item.label,
+        gdsGui_schematic_armElementPlacement(canvasName, item.shapeType, item.abbrev or item.label, nil, item.label,
             item.defaultProperties, item.spritePath, item.sizeMul, item.matchControlSize)
     elseif #item.presets == 1 then
-        gdsGui_schematic_armControlPlacement(canvasName, item.presets[1], item.label, item.callbackFunc, item.label,
+        gdsGui_schematic_armControlPlacement(canvasName, item.presets[1], item.abbrev or item.label, item.callbackFunc, item.label,
             item.spritePaths, item.overlaySpritePath, item.radiusMul, item.colorDarkenMul)
     else
         _catalogChosenControlItem = item
@@ -1383,7 +1388,7 @@ function schematicCatalogPresetChosen(canvasName, index, optionText)
     local item = _catalogChosenControlItem
     if not item then return end
     local preset = item.presets[index]
-    gdsGui_schematic_armControlPlacement(canvasName, preset, item.label, item.callbackFunc, item.label,
+    gdsGui_schematic_armControlPlacement(canvasName, preset, item.abbrev or item.label, item.callbackFunc, item.label,
         item.spritePaths, item.overlaySpritePath, item.radiusMul, item.colorDarkenMul)
     _catalogChosenControlItem = nil
 end
@@ -1454,10 +1459,77 @@ end
 -- below — opening a brand new top-level menu while a cascade from either
 -- entry point is already mid-flight would silently clobber it and orphan its
 -- tracking locals (see gdsGui_schematic_isMenuOpen).
-function schematicAddBtnPressed()
-    if gdsGui_schematic_isMenuOpen("mainCanvas") then return end
-    if gdsGui_schematic_getMode("mainCanvas") ~= "design" then return end
-    _openAddMenu("mainCanvas")
+-- Activating a dock tool moves its button up to the top dock slot (ADD's)
+-- and hides the other tools until it's deactivated, so its popup — which
+-- always opens just left of the dock at the canvas's top edge (see
+-- _toolPopupOrigin in schematic_gdsGuiLib.lua) — sits right beside it.
+local function _enterSchematicTool(tool)
+    _activeSchematicTool = tool
+    local topY = _schematicDockSlotY[_SCHEMATIC_DOCK_TOOLS.add]
+    for t, name in pairs(_SCHEMATIC_DOCK_TOOLS) do
+        if t == tool then
+            gdsGui_button_setPosition(name, _schematicDockX, topY)
+        else
+            gdsGui_button_setHidden(name, true)
+        end
+    end
+end
+
+-- Puts every dock tool back in its normal slot. Only unhides them in design
+-- mode — a mode switch to control mode ends the active tool too (setMode
+-- clears paint/panel/menu state), and the dock stays hidden there.
+local function _exitSchematicTool()
+    if not _activeSchematicTool then return end
+    _activeSchematicTool = nil
+    gdsGui_schematic_setMenuAnchorButton("mainCanvas", nil)
+    local designing = gdsGui_schematic_getMode("mainCanvas") == "design"
+    for _, name in pairs(_SCHEMATIC_DOCK_TOOLS) do
+        gdsGui_button_setPosition(name, _schematicDockX, _schematicDockSlotY[name])
+        gdsGui_button_setHidden(name, not designing)
+        if designing then gdsGui_button_setState(name, "released") end
+    end
+end
+
+-- Whether the active tool still has anything open — polled every frame in
+-- love.update() so a tool that ends on its own (ADD's flow finishing or
+-- being cancelled, a mode switch, a system reload) restores the dock the
+-- same as the user toggling the tool's own button off.
+local function _schematicToolStillActive(tool)
+    if tool == "paint" then
+        return gdsGui_schematic_isPaintModeActive("mainCanvas")
+    elseif tool == "annunciator" then
+        return gdsGui_schematic_isAnnunciatorPanelOpen("mainCanvas")
+    elseif tool == "add" then
+        -- Any step of the ADD flow: a catalog menu, an armed tap-to-place,
+        -- or the NAME THIS ... prompt that follows the tap.
+        return gdsGui_schematic_isMenuOpen("mainCanvas") or gdsGui_schematic_isPlacementArmed("mainCanvas")
+            or gdsGui_textPrompt_isOpen()
+    end
+    return false
+end
+
+-- Dedicated "+" dock button (schematicAddBtn, top-right of the canvas, design
+-- mode only): the sole entry point into the ADD cascade (SYSTEM > TYPE >
+-- POSITIONS, see _openAddMenu). A sticky toggle like PAINT/ANNUNCIATOR:
+-- switching it on opens the cascade pinned beside the dock; switching it
+-- off abandons whatever step of the flow is open. Same reentrancy guard as
+-- schematicContextButtonPressed below — opening a brand new top-level menu
+-- while another cascade is already mid-flight would silently clobber it and
+-- orphan its tracking locals (see gdsGui_schematic_isMenuOpen).
+function schematicAddBtnPressed(newState)
+    if newState == globApp.BUTTON_STATES.PRESSED then
+        if gdsGui_schematic_isMenuOpen("mainCanvas") or gdsGui_schematic_getMode("mainCanvas") ~= "design" then
+            gdsGui_button_setState("schematicAddBtn", "released")
+            return
+        end
+        _enterSchematicTool("add")
+        gdsGui_schematic_setMenuAnchorButton("mainCanvas", "schematicAddBtn")
+        _openAddMenu("mainCanvas")
+    else
+        gdsGui_schematic_closeMenu("mainCanvas")
+        gdsGui_schematic_cancelPlacement("mainCanvas")
+        _exitSchematicTool()
+    end
 end
 
 -- Dedicated brush dock button (schematicPaintBtn, just below ADD): a sticky
@@ -1475,8 +1547,10 @@ end
 function schematicPaintBtnPressed(newState)
     if newState == globApp.BUTTON_STATES.PRESSED then
         gdsGui_schematic_armPaintMode("mainCanvas")
+        _enterSchematicTool("paint")
     else
         gdsGui_schematic_disarmPaintMode("mainCanvas")
+        _exitSchematicTool()
     end
 end
 
@@ -1487,7 +1561,9 @@ end
 -- the panel ever closes some other way (mode switch, or PAINT/ADD taking
 -- over via gdsGui_schematic_cancelPlacement).
 function schematicAnnunciatorBtnPressed(newState)
-    gdsGui_schematic_setAnnunciatorPanelOpen("mainCanvas", newState == globApp.BUTTON_STATES.PRESSED)
+    local open = newState == globApp.BUTTON_STATES.PRESSED
+    gdsGui_schematic_setAnnunciatorPanelOpen("mainCanvas", open)
+    if open then _enterSchematicTool("annunciator") else _exitSchematicTool() end
 end
 
 -- Single consolidated "ACTIONS" button: design mode offers clearing the
@@ -2756,7 +2832,7 @@ function love.load()
     -- SNAPSHOT uses (see schematicModeToggled/_openSystemIntoCanvas) — the
     -- sole entry point into the ADD cascade now (see schematicAddBtnPressed),
     -- replacing the old ACTIONS-menu "ADD ELEMENT/CONTROL" row.
-    gdsGui_button_create("schematicAddBtn", "SystemSchematic", "pushonoff",
+    gdsGui_button_create("schematicAddBtn", "SystemSchematic", "toggle",
         "Sprites/button_schematicAdd_pressed.png",
         "Sprites/button_schematicAdd_released.png",
         "Sprites/button_schematicAdd_deactivated.png",
@@ -2790,6 +2866,10 @@ function love.load()
         0.97, schCanvasYFrac + 2 * (36 + 10) / globApp.safeScreenArea.h, "RT", 36, 36,
         "schematicAnnunciatorBtnPressed", globApp.BUTTON_STATES.RELEASED, true, nil
     )
+    _schematicDockX = 0.97
+    _schematicDockSlotY[_SCHEMATIC_DOCK_TOOLS.add]         = schCanvasYFrac
+    _schematicDockSlotY[_SCHEMATIC_DOCK_TOOLS.paint]       = schCanvasYFrac + (36 + 10) / globApp.safeScreenArea.h
+    _schematicDockSlotY[_SCHEMATIC_DOCK_TOOLS.annunciator] = schCanvasYFrac + 2 * (36 + 10) / globApp.safeScreenArea.h
     -- COMBINATION PREV/NEXT — design-mode-only, fixed at the left/right
     -- middle of the screen (containerName nil, so like every other floating
     -- schematic chrome button they're positioned straight off safeScreenArea
@@ -3127,6 +3207,14 @@ function love.update(dt)
     -- single discrete event to push from. gdsGui_schematic_isMenuOpen also
     -- guards against polling mid-placement, where canvas.controls can be in
     -- a transient state.
+    -- A dock tool that ended some way other than its own button being
+    -- toggled off (ADD's flow finishing, a mode switch, a system reload)
+    -- puts the dock back — see _enterSchematicTool. Outside the menu-open
+    -- guard below, since an open ADD menu is exactly what keeps that tool alive.
+    if _activeSchematicTool and not _schematicToolStillActive(_activeSchematicTool) then
+        _exitSchematicTool()
+    end
+
     local schematicCanvas = _findSchematicCanvas()
     if schematicCanvas and not gdsGui_schematic_isMenuOpen("mainCanvas") then
         if _schematicCombControlsChanged(schematicCanvas) then

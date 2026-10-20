@@ -168,9 +168,17 @@ function gdsGui_button_pressed(x, y, button, istouch)
 
     local activePageName = _getActivePageName()
 
+    -- True once this press lands on a live button, so widgets dispatched
+    -- after buttons for the SAME press (e.g. a schematic canvas a floating
+    -- button sits over) can tell it was already consumed — even when the
+    -- button's own callback moved or hid it, so hit-testing its rect again
+    -- afterward would miss.
+    globApp.buttonPressConsumed = false
+
     for _, p in ipairs(globApp.objects.buttons) do
         if p.page == activePageName and not p.hidden and p.state ~= globApp.BUTTON_STATES.DEACTIVATED and _isPressed(p, x, y) and
            (not p.ownerContainer or gdsGui_container_isTouchInOwnerContainer(p, x, y)) then
+            globApp.buttonPressConsumed = true
             if p.type == "toggle" then
                 if p.state == globApp.BUTTON_STATES.RELEASED then
                     p.state = globApp.BUTTON_STATES.PRESSED
@@ -243,6 +251,22 @@ function gdsGui_button_setState(buttonName, state)
         if b.name == buttonName then
             b.state = targetState
             b.deactivated = (targetState == globApp.BUTTON_STATES.DEACTIVATED)
+            return
+        end
+    end
+end
+
+--[[
+    Moves a button by name to a new relative (0-1 of the safe area) position,
+    keeping its anchor point and size. Stored as its new original position so
+    a later window resize keeps it there.
+]]
+function gdsGui_button_setPosition(buttonName, x, y)
+    for _, b in ipairs(globApp.objects.buttons) do
+        if b.name == buttonName then
+            b.original.x = x
+            b.original.y = y
+            b:resize()
             return
         end
     end
