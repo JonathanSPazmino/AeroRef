@@ -89,7 +89,7 @@ local _MENU_WIDTH_FRAC       = 0.8
 local _MENU_OPACITY          = 0.85 -- all modal menu panels render 15% transparent
 local _ELEMENT_TAP_SLOP_PX   = 6   -- max press->release movement still counted as a tap, not a drag
 local _LONG_PRESS_SECONDS    = 1.3 -- how long a held (not-yet-moved) press on an element/control/wire takes to unlock move/rotate/direction mode — see gdsGui_schematic_update
-local _CONFIRM_HOLD_SECONDS  = 2   -- how long an explicitly-marked (isConfirm=true) confirm menu's action row must be held before it fires — see _markConfirmMenu/_pollMenuHoldToConfirm
+local _CONFIRM_HOLD_SECONDS  = 2   -- how long a menu's explicitly-marked confirmIndex row must be held before it fires — see _markConfirmMenu/_pollMenuHoldToConfirm
 local _CONFIRM_HOLD_MAX_DT   = 0.1 -- per-frame cap when accumulating the hold above — stops one stalled/slow frame (GC pause, app resume) from satisfying the whole hold instantly
 local _WIRE_TAP_SLOP_PX      = 10  -- max distance from a wire's drawn line still counted as tapping it
 local _SWATCH_ROW_H_PX       = 64  -- height of the single row of color squares in a swatch picker
@@ -239,6 +239,11 @@ local _openElementRenamePrompt
 -- ANNUNCIATORS) once _openSwatchColorMenu exists, but referenced by
 -- gdsGui_schematic_placementNameConfirmed well before that point.
 local _openAnnunciatorColorMenu
+-- Forward-declared like _openElementRenamePrompt above: assigned further
+-- down (PUBLIC API — DESIGN-MODE ANNUNCIATOR EDIT MENU) but called from
+-- gdsGui_schematic_internal_onAnnunciatorEditChosen, defined earlier in that
+-- same section — needs to already exist as this upvalue at that point.
+local _openAnnunciatorRenamePrompt
 
 local _UNDO_STACK_MAX = 20
 
@@ -420,7 +425,7 @@ function gdsGui_schematic_placementNameConfirmed(name)
             snapshotCount .. " SNAPSHOT(S). CONTINUE?",
             {"CONTINUE", "CANCEL"},
             "gdsGui_schematic_internal_onPlacementSnapshotWipeConfirmed",
-            "gdsGui_schematic_internal_onPlacementSnapshotWipeConfirmed", true)
+            "gdsGui_schematic_internal_onPlacementSnapshotWipeConfirmed", 1)
         return
     end
     _commitNamedPlacement(canvas, pending, trimmed)
@@ -816,6 +821,14 @@ function gdsGui_schematic_create(name, page, x, y, anchorPoint, wFrac, hFrac)
     canvas._annunciatorPanelDragStartY  = nil
     canvas._annunciatorPanelDragStartScroll = nil
     canvas._annunciatorPanelMoved       = false
+    -- How long the current panel-row press has been held without moving —
+    -- polled in gdsGui_schematic_update exactly like canvas.longPressElapsed
+    -- is for an on-canvas element/control/wire, but kept separate since a
+    -- panel row has no move/rotate mode to unlock: crossing _LONG_PRESS_SECONDS
+    -- here opens the rename/delete edit menu instead (see
+    -- gdsGui_schematic_openAnnunciatorEditMenu further down).
+    canvas._annunciatorPanelLongPressElapsed = 0
+    canvas._annunciatorEditTargetId     = nil  -- annunciator id while its rename/delete edit menu is open
     canvas._placementCounter = 0
     canvas._colorPickTarget     = nil  -- {kind="element"|"wire", id=...} while the color-picker menu is open
     canvas._elementEditTargetId = nil  -- elementId while the design-mode edit (color+properties+delete) menu is open
@@ -1458,30 +1471,36 @@ end
 -- pickers, the built-in color picker, and snapshot-conflict confirmation.
 --------------------------------------------------------------------------------
 
--- Called only when the caller explicitly passes isConfirm=true (a
--- destructive action — DELETE, CLEAR, OVERWRITE, CONTINUE, DELETE ALL).
--- Tag the menu so its action row (below) requires a sustained
+-- Called only when the caller explicitly passes a confirmIndex (a
+-- destructive action — DELETE, RESET, OVERWRITE, CONTINUE). Tags the row at
+-- confirmIndex (1-based, into menu.options) as requiring a sustained
 -- _CONFIRM_HOLD_SECONDS press instead of a plain tap, guarding against an
--- accidental tap triggering something destructive, and fold a hint about
--- that into the title so the user isn't left holding a button with no idea
--- why it isn't responding — see _pollMenuHoldToConfirm for where the hold
--- is actually timed. Deliberately not inferred from menu shape (e.g. "two
--- options, second is CANCEL") — a future non-destructive binary menu with
--- that same shape must not be silently gated behind a hold.
-local function _markConfirmMenu(menu, isConfirm)
-    if not isConfirm then return end
-    menu.confirmIndex = 1
+-- accidental tap triggering something destructive, and folds a hint about
+-- that into the title so the user isn't left holding a row with no idea why
+-- it isn't responding — see _pollMenuHoldToConfirm for where the hold is
+-- actually timed. The destructive row lives directly in its menu's own
+-- option list alongside every ordinary (plain-tap) row — e.g. the element
+-- edit menu's own DELETE — rather than behind a separate "are you sure"
+-- popup: one hold IS the confirmation, so there's nothing left to pop up a
+-- second menu for. Deliberately passed explicitly by every call site rather
+-- than inferred from option text/shape — a future row that happens to be
+-- named "DELETE" or sit in a 2-option menu must not be silently gated
+-- behind a hold it never asked for.
+local function _markConfirmMenu(menu, confirmIndex)
+    if not confirmIndex then return end
+    menu.confirmIndex = confirmIndex
     if menu.title then
-        menu.title = menu.title .. " (PRESS & HOLD \"" .. menu.options[1] ..
+        menu.title = menu.title .. " (PRESS & HOLD \"" .. menu.options[confirmIndex] ..
             "\" " .. _CONFIRM_HOLD_SECONDS .. "S TO CONFIRM)"
     end
 end
 
 -- onSelectFunc(canvasName, index, optionText) and onCancelFunc(canvasName) are
 -- global function names (strings), resolved via _G[...] like every other
--- string-named callback in this library. isConfirm (optional) marks this a
--- destructive confirm/cancel gate — see _markConfirmMenu.
-function gdsGui_schematic_openMenu(canvasName, title, options, onSelectFunc, onCancelFunc, isConfirm)
+-- string-named callback in this library. confirmIndex (optional, 1-based
+-- into options) marks that row a destructive hold-to-confirm gate instead of
+-- a plain tap — see _markConfirmMenu.
+function gdsGui_schematic_openMenu(canvasName, title, options, onSelectFunc, onCancelFunc, confirmIndex)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     -- A menu always takes priority over the annunciator panel (see
@@ -1491,7 +1510,7 @@ function gdsGui_schematic_openMenu(canvasName, title, options, onSelectFunc, onC
     -- the catalog cascade while the panel happens to be open).
     canvas.annunciatorPanelOpen = false
     canvas.menu = { title = title, options = options, onSelect = onSelectFunc, onCancel = onCancelFunc }
-    _markConfirmMenu(canvas.menu, isConfirm)
+    _markConfirmMenu(canvas.menu, confirmIndex)
 end
 
 function gdsGui_schematic_closeMenu(canvasName)
@@ -1678,9 +1697,9 @@ local function _pollMenuHoldToConfirm(owner, dt)
 end
 
 -- One text menu row, highlighted red when it's the destructive "DELETE"
--- option (wherever it appears: the design-mode element-edit menu, a project's
--- manage-action menu, or either one's delete-confirm step). holdFrac
--- (optional, 0-1): while this row is the confirm-gated action AND is
+-- option (wherever it appears: the design-mode element/wire/control/
+-- annunciator edit menus, a gallery's aircraft/system manage-action menu).
+-- holdFrac (optional, 0-1): while this row is the confirm-gated action AND is
 -- currently being held down (see _pollMenuHoldToConfirm), draws a
 -- left-to-right loading-bar overlay across it so the user can see how much
 -- longer the hold needs to last instead of just waiting blind — reaching
@@ -2003,6 +2022,18 @@ function gdsGui_schematic_addAnnunciator(canvasName, id, label, color, active)
     table.insert(canvas.annunciators, { id = id, label = label, color = color, active = (active ~= false) })
 end
 
+-- Reached via the management panel's edit menu (DELETE, hold-to-confirm) —
+-- see gdsGui_schematic_internal_onAnnunciatorEditChosen further down. An
+-- annunciator has no wires/position of its own to also clean up, so this is
+-- simpler than gdsGui_schematic_removeElement/removeControl above.
+function gdsGui_schematic_removeAnnunciator(canvasName, id)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return end
+    for i = #canvas.annunciators, 1, -1 do
+        if canvas.annunciators[i].id == id then table.remove(canvas.annunciators, i) end
+    end
+end
+
 -- Toggled by a tap on its row in the management panel (see
 -- _handleAnnunciatorPanelRelease below) — not undoable (matches every other
 -- plain status flip in this file, e.g. cycling a control in control mode),
@@ -2098,8 +2129,14 @@ end
 -- Press/move/release for the panel: a plain tap on a row toggles it; a
 -- vertical drag scrolls the list — same tap-vs-drag _ELEMENT_TAP_SLOP_PX
 -- distinction, and the same "only the first finger down is tracked" rule,
--- every other gesture/menu in this file uses. Called from
--- gdsGui_schematic_pressed/_moved/_released while canvas.annunciatorPanelOpen,
+-- every other gesture/menu in this file uses. A tap-and-HOLD on a row (no
+-- drag) instead opens its rename/delete edit menu — see the
+-- canvas._annunciatorPanelLongPressElapsed poll in gdsGui_schematic_update —
+-- so a plain tap keeps doing the frequent in-flight action (toggling active)
+-- while the rarer edit actions stay a deliberate long-press away, same
+-- "tap operates, long-press edits" split every on-canvas element/control/
+-- wire already uses. Called from gdsGui_schematic_pressed/_moved/_released
+-- while canvas.annunciatorPanelOpen,
 -- at the same priority canvas.menu gets (a tap anywhere on the canvas while
 -- the panel is open is consumed here, never falls through to normal
 -- selection/pan — the panel is effectively a lightweight modal, closed only
@@ -2111,6 +2148,7 @@ local function _handleAnnunciatorPanelPress(canvas, touchId, px, py)
     canvas._annunciatorPanelDragStartY = py
     canvas._annunciatorPanelDragStartScroll = canvas.annunciatorPanelScroll or 0
     canvas._annunciatorPanelMoved = false
+    canvas._annunciatorPanelLongPressElapsed = 0
 end
 
 local function _handleAnnunciatorPanelMove(canvas, touchId, px, py)
@@ -2189,6 +2227,164 @@ function gdsGui_schematic_drawAnnunciatorPanelOverlay(pageName)
             _drawAnnunciatorPanel(canvas)
         end
     end
+end
+
+--------------------------------------------------------------------------------
+-- PUBLIC API — DESIGN-MODE ANNUNCIATOR EDIT MENU (rename + color + delete,
+-- opened by a tap-and-HOLD on a row in the management panel — see the
+-- canvas._annunciatorPanelLongPressElapsed poll in gdsGui_schematic_update
+-- and _handleAnnunciatorPanelPress/_annunciatorRowAt above). A plain tap
+-- keeps toggling active/inactive; this is the deliberate-hold path to the
+-- rarer rename/color/delete actions, same split the element/control/wire
+-- edit menus use between a tap (opens their menu) and a held drag (moves
+-- them). COLOR here reuses the same _ANNUNCIATOR_COLORS swatch picker
+-- creation uses (_openAnnunciatorColorMenu/_ANNUNCIATOR_COLORS further up),
+-- but writes straight to the annunciator's own .color field, same
+-- immediate-mutation convention RENAME uses below — UNLIKE the element/
+-- wire/control edit menus, which dropped their own embedded color row in
+-- favor of paint mode's pendingColor/snapshot workflow: an annunciator's
+-- color is a flat, always-on property (never participates in paint mode or
+-- per-combination snapshots), so there's nothing to hand off to there.
+--------------------------------------------------------------------------------
+
+-- DELETE sits last (index 3) and is passed as this menu's own confirmIndex
+-- (see gdsGui_schematic_openMenu/_markConfirmMenu) — holding IT down for
+-- _CONFIRM_HOLD_SECONDS is the entire confirmation, no separate "DELETE
+-- \"X\"?" popup involved. RENAME/COLOR stay plain-tap rows in the same menu.
+function gdsGui_schematic_openAnnunciatorEditMenu(canvasName, annunciatorId)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return end
+    local a = _findAnnunciator(canvas, annunciatorId)
+    if not a then return end
+    canvas._annunciatorEditTargetId = annunciatorId
+    gdsGui_schematic_openMenu(canvasName, a.label or annunciatorId, {"RENAME", "COLOR", "DELETE"},
+        "gdsGui_schematic_internal_onAnnunciatorEditChosen", "gdsGui_schematic_internal_onAnnunciatorEditCancelled", 3)
+end
+
+function gdsGui_schematic_internal_onAnnunciatorEditChosen(canvasName, index, optionText)
+    local canvas = _findCanvas(canvasName)
+    if not canvas or not canvas._annunciatorEditTargetId then return end
+    local annunciatorId = canvas._annunciatorEditTargetId
+    if optionText == "RENAME" then
+        -- RENAME tapped: hand off to the rename prompt, keeping the target
+        -- id around while that flow is in progress (same convention as the
+        -- element edit menu's own RENAME option).
+        canvas._annunciatorEditTargetId = nil
+        _openAnnunciatorRenamePrompt(canvasName, annunciatorId)
+        return
+    elseif optionText == "COLOR" then
+        -- COLOR tapped: hand off to the same swatch picker creation uses.
+        -- Keep _annunciatorEditTargetId set — the swatch-chosen/cancelled
+        -- handlers below clear it.
+        local a = _findAnnunciator(canvas, annunciatorId)
+        _openSwatchColorMenu(canvasName, "COLOR: " .. (a and (a.label or annunciatorId) or annunciatorId), {},
+            "gdsGui_schematic_internal_onAnnunciatorColorEditChosen",
+            "gdsGui_schematic_internal_onAnnunciatorColorEditCancelled", _ANNUNCIATOR_COLORS)
+        return
+    elseif optionText == "DELETE" then
+        -- DELETE only ever reaches here via the sustained hold the menu's
+        -- own confirmIndex gates it behind (see openAnnunciatorEditMenu
+        -- above) — a plain tap-release on this row is swallowed by
+        -- _handleMenuRelease before onSelect ever fires, so by the time
+        -- optionText == "DELETE" lands here the hold has already happened.
+        -- Safe to act immediately.
+        canvas._annunciatorEditTargetId = nil
+        _pushUndo(canvas)
+        gdsGui_schematic_removeAnnunciator(canvasName, annunciatorId)
+        _notifyChanged(canvas)
+        return
+    end
+    canvas._annunciatorEditTargetId = nil
+end
+
+-- Shared onSelect/onCancel for the COLOR swatch picker above: both picking a
+-- swatch and tapping outside land here (index is nil on cancel, same
+-- convention gdsGui_schematic_internal_onAnnunciatorColorChosen's creation
+-- counterpart uses).
+function gdsGui_schematic_internal_onAnnunciatorColorEditChosen(canvasName, index)
+    local canvas = _findCanvas(canvasName)
+    if not canvas or not canvas._annunciatorEditTargetId then return end
+    local annunciatorId = canvas._annunciatorEditTargetId
+    canvas._annunciatorEditTargetId = nil
+    local entry = _ANNUNCIATOR_COLORS[index]
+    if not entry then return end
+    local a = _findAnnunciator(canvas, annunciatorId)
+    if not a then return end
+    _pushUndo(canvas)
+    a.color = entry.color
+    _notifyChanged(canvas)
+end
+
+function gdsGui_schematic_internal_onAnnunciatorColorEditCancelled(canvasName)
+    local canvas = _findCanvas(canvasName)
+    if canvas then canvas._annunciatorEditTargetId = nil end
+end
+
+-- Tapping outside the edit menu (or outside the rename/confirm steps it
+-- leads to) just drops the in-flight target — unlike the element/control/
+-- wire edit menus, there's no on-canvas "selected" highlight to also clear
+-- here, since an annunciator isn't drawn as a selectable canvas object.
+function gdsGui_schematic_internal_onAnnunciatorEditCancelled(canvasName)
+    local canvas = _findCanvas(canvasName)
+    if canvas then canvas._annunciatorEditTargetId = nil end
+end
+
+--------------------------------------------------------------------------------
+-- PUBLIC API — DESIGN-MODE ANNUNCIATOR RENAME (reached via the edit menu's
+-- RENAME option above). Reuses the same shared element/control/annunciator
+-- label namespace/uniqueness rule as initial placement (_labelInUse), just
+-- excluding the annunciator's own current label — same pattern as
+-- _openElementRenamePrompt further up.
+--------------------------------------------------------------------------------
+
+-- Holds the annunciator being renamed while the text prompt is open; only
+-- one rename is ever in flight at a time, same shape as _pendingRename.
+local _pendingAnnunciatorRename = nil   -- {canvasName, annunciatorId}
+
+_openAnnunciatorRenamePrompt = function(canvasName, annunciatorId)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return end
+    local a = _findAnnunciator(canvas, annunciatorId)
+    if not a then return end
+    _pendingAnnunciatorRename = { canvasName = canvasName, annunciatorId = annunciatorId }
+    gdsGui_textPrompt_open("RENAME \"" .. (a.label or annunciatorId) .. "\"", a.label or "", 24,
+        "gdsGui_schematic_annunciatorRenameConfirmed", "gdsGui_schematic_annunciatorRenameCancelled")
+end
+
+-- Resolved by name via _G[...] from textPrompt_gdsGuiLib.lua, like every
+-- other string-registered callback in this library. onConfirmFunc receives
+-- only the entered text (see gdsGui_textPrompt_confirm) — the target
+-- annunciator comes from _pendingAnnunciatorRename, same pattern as
+-- gdsGui_schematic_elementRenameConfirmed.
+function gdsGui_schematic_annunciatorRenameConfirmed(text)
+    local pending = _pendingAnnunciatorRename
+    if not pending then return end
+    local canvas = _findCanvas(pending.canvasName)
+    local trimmed = (text or ""):gsub("^%s*(.-)%s*$", "%1")
+    if not canvas then return end
+    local a = _findAnnunciator(canvas, pending.annunciatorId)
+    if not a then
+        _pendingAnnunciatorRename = nil
+        return
+    end
+    if trimmed == "" then
+        gdsGui_textPrompt_open("NAME REQUIRED, TRY AGAIN", trimmed, 24,
+            "gdsGui_schematic_annunciatorRenameConfirmed", "gdsGui_schematic_annunciatorRenameCancelled")
+        return
+    end
+    if _labelInUse(canvas, trimmed, "annunciator", pending.annunciatorId) then
+        gdsGui_textPrompt_open("NAME TAKEN, TRY AGAIN", trimmed, 24,
+            "gdsGui_schematic_annunciatorRenameConfirmed", "gdsGui_schematic_annunciatorRenameCancelled")
+        return
+    end
+    _pushUndo(canvas)
+    a.label = trimmed
+    _pendingAnnunciatorRename = nil
+    _notifyChanged(canvas)
+end
+
+function gdsGui_schematic_annunciatorRenameCancelled()
+    _pendingAnnunciatorRename = nil
 end
 
 -- Annunciator readout: one black screen anchored at the content's own
@@ -2302,6 +2498,9 @@ end
 -- drag still repositions it instead). No longer offers a color swatch row —
 -- that's now PAINT MODE's job (see its own PUBLIC API block above), which
 -- replaces this and its wire/control siblings' embedded color pickers.
+-- DELETE is this menu's own confirmIndex row (passed to openMenu below) —
+-- holding IT down for _CONFIRM_HOLD_SECONDS is the whole confirmation, no
+-- separate "DELETE \"X\"?" popup. ADD WIRE/RENAME/PROPERTIES stay plain-tap.
 --------------------------------------------------------------------------------
 
 function gdsGui_schematic_openElementEditMenu(canvasName, elementId)
@@ -2310,8 +2509,9 @@ function gdsGui_schematic_openElementEditMenu(canvasName, elementId)
     local el = _findElement(canvas, elementId)
     if not el then return end
     canvas._elementEditTargetId = elementId
-    gdsGui_schematic_openMenu(canvasName, el.label or elementId, {"ADD WIRE", "RENAME", "PROPERTIES", "DELETE"},
-        "gdsGui_schematic_internal_onElementEditChosen", "gdsGui_schematic_internal_onElementEditCancelled")
+    local options = {"ADD WIRE", "RENAME", "PROPERTIES", "DELETE"}
+    gdsGui_schematic_openMenu(canvasName, el.label or elementId, options,
+        "gdsGui_schematic_internal_onElementEditChosen", "gdsGui_schematic_internal_onElementEditCancelled", #options)
 end
 
 function gdsGui_schematic_internal_onElementEditChosen(canvasName, index, optionText)
@@ -2346,43 +2546,30 @@ function gdsGui_schematic_internal_onElementEditChosen(canvasName, index, option
         _openPropertiesMenu(canvasName, elementId)
         return
     elseif optionText == "DELETE" then
-        -- DELETE tapped: confirm before actually removing it. Keep
-        -- _elementEditTargetId set — the confirm/cancel handler below clears it.
-        local el = _findElement(canvas, elementId)
-        gdsGui_schematic_openMenu(canvasName, "DELETE \"" .. (el and (el.label or elementId) or elementId) .. "\"?",
-            {"DELETE", "CANCEL"}, "gdsGui_schematic_internal_onElementDeleteConfirmed",
-            "gdsGui_schematic_internal_onElementDeleteConfirmed", true)
+        -- DELETE only ever reaches here via the sustained hold this menu's
+        -- own confirmIndex gates it behind (see openElementEditMenu above) —
+        -- a plain tap-release on this row is swallowed by _handleMenuRelease
+        -- before onSelect ever fires. Safe to act immediately.
+        canvas._elementEditTargetId = nil
+        canvas.selectedElementId = nil
+        _pushUndo(canvas)
+        gdsGui_schematic_removeElement(canvasName, elementId)
+        canvas.snapshots = {}
+        _notifyChanged(canvas)
         return
     end
     canvas._elementEditTargetId = nil
     canvas.selectedElementId = nil
 end
 
--- Tapping outside the edit menu (or outside the confirm/properties menus it
--- leads to) cancels it — the element should no longer read as "selected"
--- once the edit flow it was selected for has ended.
+-- Tapping outside the edit menu (or outside the properties menu it leads to)
+-- cancels it — the element should no longer read as "selected" once the
+-- edit flow it was selected for has ended.
 function gdsGui_schematic_internal_onElementEditCancelled(canvasName)
     local canvas = _findCanvas(canvasName)
     if canvas then
         canvas._elementEditTargetId = nil
         canvas.selectedElementId = nil
-    end
-end
-
--- Shared onSelect/onCancel for the delete-confirm menu above: both DELETE and
--- CANCEL land here (distinguished by optionText), as does tapping outside
--- (optionText is nil — treated the same as CANCEL).
-function gdsGui_schematic_internal_onElementDeleteConfirmed(canvasName, index, optionText)
-    local canvas = _findCanvas(canvasName)
-    if not canvas then return end
-    local elementId = canvas._elementEditTargetId
-    canvas._elementEditTargetId = nil
-    canvas.selectedElementId = nil
-    if optionText == "DELETE" and elementId then
-        _pushUndo(canvas)
-        gdsGui_schematic_removeElement(canvasName, elementId)
-        canvas.snapshots = {}
-        _notifyChanged(canvas)
     end
 end
 
@@ -2453,7 +2640,9 @@ end
 --------------------------------------------------------------------------------
 -- PUBLIC API — DESIGN-MODE WIRE EDIT MENU (delete, opened by a plain tap on
 -- a wire while in design mode). No longer offers a color swatch row — see
--- the matching comment on the element edit menu above.
+-- the matching comment on the element edit menu above. Its one DELETE row is
+-- itself the confirmIndex row (passed to openMenu below): holding it down
+-- for _CONFIRM_HOLD_SECONDS is the whole confirmation, no separate popup.
 --------------------------------------------------------------------------------
 
 function gdsGui_schematic_openWireEditMenu(canvasName, wireId)
@@ -2463,7 +2652,7 @@ function gdsGui_schematic_openWireEditMenu(canvasName, wireId)
     if not w then return end
     canvas._wireEditTargetId = wireId
     gdsGui_schematic_openMenu(canvasName, "WIRE: " .. wireId, {"DELETE"},
-        "gdsGui_schematic_internal_onWireEditChosen", "gdsGui_schematic_internal_onWireEditCancelled")
+        "gdsGui_schematic_internal_onWireEditChosen", "gdsGui_schematic_internal_onWireEditCancelled", 1)
 end
 
 function gdsGui_schematic_internal_onWireEditChosen(canvasName, index, optionText)
@@ -2471,42 +2660,29 @@ function gdsGui_schematic_internal_onWireEditChosen(canvasName, index, optionTex
     if not canvas or not canvas._wireEditTargetId then return end
     local wireId = canvas._wireEditTargetId
     if optionText == "DELETE" then
-        -- DELETE tapped: confirm before actually removing it. Keep
-        -- _wireEditTargetId set — the confirm/cancel handler below clears it.
-        gdsGui_schematic_openMenu(canvasName, "DELETE \"WIRE: " .. wireId .. "\"?",
-            {"DELETE", "CANCEL"}, "gdsGui_schematic_internal_onWireDeleteConfirmed",
-            "gdsGui_schematic_internal_onWireDeleteConfirmed", true)
+        -- DELETE only ever reaches here via the sustained hold this menu's
+        -- own confirmIndex gates it behind (see openWireEditMenu above) — a
+        -- plain tap-release on this row is swallowed by _handleMenuRelease
+        -- before onSelect ever fires. Safe to act immediately.
+        canvas._wireEditTargetId = nil
+        canvas.selectedWireId = nil
+        _pushUndo(canvas)
+        gdsGui_schematic_removeWire(canvasName, wireId)
+        canvas.snapshots = {}
+        _notifyChanged(canvas)
         return
     end
     canvas._wireEditTargetId = nil
     canvas.selectedWireId = nil
 end
 
--- Tapping outside the edit menu (or outside the confirm step it leads to)
--- cancels it — the wire should no longer read as "selected" once the edit
--- flow it was selected for has ended.
+-- Tapping outside the edit menu cancels it — the wire should no longer read
+-- as "selected" once the edit flow it was selected for has ended.
 function gdsGui_schematic_internal_onWireEditCancelled(canvasName)
     local canvas = _findCanvas(canvasName)
     if canvas then
         canvas._wireEditTargetId = nil
         canvas.selectedWireId = nil
-    end
-end
-
--- Shared onSelect/onCancel for the delete-confirm menu above: both DELETE and
--- CANCEL land here (distinguished by optionText), as does tapping outside
--- (optionText is nil — treated the same as CANCEL).
-function gdsGui_schematic_internal_onWireDeleteConfirmed(canvasName, index, optionText)
-    local canvas = _findCanvas(canvasName)
-    if not canvas then return end
-    local wireId = canvas._wireEditTargetId
-    canvas._wireEditTargetId = nil
-    canvas.selectedWireId = nil
-    if optionText == "DELETE" and wireId then
-        _pushUndo(canvas)
-        gdsGui_schematic_removeWire(canvasName, wireId)
-        canvas.snapshots = {}
-        _notifyChanged(canvas)
     end
 end
 
@@ -2518,7 +2694,9 @@ end
 -- element edit menu above. ADD WIRE always leads (index 1) and DELETE always
 -- trails (index #positions + 2), checked by INDEX rather than optionText so
 -- a control whose own position happens to be named "ADD WIRE" or "DELETE"
--- can't collide with them.
+-- can't collide with them — DELETE's index doubles as this menu's own
+-- confirmIndex (passed to openMenu below), so holding IT down for
+-- _CONFIRM_HOLD_SECONDS is the whole confirmation, no separate popup.
 --------------------------------------------------------------------------------
 
 function gdsGui_schematic_openControlEditMenu(canvasName, controlId)
@@ -2531,7 +2709,7 @@ function gdsGui_schematic_openControlEditMenu(canvasName, controlId)
     for _, p in ipairs(ctrl.positions) do table.insert(options, p) end
     table.insert(options, "DELETE")
     gdsGui_schematic_openMenu(canvasName, ctrl.label or controlId, options,
-        "gdsGui_schematic_internal_onControlEditChosen", "gdsGui_schematic_internal_onControlEditCancelled")
+        "gdsGui_schematic_internal_onControlEditChosen", "gdsGui_schematic_internal_onControlEditCancelled", #options)
 end
 
 function gdsGui_schematic_internal_onControlEditChosen(canvasName, index, optionText)
@@ -2551,11 +2729,16 @@ function gdsGui_schematic_internal_onControlEditChosen(canvasName, index, option
         canvas.pendingWireFromId = controlId
         return
     elseif index == nPositions + 2 then
-        -- DELETE tapped: confirm before actually removing it. Keep
-        -- _controlEditTargetId set — the confirm/cancel handler below clears it.
-        gdsGui_schematic_openMenu(canvasName, "DELETE \"" .. (ctrl and (ctrl.label or controlId) or controlId) .. "\"?",
-            {"DELETE", "CANCEL"}, "gdsGui_schematic_internal_onControlDeleteConfirmed",
-            "gdsGui_schematic_internal_onControlDeleteConfirmed", true)
+        -- DELETE only ever reaches here via the sustained hold this menu's
+        -- own confirmIndex gates it behind (see openControlEditMenu above) —
+        -- a plain tap-release on this row is swallowed by _handleMenuRelease
+        -- before onSelect ever fires. Safe to act immediately.
+        canvas._controlEditTargetId = nil
+        canvas.selectedControlId = nil
+        _pushUndo(canvas)
+        gdsGui_schematic_removeControl(canvasName, controlId)
+        canvas.snapshots = {}
+        _notifyChanged(canvas)
         return
     end
     canvas._controlEditTargetId = nil
@@ -2572,31 +2755,13 @@ function gdsGui_schematic_internal_onControlEditChosen(canvasName, index, option
     _notifyChanged(canvas)
 end
 
--- Tapping outside the edit menu (or outside the confirm step it leads to)
--- cancels it — the control should no longer read as "selected" once the edit
--- flow it was selected for has ended.
+-- Tapping outside the edit menu cancels it — the control should no longer
+-- read as "selected" once the edit flow it was selected for has ended.
 function gdsGui_schematic_internal_onControlEditCancelled(canvasName)
     local canvas = _findCanvas(canvasName)
     if canvas then
         canvas._controlEditTargetId = nil
         canvas.selectedControlId = nil
-    end
-end
-
--- Shared onSelect/onCancel for the delete-confirm menu above: both DELETE and
--- CANCEL land here (distinguished by optionText), as does tapping outside
--- (optionText is nil — treated the same as CANCEL).
-function gdsGui_schematic_internal_onControlDeleteConfirmed(canvasName, index, optionText)
-    local canvas = _findCanvas(canvasName)
-    if not canvas then return end
-    local controlId = canvas._controlEditTargetId
-    canvas._controlEditTargetId = nil
-    canvas.selectedControlId = nil
-    if optionText == "DELETE" and controlId then
-        _pushUndo(canvas)
-        gdsGui_schematic_removeControl(canvasName, controlId)
-        canvas.snapshots = {}
-        _notifyChanged(canvas)
     end
 end
 
@@ -5138,7 +5303,7 @@ function gdsGui_schematic_released(touchId, x, y)
                             "ADDING A NEW CONNECTOR WILL DELETE ALL " .. snapshotCount .. " SNAPSHOT(S). CONTINUE?",
                             {"CONTINUE", "CANCEL"},
                             "gdsGui_schematic_internal_onWireCreateConfirmed",
-                            "gdsGui_schematic_internal_onWireCreateConfirmed", true)
+                            "gdsGui_schematic_internal_onWireCreateConfirmed", 1)
                     else
                         local baseId = canvas.wireTool.fromId .. "_to_" .. toElem.id
                         gdsGui_schematic_addWire(canvas.name, _uniqueWireId(canvas, baseId),
@@ -5249,6 +5414,32 @@ function gdsGui_schematic_update(dt)
         end
         if canvas.page ~= activePageName then goto continue end
         _pollMenuHoldToConfirm(canvas, dt)
+
+        -- A stationary held touch on an annunciator-panel row generates no
+        -- touchmoved event either, so this poll is what notices the hold has
+        -- crossed _LONG_PRESS_SECONDS and opens that row's edit menu — same
+        -- "polled every frame" reason as the on-canvas pendingLongPress
+        -- handling below, just independent of it since a panel row has no
+        -- dragKind/move-mode of its own.
+        if canvas.annunciatorPanelOpen and canvas._annunciatorPanelTouchId ~= nil
+           and not canvas._annunciatorPanelMoved
+           and type(canvas._annunciatorPanelPressedHit) == "number" then
+            canvas._annunciatorPanelLongPressElapsed = (canvas._annunciatorPanelLongPressElapsed or 0) + dt
+            if canvas._annunciatorPanelLongPressElapsed >= _LONG_PRESS_SECONDS then
+                local list = _sortedAnnunciators(canvas)
+                local a = list[canvas._annunciatorPanelPressedHit]
+                canvas._annunciatorPanelTouchId    = nil
+                canvas._annunciatorPanelPressedHit = nil
+                canvas._annunciatorPanelLongPressElapsed = 0
+                if a then
+                    gdsGui_haptics_vibrate()
+                    gdsGui_schematic_openAnnunciatorEditMenu(canvas.name, a.id)
+                end
+            end
+        else
+            canvas._annunciatorPanelLongPressElapsed = 0
+        end
+
         if canvas.dragKind ~= "pendingLongPress" then goto continue end
         -- The touch already lifted (gdsGui_schematic_released clears
         -- dragKind on release, so this is only a same-frame-ordering
@@ -5407,11 +5598,14 @@ function gdsGui_schematicGallery_setOnSelect(galleryName, callbackFuncName)
     if gallery then gallery.onSelect = callbackFuncName end
 end
 
-function gdsGui_schematicGallery_openMenu(galleryName, title, options, onSelectFunc, onCancelFunc, isConfirm)
+-- confirmIndex: see gdsGui_schematic_openMenu's own comment — same optional
+-- 1-based "this row needs a hold, not a tap" marker, just for a gallery's
+-- action menu instead of a canvas's.
+function gdsGui_schematicGallery_openMenu(galleryName, title, options, onSelectFunc, onCancelFunc, confirmIndex)
     local gallery = _findGallery(galleryName)
     if not gallery then return end
     gallery.menu = { title = title, options = options, onSelect = onSelectFunc, onCancel = onCancelFunc }
-    _markConfirmMenu(gallery.menu, isConfirm)
+    _markConfirmMenu(gallery.menu, confirmIndex)
 end
 
 function gdsGui_schematicGallery_closeMenu(galleryName)

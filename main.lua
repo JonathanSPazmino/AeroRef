@@ -11,6 +11,13 @@ require("Libraries.gds_love2d_gui.loader_gdsGuiLib")
 
 APP_VERSION = "1.0.19"
 
+-- Shape version of schematicProjects.lua's data, independent of APP_VERSION
+-- (an app update can ship with no data-shape change at all, or vice versa).
+-- Bump only when the aircraft/system/element/wire/control/annunciator record
+-- shape actually changes, and add a matching step to
+-- _verifyAndRepairSchematicStore's migration handling.
+SCHEMATIC_SCHEMA_VERSION = 1
+
 -- Original orientation the app was designed for; used by the GUI library to
 -- establish the reference container width at first finalize (portrait = 1 col).
 globApp.appOriginalOrientation = "portrait"
@@ -103,6 +110,14 @@ end
 -- the same table.show()/loadFileContents() round trip as appSettings, into
 -- schematicProjects.lua.
 schematicStore = nil
+
+-- Set once in love.load() (see _buildSchematicCompatNotice) when the
+-- one-time-per-APP_VERSION schematic data compatibility check has something
+-- to tell the user; drawn as a one-button info popup the first moment the
+-- user actually lands on the SystemSchematic page (see love.update below),
+-- then cleared. nil the rest of the time (including every version after the
+-- first one it's shown for).
+local _pendingSchematicCompatNotice = nil
 
 -------------------------------------------------------------------------------
 -- HELPER FUNCTIONS
@@ -563,8 +578,475 @@ local function _systemGalleryItems(aircraft)
     return items
 end
 
-local function _saveSchematicStore()
-    love.filesystem.write("schematicProjects.lua", table.show(schematicStore, "schematicStore"))
+-- Verify-then-promote write: a bad serialize must never be able to clobber
+-- the last good save, and there must always be one prior generation to
+-- recover from. See _loadSchematicStoreSafely below for the matching load
+-- side of this.
+-- fileName defaults to the real save; unit tests pass a throwaway name so
+-- they can exercise this without ever touching the user's actual save data.
+local function _saveSchematicStore(fileName)
+    fileName = fileName or "schematicProjects.lua"
+    schematicStore.schemaVersion     = SCHEMATIC_SCHEMA_VERSION
+    schematicStore.savedByAppVersion = APP_VERSION
+
+    local serialized = table.show(schematicStore, "schematicStore")
+    local tmpName = fileName .. ".tmp"
+    love.filesystem.write(tmpName, serialized)
+
+    -- Round-trips the just-written chunk through load() (compiles only,
+    -- doesn't run it) before it's ever allowed to touch the real file — a
+    -- table.show() edge case that produced invalid Lua source must never get
+    -- the chance to overwrite a good save with garbage.
+    if not love.filesystem.load(tmpName) then
+        love.filesystem.remove(tmpName)
+        print("WARNING: " .. fileName .. " save aborted -- serialized data failed to parse back. Previous save left untouched.")
+        return
+    end
+
+    -- Roll the current good file into a one-generation backup before
+    -- overwriting it, so even a write that parses fine but is wrong in some
+    -- other way still leaves a last-known-good copy to fall back to.
+    if love.filesystem.getInfo(fileName) then
+        local prevContents = love.filesystem.read(fileName)
+        if prevContents then
+            love.filesystem.write(fileName .. ".bak", prevContents)
+        end
+    end
+
+    love.filesystem.write(fileName, serialized)
+    love.filesystem.remove(tmpName)
+end
+
+-- Loads/executes a serialized Lua data file inside pcall, so a truncated or
+-- otherwise broken save can never crash love.load() outright the way
+-- gdsGui_saveLoad_loadFileContents's unguarded loadData() call would.
+-- Returns true only if the file existed AND executed without error.
+local function _tryLoadLuaDataFile(fileName)
+    if not love.filesystem.getInfo(fileName) then return false end
+    local chunk = love.filesystem.load(fileName)
+    if not chunk then return false end
+    return pcall(chunk)
+end
+
+-- A corrupt save is archived under a timestamped name, never deleted outright
+-- — always hand-recoverable even in the worst case.
+local function _archiveCorruptSchematicFile(fileName)
+    local contents = love.filesystem.read(fileName)
+    if contents then
+        love.filesystem.write(fileName .. ".corrupt-" .. os.time(), contents)
+    end
+    love.filesystem.remove(fileName)
+end
+
+-- Loads a serialized aircraft/systems store with a fallback chain so a
+-- corrupted save can never silently lose a user's aircraft: primary file ->
+-- <fileName>.bak (one rolling generation, see _saveSchematicStore above) ->
+-- nil, which the caller's own existing fresh-install migration/seed logic in
+-- love.load() already handles exactly as before. fileName defaults to the
+-- real save; unit tests pass a throwaway name instead. An old-but-valid
+-- shape (e.g. the legacy flat project list) is still a plain table and is
+-- left alone here — only a file that fails to parse/execute, or that
+-- executes into something that isn't even a table, counts as corruption.
+-- Returns a status string consumed only by the one-time compat notice.
+local function _loadSchematicStoreSafely(fileName)
+    fileName = fileName or "schematicProjects.lua"
+    schematicStore = nil
+    local primaryExisted = love.filesystem.getInfo(fileName) ~= nil
+    local execOk = _tryLoadLuaDataFile(fileName)
+    local primaryUsable = execOk and (schematicStore == nil or type(schematicStore) == "table")
+
+    if primaryUsable or not primaryExisted then
+        return "ok"
+    end
+
+    _archiveCorruptSchematicFile(fileName)
+
+    schematicStore = nil
+    local bakOk = _tryLoadLuaDataFile(fileName .. ".bak")
+    if bakOk and type(schematicStore) == "table" then
+        love.filesystem.write(fileName, table.show(schematicStore, "schematicStore"))
+        return "restoredFromBackup"
+    end
+
+    schematicStore = nil
+    return "recoveredNone"
+end
+
+-- Suffixes the id of any list item whose id collides with an earlier item's
+-- (by idField) with _2, _3, ... — the same scheme already proven for wires
+-- (_uniqueWireId in schematic_gdsGuiLib.lua) — generalized here so a
+-- duplicate id anywhere in a loaded save can never make _findElement/
+-- _findWire/_findControl-style lookups resolve ambiguously. Renames the
+-- second (and later) occurrence; never deletes either record. notes is
+-- appended to via describe(oldId, newId) for the compat notice.
+local function _dedupeIds(list, idField, describe, notes)
+    local allIds = {}
+    for _, item in ipairs(list) do
+        if item[idField] ~= nil then allIds[item[idField]] = true end
+    end
+    local firstSeen = {}
+    for _, item in ipairs(list) do
+        local id = item[idField]
+        if id ~= nil then
+            if not firstSeen[id] then
+                firstSeen[id] = true
+            else
+                local n = 2
+                while allIds[id .. "_" .. n] do n = n + 1 end
+                local newId = id .. "_" .. n
+                allIds[newId] = true
+                table.insert(notes, describe(id, newId))
+                item[idField] = newId
+            end
+        end
+    end
+end
+
+-- Runs on every load (not just once per APP_VERSION — a duplicate-id issue
+-- isn't tied to app updates) and mutates store in place: nil-guards every
+-- expected array field per aircraft/system instead of ever discarding a
+-- record for a missing one, and de-duplicates aircraft/system/element/wire/
+-- control/annunciator ids via _dedupeIds. Returns {notes, aircraftCount,
+-- systemCount} for the one-time compat notice to summarize.
+local function _verifyAndRepairSchematicStore(store)
+    local notes = {}
+    local aircraftList = (store and store.aircraft) or {}
+    _dedupeIds(aircraftList, "id", function(old, new)
+        return "aircraft id '" .. old .. "' was duplicated — second instance renamed to '" .. new .. "'"
+    end, notes)
+
+    local aircraftCount, systemCount = 0, 0
+    for _, aircraft in ipairs(aircraftList) do
+        aircraftCount = aircraftCount + 1
+        aircraft.systems = aircraft.systems or {}
+        _dedupeIds(aircraft.systems, "id", function(old, new)
+            return "system id '" .. old .. "' was duplicated in aircraft '" .. (aircraft.name or aircraft.id) ..
+                "' — second instance renamed to '" .. new .. "'"
+        end, notes)
+        for _, sys in ipairs(aircraft.systems) do
+            systemCount = systemCount + 1
+            sys.elements     = sys.elements     or {}
+            sys.wires        = sys.wires        or {}
+            sys.controls     = sys.controls     or {}
+            sys.annunciators = sys.annunciators or {}
+            sys.snapshots    = sys.snapshots    or {}
+            local sysLabel = sys.name or sys.id or "?"
+            _dedupeIds(sys.elements, "id", function(old, new)
+                return "system '" .. sysLabel .. "': duplicate element id '" .. old .. "' renamed to '" .. new .. "'"
+            end, notes)
+            _dedupeIds(sys.wires, "id", function(old, new)
+                return "system '" .. sysLabel .. "': duplicate wire id '" .. old .. "' renamed to '" .. new .. "'"
+            end, notes)
+            _dedupeIds(sys.controls, "id", function(old, new)
+                return "system '" .. sysLabel .. "': duplicate control id '" .. old .. "' renamed to '" .. new .. "'"
+            end, notes)
+            _dedupeIds(sys.annunciators, "id", function(old, new)
+                return "system '" .. sysLabel .. "': duplicate annunciator id '" .. old .. "' renamed to '" .. new .. "'"
+            end, notes)
+        end
+    end
+
+    return { notes = notes, aircraftCount = aircraftCount, systemCount = systemCount }
+end
+
+-- Builds the one-time-per-APP_VERSION info-popup message (see love.load()'s
+-- use of _pendingSchematicCompatNotice and love.update()'s display of it).
+local function _buildSchematicCompatNotice(loadStatus, repair)
+    local summary
+    if loadStatus == "restoredFromBackup" then
+        summary = "A saved aircraft file could not be read and was restored from the last backup."
+    elseif loadStatus == "recoveredNone" then
+        summary = "A saved aircraft file could not be read and no backup was available. " ..
+            "Your previous file was kept as a '.corrupt' file (visible in the app's save folder) " ..
+            "for support; a starter project was loaded instead."
+    else
+        summary = string.format("%d aircraft / %d system(s) verified compatible with v%s.",
+            repair.aircraftCount, repair.systemCount, APP_VERSION)
+    end
+    if #repair.notes > 0 then
+        summary = summary .. " Repaired " .. #repair.notes .. " duplicate ID issue(s) automatically — nothing was lost."
+    end
+    return summary
+end
+
+-- No-op onSelect for the compat notice's single "OK" row (see love.update()
+-- below) — resolved by name via _G[...], same convention every other
+-- schematic menu callback uses.
+function schematicCompatNoticeDismissed()
+end
+
+-------------------------------------------------------------------------------
+-- AIRCRAFT EXPORT / IMPORT (JSON)
+-- JSON over this app's own table.show()/Lua serializer for anything meant to
+-- leave the app: it's a universally readable text format (inspectable,
+-- diffable, editable in any text editor) and — unlike table.show's output —
+-- never gets load()ed back as executable Lua, so a shared/tampered-with
+-- export file imported later can never become a code-execution path; _fromJSON
+-- below only ever builds plain data tables, nothing is ever executed.
+-------------------------------------------------------------------------------
+
+local function _jsonEscapeString(s)
+    s = s:gsub('[%c\\"]', function(c)
+        if c == '"' then return '\\"'
+        elseif c == '\\' then return '\\\\'
+        elseif c == '\n' then return '\\n'
+        elseif c == '\r' then return '\\r'
+        elseif c == '\t' then return '\\t'
+        else return string.format('\\u%04x', c:byte())
+        end
+    end)
+    return '"' .. s .. '"'
+end
+
+-- A table with no holes and a #-length matching its pairs() count is treated
+-- as a JSON array; everything else (including an empty table, ambiguous
+-- either way) is treated as an object.
+local function _isJsonArray(t)
+    local n = 0
+    for _ in pairs(t) do n = n + 1 end
+    return n > 0 and n == #t
+end
+
+local function _toJSON(value, indent, pad)
+    indent = indent or ""
+    pad    = pad or ""
+    local vt = type(value)
+    if vt == "string" then
+        return _jsonEscapeString(value)
+    elseif vt == "number" then
+        -- JSON has no NaN/Infinity literal; these never occur in real
+        -- schematic data (positions/colors/detent indices), so 0 is just a
+        -- safe never-taken fallback rather than something worth preserving.
+        if value ~= value or value == math.huge or value == -math.huge then
+            return "0"
+        end
+        return tostring(value)
+    elseif vt == "boolean" then
+        return tostring(value)
+    elseif vt == "table" then
+        local childPad = pad .. indent
+        local chunks = {}
+        if _isJsonArray(value) then
+            for _, v in ipairs(value) do
+                table.insert(chunks, childPad .. _toJSON(v, indent, childPad))
+            end
+            if #chunks == 0 then return "[]" end
+            return "[\n" .. table.concat(chunks, ",\n") .. "\n" .. pad .. "]"
+        else
+            local keys = {}
+            for k in pairs(value) do table.insert(keys, k) end
+            table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+            for _, k in ipairs(keys) do
+                table.insert(chunks, childPad .. _jsonEscapeString(tostring(k)) .. ": " ..
+                    _toJSON(value[k], indent, childPad))
+            end
+            if #chunks == 0 then return "{}" end
+            return "{\n" .. table.concat(chunks, ",\n") .. "\n" .. pad .. "}"
+        end
+    else
+        return "null"
+    end
+end
+
+-- Exports one aircraft, including every system it owns, as a standalone
+-- JSON file written into the LÖVE save directory (same place
+-- schematicProjects.lua itself lives — see love.filesystem.getSaveDirectory()
+-- in the confirmation popup, schematicAircraftActionChosen's EXPORT branch).
+-- Returns the file name written, or nil if the aircraft no longer exists.
+local function _exportAircraftToJSON(aircraftId)
+    local aircraft = _findAircraft(aircraftId)
+    if not aircraft then return nil end
+
+    local exportTable = {
+        exportFormatVersion = 1,
+        exportedAt          = os.date("%Y-%m-%d %H:%M:%S"),
+        appVersion          = APP_VERSION,
+        aircraft            = aircraft,
+    }
+
+    local safeName = (aircraft.name or "aircraft"):gsub("[^%w]+", "_")
+    local fileName = safeName .. "_" .. os.time() .. ".json"
+    love.filesystem.write(fileName, _toJSON(exportTable, "  "))
+    return fileName
+end
+
+-- No-op onSelect for the export confirmation popup's single "OK" row.
+function schematicExportNoticeDismissed()
+end
+
+-- Minimal recursive-descent JSON decoder -- the counterpart to _toJSON
+-- above, used only to read back an aircraft export (see
+-- _importAircraftFromJSONFile below). A JSON "null" decodes to Lua nil,
+-- which simply makes that key absent from its parent table -- fine here
+-- since _toJSON never emits "null" for this app's own real data, only as a
+-- fallback for a value type that should never occur in schematic data.
+-- Every caller wraps this in pcall: an export file can be hand-edited (or
+-- just be garbage a user dropped into the save folder), and a malformed one
+-- must never crash the app, only fail the one import attempt.
+local function _fromJSON(text)
+    local pos = 1
+    local len = #text
+
+    local function skipWhitespace()
+        while pos <= len do
+            local c = text:sub(pos, pos)
+            if c == " " or c == "\t" or c == "\n" or c == "\r" then pos = pos + 1 else break end
+        end
+    end
+
+    local parseValue  -- forward reference; parseArray/parseObject recurse into it
+
+    local function parseString()
+        pos = pos + 1  -- opening quote
+        local chars = {}
+        while true do
+            if pos > len then error("unterminated string in JSON") end
+            local c = text:sub(pos, pos)
+            if c == '"' then
+                pos = pos + 1
+                return table.concat(chars)
+            elseif c == '\\' then
+                local esc = text:sub(pos + 1, pos + 1)
+                if esc == 'u' then
+                    -- Only the ASCII/Latin-1 range is decoded (no UTF-16
+                    -- surrogate-pair merging) -- _toJSON only ever emits
+                    -- \u00XX for control characters, so this only matters
+                    -- for a hand-edited file using a codepoint outside
+                    -- that range, which just degrades to a '?' rather than
+                    -- erroring the whole import.
+                    local code = tonumber(text:sub(pos + 2, pos + 5), 16) or 63
+                    table.insert(chars, string.char(code % 256))
+                    pos = pos + 6
+                else
+                    local literal = ({ ['"']='"', ['\\']='\\', ['/']='/', b='\b', f='\f', n='\n', r='\r', t='\t' })[esc]
+                    table.insert(chars, literal or esc)
+                    pos = pos + 2
+                end
+            else
+                table.insert(chars, c)
+                pos = pos + 1
+            end
+        end
+    end
+
+    local function parseNumber()
+        local startPos = pos
+        while pos <= len and text:sub(pos, pos):match("[%d%.%-%+eE]") do pos = pos + 1 end
+        local n = tonumber(text:sub(startPos, pos - 1))
+        if not n then error("invalid number in JSON at position " .. startPos) end
+        return n
+    end
+
+    local function parseArray()
+        pos = pos + 1  -- opening [
+        local arr = {}
+        skipWhitespace()
+        if text:sub(pos, pos) == "]" then pos = pos + 1; return arr end
+        while true do
+            skipWhitespace()
+            table.insert(arr, parseValue())
+            skipWhitespace()
+            local c = text:sub(pos, pos)
+            pos = pos + 1
+            if c == "]" then break end
+            if c ~= "," then error("expected ',' or ']' in JSON array") end
+        end
+        return arr
+    end
+
+    local function parseObject()
+        pos = pos + 1  -- opening {
+        local obj = {}
+        skipWhitespace()
+        if text:sub(pos, pos) == "}" then pos = pos + 1; return obj end
+        while true do
+            skipWhitespace()
+            if text:sub(pos, pos) ~= '"' then error("expected string key in JSON object") end
+            local key = parseString()
+            skipWhitespace()
+            if text:sub(pos, pos) ~= ":" then error("expected ':' in JSON object") end
+            pos = pos + 1
+            skipWhitespace()
+            obj[key] = parseValue()
+            skipWhitespace()
+            local c = text:sub(pos, pos)
+            pos = pos + 1
+            if c == "}" then break end
+            if c ~= "," then error("expected ',' or '}' in JSON object") end
+        end
+        return obj
+    end
+
+    parseValue = function()
+        skipWhitespace()
+        local c = text:sub(pos, pos)
+        if c == '"' then return parseString()
+        elseif c == "{" then return parseObject()
+        elseif c == "[" then return parseArray()
+        elseif text:sub(pos, pos + 3) == "true" then pos = pos + 4; return true
+        elseif text:sub(pos, pos + 4) == "false" then pos = pos + 5; return false
+        elseif text:sub(pos, pos + 3) == "null" then pos = pos + 4; return nil
+        elseif c:match("[%d%-]") then return parseNumber()
+        else error("unexpected character '" .. c .. "' in JSON at position " .. pos) end
+    end
+
+    skipWhitespace()
+    local result = parseValue()
+    skipWhitespace()
+    if pos <= len then error("trailing data after JSON value") end
+    return result
+end
+
+-- Every ".json" file in the save directory that parses and has a plausible
+-- aircraft export shape (never just "every .json file exists" — a stray or
+-- hand-dropped file that isn't actually one of ours is silently skipped
+-- rather than offered as a broken import choice).
+local function _listImportableAircraftFiles()
+    local candidates = {}
+    for _, item in ipairs(love.filesystem.getDirectoryItems("")) do
+        if item:match("%.json$") then
+            local contents = love.filesystem.read(item)
+            if contents then
+                local ok, parsed = pcall(_fromJSON, contents)
+                if ok and type(parsed) == "table" and type(parsed.aircraft) == "table"
+                   and type(parsed.aircraft.name) == "string" and parsed.aircraft.id ~= nil then
+                    table.insert(candidates, { fileName = item, aircraftName = parsed.aircraft.name })
+                end
+            end
+        end
+    end
+    return candidates
+end
+
+-- Imports one aircraft export file as a brand-new aircraft record. Never
+-- overwrites or removes anything: the imported record is only ever
+-- appended, and _verifyAndRepairSchematicStore (see love.load()) is reused
+-- here to rename -- never drop -- any id that collides with an aircraft/
+-- system/element/wire/control/annunciator already in the store, the exact
+-- same protection a corrupted/duplicated save already gets on every load.
+-- saveFileName is forwarded to _saveSchematicStore (defaults to the real
+-- save; unit tests pass a throwaway name — see that function's own comment).
+-- Deliberately does NOT touch the aircraftGallery widget or the "MY
+-- AIRCRAFT" button — those are real on-screen UI state, not data, and stay
+-- the caller's job (schematicImportFileChosen below) so this function has
+-- no side effect a test could leak into the live UI.
+-- Returns the imported aircraft table, or nil + an error string.
+local function _importAircraftFromJSONFile(importFileName, saveFileName)
+    local contents = love.filesystem.read(importFileName)
+    if not contents then return nil, "could not read " .. importFileName end
+
+    local ok, parsed = pcall(_fromJSON, contents)
+    if not ok or type(parsed) ~= "table" or type(parsed.aircraft) ~= "table"
+       or parsed.aircraft.id == nil or type(parsed.aircraft.name) ~= "string" then
+        return nil, "not a valid aircraft export file"
+    end
+
+    local aircraft = parsed.aircraft
+    aircraft.systems = aircraft.systems or {}
+    table.insert(schematicStore.aircraft, aircraft)
+    _verifyAndRepairSchematicStore(schematicStore)
+    _saveSchematicStore(saveFileName)
+    return aircraft, nil
 end
 
 -- Minimum real time between two _saveSchematicStore() disk writes made via
@@ -803,7 +1285,10 @@ local function _openDesignActionsMenu(canvasName)
     end
     if gdsGui_schematic_canUndo(canvasName) then table.insert(options, "UNDO LAST ACTION") end
     table.insert(options, "RESET (CLEAR PAGE)")
-    gdsGui_schematic_openMenu(canvasName, "DESIGN ACTIONS", options, "schematicDesignActionChosen", nil)
+    -- RESET is always the last row — its own hold-to-confirm gate (see
+    -- schematicDesignActionChosen's RESET branch below), not a separate
+    -- "CLEAR ENTIRE PAGE?" popup.
+    gdsGui_schematic_openMenu(canvasName, "DESIGN ACTIONS", options, "schematicDesignActionChosen", nil, #options)
 end
 
 -- Full SELECT SYSTEM list — only ever shown for a system with no fixed
@@ -1042,22 +1527,20 @@ function schematicDesignActionChosen(canvasName, index, optionText)
         _schematicDirty = true
         _saveCurrentSystem()
     elseif optionText == "RESET (CLEAR PAGE)" then
-        gdsGui_schematic_openMenu(canvasName, "CLEAR ENTIRE PAGE?",
-            {"CLEAR", "CANCEL"}, "schematicResetConfirmed", nil, true)
+        -- RESET only ever reaches here via the sustained hold the DESIGN
+        -- ACTIONS menu's own confirmIndex gates it behind (see
+        -- _openDesignActionsMenu above) — a plain tap-release on this row is
+        -- swallowed before onSelect ever fires. Safe to act immediately.
+        -- Wipes every element/wire/control/snapshot from the live canvas and
+        -- persists the now-blank page. Irreversible, hence the hold (and
+        -- hence pushing an undo snapshot first, so "UNDO LAST ACTION" can
+        -- bring it all back).
+        gdsGui_schematic_pushUndo(canvasName)
+        _clearMainCanvas()
+        _schematicDirty = true
+        _saveCurrentSystem()
+        gdsGui_outputTxtBox_setText("schematicSnapshotLabel", "SNAPSHOTS: 0")
     end
-end
-
--- Wipes every element/wire/control/snapshot from the live canvas and persists
--- the now-blank page to the current system. Irreversible, hence the confirm
--- (and hence pushing an undo snapshot first, so "UNDO LAST ACTION" can bring
--- it all back).
-function schematicResetConfirmed(canvasName, index, optionText)
-    if optionText ~= "CLEAR" then return end
-    gdsGui_schematic_pushUndo(canvasName)
-    _clearMainCanvas()
-    _schematicDirty = true
-    _saveCurrentSystem()
-    gdsGui_outputTxtBox_setText("schematicSnapshotLabel", "SNAPSHOTS: 0")
 end
 
 -- Control mode is pure "operate": the only menu action is picking a control
@@ -1089,9 +1572,66 @@ local function _refreshSchematicHomeAvailability()
         (#schematicStore.aircraft > 0) and "released" or "deactivated")
 end
 
+-- Branches to either the existing NAME NEW AIRCRAFT flow or the import file
+-- picker. gdsGui_choiceMenu_open (not the canvas/gallery modal menu system)
+-- because SchematicHome has neither a schematic canvas nor a gallery widget
+-- of its own to anchor a menu to — see choiceMenu_gdsGuiLib.lua's own header
+-- comment on exactly this "a plain page with neither" case.
 function schematicHomeNewPressed()
-    gdsGui_textPrompt_open("NAME NEW AIRCRAFT", "Aircraft " .. schematicStore.nextAircraftNum, 24,
-        "schematicNewAircraftConfirmed", nil)
+    gdsGui_choiceMenu_open("ADD AIRCRAFT", {"NEW AIRCRAFT", "IMPORT FROM FILE", "CANCEL"},
+        "schematicHomeAddChoiceMade", nil)
+end
+
+function schematicHomeAddChoiceMade(optionText)
+    if optionText == "NEW AIRCRAFT" then
+        gdsGui_textPrompt_open("NAME NEW AIRCRAFT", "Aircraft " .. schematicStore.nextAircraftNum, 24,
+            "schematicNewAircraftConfirmed", nil)
+    elseif optionText == "IMPORT FROM FILE" then
+        local candidates = _listImportableAircraftFiles()
+        if #candidates == 0 then
+            gdsGui_choiceMenu_open(
+                "No exported aircraft files found.\n\nCopy a '.json' export into the app's data " ..
+                "folder (Files app on iOS, or " .. love.filesystem.getSaveDirectory() .. " on desktop), " ..
+                "then try again.",
+                {"OK"}, "schematicImportNoticeDismissed", nil)
+            return
+        end
+        -- Each row's filename is unique by construction (export names
+        -- include os.time()) and is embedded in "[...]" at the end of its
+        -- own label -- gdsGui_choiceMenu_open's onSelect only ever gets the
+        -- chosen TEXT back, never an index, so that's what disambiguates
+        -- which file was actually picked (schematicImportFileChosen below).
+        local options = {}
+        for _, c in ipairs(candidates) do
+            table.insert(options, c.aircraftName .. "  [" .. c.fileName .. "]")
+        end
+        table.insert(options, "CANCEL")
+        gdsGui_choiceMenu_open("IMPORT WHICH AIRCRAFT?", options, "schematicImportFileChosen", nil)
+    end
+    -- "CANCEL" (or tapping outside): no-op.
+end
+
+function schematicImportFileChosen(optionText)
+    if optionText == "CANCEL" then return end
+    local fileName = optionText:match("%[(.-)%]$")
+    if not fileName then return end
+
+    local aircraft, err = _importAircraftFromJSONFile(fileName)
+    if aircraft then
+        gdsGui_schematicGallery_setItems("aircraftGallery", _aircraftGalleryItems())
+        _refreshSchematicHomeAvailability()
+        gdsGui_choiceMenu_open(
+            "Imported \"" .. aircraft.name .. "\" (" .. #aircraft.systems .. " system(s)).",
+            {"OK"}, "schematicImportNoticeDismissed", nil)
+    else
+        gdsGui_choiceMenu_open("Import failed: " .. (err or "unknown error"),
+            {"OK"}, "schematicImportNoticeDismissed", nil)
+    end
+end
+
+-- No-op onSelect for the import flow's single-"OK" notice popups (empty
+-- list / success / failure).
+function schematicImportNoticeDismissed()
 end
 
 -- Holds the just-named aircraft's name while the required thumbnail-type
@@ -1163,11 +1703,20 @@ function schematicAircraftGallerySelected(galleryName, aircraftId)
     local aircraft = _findAircraft(aircraftId)
     if not aircraft then return end
     _manageMenuAircraftId = aircraftId
+    -- DELETE (index 4) is this menu's own confirmIndex row — holding IT down
+    -- for the usual hold duration is the whole confirmation, no separate
+    -- "DELETE \"X\"?" popup. OPEN AIRCRAFT/RENAME/EXPORT/CANCEL stay plain-tap.
     gdsGui_schematicGallery_openMenu(galleryName, aircraft.name,
-        {"OPEN AIRCRAFT", "RENAME", "DELETE", "CANCEL"},
-        "schematicAircraftActionChosen", nil)
+        {"OPEN AIRCRAFT", "RENAME", "EXPORT", "DELETE", "CANCEL"},
+        "schematicAircraftActionChosen", nil, 4)
 end
 
+-- Deleting an aircraft cascades to every system it owns (they live only
+-- inside its .systems array — nothing else references them). DELETE only
+-- ever reaches here via the sustained hold the gallery menu's own
+-- confirmIndex gates it behind (see schematicAircraftGallerySelected above)
+-- — a plain tap-release on that row is swallowed before onSelect ever
+-- fires. Safe to act immediately.
 function schematicAircraftActionChosen(galleryName, index, optionText)
     if optionText == "OPEN AIRCRAFT" then
         schematicStore.currentAircraftId = _manageMenuAircraftId
@@ -1177,31 +1726,16 @@ function schematicAircraftActionChosen(galleryName, index, optionText)
         if aircraft then
             gdsGui_textPrompt_open("RENAME AIRCRAFT", aircraft.name, 24, "schematicAircraftRenameConfirmed", nil)
         end
-    elseif optionText == "DELETE" then
+    elseif optionText == "EXPORT" then
         local aircraft = _findAircraft(_manageMenuAircraftId)
-        gdsGui_schematicGallery_openMenu(galleryName, "DELETE \"" .. (aircraft and aircraft.name or "") .. "\"?",
-            {"DELETE", "CANCEL"}, "schematicAircraftDeleteConfirmed", nil, true)
-    end
-    -- "CANCEL" (or tapping outside): no-op, _manageMenuAircraftId is overwritten next time.
-end
-
-function schematicAircraftRenameConfirmed(newName)
-    local aircraft = _findAircraft(_manageMenuAircraftId)
-    if aircraft and newName ~= "" then
-        aircraft.name = newName
-        _saveSchematicStore()
-        gdsGui_schematicGallery_setItems("aircraftGallery", _aircraftGalleryItems())
-        if schematicStore.currentAircraftId == aircraft.id then
-            gdsGui_outputTxtBox_setText("schematicManage_pageTitle", _aircraftSystemsTitle(aircraft))
+        local fileName = aircraft and _exportAircraftToJSON(_manageMenuAircraftId)
+        if fileName then
+            gdsGui_schematicGallery_openMenu(galleryName,
+                "Exported \"" .. aircraft.name .. "\" to:\n" .. fileName ..
+                "\n\nSaved in the app's data folder:\n" .. love.filesystem.getSaveDirectory(),
+                {"OK"}, "schematicExportNoticeDismissed", nil)
         end
-    end
-    _manageMenuAircraftId = nil
-end
-
--- Deleting an aircraft cascades to every system it owns (they live only
--- inside its .systems array — nothing else references them).
-function schematicAircraftDeleteConfirmed(galleryName, index, optionText)
-    if optionText == "DELETE" and _manageMenuAircraftId then
+    elseif optionText == "DELETE" and _manageMenuAircraftId then
         for i = #schematicStore.aircraft, 1, -1 do
             if schematicStore.aircraft[i].id == _manageMenuAircraftId then
                 table.remove(schematicStore.aircraft, i)
@@ -1215,6 +1749,23 @@ function schematicAircraftDeleteConfirmed(galleryName, index, optionText)
         _saveSchematicStore()
         gdsGui_schematicGallery_setItems("aircraftGallery", _aircraftGalleryItems())
         _refreshSchematicHomeAvailability()
+        _manageMenuAircraftId = nil
+    end
+    -- "CANCEL" (or tapping outside), OPEN AIRCRAFT, RENAME, and EXPORT all
+    -- leave _manageMenuAircraftId set — RENAME's text prompt confirms later,
+    -- asynchronously, and still needs it; it's simply overwritten next time
+    -- an aircraft tile is tapped.
+end
+
+function schematicAircraftRenameConfirmed(newName)
+    local aircraft = _findAircraft(_manageMenuAircraftId)
+    if aircraft and newName ~= "" then
+        aircraft.name = newName
+        _saveSchematicStore()
+        gdsGui_schematicGallery_setItems("aircraftGallery", _aircraftGalleryItems())
+        if schematicStore.currentAircraftId == aircraft.id then
+            gdsGui_outputTxtBox_setText("schematicManage_pageTitle", _aircraftSystemsTitle(aircraft))
+        end
     end
     _manageMenuAircraftId = nil
 end
@@ -1251,9 +1802,12 @@ function schematicSystemGallerySelected(galleryName, systemId)
     local sys = _findSystem(systemId)
     if sys then
         _manageMenuSystemId = systemId
+        -- DELETE (index 3) is this menu's own confirmIndex row — holding IT
+        -- down for the usual hold duration is the whole confirmation, no
+        -- separate "DELETE \"X\"?" popup.
         gdsGui_schematicGallery_openMenu(galleryName, sys.name,
             {"OPEN IN CONTROL MODE", "OPEN IN DESIGN MODE", "DELETE", "CANCEL"},
-            "schematicSystemActionChosen", nil)
+            "schematicSystemActionChosen", nil, 3)
         return
     end
     local aircraft = _findCurrentAircraft()
@@ -1271,6 +1825,10 @@ function schematicSystemGallerySelected(galleryName, systemId)
     gdsGui_page_switch("LoadingSchematic", 7, 3, false)
 end
 
+-- DELETE only ever reaches here via the sustained hold the gallery menu's
+-- own confirmIndex gates it behind (see schematicSystemGallerySelected
+-- above) — a plain tap-release on that row is swallowed before onSelect
+-- ever fires. Safe to act immediately.
 function schematicSystemActionChosen(galleryName, index, optionText)
     if optionText == "OPEN IN CONTROL MODE" then
         _openSystemIntoCanvas(_manageMenuSystemId, "control")
@@ -1280,16 +1838,7 @@ function schematicSystemActionChosen(galleryName, index, optionText)
         _openSystemIntoCanvas(_manageMenuSystemId, "design")
         _navSyncAll("SystemSchematic")
         gdsGui_page_switch("LoadingSchematic", 7, 3, false)
-    elseif optionText == "DELETE" then
-        local sys = _findSystem(_manageMenuSystemId)
-        gdsGui_schematicGallery_openMenu(galleryName, "DELETE \"" .. (sys and sys.name or "") .. "\"?",
-            {"DELETE", "CANCEL"}, "schematicSystemDeleteConfirmed", nil, true)
-    end
-    -- "CANCEL" (or tapping outside): no-op, _manageMenuSystemId is overwritten next time.
-end
-
-function schematicSystemDeleteConfirmed(galleryName, index, optionText)
-    if optionText == "DELETE" and _manageMenuSystemId then
+    elseif optionText == "DELETE" and _manageMenuSystemId then
         local aircraft = _findCurrentAircraft()
         if aircraft then
             for i = #aircraft.systems, 1, -1 do
@@ -1304,8 +1853,9 @@ function schematicSystemDeleteConfirmed(galleryName, index, optionText)
         end
         _saveSchematicStore()
         gdsGui_schematicGallery_setItems("manageGallery", _systemGalleryItems(aircraft))
+        _manageMenuSystemId = nil
     end
-    _manageMenuSystemId = nil
+    -- "CANCEL" (or tapping outside): no-op, _manageMenuSystemId is overwritten next time.
 end
 
 local function _applyTheme(isDark)
@@ -1581,12 +2131,13 @@ function love.load()
     if appSettings.schematicResumeActive == nil then appSettings.schematicResumeActive = false end
     _syncPaidLoadingScreenSkip()
 
-    -- Loads the aircraft/systems store; migrates a pre-existing single-design
-    -- save (from before projects existed) or a flat project list (from before
-    -- aircraft existed) into one aircraft's systems, or seeds a demo system on
-    -- a genuinely fresh install, so Home's NEW/MY AIRCRAFT galleries are never
-    -- confusingly empty on first run.
-    gdsGui_saveLoad_loadFileContents("schematicProjects.lua")
+    -- Loads the aircraft/systems store (see _loadSchematicStoreSafely for the
+    -- corrupt-file/backup fallback chain this now goes through); migrates a
+    -- pre-existing single-design save (from before projects existed) or a
+    -- flat project list (from before aircraft existed) into one aircraft's
+    -- systems, or seeds a demo system on a genuinely fresh install, so Home's
+    -- NEW/MY AIRCRAFT galleries are never confusingly empty on first run.
+    local _schematicLoadStatus = _loadSchematicStoreSafely()
     if schematicStore == nil then
         local migratedSystems = {}
         gdsGui_saveLoad_loadFileContents("schematicDesign.lua")
@@ -1607,7 +2158,7 @@ function love.load()
             currentAircraftId = nil, currentSystemId = nil,
             nextAircraftNum = 2,
         }
-        love.filesystem.write("schematicProjects.lua", table.show(schematicStore, "schematicStore"))
+        _saveSchematicStore()
     elseif schematicStore.aircraft == nil then
         -- Old flat-project-list save (pre-aircraft): wrap it all into one
         -- aircraft so existing systems aren't lost.
@@ -1619,7 +2170,21 @@ function love.load()
             currentAircraftId = nil, currentSystemId = nil,
             nextAircraftNum = 2,
         }
-        love.filesystem.write("schematicProjects.lua", table.show(schematicStore, "schematicStore"))
+        _saveSchematicStore()
+    end
+
+    -- Structural + duplicate-id repair always runs (cheap, protective, not
+    -- tied to app updates) — only the user-facing notice about it is gated
+    -- to once per APP_VERSION, mirroring tcAcceptedVersion's own one-time-
+    -- per-version pattern just above.
+    local _schematicRepair = _verifyAndRepairSchematicStore(schematicStore)
+    if appSettings.schematicCompatCheckedVersion ~= APP_VERSION then
+        _pendingSchematicCompatNotice = _buildSchematicCompatNotice(_schematicLoadStatus, _schematicRepair)
+        appSettings.schematicCompatCheckedVersion = APP_VERSION
+        _saveAppSettings()
+    end
+    if #_schematicRepair.notes > 0 then
+        _saveSchematicStore()
     end
 
     -- Scale pixel coordinates from the 320-pt design canvas to the actual container width
@@ -2666,6 +3231,19 @@ function love.update(dt)
     -- Update GUI
     gdsGui_update(dt)
 
+    -- Fires the one-time-per-APP_VERSION schematic data compatibility notice
+    -- (built in love.load(), see _buildSchematicCompatNotice) the first
+    -- moment the user actually lands on the schematic page, covering both
+    -- ways they can get there (navGoToSystemSchematic and the cold-boot
+    -- resume branch in love.load()) from one spot instead of duplicating the
+    -- open-menu call at both call sites.
+    if _pendingSchematicCompatNotice and gdsGui_page_currentName() == "SystemSchematic"
+       and not gdsGui_schematic_isMenuOpen("mainCanvas") then
+        gdsGui_schematic_openMenu("mainCanvas", _pendingSchematicCompatNotice, {"OK"},
+            "schematicCompatNoticeDismissed", nil)
+        _pendingSchematicCompatNotice = nil
+    end
+
     if blink.active == false then
             gdsGui_button_setState( "acknowlegeAlarm", "deactivated" )
     end
@@ -3418,7 +3996,7 @@ function captureSchematicSnapshot()
     if plan.hasConflict then
         _pendingSnapshotPlan = plan
         gdsGui_schematic_openMenu("mainCanvas", "CONFLICTS WITH EXISTING SNAPSHOT",
-            {"OVERWRITE", "CANCEL"}, "schematicSnapshotConflictResolved", "schematicSnapshotConflictResolved", true)
+            {"OVERWRITE", "CANCEL"}, "schematicSnapshotConflictResolved", "schematicSnapshotConflictResolved", 1)
     else
         gdsGui_schematic_commitSnapshot("mainCanvas", plan)
         gdsGui_outputTxtBox_setText("schematicSnapshotLabel", "SNAPSHOTS: " .. gdsGui_schematic_countSnapshots("mainCanvas"))
@@ -3481,6 +4059,294 @@ function schematicCascadeDeleteTest()
         if c.name == "unitTestCanvas" then return #c.wires end
     end
     return -1
+end
+
+-- The management panel's edit menu's DELETE option: DELETE is that menu's
+-- own confirmIndex row (see gdsGui_schematic_openAnnunciatorEditMenu), so
+-- the held-to-completion hold and the plain-tap RENAME/COLOR rows share one
+-- onSelect dispatch — calling it directly with optionText "DELETE" is
+-- exactly what a completed hold fires, no separate confirm popup involved.
+function schematicAnnunciatorDeleteTest()
+    gdsGui_schematic_delete("unitTestCanvas11")
+    gdsGui_schematic_create("unitTestCanvas11", "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_addAnnunciator("unitTestCanvas11", "a1", "MASTER CAUTION", {1, 1, 0, 1}, true)
+    gdsGui_schematic_openAnnunciatorEditMenu("unitTestCanvas11", "a1")
+    gdsGui_schematic_internal_onAnnunciatorEditChosen("unitTestCanvas11", 3, "DELETE")
+    for _, c in ipairs(globApp.objects.schematics) do
+        if c.name == "unitTestCanvas11" then return #c.annunciators end
+    end
+    return -1
+end
+
+-- The edit menu's RENAME option, end to end: open the menu, choose RENAME,
+-- confirm a new label through the same callback the text prompt itself uses.
+function schematicAnnunciatorRenameTest()
+    gdsGui_schematic_delete("unitTestCanvas12")
+    gdsGui_schematic_create("unitTestCanvas12", "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_addAnnunciator("unitTestCanvas12", "a1", "MASTER CAUTION", {1, 1, 0, 1}, true)
+    gdsGui_schematic_openAnnunciatorEditMenu("unitTestCanvas12", "a1")
+    gdsGui_schematic_internal_onAnnunciatorEditChosen("unitTestCanvas12", 1, "RENAME")
+    gdsGui_schematic_annunciatorRenameConfirmed("FIRE WARN")
+    for _, c in ipairs(globApp.objects.schematics) do
+        if c.name == "unitTestCanvas12" then
+            for _, a in ipairs(c.annunciators) do
+                if a.id == "a1" then return a.label end
+            end
+        end
+    end
+    return "not found"
+end
+
+-- The edit menu's COLOR option, end to end: open the menu, choose COLOR,
+-- pick a swatch through the same callback the swatch picker itself uses —
+-- mirrors the creation-time color pick (gdsGui_schematic_internal_
+-- onAnnunciatorColorChosen) but mutates the existing entry's .color in
+-- place instead of building a new one.
+function schematicAnnunciatorColorEditTest()
+    gdsGui_schematic_delete("unitTestCanvas14")
+    gdsGui_schematic_create("unitTestCanvas14", "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_addAnnunciator("unitTestCanvas14", "a1", "MASTER CAUTION", {1, 1, 1, 1}, true)
+    gdsGui_schematic_openAnnunciatorEditMenu("unitTestCanvas14", "a1")
+    gdsGui_schematic_internal_onAnnunciatorEditChosen("unitTestCanvas14", 2, "COLOR")
+    gdsGui_schematic_internal_onAnnunciatorColorEditChosen("unitTestCanvas14", 1)
+    for _, c in ipairs(globApp.objects.schematics) do
+        if c.name == "unitTestCanvas14" then
+            for _, a in ipairs(c.annunciators) do
+                if a.id == "a1" then return a.color[1] end
+            end
+        end
+    end
+    return -1
+end
+
+-- Renaming to a label already in use by another annunciator (shared
+-- namespace with elements/controls — see _labelInUse) must be rejected, same
+-- as it would be for an element — the target keeps its original label.
+function schematicAnnunciatorRenameRejectsDuplicateTest()
+    gdsGui_schematic_delete("unitTestCanvas13")
+    gdsGui_schematic_create("unitTestCanvas13", "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_addAnnunciator("unitTestCanvas13", "a1", "MASTER CAUTION", {1, 1, 0, 1}, true)
+    gdsGui_schematic_addAnnunciator("unitTestCanvas13", "a2", "MASTER WARNING", {1, 0, 0, 1}, true)
+    gdsGui_schematic_openAnnunciatorEditMenu("unitTestCanvas13", "a2")
+    gdsGui_schematic_internal_onAnnunciatorEditChosen("unitTestCanvas13", 1, "RENAME")
+    gdsGui_schematic_annunciatorRenameConfirmed("MASTER CAUTION")
+    for _, c in ipairs(globApp.objects.schematics) do
+        if c.name == "unitTestCanvas13" then
+            for _, a in ipairs(c.annunciators) do
+                if a.id == "a2" then return a.label end
+            end
+        end
+    end
+    return "not found"
+end
+
+-------------------------------------------------------------------------------
+-- SCHEMATIC PROJECT PERSISTENCE HARDENING TESTS
+-- Exercise _loadSchematicStoreSafely/_verifyAndRepairSchematicStore/
+-- _buildSchematicCompatNotice directly against throwaway filenames/tables —
+-- never the real schematicProjects.lua/appSettings, so a test run can never
+-- put the user's own saved aircraft at risk.
+-------------------------------------------------------------------------------
+
+-- A primary file that fails to even parse (truncated/corrupt) must fall back
+-- to its .bak rather than losing the store — see _loadSchematicStoreSafely's
+-- "corrupted" branch.
+function schematicLoadSafely_corruptPrimary_restoresFromBackupTest()
+    local testFile = "unitTestCorruptStore.lua"
+    love.filesystem.write(testFile, "schematicStore = { aircraft = { broken")
+    love.filesystem.write(testFile .. ".bak",
+        "schematicStore = { aircraft = {{ id = \"ac1\", name = \"Backup Aircraft\", systems = {} }} }")
+
+    local savedRealStore = schematicStore
+    local status = _loadSchematicStoreSafely(testFile)
+    local recoveredId = schematicStore and schematicStore.aircraft and
+        schematicStore.aircraft[1] and schematicStore.aircraft[1].id or "none"
+    schematicStore = savedRealStore
+
+    love.filesystem.remove(testFile)
+    love.filesystem.remove(testFile .. ".bak")
+    -- _loadSchematicStoreSafely promotes the recovered backup back over the
+    -- (now-archived) primary name, and the corrupt original is archived
+    -- under "<testFile>.corrupt-<timestamp>" rather than deleted outright —
+    -- clean up whatever that timestamp turned out to be.
+    for _, item in ipairs(love.filesystem.getDirectoryItems("")) do
+        if item:match("^" .. testFile:gsub("%.", "%%.") .. "%.corrupt%-%d+$") then
+            love.filesystem.remove(item)
+        end
+    end
+
+    if status == "restoredFromBackup" and recoveredId == "ac1" then return 1 end
+    return 0
+end
+
+-- Two elements sharing an id in a loaded system must both survive with
+-- distinct ids, never silently collapse into one — see _dedupeIds.
+function schematicRepair_dedupesElementIdsTest()
+    local store = { aircraft = {
+        { id = "ac1", name = "Test Aircraft", systems = {
+            { id = "sys1", name = "Electrical",
+              elements = { { id = "el_1", label = "A" }, { id = "el_1", label = "B" } },
+              wires = {}, controls = {}, annunciators = {} },
+        } },
+    } }
+    local repair = _verifyAndRepairSchematicStore(store)
+    local els = store.aircraft[1].systems[1].elements
+    if #els == 2 and els[1].id ~= els[2].id and #repair.notes >= 1 then return 1 end
+    return 0
+end
+
+-- The compat notice is built from a load status, but whether it's actually
+-- shown is gated on appSettings.schematicCompatCheckedVersion ~= APP_VERSION
+-- (see love.load()) — verifies that gate flips to "already checked" after
+-- being marked, the same one-time-per-version behavior tcAcceptedVersion
+-- already relies on elsewhere in this file.
+function schematicCompatNotice_gatesOncePerVersionTest()
+    local savedCheckedVersion = appSettings.schematicCompatCheckedVersion
+    appSettings.schematicCompatCheckedVersion = nil
+    local firstBoot  = appSettings.schematicCompatCheckedVersion ~= APP_VERSION
+    appSettings.schematicCompatCheckedVersion = APP_VERSION
+    local secondBoot = appSettings.schematicCompatCheckedVersion ~= APP_VERSION
+    appSettings.schematicCompatCheckedVersion = savedCheckedVersion
+
+    local notice = _buildSchematicCompatNotice("ok", { notes = {}, aircraftCount = 2, systemCount = 3 })
+    local mentionsCounts = notice:find("2 aircraft") ~= nil
+
+    if firstBoot and not secondBoot and mentionsCounts then return 1 end
+    return 0
+end
+
+-- _jsonEscapeString must backslash-escape embedded quotes and backslashes.
+-- Built from single-character q/bs variables rather than one dense escaped
+-- literal, so both the input and the expected output stay easy to verify by
+-- eye without a Lua runtime to check an escaping arithmetic mistake against.
+function jsonEscapeString_escapesQuotesAndBackslashesTest()
+    local q, bs = '"', '\\'
+    local input    = "He said " .. q .. "hi" .. q .. bs .. "ok"
+    local expected = q .. "He said " .. bs .. q .. "hi" .. bs .. q .. bs .. bs .. "ok" .. q
+    if _jsonEscapeString(input) == expected then return 1 end
+    return 0
+end
+
+-- _toJSON must tell an array apart from an object -- the two shapes every
+-- piece of schematic data (elements/wires/controls/snapshots) actually
+-- mixes together -- and nest an array value correctly inside an object.
+function toJSON_encodesArraysNestedInObjectsTest()
+    local encoded = _toJSON({ positions = {"OFF", "ON"}, detentIndex = 0 }, "  ")
+    local hasArrayOpen  = encoded:find("%[") ~= nil
+    local hasArrayClose = encoded:find("%]") ~= nil
+    local hasObjectOpen = encoded:find("{") ~= nil
+    local hasBothValues = encoded:find("OFF") ~= nil and encoded:find("ON") ~= nil
+    local hasDetent      = encoded:find("detentIndex") ~= nil and encoded:find(": 0") ~= nil
+    if hasArrayOpen and hasArrayClose and hasObjectOpen and hasBothValues and hasDetent then return 1 end
+    return 0
+end
+
+-- End-to-end EXPORT: writes a real file via _exportAircraftToJSON against a
+-- throwaway in-memory aircraft (never one of the user's real aircraft,
+-- never schematicStore itself), checks the file landed and contains the
+-- aircraft's own data, then deletes it -- an export test must never leave
+-- stray files in the user's real save directory.
+function schematicExport_writesAircraftJsonFileTest()
+    local savedRealStore = schematicStore
+    schematicStore = { aircraft = {
+        { id = "unitTestExportAircraft", name = "UnitTestExportAircraft", systems = {
+            { id = "sys1", name = "Electrical",
+              elements = { { id = "el_1", label = "GEN 1" } },
+              wires = {}, controls = {}, annunciators = {}, snapshots = {} },
+        } },
+    } }
+
+    local fileName = _exportAircraftToJSON("unitTestExportAircraft")
+    local contents = fileName and love.filesystem.read(fileName)
+    schematicStore = savedRealStore
+    if fileName then love.filesystem.remove(fileName) end
+
+    if contents and contents:find("UnitTestExportAircraft") and contents:find("GEN 1")
+       and contents:find("\"exportFormatVersion\"") then
+        return 1
+    end
+    return 0
+end
+
+-- _fromJSON must read back exactly what _toJSON wrote: nested
+-- objects/arrays, a string needing escaping, and a number.
+function fromJSON_roundTripsToJSONOutputTest()
+    local original = {
+        label = 'SW "1"',
+        positions = {"OFF", "ON"},
+        detentIndex = 2,
+    }
+    local decoded = _fromJSON(_toJSON(original, "  "))
+    if decoded.label == original.label and decoded.detentIndex == original.detentIndex
+       and decoded.positions[1] == "OFF" and decoded.positions[2] == "ON" then
+        return 1
+    end
+    return 0
+end
+
+-- End-to-end IMPORT into a fresh store: export one throwaway aircraft from
+-- store A, import that file into unrelated throwaway store B (never the
+-- real schematicStore, and the internal save goes to a throwaway filename —
+-- see _importAircraftFromJSONFile's saveFileName param), and confirm the
+-- aircraft actually landed with its system intact.
+function schematicImport_addsAircraftFromExportFileTest()
+    local savedRealStore = schematicStore
+    local testSaveFile = "unitTestImportStore.lua"
+
+    schematicStore = { aircraft = {
+        { id = "unitTestImportSource", name = "UnitTestImportSource", systems = {
+            { id = "sys1", name = "Fuel", elements = {}, wires = {}, controls = {}, annunciators = {} },
+        } },
+    } }
+    local exportFile = _exportAircraftToJSON("unitTestImportSource")
+
+    schematicStore = { aircraft = {} }
+    local imported, err = _importAircraftFromJSONFile(exportFile, testSaveFile)
+    local aircraftCount = #schematicStore.aircraft
+
+    schematicStore = savedRealStore
+    if exportFile then love.filesystem.remove(exportFile) end
+    love.filesystem.remove(testSaveFile)
+    love.filesystem.remove(testSaveFile .. ".tmp")
+    love.filesystem.remove(testSaveFile .. ".bak")
+
+    if imported and err == nil and aircraftCount == 1
+       and imported.name == "UnitTestImportSource" and #imported.systems == 1 then
+        return 1
+    end
+    return 0
+end
+
+-- Importing a file whose aircraft id collides with one already in the
+-- target store must rename the imported copy (via _verifyAndRepairSchematicStore,
+-- same as a corrupted/duplicated save already gets on load) rather than
+-- overwrite or merge with the existing one — both must survive.
+function schematicImport_dedupesCollidingAircraftIdTest()
+    local savedRealStore = schematicStore
+    local testSaveFile = "unitTestImportCollideStore.lua"
+
+    schematicStore = { aircraft = {
+        { id = "unitTestCollideId", name = "ExportedCopy", systems = {} },
+    } }
+    local exportFile = _exportAircraftToJSON("unitTestCollideId")
+
+    schematicStore = { aircraft = {
+        { id = "unitTestCollideId", name = "OriginalAircraft", systems = {} },
+    } }
+    local imported = _importAircraftFromJSONFile(exportFile, testSaveFile)
+    local aircraftCount = #schematicStore.aircraft
+    local idsDiffer = aircraftCount == 2 and schematicStore.aircraft[1].id ~= schematicStore.aircraft[2].id
+    local originalIntact = schematicStore.aircraft[1].name == "OriginalAircraft"
+        and schematicStore.aircraft[1].id == "unitTestCollideId"
+
+    schematicStore = savedRealStore
+    if exportFile then love.filesystem.remove(exportFile) end
+    love.filesystem.remove(testSaveFile)
+    love.filesystem.remove(testSaveFile .. ".tmp")
+    love.filesystem.remove(testSaveFile .. ".bak")
+
+    if imported and idsDiffer and originalIntact then return 1 end
+    return 0
 end
 
 -- A wire's resolved color comes from its OWN snapshot entry, independent of
@@ -3902,6 +4768,71 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcName"]={"unlockSchematicFeatureTest"},
         ["funcParameters"]={0},
         ["funcExpctOutput"]={true}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_annunciatorEditMenu_deletesViaConfirm",
+        ["funcName"]={"schematicAnnunciatorDeleteTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={0}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_annunciatorEditMenu_renames",
+        ["funcName"]={"schematicAnnunciatorRenameTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"FIRE WARN"}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_annunciatorEditMenu_recolors",
+        ["funcName"]={"schematicAnnunciatorColorEditTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={0.95}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_annunciatorRename_rejectsDuplicateLabel",
+        ["funcName"]={"schematicAnnunciatorRenameRejectsDuplicateTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"MASTER WARNING"}}
+
+    gdsGui_dev_testExecute {["id"]="schematicStore_loadSafely_corruptPrimaryRestoresBackup",
+        ["funcName"]={"schematicLoadSafely_corruptPrimary_restoresFromBackupTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+
+    gdsGui_dev_testExecute {["id"]="schematicStore_repair_dedupesElementIds",
+        ["funcName"]={"schematicRepair_dedupesElementIdsTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+
+    gdsGui_dev_testExecute {["id"]="schematicStore_compatNotice_gatesOncePerVersion",
+        ["funcName"]={"schematicCompatNotice_gatesOncePerVersionTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+
+    gdsGui_dev_testExecute {["id"]="jsonEscapeString_escapesQuotesAndBackslashes",
+        ["funcName"]={"jsonEscapeString_escapesQuotesAndBackslashesTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+
+    gdsGui_dev_testExecute {["id"]="toJSON_encodesArraysNestedInObjects",
+        ["funcName"]={"toJSON_encodesArraysNestedInObjectsTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+
+    gdsGui_dev_testExecute {["id"]="schematicExport_writesAircraftJsonFile",
+        ["funcName"]={"schematicExport_writesAircraftJsonFileTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+
+    gdsGui_dev_testExecute {["id"]="fromJSON_roundTripsToJSONOutput",
+        ["funcName"]={"fromJSON_roundTripsToJSONOutputTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+
+    gdsGui_dev_testExecute {["id"]="schematicImport_addsAircraftFromExportFile",
+        ["funcName"]={"schematicImport_addsAircraftFromExportFileTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+
+    gdsGui_dev_testExecute {["id"]="schematicImport_dedupesCollidingAircraftId",
+        ["funcName"]={"schematicImport_dedupesCollidingAircraftIdTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
 
 end)
 

@@ -21,7 +21,7 @@
 local _menu = nil   -- {title, options, onSelect, onCancel, isImagePicker, images, extraOptions}
 
 local _ROW_H         = 32
-local _TITLE_H       = 32
+local _TITLE_VPAD    = 16  -- 8px top inset (matches title printf's "by + 8" below) + 8px bottom
 local _BOX_W_FRAC    = 0.8
 local _IMAGE_ROW_H   = 110  -- height of the single row of icon cells in an image picker
 local _IMAGE_LABEL_H = 18   -- label text under each icon, inside the same row
@@ -44,6 +44,18 @@ local function _imageCellRect(bx, bw, count, index)
     return ix, size
 end
 
+-- A title longer than one line (e.g. an import/export result notice) must
+-- grow the box instead of overflowing into the option rows below it — mirrors
+-- schematic_gdsGuiLib.lua's own _titleHeight, same formula and same ambient-
+-- font assumption (this file never calls setFont itself either).
+local function _titleHeight(mw, title)
+    if not title then return _ROW_H end
+    local font = love.graphics.getFont()
+    local _, lines = font:getWrap(title, mw)
+    local numLines = math.max(1, #lines)
+    return math.max(_ROW_H, numLines * font:getHeight() + _TITLE_VPAD)
+end
+
 local function _geometry()
     local w = globApp.safeScreenArea.w * _BOX_W_FRAC
     local bodyH
@@ -52,7 +64,7 @@ local function _geometry()
     else
         bodyH = #_menu.options * _ROW_H
     end
-    local h = _TITLE_H + bodyH + 10
+    local h = _titleHeight(w, _menu.title) + bodyH + 10
     local x = globApp.safeScreenArea.x + (globApp.safeScreenArea.w - w) / 2
     local y = globApp.safeScreenArea.y + (globApp.safeScreenArea.h - h) / 2
     return x, y, w, h
@@ -111,7 +123,7 @@ end
 local function _hitMenuOption(x, y)
     local bx, by, bw, bh = _geometry()
     if x < bx or x > bx + bw or y < by or y > by + bh then return "outside" end
-    local rowY = by + _TITLE_H
+    local rowY = by + _titleHeight(bw, _menu.title)
 
     if _menu.isImagePicker then
         local n = #_menu.images
@@ -186,7 +198,7 @@ function gdsGui_choiceMenu_draw()
     love.graphics.setColor(1, 1, 1, 1)
     love.graphics.printf(_menu.title, bx, by + 8, bw, "center")
 
-    local rowY = by + _TITLE_H
+    local rowY = by + _titleHeight(bw, _menu.title)
 
     if _menu.isImagePicker then
         local n = #_menu.images
