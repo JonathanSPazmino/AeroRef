@@ -9,14 +9,31 @@
 -------------------------------------------------------------------------------
 require("Libraries.gds_love2d_gui.loader_gdsGuiLib")
 
-APP_VERSION = "1.0.19"
+-- Pure-Lua, love.*-free inference model layer (graph/solver/media) — see the
+-- inference-schematic-assistance plan. Kept separate from the GUI library:
+-- these modules never touch canvas/globApp directly, only the plain-table
+-- shapes the adapter functions below build from the live schematic.
+local ModelGraph = require("model.graph")
+local ModelSolver = require("model.solver")
+local ModelLearner = require("model.learner")
+local ModelSuggest = require("model.suggest")
+local ELECTRICAL_MEDIUM = require("model.media.electrical")
+
+APP_VERSION = "1.0.23"
 
 -- Shape version of schematicProjects.lua's data, independent of APP_VERSION
 -- (an app update can ship with no data-shape change at all, or vice versa).
 -- Bump only when the aircraft/system/element/wire/control/annunciator record
 -- shape actually changes, and add a matching step to
 -- _verifyAndRepairSchematicStore's migration handling.
-SCHEMATIC_SCHEMA_VERSION = 1
+-- v2: elements/controls gained an optional componentType tag (source/path/
+-- gate/directionalGate/sink) for the inference model's graph — nil-safe on
+-- any record saved before this existed, so no migration step was needed.
+-- v3: a system gained an optional rules field ({gateId -> ruleTable} learned
+-- by model/learner.lua's findSimplestRule, or user-locked — see
+-- _recomputeGateRules) — nil-safe (sys.rules or {}) on any record saved
+-- before this existed, same convention as v2, no migration step needed.
+SCHEMATIC_SCHEMA_VERSION = 3
 
 -- Original orientation the app was designed for; used by the GUI library to
 -- establish the reference container width at first finalize (portrait = 1 col).
@@ -118,6 +135,17 @@ schematicStore = nil
 -- then cleared. nil the rest of the time (including every version after the
 -- first one it's shown for).
 local _pendingSchematicCompatNotice = nil
+
+-- Set once in love.load(), right after the store is loaded and before
+-- anything can re-save it (which would overwrite the evidence): true when
+-- the save on disk was last written by a different, non-nil APP_VERSION
+-- (i.e. an update was just installed over the previous build) AND no system
+-- was open at the time (currentSystemId nil), meaning the user never got
+-- past the aircraft picker last session. In that case, landing back on
+-- SchematicHome risks looking like data vanished, so the schematic-flow
+-- entry points below send the user to AircraftGallery ("MY AIRCRAFT")
+-- instead, where their existing aircraft are immediately visible.
+local _schematicJustUpdatedNoSystemOpen = false
 
 -------------------------------------------------------------------------------
 -- HELPER FUNCTIONS
@@ -298,23 +326,41 @@ local _GENERATOR_OVERLAY_SPRITE_PATH = "Sprites/control_generatorGear.png"
 -- schematicCatalogItemChosen/_suggestedPlacementName.
 local SCHEMATIC_CATALOG = {
     { system = "ELECTRICAL", items = {
+        -- componentType: this item's role in the inference model's graph
+        -- (model/graph.lua) — "source" | "path" | "gate" | "directionalGate"
+        -- | "sink" — see schematicCatalogItemChosen/PresetChosen below,
+        -- which pass it straight through to armElementPlacement/
+        -- armControlPlacement. Only ELECTRICAL is tagged for now (the
+        -- inference-schematic-assistance plan's Phase 1 is electrical-only
+        -- in scope); other systems' items are untagged (componentType nil)
+        -- until a later phase extends this.
         { label = "GENERATOR", abbrev = "GENR", kind = "control", presets = { {"OFF", "ON"} },
-          spritePaths = _GENERATOR_SPRITE_PATHS, overlaySpritePath = _GENERATOR_OVERLAY_SPRITE_PATH },
+          spritePaths = _GENERATOR_SPRITE_PATHS, overlaySpritePath = _GENERATOR_OVERLAY_SPRITE_PATH,
+          componentType = "source" },
         -- matchControlSize: same on-screen footprint as a freshly-placed
         -- GENERATOR control (see gdsGui_schematic_armElementPlacement's own
         -- comment for the exact formula), rather than the shared default
         -- element size every other rect/circle item here still uses.
         { label = "BATTERY", abbrev = "BATT",   kind = "element", shapeType = "rect", matchControlSize = true,
-          defaultProperties = {"VOLTAGE", "CURRENT"}, spritePath = "Sprites/element_battery.png" },
+          defaultProperties = {"VOLTAGE", "CURRENT"}, spritePath = "Sprites/element_battery.png",
+          componentType = "source" },
         { label = "BUS", abbrev = "BUS",       kind = "element", shapeType = "rect",
-          defaultProperties = {"VOLTAGE", "CURRENT"}, spritePath = "Sprites/element_bus.png" },
+          defaultProperties = {"VOLTAGE", "CURRENT"}, spritePath = "Sprites/element_bus.png",
+          componentType = "path" },
         -- sizeMul 7/30: the diode symbol reads oversized at the shared
         -- default element size (1/3), shrunk a further 30% on top of that.
         { label = "DIODE", abbrev = "DIOD",     kind = "element", shapeType = "diode", spritePath = "Sprites/element_diode.png",
-          sizeMul = 7 / 30 },
+          sizeMul = 7 / 30, componentType = "directionalGate" },
         -- radiusMul 0.7: shrunk 30% from the shared default control size.
         { label = "SWITCH", abbrev = "SWCH",    kind = "control", presets = { {"OFF", "ON"}, {"OFF", "ON", "STBY"} },
-          spritePaths = _SWITCH_SPRITE_PATHS, radiusMul = 0.7 },
+          spritePaths = _SWITCH_SPRITE_PATHS, radiusMul = 0.7, componentType = "gate" },
+        -- Double pole, single throw: two mechanically-ganged switch poles
+        -- (the dashed link drawn between them in the artwork) each feeding
+        -- its own diode before reaching its own "ending" terminal — a fixed
+        -- static symbol (kind = "element", like DIODE/BATTERY/BUS above),
+        -- not an interactive on/off control.
+        { label = "DPST SWITCH", abbrev = "DPST", kind = "element", shapeType = "rect",
+          spritePath = "Sprites/element_dpstDiode.png", componentType = "directionalGate" },
     }},
     { system = "HYDRAULIC", items = {
         { label = "PUMP", abbrev = "PUMP",         kind = "element", shapeType = "circle" },
@@ -370,6 +416,20 @@ local _catalogChosenControlItem = nil
 local _controlMenuIds           = {}
 local _controlMenuSelectedId    = nil
 local _pendingSnapshotPlan      = nil
+
+-- Phase 5 (inference-schematic-assistance plan) UI state: which gate the
+-- open GATE RULES detail menu's LOCK action targets, and the detents the
+-- open SUGGEST NEXT SNAPSHOT menu's APPLY action would jump to — see
+-- _openGateRulesListMenu/_openSuggestNextSnapshotMenu below and their
+-- *Chosen callbacks further down the file.
+local _pendingGateRuleGateId    = nil
+local _pendingSuggestedDetents  = nil
+-- Which ambiguous node the open ATTRIBUTION RULES detail menu's LOCK
+-- action targets — see _openAttributionRulesListMenu below.
+local _pendingAttributionRuleNodeId = nil
+-- Which "source"-role node the open PER-SOURCE SETTINGS detail menu's
+-- VOLTAGE action targets — see _openPerSourceSettingDetailMenu below.
+local _pendingPerSourceTargetId = nil
 
 -- Which aircraft/system a gallery's open "manage" action menu (or the rename
 -- prompt it leads to) refers to. Two separate trackers since the aircraft
@@ -473,6 +533,27 @@ local function _findSchematicCanvas()
     return nil
 end
 
+-- Shared by all three schematic header readouts (zoom/snapshot/combination,
+-- see their create calls below) — sets a box's text and immediately
+-- shrinks its font to fit on one line within its own current width, same
+-- mechanism/rationale as schematic_pageTitle's own setFontSizeToFit use
+-- (see _applyFontSize's comment on why that one needs a per-use refit too,
+-- not just the one tied to an actual FONT SIZE setting change). Guarantees
+-- none of the three ever wraps onto a second line — no matter how long
+-- "(PREDICTED)" or a growing snapshot/combination count makes the text —
+-- at the cost of shrinking (down to minSize) rather than breaking a line.
+local function _setHeaderReadoutText(boxName, text, minSize)
+    gdsGui_outputTxtBox_setText(boxName, text)
+    gdsGui_outputTxtBox_setFontSizeToFit(boxName, appSettings.fontSize, minSize)
+end
+
+-- "SNAPSHOTS" abbreviated to "SNAP" so this fixed-width readout has room to
+-- spare at the user's current font size before _setHeaderReadoutText's
+-- shrink-to-fit ever needs to kick in at all.
+local function _setSnapshotLabelText(count)
+    _setHeaderReadoutText("schematicSnapshotLabel", "SNAP: " .. count, 8)
+end
+
 local function _findAircraft(aircraftId)
     for _, a in ipairs(schematicStore.aircraft) do
         if a.id == aircraftId then return a end
@@ -501,6 +582,20 @@ local function _aircraftThumbnailPath(key)
         if t.key == key then return t.path end
     end
     return nil
+end
+
+-- Per-aircraft-type watermark shown behind mainCanvas (see
+-- gdsGui_schematic_setBackgroundImage and _openSystemIntoCanvas below), keyed
+-- by the same AIRCRAFT_THUMBNAILS.key as the gallery tile. A type with no
+-- entry here (e.g. "jet") falls back to CANVAS_BACKGROUND_DEFAULT.
+local CANVAS_BACKGROUND_BY_TYPE = {
+    propeller  = "Sprites/bg_schematicCanvas_propeller.png",
+    helicopter = "Sprites/bg_schematicCanvas_helicopter.png",
+}
+local CANVAS_BACKGROUND_DEFAULT = "Sprites/bg_schematicCanvas.png"
+
+local function _canvasBackgroundPath(aircraft)
+    return (aircraft and CANVAS_BACKGROUND_BY_TYPE[aircraft.thumbnail]) or CANVAS_BACKGROUND_DEFAULT
 end
 
 -- Maps schematicStore.aircraft into the aircraftGallery's item list, adding
@@ -785,280 +880,6 @@ end
 function schematicCompatNoticeDismissed()
 end
 
--------------------------------------------------------------------------------
--- AIRCRAFT EXPORT / IMPORT (JSON)
--- JSON over this app's own table.show()/Lua serializer for anything meant to
--- leave the app: it's a universally readable text format (inspectable,
--- diffable, editable in any text editor) and — unlike table.show's output —
--- never gets load()ed back as executable Lua, so a shared/tampered-with
--- export file imported later can never become a code-execution path; _fromJSON
--- below only ever builds plain data tables, nothing is ever executed.
--------------------------------------------------------------------------------
-
-local function _jsonEscapeString(s)
-    s = s:gsub('[%c\\"]', function(c)
-        if c == '"' then return '\\"'
-        elseif c == '\\' then return '\\\\'
-        elseif c == '\n' then return '\\n'
-        elseif c == '\r' then return '\\r'
-        elseif c == '\t' then return '\\t'
-        else return string.format('\\u%04x', c:byte())
-        end
-    end)
-    return '"' .. s .. '"'
-end
-
--- A table with no holes and a #-length matching its pairs() count is treated
--- as a JSON array; everything else (including an empty table, ambiguous
--- either way) is treated as an object.
-local function _isJsonArray(t)
-    local n = 0
-    for _ in pairs(t) do n = n + 1 end
-    return n > 0 and n == #t
-end
-
-local function _toJSON(value, indent, pad)
-    indent = indent or ""
-    pad    = pad or ""
-    local vt = type(value)
-    if vt == "string" then
-        return _jsonEscapeString(value)
-    elseif vt == "number" then
-        -- JSON has no NaN/Infinity literal; these never occur in real
-        -- schematic data (positions/colors/detent indices), so 0 is just a
-        -- safe never-taken fallback rather than something worth preserving.
-        if value ~= value or value == math.huge or value == -math.huge then
-            return "0"
-        end
-        return tostring(value)
-    elseif vt == "boolean" then
-        return tostring(value)
-    elseif vt == "table" then
-        local childPad = pad .. indent
-        local chunks = {}
-        if _isJsonArray(value) then
-            for _, v in ipairs(value) do
-                table.insert(chunks, childPad .. _toJSON(v, indent, childPad))
-            end
-            if #chunks == 0 then return "[]" end
-            return "[\n" .. table.concat(chunks, ",\n") .. "\n" .. pad .. "]"
-        else
-            local keys = {}
-            for k in pairs(value) do table.insert(keys, k) end
-            table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
-            for _, k in ipairs(keys) do
-                table.insert(chunks, childPad .. _jsonEscapeString(tostring(k)) .. ": " ..
-                    _toJSON(value[k], indent, childPad))
-            end
-            if #chunks == 0 then return "{}" end
-            return "{\n" .. table.concat(chunks, ",\n") .. "\n" .. pad .. "}"
-        end
-    else
-        return "null"
-    end
-end
-
--- Exports one aircraft, including every system it owns, as a standalone
--- JSON file written into the LÖVE save directory (same place
--- schematicProjects.lua itself lives — see love.filesystem.getSaveDirectory()
--- in the confirmation popup, schematicAircraftActionChosen's EXPORT branch).
--- Returns the file name written, or nil if the aircraft no longer exists.
-local function _exportAircraftToJSON(aircraftId)
-    local aircraft = _findAircraft(aircraftId)
-    if not aircraft then return nil end
-
-    local exportTable = {
-        exportFormatVersion = 1,
-        exportedAt          = os.date("%Y-%m-%d %H:%M:%S"),
-        appVersion          = APP_VERSION,
-        aircraft            = aircraft,
-    }
-
-    local safeName = (aircraft.name or "aircraft"):gsub("[^%w]+", "_")
-    local fileName = safeName .. "_" .. os.time() .. ".json"
-    love.filesystem.write(fileName, _toJSON(exportTable, "  "))
-    return fileName
-end
-
--- No-op onSelect for the export confirmation popup's single "OK" row.
-function schematicExportNoticeDismissed()
-end
-
--- Minimal recursive-descent JSON decoder -- the counterpart to _toJSON
--- above, used only to read back an aircraft export (see
--- _importAircraftFromJSONFile below). A JSON "null" decodes to Lua nil,
--- which simply makes that key absent from its parent table -- fine here
--- since _toJSON never emits "null" for this app's own real data, only as a
--- fallback for a value type that should never occur in schematic data.
--- Every caller wraps this in pcall: an export file can be hand-edited (or
--- just be garbage a user dropped into the save folder), and a malformed one
--- must never crash the app, only fail the one import attempt.
-local function _fromJSON(text)
-    local pos = 1
-    local len = #text
-
-    local function skipWhitespace()
-        while pos <= len do
-            local c = text:sub(pos, pos)
-            if c == " " or c == "\t" or c == "\n" or c == "\r" then pos = pos + 1 else break end
-        end
-    end
-
-    local parseValue  -- forward reference; parseArray/parseObject recurse into it
-
-    local function parseString()
-        pos = pos + 1  -- opening quote
-        local chars = {}
-        while true do
-            if pos > len then error("unterminated string in JSON") end
-            local c = text:sub(pos, pos)
-            if c == '"' then
-                pos = pos + 1
-                return table.concat(chars)
-            elseif c == '\\' then
-                local esc = text:sub(pos + 1, pos + 1)
-                if esc == 'u' then
-                    -- Only the ASCII/Latin-1 range is decoded (no UTF-16
-                    -- surrogate-pair merging) -- _toJSON only ever emits
-                    -- \u00XX for control characters, so this only matters
-                    -- for a hand-edited file using a codepoint outside
-                    -- that range, which just degrades to a '?' rather than
-                    -- erroring the whole import.
-                    local code = tonumber(text:sub(pos + 2, pos + 5), 16) or 63
-                    table.insert(chars, string.char(code % 256))
-                    pos = pos + 6
-                else
-                    local literal = ({ ['"']='"', ['\\']='\\', ['/']='/', b='\b', f='\f', n='\n', r='\r', t='\t' })[esc]
-                    table.insert(chars, literal or esc)
-                    pos = pos + 2
-                end
-            else
-                table.insert(chars, c)
-                pos = pos + 1
-            end
-        end
-    end
-
-    local function parseNumber()
-        local startPos = pos
-        while pos <= len and text:sub(pos, pos):match("[%d%.%-%+eE]") do pos = pos + 1 end
-        local n = tonumber(text:sub(startPos, pos - 1))
-        if not n then error("invalid number in JSON at position " .. startPos) end
-        return n
-    end
-
-    local function parseArray()
-        pos = pos + 1  -- opening [
-        local arr = {}
-        skipWhitespace()
-        if text:sub(pos, pos) == "]" then pos = pos + 1; return arr end
-        while true do
-            skipWhitespace()
-            table.insert(arr, parseValue())
-            skipWhitespace()
-            local c = text:sub(pos, pos)
-            pos = pos + 1
-            if c == "]" then break end
-            if c ~= "," then error("expected ',' or ']' in JSON array") end
-        end
-        return arr
-    end
-
-    local function parseObject()
-        pos = pos + 1  -- opening {
-        local obj = {}
-        skipWhitespace()
-        if text:sub(pos, pos) == "}" then pos = pos + 1; return obj end
-        while true do
-            skipWhitespace()
-            if text:sub(pos, pos) ~= '"' then error("expected string key in JSON object") end
-            local key = parseString()
-            skipWhitespace()
-            if text:sub(pos, pos) ~= ":" then error("expected ':' in JSON object") end
-            pos = pos + 1
-            skipWhitespace()
-            obj[key] = parseValue()
-            skipWhitespace()
-            local c = text:sub(pos, pos)
-            pos = pos + 1
-            if c == "}" then break end
-            if c ~= "," then error("expected ',' or '}' in JSON object") end
-        end
-        return obj
-    end
-
-    parseValue = function()
-        skipWhitespace()
-        local c = text:sub(pos, pos)
-        if c == '"' then return parseString()
-        elseif c == "{" then return parseObject()
-        elseif c == "[" then return parseArray()
-        elseif text:sub(pos, pos + 3) == "true" then pos = pos + 4; return true
-        elseif text:sub(pos, pos + 4) == "false" then pos = pos + 5; return false
-        elseif text:sub(pos, pos + 3) == "null" then pos = pos + 4; return nil
-        elseif c:match("[%d%-]") then return parseNumber()
-        else error("unexpected character '" .. c .. "' in JSON at position " .. pos) end
-    end
-
-    skipWhitespace()
-    local result = parseValue()
-    skipWhitespace()
-    if pos <= len then error("trailing data after JSON value") end
-    return result
-end
-
--- Every ".json" file in the save directory that parses and has a plausible
--- aircraft export shape (never just "every .json file exists" — a stray or
--- hand-dropped file that isn't actually one of ours is silently skipped
--- rather than offered as a broken import choice).
-local function _listImportableAircraftFiles()
-    local candidates = {}
-    for _, item in ipairs(love.filesystem.getDirectoryItems("")) do
-        if item:match("%.json$") then
-            local contents = love.filesystem.read(item)
-            if contents then
-                local ok, parsed = pcall(_fromJSON, contents)
-                if ok and type(parsed) == "table" and type(parsed.aircraft) == "table"
-                   and type(parsed.aircraft.name) == "string" and parsed.aircraft.id ~= nil then
-                    table.insert(candidates, { fileName = item, aircraftName = parsed.aircraft.name })
-                end
-            end
-        end
-    end
-    return candidates
-end
-
--- Imports one aircraft export file as a brand-new aircraft record. Never
--- overwrites or removes anything: the imported record is only ever
--- appended, and _verifyAndRepairSchematicStore (see love.load()) is reused
--- here to rename -- never drop -- any id that collides with an aircraft/
--- system/element/wire/control/annunciator already in the store, the exact
--- same protection a corrupted/duplicated save already gets on every load.
--- saveFileName is forwarded to _saveSchematicStore (defaults to the real
--- save; unit tests pass a throwaway name — see that function's own comment).
--- Deliberately does NOT touch the aircraftGallery widget or the "MY
--- AIRCRAFT" button — those are real on-screen UI state, not data, and stay
--- the caller's job (schematicImportFileChosen below) so this function has
--- no side effect a test could leak into the live UI.
--- Returns the imported aircraft table, or nil + an error string.
-local function _importAircraftFromJSONFile(importFileName, saveFileName)
-    local contents = love.filesystem.read(importFileName)
-    if not contents then return nil, "could not read " .. importFileName end
-
-    local ok, parsed = pcall(_fromJSON, contents)
-    if not ok or type(parsed) ~= "table" or type(parsed.aircraft) ~= "table"
-       or parsed.aircraft.id == nil or type(parsed.aircraft.name) ~= "string" then
-        return nil, "not a valid aircraft export file"
-    end
-
-    local aircraft = parsed.aircraft
-    aircraft.systems = aircraft.systems or {}
-    table.insert(schematicStore.aircraft, aircraft)
-    _verifyAndRepairSchematicStore(schematicStore)
-    _saveSchematicStore(saveFileName)
-    return aircraft, nil
-end
-
 -- Minimum real time between two _saveSchematicStore() disk writes made via
 -- _requestSchematicSave below. table.show()+write there serializes the
 -- ENTIRE store (every aircraft, every system) — not just the system that
@@ -1113,6 +934,9 @@ local function _captureCurrentSystemFromCanvas()
     sys.controls      = _deepCopyTable(canvas.controls)
     sys.annunciators  = _deepCopyTable(canvas.annunciators)
     sys.snapshots     = _deepCopyTable(canvas.snapshots)
+    sys.rules         = _deepCopyTable(canvas.rules)
+    sys.attributionRules = _deepCopyTable(canvas.attributionRules)
+    sys.voltageColors = _deepCopyTable(canvas.voltageColors)
     sys.modifiedAt    = os.date("%Y-%m-%d %H:%M:%S")
 end
 
@@ -1149,16 +973,6 @@ local function _requestSchematicSave()
     end
 end
 
--- Resolved by name via _G[...] from gdsGui_schematic's _notifyChanged, the
--- same string-callback pattern used for buttons/scrollbars elsewhere in this
--- app. mainCanvas.onChange is wired to this name in love.load() — fires on
--- every discrete design-mode edit (drag committed, element/wire/control
--- added/deleted/renamed, color picked, etc.), so this is the single hot-path
--- source of _schematicDirty.
-function schematicCanvasChanged()
-    _requestSchematicSave()
-end
-
 local function _clearMainCanvas()
     local canvas = _findSchematicCanvas()
     if not canvas then return end
@@ -1167,7 +981,1598 @@ local function _clearMainCanvas()
     for i = #canvas.controls, 1, -1 do table.remove(canvas.controls, i) end
     for i = #canvas.annunciators, 1, -1 do table.remove(canvas.annunciators, i) end
     canvas.snapshots = {}
+    canvas.rules = {}
+    canvas.attributionRules = {}
+    canvas.voltageColors = {}
     canvas.selectedElementId = nil
+    -- Every id-bearing thing this counter could ever collide with (every
+    -- element/control/annunciator above) is already gone at this point —
+    -- nothing left for a stale high counter to protect against, so a reset
+    -- page should mint ids starting back at _1 like a brand-new canvas does
+    -- (see schematic_gdsGuiLib.lua's own canvas._placementCounter = 0 at
+    -- creation), not silently keep climbing from wherever it left off.
+    canvas._placementCounter = 0
+end
+
+-------------------------------------------------------------------------------
+-- INFERENCE MODEL ADAPTER
+-- Translates the live mainCanvas (elements/controls/wires + their
+-- componentType tags, see SCHEMATIC_CATALOG) into the plain-table shapes
+-- model/graph.lua and model/solver.lua expect, and translates the solved
+-- result back into colors gdsGui_schematic_applySolvedColors can apply. See
+-- the inference-schematic-assistance plan's Phase 1 — electrical domain
+-- only; componentType is nil (untagged) for every other system's catalog
+-- items today, so _solveCurrentSchematic is a no-op for them.
+-------------------------------------------------------------------------------
+
+local function _buildComponentTypeMap(canvas)
+    local map = {}
+    for _, e in ipairs(canvas.elements) do if e.componentType then map[e.id] = e.componentType end end
+    for _, c in ipairs(canvas.controls) do if c.componentType then map[c.id] = c.componentType end end
+    return map
+end
+
+-- The live element OR control table for id, whichever array it's actually
+-- in — a "source" node can be either (BATTERY is an element, GENERATOR is
+-- a control). Used by _colorForPoweredNode's per-source color/voltage
+-- lookup below, and by the per-source settings menus further down.
+local function _findSourceEntity(canvas, id)
+    for _, e in ipairs(canvas.elements) do if e.id == id then return e end end
+    for _, c in ipairs(canvas.controls) do if c.id == id then return c end end
+    return nil
+end
+
+-- "ON"/"CLOSED" is the v1 convention for "this control is in its
+-- conducting position" (a gate that's closed, or a source that's on) --
+-- the plan's open design question flags a per-catalog-item
+-- closedPositionLabels table as a possible refinement, but a hard-coded
+-- literal check is the stated Phase 1 baseline, not a stand-in for it.
+local function _isActivePosition(control)
+    local label = control.positions and control.positions[control.detentIndex + 1]
+    return label == "ON" or label == "CLOSED"
+end
+
+local function _currentGateStates(canvas, componentTypes)
+    local states = {}
+    for _, c in ipairs(canvas.controls) do
+        if componentTypes[c.id] == "gate" then
+            states[c.id] = _isActivePosition(c) and "closed" or "open"
+        end
+    end
+    return states
+end
+
+-- A "source" element (e.g. BATTERY) has no detent of its own, so it's
+-- simply on whenever it's present; a "source" control (e.g. GENERATOR) is
+-- on only in its active position.
+local function _currentSourceStates(canvas, componentTypes)
+    local states = {}
+    for _, e in ipairs(canvas.elements) do
+        if componentTypes[e.id] == "source" then states[e.id] = true end
+    end
+    for _, c in ipairs(canvas.controls) do
+        if componentTypes[c.id] == "source" then states[c.id] = _isActivePosition(c) end
+    end
+    return states
+end
+
+-- Like _currentGateStates/_currentSourceStates above, but for a CANDIDATE
+-- detents table (model/suggest.lua's own {id -> detentIndex} shape) rather
+-- than canvas.controls' own live detentIndex -- lets _computeAiPanelStats'
+-- targeted-suggestion scorer ask "what would this gate/source look like
+-- UNDER a combination that hasn't actually been navigated to" without
+-- touching the live canvas at all. A control missing from detents falls
+-- back to its own current detentIndex, same "control added since this
+-- reference point existed" safety as _pastGateAndSourceStates' own
+-- signature-parsing fallback.
+local function _gateAndSourceStatesForDetents(canvas, componentTypes, detents)
+    local gateStates, sourceStates = {}, {}
+    for _, e in ipairs(canvas.elements) do
+        if componentTypes[e.id] == "source" then sourceStates[e.id] = true end
+    end
+    for _, c in ipairs(canvas.controls) do
+        local isActive = _isActivePosition({ positions = c.positions, detentIndex = detents[c.id] or c.detentIndex })
+        if componentTypes[c.id] == "gate" then
+            gateStates[c.id] = isActive and "closed" or "open"
+        elseif componentTypes[c.id] == "source" then
+            sourceStates[c.id] = isActive
+        end
+    end
+    return gateStates, sourceStates
+end
+
+-- Builds the graph from the live mainCanvas, solves it, and maps the
+-- result through the electrical medium's style table into a
+-- snapshot-bucket-shaped {elements={id=color}, wires={id=color},
+-- controls={id=color}} ready for gdsGui_schematic_applySolvedColors.
+-- Returns nil if the canvas has no graph-tagged nodes at all (nothing to
+-- solve — e.g. every other system besides ELECTRICAL today). No canvasName
+-- parameter, same as _requestSchematicSave/_captureCurrentSystemFromCanvas
+-- above — this app only ever has the one live canvas, "mainCanvas" (see
+-- _findSchematicCanvas); a throwaway-canvas unit test exercises the smaller
+-- pieces (_buildComponentTypeMap/_currentGateStates/_currentSourceStates,
+-- which DO take an explicit canvas table) directly instead.
+-- The color registered for a given nominal voltage on THIS system
+-- (canvas.voltageColors, keyed by the plain voltage number — see
+-- _ensureVoltageHasColor), or defaultColor if that voltage has none yet
+-- registered on this particular system (or voltage is nil, i.e. the source
+-- was never given one at all). Deliberately per-system, not an appSettings
+-- global — see canvas.voltageColors' own comment in _clearMainCanvas.
+local function _colorForVoltage(canvas, voltage, defaultColor)
+    if not voltage then return defaultColor end
+    local registered = canvas.voltageColors and canvas.voltageColors[voltage]
+    return registered or defaultColor
+end
+
+-- The source id a learned/locked attribution rule (model/learner.lua's
+-- findAttributionRule, see _recomputeAttributionRules) predicts actually
+-- explains nodeId under the CURRENT combination (nodeStates — the same
+-- "powered"/"unpowered" vocabulary _snapshotToNodeStates/solve() produce),
+-- or nil when there's no rule for this node, or the rule exists but its
+-- condition states were never seen in training (buildConditionKey returns
+-- nil for a missing condition state, or the key just isn't in the
+-- mapping) — either way, "not covered," not a guess.
+local function _attributionRuleWinner(canvas, nodeId, nodeStates)
+    local rule = canvas.attributionRules and canvas.attributionRules[nodeId]
+    if not rule or (rule.status ~= "learned" and rule.status ~= "locked") then return nil end
+    local key = ModelLearner.buildConditionKey(rule.conditionIds, nodeStates)
+    return key and rule.mapping[key]
+end
+
+-- True when a node reached by 2+ contributing sources is genuinely
+-- ambiguous in DISPLAY-COLOR terms — i.e. _colorForPoweredNode's
+-- highest-voltage pick is an actual, unverified assumption about which
+-- contributor dominates, not a foregone conclusion. False (not ambiguous
+-- at all, nothing to teach or distrust) when the TOP voltage among the
+-- contributors is shared by two or more of them — a true parallel tie
+-- (e.g. two 28V generators feeding the same bus) always resolves to the
+-- identical registered color regardless of which one "really" explains
+-- it, exactly like _colorForPoweredNode's own "a tie in voltage is never
+-- ambiguous on its own" case. Only when the top voltage belongs to
+-- exactly ONE contributor (a genuine highest-vs-the-rest pick that could
+-- be wrong — see the single-shared-gate-node case in
+-- _colorForPoweredNode's own comment) or some contributor's voltage is
+-- unset at all (the dashed-sequence fallback, truly unknowable) does this
+-- return true. Shared by _deduceAttributionWinnersForSnapshot (only
+-- worth teaching a winner for a genuinely ambiguous node — trying to
+-- match a tied-but-same-color case would just find the painted color
+-- matching BOTH tied contributors at once and get correctly skipped as
+-- inconclusive anyway, so there's nothing to learn there) and
+-- _aiColorAttributionConfidence (only worth scoring unconfident for one).
+local function _isGenuinelyColorAmbiguous(canvas, contributingIds)
+    local count, maxVoltage, maxCount, allHaveVoltage = 0, -math.huge, 0, true
+    for id in pairs(contributingIds) do
+        count = count + 1
+        local entity = _findSourceEntity(canvas, id)
+        local voltage = entity and entity.voltage
+        if not voltage then
+            allHaveVoltage = false
+        elseif voltage > maxVoltage then
+            maxVoltage, maxCount = voltage, 1
+        elseif voltage == maxVoltage then
+            maxCount = maxCount + 1
+        end
+    end
+    if count <= 1 then return false end
+    if not allHaveVoltage then return true end
+    return maxCount == 1
+end
+
+-- Which color (or, when genuinely ambiguous — see below — which SEQUENCE
+-- of colors) a powered node should show, given attribution[nodeId] (the
+-- set of currently-active sources actually reaching it — see
+-- model/solver.lua's solveSourceAttribution) and each source's own
+-- optional VOLTAGE (see _openPerSourceSettingsListMenu). Color is keyed by
+-- VOLTAGE now, not by individual source (_colorForVoltage above) — so two
+-- sources sharing a voltage always share a color too, automatically.
+-- nodeStates (optional, defaults to {}) is this combination's own solved
+-- "powered"/"unpowered" state per node — needed only to look up an
+-- attribution rule's condition match; every existing caller that doesn't
+-- care about rules (e.g. a hand-built test canvas) can omit it and falls
+-- straight through to the voltage heuristic below, unchanged.
+--
+-- A node reached by exactly one active source shows that source's voltage
+-- color (falling back to the system-wide default powered color if it has
+-- no voltage registered). A node reached by TWO OR MORE at once (an
+-- un-isolated tie, e.g. a bus-tie relay left closed with both sides live,
+-- or a single "gate"-role node whose two real-world terminals are fed by
+-- different sources while it's open — see model/solver.lua's own comment)
+-- first asks whether a learned/locked attribution rule actually covers
+-- this exact combination (_attributionRuleWinner) — evidence straight
+-- from a painted snapshot beats a structural assumption. Only when no
+-- rule covers it does this fall back to picking the single highest-
+-- voltage contributor's color outright, as long as every contributor's
+-- voltage is actually known — a real higher-voltage source would
+-- genuinely dominate/back-feed a lower one, though this is exactly the
+-- assumption that can be WRONG for the single-shared-node case above
+-- (see _aiColorAttributionConfidence, which scores this fallback as
+-- unconfident for precisely that reason). A tie in voltage is never
+-- ambiguous on its own: equal voltages already resolve to the identical
+-- registered color. Only when some contributor's voltage is UNSET does
+-- this stay genuinely unknowable — that source's real color can't be
+-- derived, so this returns every contributor's color as a SEQUENCE
+-- instead of a single color — the caller threads this through
+-- applySolvedColors as-is, and the draw functions render a sequence as an
+-- alternating dash pattern rather than a flat fill, precisely because
+-- there's no principled single answer.
+local function _colorForPoweredNode(nodeId, attribution, canvas, defaultColor, nodeStates)
+    nodeStates = nodeStates or {}
+    local contributingIds = attribution[nodeId]
+    if not contributingIds or next(contributingIds) == nil then return defaultColor end
+
+    local sortedIds = {}
+    for id in pairs(contributingIds) do table.insert(sortedIds, id) end
+    table.sort(sortedIds)
+
+    if #sortedIds == 1 then
+        local entity = _findSourceEntity(canvas, sortedIds[1])
+        return _colorForVoltage(canvas, entity and entity.voltage, defaultColor)
+    end
+
+    local winnerId = _attributionRuleWinner(canvas, nodeId, nodeStates)
+    if winnerId then
+        local entity = _findSourceEntity(canvas, winnerId)
+        return _colorForVoltage(canvas, entity and entity.voltage, defaultColor)
+    end
+
+    local colors, allHaveVoltage, maxVoltage = {}, true, -math.huge
+    for _, id in ipairs(sortedIds) do
+        local entity = _findSourceEntity(canvas, id)
+        local voltage = entity and entity.voltage
+        table.insert(colors, _colorForVoltage(canvas, voltage, defaultColor))
+        if not voltage then
+            allHaveVoltage = false
+        elseif voltage > maxVoltage then
+            maxVoltage = voltage
+        end
+    end
+
+    if allHaveVoltage then return _colorForVoltage(canvas, maxVoltage, defaultColor) end
+
+    return colors -- a sequence (length 2+) -- see this function's own comment
+end
+
+local function _solveCurrentSchematic()
+    local canvas = _findSchematicCanvas()
+    if not canvas then return nil end
+    local componentTypes = _buildComponentTypeMap(canvas)
+    if next(componentTypes) == nil then return nil end
+
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes)
+    local sourceStates = _currentSourceStates(canvas, componentTypes)
+    local gateStates = _currentGateStates(canvas, componentTypes)
+
+    -- A "gate"-role node the user operates directly (gateStates already
+    -- has an entry for it, via _currentGateStates) is ALWAYS passed to
+    -- solveWithRules as a lockedGateStates entry — a user's own switch
+    -- position is ground truth, never second-guessed by a learned rule,
+    -- even if one happens to exist for that same id. Only a gate with NO
+    -- direct user control (a relay/element-kind gate — see canvas.rules'
+    -- own comment above _recomputeGateRules) is left for its rule, if any,
+    -- to decide every iteration. Plain solve() is still used whenever no
+    -- rule exists at all yet (canvas.rules empty) — same Phase 1 behavior,
+    -- unchanged, until there's actually something for Phase 4 to feed back.
+    local nodeStates
+    local oscillatingIds = {}
+    -- Every gate's FINAL open/closed position (direct control positions,
+    -- same as gateStates, plus whatever a rule decided for a relay) — kept
+    -- separately from gateStates itself since a relay's entry only exists
+    -- on solveWithRules' own result, not on the plain lockedGateStates this
+    -- function passes in. Used below by the wire loop's open-gate anchor
+    -- check, which needs EVERY gate's real position, not just the
+    -- directly-controlled ones.
+    local finalGateStates = gateStates
+    if canvas.rules and next(canvas.rules) ~= nil then
+        local rulesByGate = {}
+        for gateId, rule in pairs(canvas.rules) do
+            if rule and (rule.status == "learned" or rule.status == "locked") and not gateStates[gateId] then
+                rulesByGate[gateId] = rule
+            end
+        end
+        local result = ModelSolver.solveWithRules(graph, sourceStates, gateStates, rulesByGate)
+        nodeStates = result.nodeStates
+        finalGateStates = result.gateStates
+        if not result.converged then
+            for _, id in ipairs(result.oscillating) do oscillatingIds[id] = true end
+        end
+    else
+        nodeStates = ModelSolver.solve(graph, sourceStates, gateStates)
+    end
+
+    -- Which active source(s) actually reach each powered node — see
+    -- _colorForPoweredNode's own comment. Purely a display/coloring
+    -- concern layered on top of nodeStates above, never consulted by the
+    -- logical powered/unpowered vocabulary itself (deduction, rule
+    -- learning, solveWithRules' own feedback loop are all untouched by
+    -- this — a node is still simply "powered" or "unpowered" to all of
+    -- them, exactly as before per-source colors existed).
+    local attribution = ModelSolver.solveSourceAttribution(graph, sourceStates, gateStates)
+
+    -- A node with no settled answer (see oscillatingIds above) is left out
+    -- entirely — resolveColor falls through to that entity's own flat
+    -- defaultColor tier rather than painting an arbitrary guess for a gate
+    -- Phase 4 couldn't actually resolve.
+    local result = { elements = {}, wires = {}, controls = {} }
+    for _, e in ipairs(canvas.elements) do
+        local state = nodeStates[e.id]
+        if state and not oscillatingIds[e.id] then
+            result.elements[e.id] = state == ModelSolver.POWERED
+                and _colorForPoweredNode(e.id, attribution, canvas, ELECTRICAL_MEDIUM.style.powered, nodeStates)
+                or ELECTRICAL_MEDIUM.style.unpowered
+        end
+    end
+    for _, c in ipairs(canvas.controls) do
+        local state = nodeStates[c.id]
+        if state and not oscillatingIds[c.id] then
+            -- A "gate"-role control (SWITCH, ...) in its OPEN position, or a
+            -- "source"-role control (GENERATOR, ...) that's switched OFF,
+            -- always reads as the flat unpowered gray, even though solve()
+            -- itself still marks it POWERED when its input terminal is
+            -- genuinely hot (see solver.lua's own comment — that's correct
+            -- physics, kept for the logical powered/unpowered vocabulary
+            -- deduction/rule-learning reason over). This is purely the
+            -- display override: an open switch's/off generator's own body
+            -- shows its own OFF state, not whatever's live on the wire
+            -- feeding it: ON/CLOSED still takes its color from the
+            -- highest-voltage source reaching it, same as any other
+            -- powered node, via _colorForPoweredNode below.
+            local isOpenGate = componentTypes[c.id] == "gate" and not _isActivePosition(c)
+            local isOffSource = componentTypes[c.id] == "source" and not sourceStates[c.id]
+            result.controls[c.id] = (state == ModelSolver.POWERED and not isOpenGate and not isOffSource)
+                and _colorForPoweredNode(c.id, attribution, canvas, ELECTRICAL_MEDIUM.style.powered, nodeStates)
+                or ELECTRICAL_MEDIUM.style.unpowered
+        end
+    end
+    -- A wire's predicted color is a conservative "both ends powered"
+    -- approximation, not a true per-edge flow trace (solve() only reports
+    -- per-node reachability, not which edge actually carried the power to
+    -- a node reachable several ways) — it's enough to show power stopping
+    -- exactly at an open gate or an unreached branch, which is all Phase 1
+    -- needs to prove. Colored off the FROM end's own attribution (what's
+    -- leaving that end), same approximation in spirit — not a true
+    -- per-edge trace either, just "which color this wire would carry if
+    -- it's actually conducting right now" — EXCEPT when the FROM end is
+    -- itself an OPEN gate and the TO end isn't: an open gate is exactly
+    -- the "single node whose two real-world terminals are fed by
+    -- different sources" case _isGenuinelyColorAmbiguous's own comment
+    -- flags (e.g. a generator feeding the gate's near side while the far
+    -- side is independently backfed from a bus on the other side of the
+    -- very contact that's open) — the gate's OWN attributed color can be
+    -- the WRONG side's source entirely for THIS specific wire, whereas the
+    -- non-gate end's attribution is never affected by whether this one
+    -- edge conducts. Anchoring off that end instead is still the same
+    -- approximation, just picking whichever end it's actually accurate
+    -- for.
+    for _, w in ipairs(canvas.wires) do
+        local fromState, toState = nodeStates[w.fromElementId], nodeStates[w.toElementId]
+        if fromState and toState and not oscillatingIds[w.fromElementId] and not oscillatingIds[w.toElementId] then
+            if fromState == ModelSolver.POWERED and toState == ModelSolver.POWERED then
+                local fromIsOpenGate = componentTypes[w.fromElementId] == "gate" and finalGateStates[w.fromElementId] ~= "closed"
+                local toIsOpenGate = componentTypes[w.toElementId] == "gate" and finalGateStates[w.toElementId] ~= "closed"
+                local anchorId = (fromIsOpenGate and not toIsOpenGate) and w.toElementId or w.fromElementId
+                result.wires[w.id] = _colorForPoweredNode(anchorId, attribution, canvas, ELECTRICAL_MEDIUM.style.powered, nodeStates)
+            else
+                result.wires[w.id] = ELECTRICAL_MEDIUM.style.unpowered
+            end
+        end
+    end
+    return result
+end
+
+-- Re-solves and re-applies predicted colors for whatever combination
+-- mainCanvas is currently on — called once after a system loads, and after
+-- PREV/NEXT lands on a combination with no captured snapshot (see
+-- schematicCombPrevPressed/NextPressed below). Safe to call even when
+-- there's nothing to solve (_solveCurrentSchematic returns nil) or when a
+-- snapshot already covers this combination — applySolvedColors only ever
+-- writes the predictedColor tier, which resolveColor consults strictly
+-- below an authored snapshot, so this can't override one.
+local function _applySolvedColorsToCurrentCombination()
+    gdsGui_schematic_applySolvedColors("mainCanvas", _solveCurrentSchematic())
+end
+
+-- Resolved by name via _G[...] from gdsGui_schematic's _notifyChanged, the
+-- same string-callback pattern used for buttons/scrollbars elsewhere in this
+-- app. mainCanvas.onChange is wired to this name in love.load() — fires on
+-- every discrete design-mode edit (drag committed, element/wire/control
+-- added/deleted/renamed, color picked, etc.), so this is the single hot-path
+-- source of _schematicDirty. Defined here (rather than back where
+-- _schematicDirty/_requestSchematicSave live) specifically so
+-- _applySolvedColorsToCurrentCombination is already in lexical scope —
+-- schematicCanvasChanged is a global (resolved by name, so WHERE it's
+-- defined never matters for callers), but the identifiers inside its own
+-- body still resolve lexically at parse time, same as any other function.
+function schematicCanvasChanged()
+    -- A design-mode edit (wire drawn, element/control added, componentType
+    -- changed via a re-placement, etc.) can change what the graph itself
+    -- looks like, not just a control's position — the per-frame poll in
+    -- love.update() only re-solves on a control id/detentIndex/numDetents
+    -- change (see _schematicCombControlsChanged), which misses a wire or
+    -- element being added/removed with every control left untouched. This
+    -- is the one hook that already fires for every such edit, so it's the
+    -- right place to also keep predicted colors in sync — safe to call even
+    -- when there's nothing to solve yet (see _applySolvedColorsToCurrentCombination).
+    _applySolvedColorsToCurrentCombination()
+    _requestSchematicSave()
+end
+
+-- True if ANY element/control on canvasName is currently showing a
+-- predictedColor rather than an authored snapshot or flat default (see
+-- gdsGui_schematic_isColorPredicted) — i.e. the combination readout's
+-- "(predicted)" suffix (Phase 5, see the love.update() poll below) should
+-- show. Only meaningful when the combination has no exact snapshot of its
+-- own (resolveColor's tier 1/2 always win over tier 2.5 anyway), but cheap
+-- enough to just check outright rather than duplicate that tier logic here.
+local function _currentCombinationHasPredictedColor(canvasName, signature)
+    local canvas = _findSchematicCanvas()
+    if not canvas then return false end
+    for _, e in ipairs(canvas.elements) do
+        if gdsGui_schematic_isColorPredicted(canvasName, "element", e.id, signature) then return true end
+    end
+    for _, c in ipairs(canvas.controls) do
+        if gdsGui_schematic_isColorPredicted(canvasName, "control", c.id, signature) then return true end
+    end
+    return false
+end
+
+-- Reverse-maps one snapshot's painted colors back into {id -> "powered"|
+-- "unpowered"} for every graph node, via an exact-match lookup against
+-- ELECTRICAL_MEDIUM.style -- the same colors _solveCurrentSchematic writes
+-- forward. A color that doesn't exactly match either style entry (a
+-- manual pick that isn't flat gray/yellow) simply has no entry, same as a
+-- node the snapshot's buckets never mention -- model/learner.lua's
+-- inferGate already treats a missing/unmatched state as no evidence
+-- rather than guessing.
+local function _stateForColor(color)
+    if not color then return nil end
+    for state, styleColor in pairs(ELECTRICAL_MEDIUM.style) do
+        if color[1] == styleColor[1] and color[2] == styleColor[2]
+           and color[3] == styleColor[3] and color[4] == styleColor[4] then
+            return state
+        end
+    end
+    return nil
+end
+
+local function _snapshotToNodeStates(snapshot, graph)
+    local nodeStates = {}
+    for id in pairs(graph.nodes) do
+        local color = (snapshot.elements and snapshot.elements[id]) or (snapshot.controls and snapshot.controls[id])
+        local state = _stateForColor(color)
+        if state then nodeStates[id] = state end
+    end
+    return nodeStates
+end
+
+-- Reconstructs ONE already-captured snapshot's own gateStates/sourceStates
+-- straight off its signature key (gdsGui_schematic_parseSignature) rather
+-- than canvas.controls' CURRENT detentIndex, which may have moved on
+-- since this snapshot was taken. Unlike a relay's open/closed position
+-- (which model/learner.lua's inferGate has to deduce from context because
+-- nothing records it directly), every control's position at capture time
+-- IS recorded, in the signature itself -- no deduction needed here, just
+-- parsing. A control missing from the signature (added to the schematic
+-- after this snapshot was captured) falls back to solve()'s own safe
+-- default (open/off), same as a gate with no gateStates entry at all.
+local function _pastGateAndSourceStates(canvas, graph, signature)
+    local detentById = gdsGui_schematic_parseSignature(signature)
+    local controlById = {}
+    for _, c in ipairs(canvas.controls) do controlById[c.id] = c end
+
+    local gateStates, sourceStates = {}, {}
+    for id, node in pairs(graph.nodes) do
+        if node.role == "gate" or node.role == "source" then
+            local control = controlById[id]
+            if control then
+                local detentIndex = detentById[id]
+                local isActive = detentIndex ~= nil
+                    and _isActivePosition({ positions = control.positions, detentIndex = detentIndex })
+                if node.role == "gate" then
+                    gateStates[id] = isActive and "closed" or "open"
+                else
+                    sourceStates[id] = isActive or false
+                end
+            elseif node.role == "source" then
+                sourceStates[id] = true -- element-kind source: always on when present, same as _currentSourceStates
+            end
+        end
+    end
+    return gateStates, sourceStates
+end
+
+-- For one already-captured snapshot, re-solves source attribution under
+-- THAT snapshot's own combination (_pastGateAndSourceStates above), then
+-- for every node GENUINELY ambiguous there (_isGenuinelyColorAmbiguous —
+-- a node merely tied at its top voltage isn't worth a word: the painted
+-- color would match every tied contributor's identical registered color
+-- at once, correctly skipped below as inconclusive, so there's nothing
+-- real to learn from it), checks whether the snapshot's own painted color
+-- exactly matches exactly one contributor's registered voltage color
+-- (canvas.voltageColors, via that source's own .voltage — see
+-- _colorForVoltage). An exact, UNIQUE match is a positive "this source
+-- actually explains this node" example; no match, or a match shared by
+-- two or more contributors that happen to share the same registered
+-- color, is inconclusive and skipped — same "never guess" discipline
+-- model/learner.lua's own _tryConditionSet contradiction handling follows
+-- for gate rules.
+-- Returns {nodeId -> sourceId} for this one snapshot.
+local function _deduceAttributionWinnersForSnapshot(canvas, graph, signature, snapshot)
+    local gateStates, sourceStates = _pastGateAndSourceStates(canvas, graph, signature)
+    local attribution = ModelSolver.solveSourceAttribution(graph, sourceStates, gateStates)
+
+    local winners = {}
+    for nodeId, contributingIds in pairs(attribution) do
+        if _isGenuinelyColorAmbiguous(canvas, contributingIds) then
+            local paintedColor = (snapshot.elements and snapshot.elements[nodeId]) or (snapshot.controls and snapshot.controls[nodeId])
+            if paintedColor then
+                local matchedId, matchCount = nil, 0
+                for id in pairs(contributingIds) do
+                    local entity = _findSourceEntity(canvas, id)
+                    local color = entity and entity.voltage and canvas.voltageColors and canvas.voltageColors[entity.voltage]
+                    if color and color[1] == paintedColor[1] and color[2] == paintedColor[2]
+                       and color[3] == paintedColor[3] and (color[4] or 1) == (paintedColor[4] or 1) then
+                        matchedId, matchCount = id, matchCount + 1
+                    end
+                end
+                if matchCount == 1 then winners[nodeId] = matchedId end
+            end
+        end
+    end
+    return winners
+end
+
+-- Deduced gate states (open/closed/unknown), per already-captured snapshot
+-- signature -- keyed off each snapshot's OWN painted colors via
+-- model/learner.lua's inferGate, not off whatever control the app thinks
+-- drives the gate (contrast _currentGateStates above, which only knows
+-- about a gate the user operates directly). This is what will eventually
+-- let a relay nothing in the UI sets directly still get a learned rule
+-- (Phase 3). Purely a derived, in-memory cache -- never a system-record
+-- field, never persisted (recomputing from the snapshots that are already
+-- saved is cheap and avoids yet another JSON-export gap, see the plan's
+-- "persist deduced gate states?" open question) -- rebuilt wholesale by
+-- _recomputeDeducedGateStates after every snapshot commit and after a
+-- system loads.
+local _deducedGateStatesBySignature = {}
+
+-- canvas.rules[gateId] = a model/learner.lua rule table (see
+-- findSimplestRule), or {status="noRule"} -- always an explicit entry for
+-- every "gate"-role node, same "never omit, always say what's known"
+-- convention as _deducedGateStatesBySignature above. A rule the user has
+-- LOCKED (Phase 5's eventual confirm/lock action -- see _lockGateRule
+-- below) is the one entry this never overwrites: relearning only ever
+-- replaces a rule the learner itself produced, never one a person
+-- confirmed. Unlike _deducedGateStatesBySignature, canvas.rules IS
+-- persisted (sys.rules, see _captureCurrentSystemFromCanvas/
+-- _openSystemIntoCanvas) -- a lock is a user decision, not something
+-- cheaply re-derivable from the snapshots alone.
+--
+-- Builds each gate's training examples from every captured snapshot whose
+-- deduced state for that gate isn't "unknown" (see
+-- _deducedGateStatesBySignature), paired with that same snapshot's own
+-- painted node states as the pool of candidate explanatory conditions
+-- (every other graph node, sorted by id for a deterministic candidate
+-- order -- sense-linked-first ordering per the plan's R4 is a seam left
+-- for whenever that optional feature is actually built, not wired here).
+local function _recomputeGateRules(canvas, graph)
+    canvas.rules = canvas.rules or {}
+
+    local examplesByGate = {}
+    for signature, snapshot in pairs(canvas.snapshots) do
+        local gateStates = _deducedGateStatesBySignature[signature]
+        if gateStates then
+            local nodeStates = _snapshotToNodeStates(snapshot, graph)
+            for gateId, state in pairs(gateStates) do
+                if state ~= ModelLearner.UNKNOWN then
+                    examplesByGate[gateId] = examplesByGate[gateId] or {}
+                    table.insert(examplesByGate[gateId], { nodeStates = nodeStates, result = state })
+                end
+            end
+        end
+    end
+
+    for id, node in pairs(graph.nodes) do
+        if node.role == "gate" then
+            local existing = canvas.rules[id]
+            if not (existing and existing.status == "locked") then
+                local candidateIds = {}
+                for otherId in pairs(graph.nodes) do
+                    if otherId ~= id then table.insert(candidateIds, otherId) end
+                end
+                table.sort(candidateIds)
+                canvas.rules[id] = ModelLearner.findSimplestRule(id, examplesByGate[id] or {}, candidateIds)
+            end
+        end
+    end
+end
+
+-- Confirms a gate's current rule as user-verified, so future relearning
+-- (_recomputeGateRules above) never touches it again. No-op if the gate
+-- has no learned rule yet (nothing to lock) — mirrors _recomputeGateRules'
+-- own skip condition exactly, so a caller can't lock a rule that wasn't
+-- actually "learned".
+local function _lockGateRule(canvas, gateId)
+    local rule = canvas.rules and canvas.rules[gateId]
+    if rule and rule.status == "learned" then rule.status = "locked" end
+end
+
+-- canvas.attributionRules[nodeId] = a model/learner.lua attribution rule
+-- (see findAttributionRule), or {status="noRule"} — same "always an
+-- explicit entry for every node that's ever shown up ambiguous, never
+-- touch a LOCKED one" shape as canvas.rules just above, just keyed by
+-- ambiguous node instead of by gate, and sourced from
+-- _deduceAttributionWinnersForSnapshot instead of inferGate. Also
+-- persisted (sys.attributionRules — see _captureCurrentSystemFromCanvas/
+-- _openSystemIntoCanvas) for the same reason: a lock is a user decision.
+local function _recomputeAttributionRules(canvas, graph)
+    canvas.attributionRules = canvas.attributionRules or {}
+
+    local examplesByNode = {}
+    for signature, snapshot in pairs(canvas.snapshots) do
+        local winners = _deduceAttributionWinnersForSnapshot(canvas, graph, signature, snapshot)
+        if next(winners) ~= nil then
+            local nodeStates = _snapshotToNodeStates(snapshot, graph)
+            for nodeId, sourceId in pairs(winners) do
+                examplesByNode[nodeId] = examplesByNode[nodeId] or {}
+                table.insert(examplesByNode[nodeId], { nodeStates = nodeStates, result = sourceId })
+            end
+        end
+    end
+
+    for nodeId, examples in pairs(examplesByNode) do
+        local existing = canvas.attributionRules[nodeId]
+        if not (existing and existing.status == "locked") then
+            local candidateIds = {}
+            for otherId in pairs(graph.nodes) do
+                if otherId ~= nodeId then table.insert(candidateIds, otherId) end
+            end
+            table.sort(candidateIds)
+            canvas.attributionRules[nodeId] = ModelLearner.findAttributionRule(examples, candidateIds)
+        end
+    end
+    -- Prune entries for a node no longer in the graph at all (its element/
+    -- control was deleted) — same spirit as the library's own
+    -- _pruneUnreachableSnapshots, just for this table. A node that's
+    -- simply stopped being ambiguous (circuit edited, still exists) keeps
+    -- its stale rule rather than being pruned — harmless dead weight,
+    -- since _attributionRuleWinner is only ever consulted for a node that
+    -- IS currently ambiguous.
+    for nodeId in pairs(canvas.attributionRules) do
+        if not graph.nodes[nodeId] then canvas.attributionRules[nodeId] = nil end
+    end
+end
+
+-- Confirms an ambiguous node's current attribution rule as user-verified
+-- — same shape/reasoning as _lockGateRule above.
+local function _lockAttributionRule(canvas, nodeId)
+    local rule = canvas.attributionRules and canvas.attributionRules[nodeId]
+    if rule and rule.status == "learned" then rule.status = "locked" end
+end
+
+-- True if rule is LOCKED and its verdict disagrees with deducedState (the
+-- gate's actual position per THIS snapshot's own painted colors — see
+-- model/learner.lua's inferGate). A merely "learned" (not yet confirmed)
+-- rule never contradicts anything here — relearning already absorbs new
+-- evidence for those every time (_recomputeGateRules); only a LOCKED rule
+-- is a standing claim a fresh paint can actually break.
+local function _ruleContradictsDeducedState(rule, nodeStates, deducedState)
+    if not rule or rule.status ~= "locked" then return false end
+    if deducedState == ModelLearner.UNKNOWN then return false end
+    local matches = true
+    for _, conditionId in ipairs(rule.conditionIds) do
+        if nodeStates[conditionId] ~= rule.conditionStates[conditionId] then matches = false; break end
+    end
+    local predicted = (matches and rule.resultState == "closed") and "closed" or "open"
+    return predicted ~= deducedState
+end
+
+-- Checked right after a snapshot commit (see captureSchematicSnapshot/
+-- schematicSnapshotConflictResolved) — this is Phase 5's "contradiction
+-- flagging": a fresh paint for a combination can reveal that a gate's
+-- LOCKED rule (a user-confirmed claim, never silently relearned — see
+-- _recomputeGateRules) no longer actually holds. Returns the first broken
+-- gate's id, or nil if nothing contradicts.
+local function _findLockedRuleContradiction(canvas, graph, signature)
+    local snapshot = canvas.snapshots[signature]
+    local deducedStates = _deducedGateStatesBySignature[signature]
+    if not snapshot or not deducedStates then return nil end
+    local nodeStates = _snapshotToNodeStates(snapshot, graph)
+    for gateId, rule in pairs(canvas.rules or {}) do
+        if _ruleContradictsDeducedState(rule, nodeStates, deducedStates[gateId]) then return gateId end
+    end
+    return nil
+end
+
+-- Shared by both snapshot-commit sites below: re-finds a contradiction
+-- against a LOCKED rule for whatever combination mainCanvas is now showing,
+-- and surfaces it as a one-shot informational notice (never blocking the
+-- commit itself — the paint already happened; this only tells the user
+-- their locked rule's claim just got disproven, so they can revisit it via
+-- DESIGN ACTIONS > GATE RULES).
+local function _flagLockedRuleContradictionIfAny(canvasName)
+    local canvas = _findSchematicCanvas()
+    if not canvas then return end
+    local componentTypes = _buildComponentTypeMap(canvas)
+    if next(componentTypes) == nil then return end
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes)
+    local signature = gdsGui_schematic_computeSignature(canvasName)
+    local brokenGateId = _findLockedRuleContradiction(canvas, graph, signature)
+    if brokenGateId then
+        local labelsById = _labelsByIdForCanvas(canvas)
+        gdsGui_schematic_openMenu(canvasName,
+            "This paint contradicts the locked rule for " .. (labelsById[brokenGateId] or brokenGateId) .. ".",
+            { "OK" }, "schematicRuleContradictionDismissed", nil)
+    end
+end
+
+-- Plain-English description of one gate's rule, e.g. "G1 is closed when
+-- BUS A is powered" — reusing each referenced node's own display label
+-- (falling back to its bare id when no label is known) so this reads
+-- using the same names already painted on the schematic, not internal
+-- ids. Pure/testable on its own: takes plain lookup tables, never touches
+-- canvas/globApp directly (see _labelsByIdForCanvas below for the
+-- live-canvas adapter that builds labelsById).
+local function _formatRuleText(gateId, rule, labelsById)
+    labelsById = labelsById or {}
+    local function labelFor(id) return labelsById[id] or id end
+    if not rule or (rule.status ~= "learned" and rule.status ~= "locked") then
+        return labelFor(gateId) .. ": no rule learned yet"
+    end
+    local clauses = {}
+    for _, conditionId in ipairs(rule.conditionIds) do
+        table.insert(clauses, labelFor(conditionId) .. " is " .. rule.conditionStates[conditionId])
+    end
+    return labelFor(gateId) .. " is " .. rule.resultState .. " when " .. table.concat(clauses, " and ")
+end
+
+-- Plain-English description of one ambiguous node's attribution rule —
+-- same shape/reasoning as _formatRuleText above, except the rule's
+-- vocabulary is an explicit condition-state -> winner MAPPING rather than
+-- a single clause (see model/learner.lua's findAttributionRule), so every
+-- entry in the mapping becomes its own clause, e.g. "BUS_1 is powered ->
+-- GENR_1; BUS_1 is unpowered -> BATT_2". Each mapping key is the same
+-- "state1|state2|..." format model/learner.lua's buildConditionKey
+-- produces, aligned positionally with rule.conditionIds.
+local function _formatAttributionRuleText(nodeId, rule, labelsById)
+    labelsById = labelsById or {}
+    local function labelFor(id) return labelsById[id] or id end
+    if not rule or (rule.status ~= "learned" and rule.status ~= "locked") then
+        return labelFor(nodeId) .. ": no rule learned yet (defaults to the highest-voltage contributor)"
+    end
+    local clauses = {}
+    for key, winnerId in pairs(rule.mapping) do
+        local parts, i = {}, 1
+        for state in (key .. "|"):gmatch("([^|]*)|") do
+            table.insert(parts, labelFor(rule.conditionIds[i]) .. " is " .. state)
+            i = i + 1
+        end
+        table.insert(clauses, table.concat(parts, " and ") .. " -> " .. labelFor(winnerId))
+    end
+    table.sort(clauses)
+    return labelFor(nodeId) .. ": " .. table.concat(clauses, "; ")
+end
+
+-- Live-canvas adapter for _formatRuleText above: every element/control's
+-- own .label, keyed by id.
+local function _labelsByIdForCanvas(canvas)
+    local labelsById = {}
+    for _, e in ipairs(canvas.elements) do labelsById[e.id] = e.label end
+    for _, c in ipairs(canvas.controls) do labelsById[c.id] = c.label end
+    return labelsById
+end
+
+-- Deterministic (sorted) id order for every "source"-role node, same
+-- "stable row-to-id mapping without stashing the list" convention as
+-- _sortedGateIds below.
+local function _sortedSourceIds(canvas)
+    local componentTypes = _buildComponentTypeMap(canvas)
+    local sourceIds = {}
+    for id, role in pairs(componentTypes) do
+        if role == "source" then table.insert(sourceIds, id) end
+    end
+    table.sort(sourceIds)
+    return sourceIds
+end
+
+local function _recomputeDeducedGateStates()
+    _deducedGateStatesBySignature = {}
+    local canvas = _findSchematicCanvas()
+    if not canvas then return end
+    local componentTypes = _buildComponentTypeMap(canvas)
+    if next(componentTypes) == nil then return end
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes)
+    for signature, snapshot in pairs(canvas.snapshots) do
+        local nodeStates = _snapshotToNodeStates(snapshot, graph)
+        _deducedGateStatesBySignature[signature] = ModelLearner.deduceAllGates(graph, nodeStates)
+    end
+    _recomputeGateRules(canvas, graph)
+    _recomputeAttributionRules(canvas, graph)
+end
+
+-------------------------------------------------------------------------------
+-- SYSTEM SCHEMATIC — AI INFO PANEL: a read-only overlay (schematicAiBtn,
+-- just below ANNUNCIATOR) surfacing three things about the inference
+-- engine's current state for whichever system is open:
+--   COMBINATION         -- which control-position combination is showing
+--                          now (same counter as schematicCombLabel).
+--   PREDICTION CONFIDENCE -- how much to trust the colors currently
+--                          shown. 100% only when the current combination
+--                          has an exact authored snapshot (ground truth,
+--                          nothing inferred at all); otherwise the
+--                          average, over every "thing this combination
+--                          had to guess rather than read off directly",
+--                          of: _aiGateConfidence (one per rule-governed
+--                          gate — did we have to infer its open/closed
+--                          position?) and _aiColorAttributionConfidence
+--                          (one per powered element/control — did we have
+--                          to pick a winner among 2+ sources reaching it
+--                          at once, rather than there being exactly one
+--                          unambiguous explanation?). Both matter: a
+--                          system with every gate directly user-operated
+--                          (nothing to infer there) can still show a
+--                          wrong, low-confidence color purely from the
+--                          second factor — see _aiColorAttributionConfidence's
+--                          own comment for a concrete case.
+--   SNAPSHOT IMPORTANCE -- of every snapshot captured on this system, what
+--                          fraction actually taught the engine anything
+--                          (contributed a non-"unknown" deduced state for
+--                          at least one gate — see
+--                          _deducedGateStatesBySignature) rather than
+--                          being dead weight the learner can't use.
+-------------------------------------------------------------------------------
+
+-- A "learned" (not yet locked) rule's own confidence scales with how many
+-- example snapshots it was learned from (model/learner.lua's
+-- findSimplestRule -> rule.confidence), saturating at 100% once it has
+-- this many — more agreeing examples make a coincidental fit less likely,
+-- but there's no principled "correct" threshold; chosen as a reasonable,
+-- reachable-in-normal-use target, not derived from anything. A gate whose
+-- iterative solve never settled THIS combination (model/solver.lua's
+-- solveWithRules' own "oscillating" set) has no trustworthy answer at all,
+-- regardless of its rule's own history.
+local _AI_CONFIDENT_EXAMPLE_COUNT = 5
+
+local function _aiGateConfidence(rule, isOscillating)
+    if isOscillating then return 0 end
+    if not rule or rule.status == "noRule" then return 0 end
+    if rule.status == "locked" then return 1 end
+    return math.min(1, (rule.confidence or 0) / _AI_CONFIDENT_EXAMPLE_COUNT)
+end
+
+-- 1 when exactly one active source's attribution reaches nodeId (the
+-- color shown there traces back to a single, unambiguous explanation, OR
+-- several contributors that are tied at the top voltage anyway — see
+-- _isGenuinelyColorAmbiguous, whose whole point is that a true parallel
+-- tie (e.g. two 28V generators sharing a bus with a 24V battery) is NOT
+-- actually at risk: the displayed color is the same regardless of which
+-- tied contributor "really" explains it). For a GENUINELY ambiguous node —
+-- _colorForPoweredNode's risky case, e.g. a "gate"-role node whose single
+-- shared graph point blends BOTH of its real-world terminals when fed by
+-- different-voltage sources (see model/solver.lua's own comment) — this
+-- matches _colorForPoweredNode's OWN tier order exactly: a LOCKED
+-- attribution rule that covers this combination is trusted fully (1); a
+-- "learned" (not yet confirmed) one scales by its own example count, same
+-- shape _aiGateConfidence uses for gate rules; no rule, or one that
+-- doesn't cover this exact combination (buildConditionKey/mapping miss —
+-- never seen in training), falls back to the unverified highest-voltage
+-- heuristic and scores 0 — which is exactly the case that flagged this
+-- check's own addition: a wire against an open switch's far side painted
+-- the WRONG side's (higher-voltage) color with no rule yet to say
+-- otherwise. A wire's own color is taken straight from its FROM node (see
+-- _colorForPoweredNode's caller in _solveCurrentSchematic), so checking
+-- every powered element/control node already covers every wire's
+-- confidence too without a separate pass over canvas.wires.
+--
+-- gateStates (optional, the DIRECT per-control map from
+-- _currentGateStates/_pastGateAndSourceStates — never the relay-inclusive
+-- "final" one) short-circuits to 1 when nodeId is itself a currently OPEN
+-- gate CONTROL: that node's own displayed color is ALWAYS the flat
+-- unpowered-gray override (_solveCurrentSchematic's own isOpenGate check),
+-- never actually painted from attribution at all, open or closed — so
+-- however ambiguous its attribution looks on paper, there is no guess
+-- being shown for it to be wrong about. Without this, an open switch fed
+-- from two different-voltage sources on its two (graph-merged) terminals
+-- scored 0 confidence and got flagged "ambiguous, currently showing a
+-- guess" even though nothing resembling that guess was ever displayed or
+-- captured — the exact false alarm a real schematic (two sources separated
+-- by an open switch, never actually tied) would trip on every combination.
+-- sourceStates (optional, same DIRECT per-control provenance as gateStates)
+-- short-circuits to 1 the same way when nodeId is itself a currently OFF
+-- source CONTROL (a generator switched off but still reached by another
+-- source on the same bus — see solver.lua's own comment): that node's own
+-- displayed color is ALWAYS the flat unpowered-gray isOffSource override
+-- too, so it's never actually showing whatever its attribution computes to
+-- either, same "no guess being shown to be wrong about" reasoning.
+local function _aiColorAttributionConfidence(canvas, attribution, nodeStates, nodeId, gateStates, sourceStates)
+    if gateStates and gateStates[nodeId] == "open" then return 1 end
+    if sourceStates and sourceStates[nodeId] == false then return 1 end
+    local contributingIds = attribution[nodeId]
+    if not contributingIds or not _isGenuinelyColorAmbiguous(canvas, contributingIds) then return 1 end
+
+    local rule = canvas.attributionRules and canvas.attributionRules[nodeId]
+    if rule and (rule.status == "learned" or rule.status == "locked") then
+        local key = ModelLearner.buildConditionKey(rule.conditionIds, nodeStates)
+        if key and rule.mapping[key] then
+            if rule.status == "locked" then return 1 end
+            return math.min(1, (rule.confidence or 0) / _AI_CONFIDENT_EXAMPLE_COUNT)
+        end
+    end
+    return 0
+end
+
+-- Mirrors gdsGui_schematic_getCombinationIndex's own mixed-radix formula
+-- exactly (sorted controls by id, idx = idx*numDetents + detentIndex), but
+-- for a CANDIDATE detents table rather than the canvas' CURRENT positions
+-- — lets a suggestion (model/suggest.lua's own {detents=...} shape) be
+-- reported as a combination NUMBER without touching the live canvas (and
+-- so without disturbing whatever combination is actually showing) to find
+-- out.
+local function _combinationIndexForDetents(canvas, detents)
+    local sorted = {}
+    for _, c in ipairs(canvas.controls) do table.insert(sorted, c) end
+    table.sort(sorted, function(a, b) return a.id < b.id end)
+    local idx = 0
+    for _, c in ipairs(sorted) do
+        idx = idx * c.numDetents + (detents[c.id] or 0)
+    end
+    return idx + 1
+end
+
+local function _controlsForSuggest(canvas)
+    local list = {}
+    for _, c in ipairs(canvas.controls) do
+        table.insert(list, { id = c.id, numDetents = c.numDetents })
+    end
+    return list
+end
+
+local function _capturedSignaturesSet(canvas)
+    local set = {}
+    for signature in pairs(canvas.snapshots) do set[signature] = true end
+    return set
+end
+
+-- {combinationIndex, combinationTotal, confidencePercent,
+-- primaryReasonText, suggestedCombinationIndex, teachInstructionText,
+-- supportingReasonText, snapshotImportancePercent} for whichever system
+-- mainCanvas currently has open — confidencePercent/snapshotImportancePercent
+-- are nil (rather than a misleading number) when there's genuinely
+-- nothing to measure (an untyped/non-ELECTRICAL system for the former;
+-- zero captured snapshots for the latter). nil entirely if there's no
+-- canvas at all.
+-- primaryReasonText is set alongside any confidencePercent < 100;
+-- supportingReasonText is its positive counterpart, set alongside any
+-- confidencePercent == 100 (see supportingReasonTextForFullConfidence
+-- and the two trivial-100% cases below — an exact captured snapshot with
+-- no structural mismatch, or nothing in this combination needing
+-- inference at all) — exactly one of the two is ever set, never both,
+-- never neither.
+-- An exact captured snapshot is the ONE case primaryReasonText can be set
+-- WITHOUT either suggestedCombinationIndex or teachInstructionText
+-- alongside it: structuralColorMismatches below catches a captured
+-- snapshot's own paint flatly contradicting a provable single-source
+-- expectation — not a data gap a new combination or a confirmed guess
+-- could fix, but an outright mistake in THIS exact snapshot, so
+-- teachInstructionText instead just says to repaint and re-capture it.
+-- Otherwise, suggestedCombinationIndex and teachInstructionText are
+-- mutually exclusive (at most one is ever set, alongside
+-- primaryReasonText) — which one depends on what kind of factor the
+-- confidenceEntries loop below picked as worst:
+--   gateRule (or any oscillating factor)  -> suggestedCombinationIndex, a
+--     genuinely missing COMBINATION worth navigating to: for a learnable
+--     gate rule, model/suggest.lua's suggestTargetedSnapshot targets one
+--     that would deduce a gate state not already seen in training (falls
+--     back to its plain suggestNextSnapshot if no such candidate exists);
+--     for an oscillating gate, any untested neighbor is as good as any
+--     other (a stability problem, not a data-gap one), so the plain
+--     heuristic is used directly.
+--   attribution (not oscillating)  -> teachInstructionText instead: an
+--     ambiguous-attribution node's problem isn't a missing combination at
+--     all (THIS one already exercises the ambiguity) — it's a missing
+--     DISAGREEING EXAMPLE, which no navigation target can supply; only
+--     manually overriding the painted color before capture can (see that
+--     branch's own comment below).
+-- Either remedy excludes the current combination's own signature from
+-- consideration (not in _openSuggestNextSnapshotMenu, where suggesting it
+-- is fine): capturing the exact combination this panel is reporting low
+-- confidence for would trivially jump to 100% via the exact-snapshot
+-- short-circuit below, without anything having been learned, making
+-- either remedy a circular/useless claim.
+local function _computeAiPanelStats()
+    local canvas = _findSchematicCanvas()
+    if not canvas then return nil end
+
+    local stats = { combinationIndex = _schematicCombIndex, combinationTotal = _schematicCombTotal }
+
+    local componentTypes = _buildComponentTypeMap(canvas)
+    if next(componentTypes) == nil then return stats end -- untyped/non-ELECTRICAL: nothing to infer
+
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes)
+    local sourceStates = _currentSourceStates(canvas, componentTypes)
+    local gateStates = _currentGateStates(canvas, componentTypes)
+
+    -- Every captured combination (by combination NUMBER, see
+    -- _combinationIndexForDetents) that was actually usable as a training
+    -- example for gateId's rule, PAIRED with that example's own deduced
+    -- result ("open"/"closed") — the exact signature set
+    -- _recomputeGateRules' own examplesByGate loop draws from, just mapped
+    -- to something a user can read instead of a raw signature string.
+    -- Shared by both the low-confidence REASON text and the full-
+    -- confidence WHY text below — nested here (not top-level locals)
+    -- purely to stay under this file's 200-local ceiling.
+    local function gateExamplesByCombination(gateId)
+        local examples = {}
+        for signature in pairs(canvas.snapshots) do
+            local deduced = _deducedGateStatesBySignature[signature]
+            local s = deduced and deduced[gateId]
+            if s and s ~= ModelLearner.UNKNOWN then
+                table.insert(examples,
+                    { index = _combinationIndexForDetents(canvas, gdsGui_schematic_parseSignature(signature)), result = s })
+            end
+        end
+        table.sort(examples, function(a, b) return a.index < b.index end)
+        return examples
+    end
+
+    -- Same as above, but for an attribution rule — every captured
+    -- combination whose own painted color was usable as a winner example
+    -- for nodeId (see _deduceAttributionWinnersForSnapshot), paired with
+    -- that winning source's own label.
+    local function attributionExamplesByCombination(nodeId, labelsById)
+        local examples = {}
+        for signature, snapshot in pairs(canvas.snapshots) do
+            local winners = _deduceAttributionWinnersForSnapshot(canvas, graph, signature, snapshot)
+            local winnerId = winners[nodeId]
+            if winnerId then
+                table.insert(examples, { index = _combinationIndexForDetents(canvas, gdsGui_schematic_parseSignature(signature)),
+                    result = labelsById[winnerId] or winnerId })
+            end
+        end
+        table.sort(examples, function(a, b) return a.index < b.index end)
+        return examples
+    end
+
+    -- Plain-English reason one rule isn't fully trusted yet, WITH the
+    -- specific captured combinations backing that reason named by number
+    -- and outcome — "existing snapshots give contradicting evidence" on
+    -- its own doesn't say WHICH captures disagree; this does. Shared by
+    -- both the gate-position and color-attribution confidence factors,
+    -- since both use the same model/learner.lua {status, reason,
+    -- exampleCount} shape (see findSimplestRule/findAttributionRule's own
+    -- comments). The caller only reaches here once it already knows
+    -- confidence < 1, so there's always something to say.
+    local function reasonTextWithEvidence(entry, labelsById)
+        local examples = (entry.kind == "gateRule")
+            and gateExamplesByCombination(entry.id)
+            or attributionExamplesByCombination(entry.id, labelsById)
+        local function listed()
+            local parts = {}
+            for _, ex in ipairs(examples) do
+                table.insert(parts, ex.index .. "/" .. _schematicCombTotal .. " (" .. ex.result .. ")")
+            end
+            return table.concat(parts, ", ")
+        end
+
+        local rule = entry.rule
+        if not rule or rule.status == "noRule" then
+            local reason = rule and rule.reason
+            if reason == "insufficient_examples" then
+                return #examples == 0 and "no snapshots have taught this yet"
+                    or ("only " .. #examples .. " relevant snapshot captured so far (" .. listed()
+                        .. ") — needs at least 2 with different outcomes")
+            elseif reason == "no_variation" then
+                return "every relevant snapshot captured so far agrees (" .. listed()
+                    .. ") — needs one where the outcome differs"
+            elseif reason == "no_consistent_explanation" then
+                return "conflicting evidence from " .. listed() .. " — no consistent switch pattern explains them yet"
+            end
+            return "nothing taught yet"
+        elseif rule.status == "learned" then
+            return "learned from " .. #examples .. " snapshot(s) (" .. listed()
+                .. "), not yet confirmed — capture more agreeing snapshots, or LOCK it in via DESIGN ACTIONS"
+        end
+        return "nothing taught yet" -- locked: unreachable as a primary-reason source (full confidence instead)
+    end
+
+    -- Plain-English account of WHY a fully-confident (every entry already
+    -- at 1.0) confidenceEntries list earned that score — the positive
+    -- counterpart to reasonTextWithEvidence above, which only ever
+    -- explains a SHORTFALL. An entry needing no rule at all (already
+    -- unambiguous — one contributing source, or a tie that's not
+    -- genuinely ambiguous to begin with) isn't worth a line: nothing was
+    -- resolved there, so there's nothing to explain. Only a LOCKED rule
+    -- or a saturated LEARNED one (confidence == 1 via
+    -- _AI_CONFIDENT_EXAMPLE_COUNT examples, same scaling
+    -- _aiGateConfidence/_aiColorAttributionConfidence already use)
+    -- actually did work, so only those are named — a learned one lists
+    -- exactly which captured combinations (by number) backed it and how
+    -- much each contributed.
+    local function supportingReasonTextForFullConfidence(confidenceEntries, labelsById)
+        local perEachPercent = math.floor(100 / _AI_CONFIDENT_EXAMPLE_COUNT + 0.5)
+        local parts = {}
+        for _, e in ipairs(confidenceEntries) do
+            local label = labelsById[e.id] or e.id
+            if e.rule and e.rule.status == "locked" then
+                table.insert(parts, label .. ": rule locked (user-confirmed)")
+            elseif e.rule and e.rule.status == "learned" then
+                local examples = (e.kind == "gateRule")
+                    and gateExamplesByCombination(e.id)
+                    or attributionExamplesByCombination(e.id, labelsById)
+                local labeledCombos = {}
+                for _, ex in ipairs(examples) do table.insert(labeledCombos, ex.index .. "/" .. _schematicCombTotal) end
+                table.insert(parts, label .. ": learned from " .. #examples .. " snapshot(s) ("
+                    .. table.concat(labeledCombos, ", ") .. "), " .. perEachPercent .. "% each = 100%")
+            end
+        end
+        if #parts == 0 then
+            return "every color here traces back to exactly one source — nothing ambiguous to resolve"
+        end
+        return table.concat(parts, "; ")
+    end
+
+    -- Every powered element/control/wire in signature's own captured
+    -- snapshot whose painted color flatly contradicts what the model can
+    -- PROVE it must be — not a guess, not a rule, just "exactly one
+    -- source can possibly reach this, that source has a registered
+    -- voltage color, and the snapshot's own paint is neither that color
+    -- nor plain unpowered gray". Unlike every other confidence factor in
+    -- this file, this needs NO ambiguity and NO learned rule to fire —
+    -- it's the one thing a captured snapshot (otherwise unconditional
+    -- ground truth, see the hasSnapshot branch below) can still be
+    -- flatly WRONG about on its own terms, e.g. a wire left showing some
+    -- stale/unrelated color that was never actually live under this
+    -- combination's own true source attribution. Mirrors the SAME
+    -- open-gate wire-anchor logic _solveCurrentSchematic's live wire loop
+    -- uses, so this never flags a wire the live display itself wouldn't
+    -- also color that way. Nested here (not a top-level local) purely to
+    -- stay under this file's 200-local ceiling.
+    local function structuralColorMismatches(signature, snapshot)
+        local gateStatesForSig, sourceStatesForSig = _pastGateAndSourceStates(canvas, graph, signature)
+        local nodeStatesForSig = ModelSolver.solve(graph, sourceStatesForSig, gateStatesForSig)
+        local attributionForSig = ModelSolver.solveSourceAttribution(graph, sourceStatesForSig, gateStatesForSig)
+        local labelsById = _labelsByIdForCanvas(canvas)
+        local detentById = gdsGui_schematic_parseSignature(signature)
+
+        local function colorsEqual(a, b)
+            if not a or not b then return false end
+            for i = 1, 3 do if math.abs((a[i] or 0) - (b[i] or 0)) > 0.02 then return false end end
+            return true
+        end
+
+        -- nil when nodeId's attribution isn't provably a single source
+        -- (genuinely ambiguous, or that one source has no registered
+        -- voltage to compare against) — those cases are left to the
+        -- ordinary confidence/attribution-rule machinery, never flagged
+        -- here as a flat contradiction.
+        local function expectedColorAndSource(nodeId)
+            local contributingIds = attributionForSig[nodeId]
+            if not contributingIds or _isGenuinelyColorAmbiguous(canvas, contributingIds) then return nil end
+            local onlySourceId
+            for sourceId in pairs(contributingIds) do onlySourceId = sourceId end
+            if not onlySourceId then return nil end
+            local entity = _findSourceEntity(canvas, onlySourceId)
+            local voltage = entity and entity.voltage
+            if not voltage then return nil end
+            return _colorForVoltage(canvas, voltage, ELECTRICAL_MEDIUM.style.powered), onlySourceId
+        end
+
+        local mismatches = {}
+        for _, e in ipairs(canvas.elements) do
+            if nodeStatesForSig[e.id] == ModelSolver.POWERED then
+                local expected, sourceId = expectedColorAndSource(e.id)
+                local painted = snapshot.elements and snapshot.elements[e.id]
+                if expected and painted and not colorsEqual(expected, painted) then
+                    table.insert(mismatches, { id = e.id, label = labelsById[e.id] or e.id,
+                        expectedSourceLabel = labelsById[sourceId] or sourceId })
+                end
+            end
+        end
+        for _, c in ipairs(canvas.controls) do
+            -- An open gate's or off source's own body always displays flat
+            -- unpowered gray regardless of attribution (see
+            -- _solveCurrentSchematic's own isOpenGate/isOffSource override)
+            -- — checking it against its source's color would be a false
+            -- positive, not a real contradiction.
+            local isOpenGate = componentTypes[c.id] == "gate"
+                and not _isActivePosition({ positions = c.positions, detentIndex = detentById[c.id] or c.detentIndex })
+            local isOffSource = componentTypes[c.id] == "source" and not sourceStatesForSig[c.id]
+            if nodeStatesForSig[c.id] == ModelSolver.POWERED and not isOpenGate and not isOffSource then
+                local expected, sourceId = expectedColorAndSource(c.id)
+                local painted = snapshot.controls and snapshot.controls[c.id]
+                if expected and painted and not colorsEqual(expected, painted) then
+                    table.insert(mismatches, { id = c.id, label = labelsById[c.id] or c.id,
+                        expectedSourceLabel = labelsById[sourceId] or sourceId })
+                end
+            end
+        end
+        for _, w in ipairs(canvas.wires) do
+            local fromState, toState = nodeStatesForSig[w.fromElementId], nodeStatesForSig[w.toElementId]
+            if fromState == ModelSolver.POWERED and toState == ModelSolver.POWERED then
+                local fromIsOpenGate = componentTypes[w.fromElementId] == "gate" and gateStatesForSig[w.fromElementId] ~= "closed"
+                local toIsOpenGate = componentTypes[w.toElementId] == "gate" and gateStatesForSig[w.toElementId] ~= "closed"
+                local anchorId = (fromIsOpenGate and not toIsOpenGate) and w.toElementId or w.fromElementId
+                local expected, sourceId = expectedColorAndSource(anchorId)
+                local painted = snapshot.wires and snapshot.wires[w.id]
+                if expected and painted and not colorsEqual(expected, painted) then
+                    table.insert(mismatches, { id = w.id, label = labelsById[w.id] or w.id,
+                        expectedSourceLabel = labelsById[sourceId] or sourceId })
+                end
+            end
+        end
+        return mismatches
+    end
+
+    local currentSignature = gdsGui_schematic_computeSignature("mainCanvas")
+    if gdsGui_schematic_hasSnapshot("mainCanvas", currentSignature) then
+        -- An exact authored snapshot is normally this combination's
+        -- ground truth outright — EXCEPT when its own paint flatly
+        -- contradicts a provable single-source expectation (see
+        -- structuralColorMismatches above); that's not "nothing was
+        -- inferred", it's a captured color the model can PROVE is wrong
+        -- on its own terms, so it no longer gets a free pass to 100%.
+        local snapshot = canvas.snapshots[currentSignature]
+        local mismatches = structuralColorMismatches(currentSignature, snapshot)
+        if #mismatches == 0 then
+            stats.confidencePercent = 100
+            stats.supportingReasonText = "this exact combination was captured directly — nothing here was inferred"
+        else
+            stats.confidencePercent = 0
+            local worst = mismatches[1]
+            stats.primaryReasonText = worst.label .. ": captured color doesn't match " .. worst.expectedSourceLabel
+                .. " (its only possible source here) — this snapshot's own paint looks wrong"
+                .. (#mismatches > 1 and (" (+" .. (#mismatches - 1) .. " more mismatch(es) in this same snapshot)") or "")
+            stats.teachInstructionText = "repaint " .. worst.label .. " to " .. worst.expectedSourceLabel
+                .. "'s color and re-capture this exact combination (OVERWRITE) to fix it"
+        end
+    else
+        -- Only a gate NOT directly pinned by the user's own control
+        -- (gateStates already has an entry for one of those — see
+        -- _currentGateStates) has its POSITION guessed at; a plain
+        -- user-operated switch's position is ground truth. Its COLOR can
+        -- still be guessed though (see _aiColorAttributionConfidence
+        -- below), which is exactly why this no longer short-circuits to
+        -- 100% just because ruleGovernedIds turns out empty.
+        local ruleGovernedIds = {}
+        for id, node in pairs(graph.nodes) do
+            if node.role == "gate" and not gateStates[id] then table.insert(ruleGovernedIds, id) end
+        end
+
+        local rulesByGate = {}
+        for gateId, rule in pairs(canvas.rules or {}) do
+            if rule and (rule.status == "learned" or rule.status == "locked") and not gateStates[gateId] then
+                rulesByGate[gateId] = rule
+            end
+        end
+        local result = ModelSolver.solveWithRules(graph, sourceStates, gateStates, rulesByGate)
+        local oscillating = {}
+        if not result.converged then
+            for _, id in ipairs(result.oscillating) do oscillating[id] = true end
+        end
+
+        -- {confidence, id, isOscillating, rule, kind} per factor, not bare
+        -- numbers — kept around only long enough to both average them AND
+        -- find the single WORST one to explain below. kind ("gateRule" or
+        -- "attribution") tells the suggestion-building step below which of
+        -- two very different remedies actually applies to whichever entry
+        -- turns out worst — see that step's own comment.
+        local confidenceEntries = {}
+        for _, id in ipairs(ruleGovernedIds) do
+            local rule = canvas.rules and canvas.rules[id]
+            local isOsc = oscillating[id]
+            table.insert(confidenceEntries,
+                { confidence = _aiGateConfidence(rule, isOsc), id = id, isOscillating = isOsc, rule = rule, kind = "gateRule" })
+        end
+
+        local attribution = ModelSolver.solveSourceAttribution(graph, sourceStates, gateStates)
+        for id, state in pairs(result.nodeStates) do
+            if state == ModelSolver.POWERED and not oscillating[id] then
+                local rule = canvas.attributionRules and canvas.attributionRules[id]
+                table.insert(confidenceEntries,
+                    { confidence = _aiColorAttributionConfidence(canvas, attribution, result.nodeStates, id, gateStates, sourceStates),
+                      id = id, rule = rule, kind = "attribution" })
+            end
+        end
+
+        if #confidenceEntries == 0 then
+            stats.confidencePercent = 100 -- nothing powered, nothing rule-governed: genuinely nothing to guess
+            stats.supportingReasonText = "nothing in this combination needed inferring (no ambiguous colors, no relay positions to deduce)"
+        else
+            local total, worst = 0, nil
+            for _, e in ipairs(confidenceEntries) do
+                total = total + e.confidence
+                if not worst or e.confidence < worst.confidence or (e.confidence == worst.confidence and e.id < worst.id) then
+                    worst = e
+                end
+            end
+            stats.confidencePercent = math.floor(total / #confidenceEntries * 100 + 0.5)
+
+            if stats.confidencePercent < 100 then
+                local labelsById = _labelsByIdForCanvas(canvas)
+                local label = labelsById[worst.id] or worst.id
+                local why = worst.isOscillating
+                    and "this combination's relay feedback never settled to a stable answer (unstable) — try a nearby combination instead"
+                    or reasonTextWithEvidence(worst, labelsById)
+                stats.primaryReasonText = label .. ": " .. why
+
+                -- currentSignature is marked as if already captured so
+                -- neither remedy below ever points at the very combination
+                -- this panel is currently unsure about — capturing THAT
+                -- one trivially hits 100% by the exact-snapshot short-
+                -- circuit above without teaching anything, which would
+                -- make either remedy a circular/useless claim.
+                local excludedSignatures = _capturedSignaturesSet(canvas)
+                excludedSignatures[currentSignature] = true
+
+                if worst.kind == "attribution" and not worst.isOscillating then
+                    -- An ambiguous-attribution node's own worst case isn't
+                    -- a missing COMBINATION at all — THIS combination
+                    -- already exercises the ambiguity (that's exactly why
+                    -- it's the worst factor right now). What's missing is
+                    -- a disagreeing EXAMPLE: _deduceAttributionWinnersForSnapshot
+                    -- only ever learns from a snapshot whose painted color
+                    -- was manually asserted against one specific
+                    -- contributor — the auto-predicted color (whatever the
+                    -- display's own highest-voltage fallback already
+                    -- picked) agrees with that same fallback by
+                    -- construction, every time, so capturing it as-is can
+                    -- never produce the variation findAttributionRule
+                    -- needs. No combination to navigate to fixes that —
+                    -- only manually overriding the paint before capture
+                    -- does, so this says so directly instead of pointing
+                    -- at a navigation target that wouldn't help.
+                    local contributorIds = {}
+                    for sourceId in pairs(attribution[worst.id] or {}) do table.insert(contributorIds, sourceId) end
+                    table.sort(contributorIds)
+                    local contributorLabels = {}
+                    for _, sourceId in ipairs(contributorIds) do
+                        table.insert(contributorLabels, labelsById[sourceId] or sourceId)
+                    end
+                    stats.teachInstructionText = label .. " is ambiguous between "
+                        .. table.concat(contributorLabels, " and ")
+                        .. " right here — manually set its color to whichever one actually explains it, THEN capture"
+                        .. " (this combination already qualifies; its own auto-predicted color would just repeat"
+                        .. " the same unverified guess and teach nothing)"
+                else
+                    -- Gate-rule data gap (or an oscillating gate — see
+                    -- below): a genuinely missing COMBINATION, so a
+                    -- navigation suggestion actually helps here, unlike
+                    -- the attribution case above. For an oscillating gate,
+                    -- any nearby untested combination is as good as any
+                    -- other (it's a stability problem, not a data-gap
+                    -- one), so this keeps the plain one-flip heuristic.
+                    -- For a learnable gate rule (insufficient_examples/
+                    -- no_variation/no_consistent_explanation), targets a
+                    -- combination that would deduce a state for worst.id
+                    -- NOT already seen in training — see suggestTargetedSnapshot
+                    -- and _gateAndSourceStatesForDetents above.
+                    local suggestion
+                    if worst.kind == "gateRule" and not worst.isOscillating then
+                        local seenStates = {}
+                        for signature in pairs(canvas.snapshots) do
+                            local deduced = _deducedGateStatesBySignature[signature]
+                            local s = deduced and deduced[worst.id]
+                            if s and s ~= ModelLearner.UNKNOWN then seenStates[s] = true end
+                        end
+                        local function scoreFn(candidateDetents)
+                            local candGateStates, candSourceStates =
+                                _gateAndSourceStatesForDetents(canvas, componentTypes, candidateDetents)
+                            local candNodeStates = ModelSolver.solve(graph, candSourceStates, candGateStates)
+                            local deduced = ModelLearner.inferGate(worst.id, candNodeStates, graph)
+                            if deduced == ModelLearner.UNKNOWN then return nil end
+                            return (not seenStates[deduced]) and 2 or 1
+                        end
+                        suggestion = ModelSuggest.suggestTargetedSnapshot(_controlsForSuggest(canvas), excludedSignatures, scoreFn)
+                    end
+                    suggestion = suggestion or ModelSuggest.suggestNextSnapshot(_controlsForSuggest(canvas), excludedSignatures)
+                    if suggestion then
+                        stats.suggestedCombinationIndex = _combinationIndexForDetents(canvas, suggestion.detents)
+                    end
+                end
+            else
+                stats.supportingReasonText =
+                    supportingReasonTextForFullConfidence(confidenceEntries, _labelsByIdForCanvas(canvas))
+            end
+        end
+    end
+
+    -- A snapshot is "informative" if it taught the engine EITHER a
+    -- relay's position (only a gate NOT in canvas.controls can ever
+    -- actually need this — a control-kind switch's position is already
+    -- known directly, so deducing it, even successfully, is never
+    -- consulted by anything — see _solveCurrentSchematic's own
+    -- rulesByGate exclusion) OR a genuinely-ambiguous node's winning
+    -- source (see _deduceAttributionWinnersForSnapshot) — never dead
+    -- weight the learner silently ignored.
+    local controlIds = {}
+    for _, c in ipairs(canvas.controls) do controlIds[c.id] = true end
+
+    local snapshotCount = 0
+    for _ in pairs(canvas.snapshots) do snapshotCount = snapshotCount + 1 end
+    if snapshotCount > 0 then
+        local informativeCount = 0
+        for signature, snapshot in pairs(canvas.snapshots) do
+            local informative = false
+            local deduced = _deducedGateStatesBySignature[signature]
+            if deduced then
+                for gateId, state in pairs(deduced) do
+                    if state ~= ModelLearner.UNKNOWN and not controlIds[gateId] then informative = true; break end
+                end
+            end
+            if not informative then
+                local winners = _deduceAttributionWinnersForSnapshot(canvas, graph, signature, snapshot)
+                if next(winners) ~= nil then informative = true end
+            end
+            if informative then informativeCount = informativeCount + 1 end
+        end
+        stats.snapshotImportancePercent = math.floor(informativeCount / snapshotCount * 100 + 0.5)
+    end
+
+    return stats
+end
+
+-- Whether the AI panel overlay is currently showing — see
+-- schematicAiBtnPressed/drawSchematicAiPanel below. A plain app-layer flag
+-- (not a canvas field, unlike the annunciator panel's own library-owned
+-- open/close state): this is a read-only info overlay with no editing
+-- semantics of its own, so it doesn't need anything the library tracks —
+-- just drawn directly, same convention as drawSchematicZoomFullScreenLabel.
+-- Canvas interaction under its own footprint IS inhibited though (see
+-- _syncAiPanelInputBlock/gdsGui_schematic_setInputBlockRect) — unlike
+-- PAINT's swatch palette or the annunciator panel, a tap meant for
+-- scrolling this panel's text must never also pan/select on the canvas
+-- underneath it.
+local _aiPanelOpen = false
+local _aiPanelFont  = nil
+-- How many pixels of the panel's own text content are scrolled past the
+-- top (0 = top; clamped against actual content height every draw — see
+-- drawSchematicAiPanel) — fed by schematicAiPanelScrolled, the wheel/
+-- drag-forwarding callback gdsGui_schematic_setInputBlockRect calls.
+local _aiPanelScrollY = 0
+local _AI_PANEL_WHEEL_PX_PER_NOTCH = 24
+
+function schematicAiBtnPressed(newState)
+    _aiPanelOpen = (newState == globApp.BUTTON_STATES.PRESSED)
+    _aiPanelScrollY = 0 -- fresh scroll position each time the panel is (re)opened
+end
+
+-- The panel's own on-screen rectangle, pinned to the bottom 1/4 of the
+-- live canvas — shared by drawSchematicAiPanel (what actually gets drawn)
+-- and _syncAiPanelInputBlock (what gets blocked/scroll-forwarded), so the
+-- two can never drift out of sync with each other. nil if there's no
+-- canvas to pin to at all.
+local function _aiPanelRect()
+    local cx, cy, cw, ch = gdsGui_schematic_getCanvasRect("mainCanvas")
+    if not cx then return nil end
+    local panelH = ch * 0.25
+    return cx, cy + ch - panelH, cw, panelH
+end
+
+-- gdsGui_schematic_setInputBlockRect's own by-name wheel/drag callback
+-- (see _syncAiPanelInputBlock below, which registers this name) — delta is
+-- either a wheel notch count (isDrag false) or a raw drag pixel offset
+-- (isDrag true, see that setter's own comment). Actual clamping against
+-- content height happens once, at draw time (drawSchematicAiPanel), not
+-- here — this just accumulates an unclamped intent.
+function schematicAiPanelScrolled(delta, isDrag)
+    if isDrag then
+        _aiPanelScrollY = _aiPanelScrollY + delta
+    else
+        _aiPanelScrollY = _aiPanelScrollY - delta * _AI_PANEL_WHEEL_PX_PER_NOTCH
+    end
+end
+
+-- Polled once a frame (see love.update(), right after gdsGui_update(dt) so
+-- canvas.x/y/w/h already reflect this frame's pan/zoom) rather than only
+-- at open/close: the panel's rectangle moves whenever the canvas itself
+-- pans/zooms/resizes, and the dead zone has to track it exactly or it'd
+-- either block taps on canvas content the panel no longer actually covers,
+-- or (worse) leave a gap where the panel LOOKS like it's blocking input
+-- but isn't.
+local function _syncAiPanelInputBlock()
+    if _aiPanelOpen and gdsGui_page_currentName() == "SystemSchematic" and not gdsGui_schematic_isMenuOpen("mainCanvas") then
+        local px, py, pw, ph = _aiPanelRect()
+        if px then
+            gdsGui_schematic_setInputBlockRect("mainCanvas", { x = px, y = py, w = pw, h = ph }, "schematicAiPanelScrolled")
+            return
+        end
+    end
+    gdsGui_schematic_setInputBlockRect("mainCanvas", nil)
+end
+
+-- Drawn directly (not as an outputTxtBox widget), after gdsGui_draw() in
+-- love.draw(): the library's own schematic-canvas draw pass needs to have
+-- already happened so this paints on top of it, same reasoning as
+-- drawSchematicZoomFullScreenLabel above. Modal to the CANVAS underneath
+-- its own footprint (see _syncAiPanelInputBlock) but not to the rest of
+-- the UI — the AI panel ISN'T part of _SCHEMATIC_DOCK_TOOLS' mutually-
+-- exclusive set (see its own creation comment), so it CAN stay open while
+-- a schematic modal menu (DESIGN ACTIONS, the color picker, ...) is also
+-- open — skipped here whenever one is, so its bottom-of-canvas footprint
+-- never covers up menu options a modal is relying on being tappable.
+function drawSchematicAiPanel()
+    if not _aiPanelOpen then return end
+    if gdsGui_page_currentName() ~= "SystemSchematic" then return end
+    if gdsGui_schematic_isMenuOpen("mainCanvas") then return end
+    local px, py, pw, ph = _aiPanelRect()
+    if not px then return end
+
+    local stats = _computeAiPanelStats()
+    if not stats then return end
+
+    love.graphics.setColor(0, 0, 0, 0.72)
+    love.graphics.rectangle("fill", px, py, pw, ph)
+    love.graphics.setColor(1, 1, 0, 1)
+    love.graphics.rectangle("line", px, py, pw, ph)
+
+    if not _aiPanelFont then _aiPanelFont = love.graphics.newFont(13) end
+    love.graphics.setFont(_aiPanelFont)
+
+    local lines = {
+        string.format("COMBINATION: %d / %d", stats.combinationIndex, stats.combinationTotal),
+        "PREDICTION CONFIDENCE: " .. (stats.confidencePercent and (stats.confidencePercent .. "%") or "N/A"),
+    }
+    -- REASON/TRY NEXT/TEACH only ever appear alongside a confidence
+    -- shortfall — see _computeAiPanelStats' own comment on why these
+    -- fields are only ever set together with confidencePercent < 100, and
+    -- on why TRY NEXT and TEACH are mutually exclusive. WHY is the
+    -- positive counterpart, only ever set alongside confidencePercent ==
+    -- 100 — so WHY and the other three are themselves mutually exclusive.
+    if stats.primaryReasonText then
+        table.insert(lines, "REASON: " .. stats.primaryReasonText)
+    end
+    if stats.suggestedCombinationIndex then
+        table.insert(lines, string.format("TRY NEXT: COMBINATION %d / %d TO IMPROVE CONFIDENCE",
+            stats.suggestedCombinationIndex, stats.combinationTotal))
+    end
+    if stats.teachInstructionText then
+        table.insert(lines, "TEACH: " .. stats.teachInstructionText)
+    end
+    if stats.supportingReasonText then
+        table.insert(lines, "WHY: " .. stats.supportingReasonText)
+    end
+    table.insert(lines, "SNAPSHOT IMPORTANCE: " .. (stats.snapshotImportancePercent and (stats.snapshotImportancePercent .. "%") or "N/A"))
+
+    local pad, wrapW, lineGap = 10, pw - 20, 4
+    local lineH = _aiPanelFont:getHeight() + lineGap
+
+    -- First pass: each line's own wrapped height (REASON in particular can
+    -- run past one line's width) and the running total — needed to clamp
+    -- scroll BEFORE drawing anything, so a stale scroll position (e.g.
+    -- left over from a longer REASON line that just got shorter) never
+    -- leaves a blank gap hanging at the bottom instead of snapping back.
+    local lineCounts, totalH = {}, 0
+    for i, line in ipairs(lines) do
+        local _, wrapped = _aiPanelFont:getWrap(line, wrapW)
+        lineCounts[i] = math.max(1, #wrapped)
+        totalH = totalH + lineCounts[i] * lineH
+    end
+    local innerH = ph - pad * 2
+    local maxScroll = math.max(0, totalH - innerH)
+    _aiPanelScrollY = math.max(0, math.min(maxScroll, _aiPanelScrollY))
+
+    love.graphics.setScissor(px, py, pw, ph)
+    love.graphics.setColor(1, 1, 0, 1)
+    local y = py + pad - _aiPanelScrollY
+    for i, line in ipairs(lines) do
+        love.graphics.printf(line, px + pad, y, wrapW, "left")
+        y = y + lineCounts[i] * lineH
+    end
+    love.graphics.setScissor()
+
+    -- A thin scroll-position indicator along the right edge — only drawn
+    -- once content actually overflows the panel (maxScroll > 0); nothing
+    -- to indicate otherwise.
+    if maxScroll > 0 then
+        local trackX = px + pw - 6
+        love.graphics.setColor(1, 1, 1, 0.25)
+        love.graphics.rectangle("fill", trackX, py + 2, 3, ph - 4)
+        local thumbH = math.max(14, (innerH / totalH) * (ph - 4))
+        local thumbY = py + 2 + (_aiPanelScrollY / maxScroll) * (ph - 4 - thumbH)
+        love.graphics.setColor(1, 1, 0, 0.8)
+        love.graphics.rectangle("fill", trackX, thumbY, 3, thumbH)
+    end
+
+    love.graphics.setColor(1, 1, 1, 1)
 end
 
 -- Loads one saved system's data into the live mainCanvas (replacing whatever
@@ -1181,17 +2586,37 @@ local function _openSystemIntoCanvas(systemId, mode)
     -- elements/wires/controls back in if "undo" were used right after this.
     gdsGui_schematic_clearUndo("mainCanvas")
     _clearMainCanvas()
+    gdsGui_schematic_setBackgroundImage("mainCanvas", _canvasBackgroundPath(_findCurrentAircraft()))
     -- Every value handed to the library is deep-copied off of sys's own
     -- tables (see _deepCopyTable) so mainCanvas never ends up aliasing the
     -- stored record it was just loaded from.
+    local canvas = _findSchematicCanvas()
     for _, e in ipairs(sys.elements or {}) do
         gdsGui_schematic_addElement("mainCanvas", e.id, e.shapeType, e.x, e.y, e.w, e.h, e.label,
-            _deepCopyTable(e.defaultColor), _deepCopyTable(e.properties), e.rotation or 0, e.spritePath)
+            _deepCopyTable(e.defaultColor), _deepCopyTable(e.properties), e.rotation or 0, e.spritePath,
+            e.componentType)
+        -- voltage (per-source display setting — see
+        -- _openPerSourceSettingsMenu) isn't among addElement's own
+        -- parameters, so it doesn't round-trip through it like
+        -- componentType does — attached directly here instead, same as
+        -- how a loaded canvas's predictedColor is never trusted from disk
+        -- in the first place (always nil-safe, re-derived or re-set,
+        -- never a required field). Color itself is never stored per-source
+        -- any more — it's derived live from voltage via this system's own
+        -- canvas.voltageColors, set just below (see _colorForPoweredNode).
+        if canvas then
+            local el = canvas.elements[#canvas.elements]
+            el.voltage = e.voltage
+        end
     end
     for _, c in ipairs(sys.controls or {}) do
         gdsGui_schematic_addControl("mainCanvas", c.id, c.x, c.y, _deepCopyTable(c.positions), c.detentIndex,
             c.label, c.callbackFunc, c.radiusScale, c.spritePaths, c.rotation, c.overlaySpritePath,
-            _deepCopyTable(c.defaultColor))
+            _deepCopyTable(c.defaultColor), c.colorDarkenMul, c.componentType)
+        if canvas then
+            local ctrl = canvas.controls[#canvas.controls]
+            ctrl.voltage = c.voltage
+        end
     end
     for _, w in ipairs(sys.wires or {}) do
         gdsGui_schematic_addWire("mainCanvas", w.id, w.fromElementId, w.toElementId, _deepCopyTable(w.defaultColor),
@@ -1200,8 +2625,19 @@ local function _openSystemIntoCanvas(systemId, mode)
     for _, a in ipairs(sys.annunciators or {}) do
         gdsGui_schematic_addAnnunciator("mainCanvas", a.id, a.label, _deepCopyTable(a.color), a.active)
     end
-    local canvas = _findSchematicCanvas()
-    if canvas then canvas.snapshots = _deepCopyTable(sys.snapshots or {}) end
+    if canvas then
+        canvas.snapshots = _deepCopyTable(sys.snapshots or {})
+        canvas.rules = _deepCopyTable(sys.rules or {})
+        canvas.attributionRules = _deepCopyTable(sys.attributionRules or {})
+        -- Starts empty for a system that's never had a voltage taught yet
+        -- (new system, or one re-created after deleting it or its whole
+        -- aircraft) — same "has to be taught again" lifecycle as
+        -- snapshots/rules just above, deliberately not an appSettings
+        -- global (see _ensureVoltageHasColor's own comment).
+        canvas.voltageColors = _deepCopyTable(sys.voltageColors or {})
+    end
+    _applySolvedColorsToCurrentCombination()
+    _recomputeDeducedGateStates()
 
     schematicStore.currentSystemId = systemId
     local designing = (mode == "design")
@@ -1222,6 +2658,9 @@ local function _openSystemIntoCanvas(systemId, mode)
     gdsGui_button_setHidden("schematicPaintBtn", not designing)
     gdsGui_button_setState("schematicAnnunciatorBtn", designing and "released" or "deactivated")
     gdsGui_button_setHidden("schematicAnnunciatorBtn", not designing)
+    gdsGui_button_setState("schematicAiBtn", designing and "released" or "deactivated")
+    gdsGui_button_setHidden("schematicAiBtn", not designing)
+    _aiPanelOpen = false -- a freshly (re)loaded system starts with the AI panel closed
     gdsGui_button_setState("schematicFullScreenToggle", designing and "deactivated" or "released")
     -- setFontSizeToFit (not a plain setText) since sys.name's length varies
     -- per system — refitting on every load keeps a long name from wrapping/
@@ -1230,7 +2669,7 @@ local function _openSystemIntoCanvas(systemId, mode)
     -- system switch).
     gdsGui_outputTxtBox_setText("schematic_pageTitle", sys.name)
     gdsGui_outputTxtBox_setFontSizeToFit("schematic_pageTitle", appSettings.fontSize, 10)
-    gdsGui_outputTxtBox_setText("schematicSnapshotLabel", "SNAPSHOTS: " .. gdsGui_schematic_countSnapshots("mainCanvas"))
+    _setSnapshotLabelText(gdsGui_schematic_countSnapshots("mainCanvas"))
     _saveSchematicStore()
 end
 
@@ -1286,12 +2725,322 @@ local function _openDesignActionsMenu(canvasName)
     if gdsGui_schematic_hasSnapshot(canvasName, gdsGui_schematic_computeSignature(canvasName)) then
         table.insert(options, "CLEAR SNAPSHOT")
     end
+    -- SNAPSHOT RESET -- unlike CLEAR SNAPSHOT (just the current combination)
+    -- or RESET (CLEAR PAGE) further down (the whole diagram, snapshots
+    -- included), this wipes every snapshot AND every learned/locked gate
+    -- rule on the system while leaving the elements/wires/controls/
+    -- annunciators themselves untouched -- "start teaching the engine over"
+    -- without having to rebuild the diagram from scratch. Only offered when
+    -- there's actually something to reset. Routed through its own CONTINUE/
+    -- CANCEL confirm sub-menu (see _openSnapshotResetConfirmMenu) rather
+    -- than DESIGN ACTIONS' own single hold-to-confirm slot, which RESET
+    -- already occupies (gdsGui_schematic_openMenu only supports one
+    -- confirmIndex row per menu).
+    if gdsGui_schematic_countSnapshots(canvasName) > 0 then
+        table.insert(options, "SNAPSHOT RESET")
+    end
     if gdsGui_schematic_canUndo(canvasName) then table.insert(options, "UNDO LAST ACTION") end
+    -- GATE RULES only offered once the canvas actually has a "gate"-role
+    -- node to show a rule for (see model/learner.lua's findSimplestRule,
+    -- Phase 3) — nothing untyped/non-electrical schematics could ever
+    -- populate. SUGGEST NEXT SNAPSHOT only needs controls to exist at all
+    -- (model/suggest.lua's heuristic is domain-agnostic — see its own
+    -- comment), so it's offered for any system with at least one.
+    local canvas = _findSchematicCanvas()
+    if canvas then
+        local componentTypes = _buildComponentTypeMap(canvas)
+        for _, role in pairs(componentTypes) do
+            if role == "gate" then table.insert(options, "GATE RULES"); break end
+        end
+        -- ATTRIBUTION RULES only offered once some node has actually shown
+        -- up ambiguous across a captured snapshot (see
+        -- _recomputeAttributionRules) — nothing to show otherwise.
+        if next(canvas.attributionRules or {}) ~= nil then
+            table.insert(options, "ATTRIBUTION RULES")
+        end
+        if #canvas.controls > 0 then table.insert(options, "SUGGEST NEXT SNAPSHOT") end
+    end
+    -- ELECTRICAL COLORS lets the user pick their own powered/unpowered
+    -- display colors (default yellow/gray — see ELECTRICAL_MEDIUM.style)
+    -- instead of being stuck with the medium's built-in ones. Gated on the
+    -- CURRENT system's own systemType, not componentTypes (a system with
+    -- nothing tagged yet still has an ELECTRICAL color scheme worth being
+    -- able to set before placing anything).
+    local sys = _findSystem(schematicStore.currentSystemId)
+    if sys and sys.systemType == "ELECTRICAL" then table.insert(options, "ELECTRICAL COLORS") end
     table.insert(options, "RESET (CLEAR PAGE)")
     -- RESET is always the last row — its own hold-to-confirm gate (see
     -- schematicDesignActionChosen's RESET branch below), not a separate
     -- "CLEAR ENTIRE PAGE?" popup.
     gdsGui_schematic_openMenu(canvasName, "DESIGN ACTIONS", options, "schematicDesignActionChosen", nil, #options)
+end
+
+-- SNAPSHOT RESET's own confirm step (see _openDesignActionsMenu's own
+-- comment on why this is a sub-menu rather than a second hold-to-confirm
+-- row on DESIGN ACTIONS itself). Same CONTINUE/CANCEL shape as the
+-- library's own "adding a new element/control would wipe every snapshot"
+-- confirm (gdsGui_schematic_internal_onPlacementSnapshotWipeConfirmed) —
+-- one function handles both onSelect and onCancel, since a cancel/tap-
+-- outside lands here with optionText nil, which the CONTINUE check below
+-- already treats as a no-op.
+local function _openSnapshotResetConfirmMenu(canvasName)
+    local count = gdsGui_schematic_countSnapshots(canvasName)
+    gdsGui_schematic_openMenu(canvasName,
+        "THIS WILL DELETE ALL " .. count .. " SNAPSHOT(S) AND EVERY LEARNED GATE/ATTRIBUTION RULE ON THIS SYSTEM " ..
+        "— THE SCHEMATIC ITSELF (ELEMENTS/WIRES/CONTROLS) IS NOT AFFECTED. CONTINUE?",
+        { "CONTINUE", "CANCEL" }, "schematicSnapshotResetConfirmed", "schematicSnapshotResetConfirmed", 1)
+end
+
+function schematicSnapshotResetConfirmed(canvasName, index, optionText)
+    if optionText ~= "CONTINUE" then return end
+    local canvas = _findSchematicCanvas()
+    if not canvas then return end
+    gdsGui_schematic_pushUndo(canvasName)
+    canvas.snapshots = {}
+    -- Cleared outright (not left to _recomputeDeducedGateStates' own
+    -- _recomputeGateRules/_recomputeAttributionRules passes below) --
+    -- specifically to override those passes' usual "never touch a LOCKED
+    -- rule" protection — a full snapshot reset is meant to wipe every
+    -- taught rule, confirmed or not, same as _clearMainCanvas' own
+    -- unconditional canvas.rules = {} on a full page RESET.
+    canvas.rules = {}
+    canvas.attributionRules = {}
+    _recomputeDeducedGateStates()
+    _applySolvedColorsToCurrentCombination()
+    _schematicDirty = true
+    _saveCurrentSystem()
+    _setSnapshotLabelText(0)
+end
+
+-------------------------------------------------------------------------------
+-- SYSTEM SCHEMATIC — GATE RULES (inference-schematic-assistance plan, Phase
+-- 5): lists every "gate"-role node (see model/graph.lua) with its current
+-- rule status, then drills into one gate's plain-word rule text with a LOCK
+-- action (see _lockGateRule) — all built from the library's generic
+-- gdsGui_schematic_openMenu primitive, same as _openDesignActionsMenu above,
+-- never touching the library's own element/control edit menu (componentType/
+-- rules stay app-layer-opaque per CLAUDE.md's library/app boundary).
+-------------------------------------------------------------------------------
+
+-- Deterministic (sorted) gate id order, shared by the list menu below and
+-- its onSelect callback (schematicGateRulesListChosen, further down the
+-- file) so a row's tapped INDEX maps back to the same gate every time,
+-- without having to stash the list itself in module state.
+local function _sortedGateIds(canvas)
+    local componentTypes = _buildComponentTypeMap(canvas)
+    local gateIds = {}
+    for id, role in pairs(componentTypes) do
+        if role == "gate" then table.insert(gateIds, id) end
+    end
+    table.sort(gateIds)
+    return gateIds
+end
+
+local function _openGateRulesListMenu(canvasName)
+    local canvas = _findSchematicCanvas()
+    if not canvas then return end
+    local gateIds = _sortedGateIds(canvas)
+    local labelsById = _labelsByIdForCanvas(canvas)
+
+    local options = {}
+    for _, id in ipairs(gateIds) do
+        local rule = canvas.rules and canvas.rules[id]
+        local status = (rule and rule.status) or "noRule"
+        table.insert(options, (labelsById[id] or id) .. " (" .. status .. ")")
+    end
+    table.insert(options, "RETURN")
+    gdsGui_schematic_openMenu(canvasName, "GATE RULES", options, "schematicGateRulesListChosen", nil, nil, 0.8)
+end
+
+local function _openGateRuleDetailMenu(canvasName, gateId)
+    local canvas = _findSchematicCanvas()
+    if not canvas then return end
+    local rule = canvas.rules and canvas.rules[gateId]
+    local text = _formatRuleText(gateId, rule, _labelsByIdForCanvas(canvas))
+
+    local options = {}
+    -- Only a freshly-learned (not yet confirmed) rule can be locked — a
+    -- rule that's already locked, or isn't learned at all yet, has nothing
+    -- for this action to do (mirrors _lockGateRule's own no-op guard).
+    if rule and rule.status == "learned" then table.insert(options, "LOCK THIS RULE") end
+    table.insert(options, "RETURN")
+
+    _pendingGateRuleGateId = gateId
+    gdsGui_schematic_openMenu(canvasName, text, options, "schematicGateRuleDetailChosen", "schematicGateRuleDetailCancelled", nil, 0.8)
+end
+
+-------------------------------------------------------------------------------
+-- SYSTEM SCHEMATIC — ATTRIBUTION RULES: same list/detail/LOCK shape as GATE
+-- RULES just above, for a node ambiguous between 2+ simultaneously-active
+-- sources (see model/learner.lua's findAttributionRule and
+-- _recomputeAttributionRules) instead of a gate's own open/closed
+-- position.
+-------------------------------------------------------------------------------
+
+-- Deterministic (sorted) id order over canvas.attributionRules' own keys
+-- (every node that's EVER shown up ambiguous across a captured snapshot —
+-- see _recomputeAttributionRules), same "stable row-to-id mapping without
+-- stashing the list" convention as _sortedGateIds above.
+local function _sortedAmbiguousNodeIds(canvas)
+    local ids = {}
+    for id in pairs(canvas.attributionRules or {}) do table.insert(ids, id) end
+    table.sort(ids)
+    return ids
+end
+
+local function _openAttributionRulesListMenu(canvasName)
+    local canvas = _findSchematicCanvas()
+    if not canvas then return end
+    local nodeIds = _sortedAmbiguousNodeIds(canvas)
+    local labelsById = _labelsByIdForCanvas(canvas)
+
+    local options = {}
+    for _, id in ipairs(nodeIds) do
+        local rule = canvas.attributionRules[id]
+        local status = (rule and rule.status) or "noRule"
+        table.insert(options, (labelsById[id] or id) .. " (" .. status .. ")")
+    end
+    table.insert(options, "RETURN")
+    gdsGui_schematic_openMenu(canvasName, "ATTRIBUTION RULES", options, "schematicAttributionRulesListChosen", nil, nil, 0.8)
+end
+
+local function _openAttributionRuleDetailMenu(canvasName, nodeId)
+    local canvas = _findSchematicCanvas()
+    if not canvas then return end
+    local rule = canvas.attributionRules and canvas.attributionRules[nodeId]
+    local text = _formatAttributionRuleText(nodeId, rule, _labelsByIdForCanvas(canvas))
+
+    local options = {}
+    if rule and rule.status == "learned" then table.insert(options, "LOCK THIS RULE") end
+    table.insert(options, "RETURN")
+
+    _pendingAttributionRuleNodeId = nodeId
+    gdsGui_schematic_openMenu(canvasName, text, options, "schematicAttributionRuleDetailChosen",
+        "schematicAttributionRuleDetailCancelled", nil, 0.8)
+end
+
+-------------------------------------------------------------------------------
+-- SYSTEM SCHEMATIC — SUGGEST NEXT SNAPSHOT (Phase 5): surfaces
+-- model/suggest.lua's one-flip-from-an-existing-capture heuristic, and lets
+-- the user jump the live combination straight to it (APPLY) instead of
+-- hunting for an untested combination by hand.
+-------------------------------------------------------------------------------
+
+local function _openSuggestNextSnapshotMenu(canvasName)
+    local canvas = _findSchematicCanvas()
+    if not canvas then return end
+    local suggestion = ModelSuggest.suggestNextSnapshot(_controlsForSuggest(canvas), _capturedSignaturesSet(canvas))
+    if not suggestion then
+        gdsGui_schematic_openMenu(canvasName,
+            "Every one-flip combination from an existing snapshot is already captured.",
+            { "OK" }, "schematicSuggestNextSnapshotDismissed", nil)
+        return
+    end
+
+    local labelsById = _labelsByIdForCanvas(canvas)
+    local parts = {}
+    for _, c in ipairs(canvas.controls) do
+        local detentIndex = suggestion.detents[c.id]
+        local positionLabel = (detentIndex and c.positions and c.positions[detentIndex + 1]) or tostring(detentIndex)
+        table.insert(parts, (labelsById[c.id] or c.id) .. "=" .. positionLabel)
+    end
+
+    _pendingSuggestedDetents = suggestion.detents
+    gdsGui_schematic_openMenu(canvasName, "TRY: " .. table.concat(parts, ", "),
+        { "APPLY", "CANCEL" }, "schematicSuggestNextSnapshotChosen", "schematicSuggestNextSnapshotDismissed", nil, 0.8)
+end
+
+-------------------------------------------------------------------------------
+-- SYSTEM SCHEMATIC — ELECTRICAL COLORS: lets the user pick their own
+-- powered/unpowered display color (default yellow/gray — see
+-- ELECTRICAL_MEDIUM.style) instead of being stuck with the medium's
+-- built-in ones. The SAME style table drives both forward prediction
+-- (_solveCurrentSchematic) and backward deduction (_stateForColor/
+-- inferGate/findSimplestRule), so picking a color here is what actually
+-- "teaches" the inference model to recognize it — paint, prediction, and
+-- deduction all stay in lockstep automatically, with no separate step.
+--
+-- One real caveat, called out in the swatch picker's own title text below
+-- rather than hidden: changing this AFTER painting snapshots under the old
+-- color doesn't retroactively relabel them. The snapshots still DISPLAY
+-- correctly forever (an authored snapshot always wins over a prediction,
+-- regardless of color scheme) — but _stateForColor's exact-match lookup
+-- against the CURRENT style table means the deduction/rule-learner no
+-- longer recognizes that old color as "powered", so a gate whose only
+-- evidence came from pre-change snapshots reverts to unknown/noRule until
+-- those combinations are re-painted in the new color.
+-------------------------------------------------------------------------------
+
+local function _openElectricalColorsMenu(canvasName)
+    gdsGui_schematic_openMenu(canvasName, "ELECTRICAL COLORS",
+        { "POWERED COLOR", "UNPOWERED COLOR", "PER-SOURCE SETTINGS", "RETURN" }, "schematicElectricalColorsChosen", nil)
+end
+
+-------------------------------------------------------------------------------
+-- SYSTEM SCHEMATIC — PER-SOURCE SETTINGS: an individual source (BATTERY,
+-- GENERATOR, ...) is given a nominal VOLTAGE — its powered color is never
+-- set directly any more; it's always whatever color is registered for that
+-- VOLTAGE on THIS system (canvas.voltageColors — see
+-- _ensureVoltageHasColor), so any two sources sharing a voltage on the
+-- same system always read as the same color automatically. Purely a
+-- display-layer setting consulted only by _solveCurrentSchematic's color
+-- provenance step (see model/solver.lua's solveSourceAttribution), never
+-- by the solver's own logical powered/unpowered vocabulary or the
+-- deduction/rule-learning pipeline, which stay medium-wide and
+-- source-blind exactly as before.
+--
+-- When a node is reached by more than one currently-active source at once
+-- (a genuine tie, e.g. an unisolated bus-tie), _solveCurrentSchematic picks
+-- the single highest-VOLTAGE contributor's color outright, as long as
+-- every contributor's voltage is known (the higher-voltage source would
+-- actually dominate/back-feed the lower one on a real bus) — a tie in
+-- voltage no longer needs special-casing, since equal voltages already
+-- share the identical registered color. Only when voltage is genuinely
+-- unset on some contributor does it fall back to an alternating dashed mix
+-- of every contributor's color.
+-------------------------------------------------------------------------------
+
+-- The palette name of the color currently registered for a voltage ON THIS
+-- SYSTEM (canvas.voltageColors — see _ensureVoltageHasColor), or
+-- "UNASSIGNED" if that voltage has no color yet (nil voltage reads as
+-- "? V" by its caller instead of hitting this).
+local function _voltageColorDescription(canvas, voltage)
+    local c = canvas.voltageColors and canvas.voltageColors[voltage]
+    if not c then return "UNASSIGNED" end
+    for i = 1, 5 do
+        local paletteColor, paletteName = gdsGui_schematic_getColorPaletteEntry(i)
+        if paletteColor and paletteColor[1] == c[1] and paletteColor[2] == c[2]
+           and paletteColor[3] == c[3] and (paletteColor[4] or 1) == (c[4] or 1) then
+            return paletteName
+        end
+    end
+    return "CUSTOM"
+end
+
+local function _openPerSourceSettingsListMenu(canvasName)
+    local canvas = _findSchematicCanvas()
+    if not canvas then return end
+    local sourceIds = _sortedSourceIds(canvas)
+    local labelsById = _labelsByIdForCanvas(canvas)
+
+    local options = {}
+    for _, id in ipairs(sourceIds) do
+        local entity = _findSourceEntity(canvas, id)
+        local voltage = entity and entity.voltage
+        local voltageDescription = voltage and (voltage .. "V") or "? V"
+        local colorDescription = voltage and _voltageColorDescription(canvas, voltage) or "default"
+        table.insert(options, (labelsById[id] or id) .. " (" .. voltageDescription .. ", " .. colorDescription .. ")")
+    end
+    table.insert(options, "RETURN")
+    gdsGui_schematic_openMenu(canvasName, "PER-SOURCE SETTINGS", options, "schematicPerSourceSettingsListChosen", nil, nil, 0.85)
+end
+
+local function _openPerSourceSettingDetailMenu(canvasName, sourceId)
+    _pendingPerSourceTargetId = sourceId
+    local canvas = _findSchematicCanvas()
+    local labelsById = canvas and _labelsByIdForCanvas(canvas) or {}
+    gdsGui_schematic_openMenu(canvasName, labelsById[sourceId] or sourceId,
+        { "VOLTAGE", "RETURN" }, "schematicPerSourceSettingDetailChosen", "schematicPerSourceSettingDetailCancelled")
 end
 
 -- Full SELECT SYSTEM list — only ever shown for a system with no fixed
@@ -1365,10 +3114,10 @@ function schematicCatalogItemChosen(canvasName, index, optionText)
     -- gdsGui_schematic_internal_onElementEditChosen).
     if item.kind == "element" then
         gdsGui_schematic_armElementPlacement(canvasName, item.shapeType, item.abbrev or item.label, nil, item.label,
-            item.defaultProperties, item.spritePath, item.sizeMul, item.matchControlSize)
+            item.defaultProperties, item.spritePath, item.sizeMul, item.matchControlSize, item.componentType)
     elseif #item.presets == 1 then
         gdsGui_schematic_armControlPlacement(canvasName, item.presets[1], item.abbrev or item.label, item.callbackFunc, item.label,
-            item.spritePaths, item.overlaySpritePath, item.radiusMul, item.colorDarkenMul)
+            item.spritePaths, item.overlaySpritePath, item.radiusMul, item.colorDarkenMul, item.componentType)
     else
         _catalogChosenControlItem = item
         local names = {}
@@ -1389,7 +3138,7 @@ function schematicCatalogPresetChosen(canvasName, index, optionText)
     if not item then return end
     local preset = item.presets[index]
     gdsGui_schematic_armControlPlacement(canvasName, preset, item.abbrev or item.label, item.callbackFunc, item.label,
-        item.spritePaths, item.overlaySpritePath, item.radiusMul, item.colorDarkenMul)
+        item.spritePaths, item.overlaySpritePath, item.radiusMul, item.colorDarkenMul, item.componentType)
     _catalogChosenControlItem = nil
 end
 
@@ -1537,9 +3286,11 @@ end
 -- button's own "toggle" type comment at its gdsGui_button_create call) —
 -- armed/disarmed directly rather than via gdsGui_schematic_togglePaintMode,
 -- so this always matches what the button itself just displayed regardless
--- of whether the library's paintMode had already been auto-disarmed by an
--- empty-canvas tap since the last press (see love.update's poll below,
--- which corrects the button back to "released" when that happens). No
+-- of whether the library's paintMode had already been disarmed some other
+-- way (a mode switch or project reload — see love.update's poll below,
+-- which corrects the button back to "released" when that happens; a drag
+-- on empty canvas space while armed just pans the view instead, it's not a
+-- disarm). No
 -- isMenuOpen reentrancy guard needed, unlike schematicAddBtnPressed above —
 -- gdsGui_schematic_pressed checks canvas.menu before ever consulting
 -- canvas.paintMode, so arming it under an open menu is inert until that
@@ -1598,10 +3349,20 @@ function schematicDesignActionChosen(canvasName, index, optionText)
         gdsGui_schematic_removeSnapshot(canvasName, gdsGui_schematic_computeSignature(canvasName))
         _schematicDirty = true
         _saveCurrentSystem()
+    elseif optionText == "SNAPSHOT RESET" then
+        _openSnapshotResetConfirmMenu(canvasName)
     elseif optionText == "UNDO LAST ACTION" then
         gdsGui_schematic_undo(canvasName)
         _schematicDirty = true
         _saveCurrentSystem()
+    elseif optionText == "GATE RULES" then
+        _openGateRulesListMenu(canvasName)
+    elseif optionText == "ATTRIBUTION RULES" then
+        _openAttributionRulesListMenu(canvasName)
+    elseif optionText == "SUGGEST NEXT SNAPSHOT" then
+        _openSuggestNextSnapshotMenu(canvasName)
+    elseif optionText == "ELECTRICAL COLORS" then
+        _openElectricalColorsMenu(canvasName)
     elseif optionText == "RESET (CLEAR PAGE)" then
         -- RESET only ever reaches here via the sustained hold the DESIGN
         -- ACTIONS menu's own confirmIndex gates it behind (see
@@ -1615,7 +3376,7 @@ function schematicDesignActionChosen(canvasName, index, optionText)
         _clearMainCanvas()
         _schematicDirty = true
         _saveCurrentSystem()
-        gdsGui_outputTxtBox_setText("schematicSnapshotLabel", "SNAPSHOTS: 0")
+        _setSnapshotLabelText(0)
     end
 end
 
@@ -1634,10 +3395,10 @@ end
 -- The top landing point for the whole System Schematic flow.
 -------------------------------------------------------------------------------
 
--- The systems gallery's header reads "<aircraft name> [SYSTEMS]" once an
+-- The systems gallery's header reads "<AIRCRAFT NAME> SYSTEMS" once an
 -- aircraft is open, so it's clear at a glance whose systems are listed.
 local function _aircraftSystemsTitle(aircraft)
-    return aircraft.name .. " [SYSTEMS]"
+    return string.upper(aircraft.name) .. " SYSTEMS"
 end
 
 -- Keeps the "MY AIRCRAFT" button in sync with whether there's anything to
@@ -1648,66 +3409,10 @@ local function _refreshSchematicHomeAvailability()
         (#schematicStore.aircraft > 0) and "released" or "deactivated")
 end
 
--- Branches to either the existing NAME NEW AIRCRAFT flow or the import file
--- picker. gdsGui_choiceMenu_open (not the canvas/gallery modal menu system)
--- because SchematicHome has neither a schematic canvas nor a gallery widget
--- of its own to anchor a menu to — see choiceMenu_gdsGuiLib.lua's own header
--- comment on exactly this "a plain page with neither" case.
+-- Opens the NAME NEW AIRCRAFT prompt directly.
 function schematicHomeNewPressed()
-    gdsGui_choiceMenu_open("ADD AIRCRAFT", {"NEW AIRCRAFT", "IMPORT FROM FILE", "CANCEL"},
-        "schematicHomeAddChoiceMade", nil)
-end
-
-function schematicHomeAddChoiceMade(optionText)
-    if optionText == "NEW AIRCRAFT" then
-        gdsGui_textPrompt_open("NAME NEW AIRCRAFT", "Aircraft " .. schematicStore.nextAircraftNum, 24,
-            "schematicNewAircraftConfirmed", nil)
-    elseif optionText == "IMPORT FROM FILE" then
-        local candidates = _listImportableAircraftFiles()
-        if #candidates == 0 then
-            gdsGui_choiceMenu_open(
-                "No exported aircraft files found.\n\nCopy a '.json' export into the app's data " ..
-                "folder (Files app on iOS, or " .. love.filesystem.getSaveDirectory() .. " on desktop), " ..
-                "then try again.",
-                {"OK"}, "schematicImportNoticeDismissed", nil)
-            return
-        end
-        -- Each row's filename is unique by construction (export names
-        -- include os.time()) and is embedded in "[...]" at the end of its
-        -- own label -- gdsGui_choiceMenu_open's onSelect only ever gets the
-        -- chosen TEXT back, never an index, so that's what disambiguates
-        -- which file was actually picked (schematicImportFileChosen below).
-        local options = {}
-        for _, c in ipairs(candidates) do
-            table.insert(options, c.aircraftName .. "  [" .. c.fileName .. "]")
-        end
-        table.insert(options, "CANCEL")
-        gdsGui_choiceMenu_open("IMPORT WHICH AIRCRAFT?", options, "schematicImportFileChosen", nil)
-    end
-    -- "CANCEL" (or tapping outside): no-op.
-end
-
-function schematicImportFileChosen(optionText)
-    if optionText == "CANCEL" then return end
-    local fileName = optionText:match("%[(.-)%]$")
-    if not fileName then return end
-
-    local aircraft, err = _importAircraftFromJSONFile(fileName)
-    if aircraft then
-        gdsGui_schematicGallery_setItems("aircraftGallery", _aircraftGalleryItems())
-        _refreshSchematicHomeAvailability()
-        gdsGui_choiceMenu_open(
-            "Imported \"" .. aircraft.name .. "\" (" .. #aircraft.systems .. " system(s)).",
-            {"OK"}, "schematicImportNoticeDismissed", nil)
-    else
-        gdsGui_choiceMenu_open("Import failed: " .. (err or "unknown error"),
-            {"OK"}, "schematicImportNoticeDismissed", nil)
-    end
-end
-
--- No-op onSelect for the import flow's single-"OK" notice popups (empty
--- list / success / failure).
-function schematicImportNoticeDismissed()
+    gdsGui_textPrompt_open("NAME NEW AIRCRAFT", "Aircraft " .. schematicStore.nextAircraftNum, 24,
+        "schematicNewAircraftConfirmed", nil)
 end
 
 -- Holds the just-named aircraft's name while the required thumbnail-type
@@ -1779,12 +3484,12 @@ function schematicAircraftGallerySelected(galleryName, aircraftId)
     local aircraft = _findAircraft(aircraftId)
     if not aircraft then return end
     _manageMenuAircraftId = aircraftId
-    -- DELETE (index 4) is this menu's own confirmIndex row — holding IT down
+    -- DELETE (index 3) is this menu's own confirmIndex row — holding IT down
     -- for the usual hold duration is the whole confirmation, no separate
-    -- "DELETE \"X\"?" popup. OPEN AIRCRAFT/RENAME/EXPORT/CANCEL stay plain-tap.
+    -- "DELETE \"X\"?" popup. OPEN AIRCRAFT/RENAME/CANCEL stay plain-tap.
     gdsGui_schematicGallery_openMenu(galleryName, aircraft.name,
-        {"OPEN AIRCRAFT", "RENAME", "EXPORT", "DELETE", "CANCEL"},
-        "schematicAircraftActionChosen", nil, 4)
+        {"OPEN AIRCRAFT", "RENAME", "DELETE", "CANCEL"},
+        "schematicAircraftActionChosen", nil, 3)
 end
 
 -- Deleting an aircraft cascades to every system it owns (they live only
@@ -1802,15 +3507,6 @@ function schematicAircraftActionChosen(galleryName, index, optionText)
         if aircraft then
             gdsGui_textPrompt_open("RENAME AIRCRAFT", aircraft.name, 24, "schematicAircraftRenameConfirmed", nil)
         end
-    elseif optionText == "EXPORT" then
-        local aircraft = _findAircraft(_manageMenuAircraftId)
-        local fileName = aircraft and _exportAircraftToJSON(_manageMenuAircraftId)
-        if fileName then
-            gdsGui_schematicGallery_openMenu(galleryName,
-                "Exported \"" .. aircraft.name .. "\" to:\n" .. fileName ..
-                "\n\nSaved in the app's data folder:\n" .. love.filesystem.getSaveDirectory(),
-                {"OK"}, "schematicExportNoticeDismissed", nil)
-        end
     elseif optionText == "DELETE" and _manageMenuAircraftId then
         for i = #schematicStore.aircraft, 1, -1 do
             if schematicStore.aircraft[i].id == _manageMenuAircraftId then
@@ -1826,8 +3522,15 @@ function schematicAircraftActionChosen(galleryName, index, optionText)
         gdsGui_schematicGallery_setItems("aircraftGallery", _aircraftGalleryItems())
         _refreshSchematicHomeAvailability()
         _manageMenuAircraftId = nil
+        -- Deleted the last aircraft: AircraftGallery would otherwise just
+        -- sit there empty, so step back up to SchematicHome where NEW
+        -- AIRCRAFT is one tap away instead of two.
+        if #schematicStore.aircraft == 0 then
+            _navSyncAll("SchematicHome")
+            gdsGui_page_switch("LoadingSchematicHome", 9, 2, false)
+        end
     end
-    -- "CANCEL" (or tapping outside), OPEN AIRCRAFT, RENAME, and EXPORT all
+    -- "CANCEL" (or tapping outside), OPEN AIRCRAFT, and RENAME all
     -- leave _manageMenuAircraftId set — RENAME's text prompt confirms later,
     -- asynchronously, and still needs it; it's simply overwritten next time
     -- an aircraft tile is tapped.
@@ -1993,23 +3696,36 @@ local function _applyFontSize(fontSize)
         -- learn page content
         "timerLearnContent", "windLearnContent", "calcLearnContent",
         "dutyLearnContent", "settingsLearnContent",
-        -- page header titles (all pages) — schematic_pageTitle is handled
-        -- separately below: unlike every other page's title, its text is a
-        -- user-renameable system name of arbitrary length, so it needs the
-        -- shrink-to-fit variant instead of a flat setFontSize (see
-        -- gdsGui_outputTxtBox_setFontSizeToFit's comment).
+        -- page header titles (all pages) — schematic_pageTitle and the
+        -- three schematic header readouts (zoom/snapshot/combination) are
+        -- handled separately below: unlike every other page's title/
+        -- readout, their text is variable-length (a user-renameable system
+        -- name; a growing snapshot/combination count; a trailing
+        -- " (PREDICTED)"), so they need the shrink-to-fit variant instead
+        -- of a flat setFontSize (see gdsGui_outputTxtBox_setFontSizeToFit's
+        -- comment) to guarantee they never wrap onto a second line.
         "mainMenu_pageTitle", "learn_pageTitle", "settings_pageTitle", "tc_pageTitle",
         "schematicHome_pageTitle", "schematicManage_pageTitle",
         "aircraftGallery_pageTitle",
         -- terms and conditions body
         "tcText",
-        -- system schematic page readouts
-        "schematicSnapshotLabel", "schematicZoomLabel", "schematicCombLabel",
     }
     for _, name in ipairs(names) do
         gdsGui_outputTxtBox_setFontSize(name, fontSize)
     end
     gdsGui_outputTxtBox_setFontSizeToFit("schematic_pageTitle", fontSize, 10)
+    -- Re-fit each at whatever text is CURRENTLY showing rather than
+    -- recomputing it — idempotent, same "re-display what's already there
+    -- at the new size" shape as schematic_pageTitle just above. Safe
+    -- before any system is ever opened too: mainCanvas (and its empty
+    -- snapshots table) already exists by the time love.load() first calls
+    -- this (see gdsGui_schematic_create's own call site), and
+    -- _prevSchematicZoomText/_prevSchematicCombText fall back to each
+    -- box's own initial create-time text before the first live poll ever
+    -- runs (see the per-frame polling block further down).
+    _setSnapshotLabelText(gdsGui_schematic_countSnapshots("mainCanvas"))
+    _setHeaderReadoutText("schematicZoomLabel", _prevSchematicZoomText or "1.0x", 10)
+    _setHeaderReadoutText("schematicCombLabel", _prevSchematicCombText or "[1/1]", 8)
     gdsGui_outputTxtBox_setFontSize("dutyWarningBox", math.max(8, fontSize - 2))
     gdsGui_outputTxtBox_setText("fontSizeLabel", "FONT SIZE: " .. fontSize .. "pt")
     for _, sb in ipairs(globApp.objects.scrollBars) do
@@ -2200,11 +3916,31 @@ function love.load()
     -- app yet) flipped true by the Simulate Purchase button on the paywall page.
     if appSettings.schematicUnlocked == nil then appSettings.schematicUnlocked = false end
     if appSettings.schematicEditMode == nil then appSettings.schematicEditMode = true  end
-    -- True if the app was sitting on the SystemSchematic/SchematicFullScreen
-    -- page the last time it quit or was backgrounded (see love.quit/
-    -- love.focus below) — lets a cold boot resume straight back into that
-    -- page/system/mode instead of always landing on MainMenu first.
-    if appSettings.schematicResumeActive == nil then appSettings.schematicResumeActive = false end
+    -- Which schematic-flow page (SchematicHome/AircraftGallery/
+    -- SchematicManageGallery/SystemSchematic) the app was sitting on the last
+    -- time it quit or was backgrounded (see love.quit/love.focus below), or
+    -- nil if it wasn't in the schematic flow at all — lets a cold boot resume
+    -- straight back into that exact page (and system/mode, for the canvas)
+    -- instead of always landing on MainMenu first.
+    if appSettings.schematicLastPage == nil then appSettings.schematicLastPage = false end
+    -- A user-chosen override for the ELECTRICAL medium's powered/unpowered
+    -- display colors (see schematicPoweredColorChosen/
+    -- schematicUnpoweredColorChosen below) — nil means "use
+    -- model/media/electrical.lua's own default yellow/gray". Applied here,
+    -- once, since ELECTRICAL_MEDIUM is a single shared module table
+    -- (require() caches it) consulted by both forward prediction
+    -- (_solveCurrentSchematic) and backward deduction (_stateForColor) —
+    -- overriding it here keeps both consistent without touching either.
+    if appSettings.electricalPoweredColor then ELECTRICAL_MEDIUM.style.powered = appSettings.electricalPoweredColor end
+    if appSettings.electricalUnpoweredColor then ELECTRICAL_MEDIUM.style.unpowered = appSettings.electricalUnpoweredColor end
+    -- Voltage -> powered color is PER-SYSTEM (canvas.voltageColors — see
+    -- _clearMainCanvas/_openSystemIntoCanvas below), not an appSettings
+    -- global: every source sharing a nominal VOLTAGE within the SAME system
+    -- shares a display color automatically, picked once (see
+    -- _ensureVoltageHasColor) and reused for the rest of that system's
+    -- life — but a fresh system (a brand new one, or re-creating one after
+    -- deleting it or its whole aircraft) starts with no voltage colors
+    -- taught at all, same as it starts with no snapshots/rules taught.
     _syncPaidLoadingScreenSkip()
 
     -- Loads the aircraft/systems store (see _loadSchematicStoreSafely for the
@@ -2214,6 +3950,13 @@ function love.load()
     -- systems, or seeds a demo system on a genuinely fresh install, so Home's
     -- NEW/MY AIRCRAFT galleries are never confusingly empty on first run.
     local _schematicLoadStatus = _loadSchematicStoreSafely()
+    -- Captured here, before the nil/legacy-migration branches below (or the
+    -- repair save further down) can touch schematicStore.savedByAppVersion —
+    -- see _schematicJustUpdatedNoSystemOpen's declaration above.
+    _schematicJustUpdatedNoSystemOpen = schematicStore ~= nil
+        and schematicStore.savedByAppVersion ~= nil
+        and schematicStore.savedByAppVersion ~= APP_VERSION
+        and schematicStore.currentSystemId == nil
     if schematicStore == nil then
         local migratedSystems = {}
         gdsGui_saveLoad_loadFileContents("schematicDesign.lua")
@@ -2866,6 +4609,22 @@ function love.load()
         0.97, schCanvasYFrac + 2 * (36 + 10) / globApp.safeScreenArea.h, "RT", 36, 36,
         "schematicAnnunciatorBtnPressed", globApp.BUTTON_STATES.RELEASED, true, nil
     )
+    -- AI: docked directly below ANNUNCIATOR, same floating-chrome
+    -- convention and sticky "toggle" type (stays open across any number of
+    -- taps, same as PAINT/ANNUNCIATOR). Deliberately NOT one of
+    -- _SCHEMATIC_DOCK_TOOLS' mutually-exclusive set, unlike those three —
+    -- it's a read-only info overlay (see drawSchematicAiPanel), so there's
+    -- no reason it couldn't stay open alongside PAINT or an ADD placement;
+    -- it just sits in its own fixed slot below them, toggled independently
+    -- (schematicAiBtnPressed). Design-mode only, same enable/disable
+    -- gating SNAPSHOT/ADD/PAINT/ANNUNCIATOR use.
+    gdsGui_button_create("schematicAiBtn", "SystemSchematic", "toggle",
+        "Sprites/button_schematicAi_pressed.png",
+        "Sprites/button_schematicAi_released.png",
+        "Sprites/button_schematicAi_deactivated.png",
+        0.97, schCanvasYFrac + 3 * (36 + 10) / globApp.safeScreenArea.h, "RT", 36, 36,
+        "schematicAiBtnPressed", globApp.BUTTON_STATES.RELEASED, true, nil
+    )
     _schematicDockX = 0.97
     _schematicDockSlotY[_SCHEMATIC_DOCK_TOOLS.add]         = schCanvasYFrac
     _schematicDockSlotY[_SCHEMATIC_DOCK_TOOLS.paint]       = schCanvasYFrac + (36 + 10) / globApp.safeScreenArea.h
@@ -2892,28 +4651,33 @@ function love.load()
         1, 0.5, "RC", 32, 64,
         "schematicCombNextPressed", globApp.BUTTON_STATES.DEACTIVATED, true, nil
     )
-    -- Narrowed from the old full-width centered box (and anchored off the
-    -- opposite side of center) to leave room for schematicZoomLabel right
-    -- beside it, so the pair reads as one centered row: "SNAPSHOTS: 0  1.0x".
-    gdsGui_outputTxtBox_create("schematicSnapshotLabel", "SystemSchematic", nil,
-        0.48, schLabelYFrac, "RT", _w(150), 20,
-        colorYellow, "SNAPSHOTS: 0", 12, nil
-    )
+    -- One header row, left to right: ZOOM (shortest, fixed-ish length —
+    -- "999.9x" never gets much longer) — SNAPSHOT — COMBINATION (longest
+    -- and most variable, since it can grow a trailing " (PREDICTED)" — see
+    -- its own creation comment below). ZOOM moved to the far left (was
+    -- 0.52, center-ish) specifically to free up the wide middle-to-right
+    -- span for the other two, which need it far more. All three rely on
+    -- _setHeaderReadoutText's shrink-to-fit, not generous width alone, to
+    -- actually guarantee no wrap — the widths below are a reasonable
+    -- starting budget, not a hard requirement to fit at full font size.
     gdsGui_outputTxtBox_create("schematicZoomLabel", "SystemSchematic", nil,
-        0.52, schLabelYFrac, "LT", _w(60), 20,
+        0.02, schLabelYFrac, "LT", _w(55), 20,
         colorYellow, "1.0x", 12, nil
+    )
+    gdsGui_outputTxtBox_create("schematicSnapshotLabel", "SystemSchematic", nil,
+        0.21, schLabelYFrac, "LT", _w(85), 20,
+        colorYellow, "SNAP: 0", 12, nil
     )
     -- COMBINATION readout — [current/total] of every possible control-
     -- position combination, plus a checkmark that's green once a snapshot
     -- has been captured for whichever combination is currently showing
-    -- (gray/empty otherwise). Sits right of schematicZoomLabel, same row.
-    -- Widened from the old 46px so multi-digit totals (e.g. "[12/16]")
-    -- never wrap to a second line (see _buildLines' getWrap in
-    -- outputTxtBox_gdsGuiLib.lua — wrap is width-triggered, so staying
-    -- comfortably under the available gap before schematicCombCheckIcon
-    -- is what keeps this box single-line).
+    -- (gray/empty otherwise), and a trailing " (PREDICTED)" (Phase 5) when
+    -- the shown color is only a model guess, not an authored snapshot —
+    -- by far the longest string any of these three readouts ever shows, so
+    -- it gets the largest share of the row, immediately left of
+    -- schematicCombCheckIcon.
     gdsGui_outputTxtBox_create("schematicCombLabel", "SystemSchematic", nil,
-        0.72, schLabelYFrac, "LT", _w(66), 20,
+        0.49, schLabelYFrac, "LT", _w(140), 20,
         colorYellow, "[1/1]", 12, nil
     )
     -- fontSize 10 (not 1) despite this box showing no text of its own: love's
@@ -2937,7 +4701,7 @@ function love.load()
     -- leftward out of its own dock button — see
     -- _annunciatorPanelGeometry in schematic_gdsGuiLib.lua.
     gdsGui_schematic_setAnnunciatorButtonName("mainCanvas", "schematicAnnunciatorBtn")
-    gdsGui_schematic_setBackgroundImage("mainCanvas", "Sprites/bg_schematicCanvas.png")
+    gdsGui_schematic_setBackgroundImage("mainCanvas", CANVAS_BACKGROUND_DEFAULT)
     gdsGui_schematic_setCornerBackgroundImage("mainCanvas", "Sprites/bg_schematicCanvasCorner.png")
     gdsGui_schematic_setCornerRightBackgroundImage("mainCanvas", "Sprites/bg_schematicCanvasCornerRight.png")
     gdsGui_schematic_setCornerTopRightBackgroundImage("mainCanvas", "Sprites/bg_schematicCanvasCornerTopRight.png")
@@ -2946,6 +4710,11 @@ function love.load()
     -- so in-progress work survives a quit/background without waiting for the
     -- next page-nav save point.
     _findSchematicCanvas().onChange = "schematicCanvasChanged"
+    -- Fires once, right after a freshly-placed element/control is named —
+    -- see schematicSourceElementPlaced below, which chains straight into the
+    -- VOLTAGE prompt for a "source"-role item (BATTERY, GENERATOR, ...) and
+    -- ignores everything else.
+    _findSchematicCanvas().onElementPlaced = "schematicSourceElementPlaced"
     -- Starts empty: the canvas is only ever populated by an explicit NEW
     -- SYSTEM or OPEN action from the aircraft flow (see _openSystemIntoCanvas above).
     _schematicCanvasNormalLayout = { x = schCanvasXFrac, y = schCanvasYFrac, anchorPoint = "LT", wFrac = schCanvasWFrac, hFrac = schCanvasHFrac }
@@ -3056,22 +4825,56 @@ function love.load()
     -- mainCanvas starts empty; _openSystemIntoCanvas() sets its mode and the
     -- dock button states the moment a system is actually opened, so there is
     -- nothing to initialise here — UNLESS this boot is resuming straight back
-    -- into a system the user was actively looking at when the app last quit
-    -- or backgrounded (appSettings.schematicResumeActive — see
-    -- _saveSchematicResumeState), in which case it's loaded right here before
-    -- the very first page switch below ever lands on MainMenu at all.
+    -- into whichever schematic-flow page the user was actually looking at
+    -- when the app last quit or backgrounded (appSettings.schematicLastPage —
+    -- see _saveSchematicResumeState), in which case that page's own setup is
+    -- done right here before the very first page switch below ever lands on
+    -- MainMenu at all.
     local showTC = (appSettings.tcAcceptedVersion ~= APP_VERSION)
-    local resumeSystem = (not showTC) and appSettings.schematicResumeActive and appSettings.schematicUnlocked
-        and _findSystem(schematicStore.currentSystemId)
+    local lastSchematicPage = (not showTC) and appSettings.schematicUnlocked and appSettings.schematicLastPage
+
+    local resumeSystem = lastSchematicPage == "SystemSchematic" and _findSystem(schematicStore.currentSystemId)
+    local resumeAircraft = lastSchematicPage == "SchematicManageGallery" and _findCurrentAircraft()
 
     if resumeSystem then
         _openSystemIntoCanvas(resumeSystem.id, appSettings.schematicEditMode and "design" or "control")
         _navSyncAll("SystemSchematic")
         gdsGui_page_switch("LoadingSchematic", 7, 3, false)
+    elseif resumeAircraft then
+        gdsGui_schematicGallery_setItems("manageGallery", _systemGalleryItems(resumeAircraft))
+        gdsGui_outputTxtBox_setText("schematicManage_pageTitle", _aircraftSystemsTitle(resumeAircraft))
+        _navSyncAll("SchematicManageGallery")
+        gdsGui_page_switch("LoadingSchematicManage", 11, 2, false)
+    elseif lastSchematicPage == "AircraftGallery" then
+        gdsGui_schematicGallery_setItems("aircraftGallery", _aircraftGalleryItems())
+        _navSyncAll("AircraftGallery")
+        gdsGui_page_switch("LoadingAircraftGallery", 12, 2, false)
+    elseif lastSchematicPage == "SchematicHome" and _schematicJustUpdatedNoSystemOpen then
+        -- Was sitting on the aircraft picker with no system ever opened, and
+        -- an update was just installed over the previous build — resume
+        -- into AircraftGallery instead (see _schematicJustUpdatedNoSystemOpen).
+        gdsGui_schematicGallery_setItems("aircraftGallery", _aircraftGalleryItems())
+        _navSyncAll("AircraftGallery")
+        gdsGui_page_switch("LoadingAircraftGallery", 12, 2, false)
+    elseif lastSchematicPage == "SchematicHome" then
+        _refreshSchematicHomeAvailability()
+        _navSyncAll("SchematicHome")
+        gdsGui_page_switch("LoadingSchematicHome", 9, 2, false)
     else
         _navSyncAll("MainMenu")
         gdsGui_page_switch("IntialBooting", showTC and 4 or 3, 3, false)
     end
+    -- This boot's resume decision is made exactly once, right above, no
+    -- matter which branch fired -- so _schematicJustUpdatedNoSystemOpen's
+    -- job is done the moment we get here. Clearing it unconditionally (not
+    -- just inside the branch that actually read it) matters because the
+    -- resumeAircraft/AircraftGallery branches above can each fire with the
+    -- flag still true (lastSchematicPage was SchematicManageGallery/
+    -- AircraftGallery, not SchematicHome, so they never check it) -- leaving
+    -- it set would make the first later navBackToSchematicHome() call this
+    -- session (e.g. the "<" back button) wrongly redirect to AircraftGallery
+    -- again instead of actually stepping up to SchematicHome.
+    _schematicJustUpdatedNoSystemOpen = false
 
     -- Initialize starting time
     timer.t = 0
@@ -3194,9 +4997,12 @@ function love.update(dt)
     local schematicZoom = gdsGui_schematic_getZoom("mainCanvas")
     if schematicZoom then
         local zoomText = string.format("%.1fx", schematicZoom)
-        if zoomText ~= _prevSchematicZoomText then
+        -- Also re-fits on every resize, not just a text change — see
+        -- schematicSnapshotLabel's own resize-refit comment further down,
+        -- same reasoning applies to every one of these three readouts.
+        if zoomText ~= _prevSchematicZoomText or globApp.resizeDetected then
             _prevSchematicZoomText = zoomText
-            gdsGui_outputTxtBox_setText("schematicZoomLabel", zoomText)
+            _setHeaderReadoutText("schematicZoomLabel", zoomText, 10)
         end
     end
 
@@ -3221,20 +5027,34 @@ function love.update(dt)
             _schematicCombIndex = gdsGui_schematic_getCombinationIndex("mainCanvas")
             _schematicCombTotal = gdsGui_schematic_getCombinationTotal("mainCanvas")
             _schematicCombSig   = gdsGui_schematic_computeSignature("mainCanvas")
+            -- A control tap in control mode (gdsGui_schematic_general's touch
+            -- handler cycles detentIndex directly, with no app-layer callback
+            -- of its own — catalog items don't set one) lands here same as
+            -- add/remove/undo/reload: _schematicCombControlsChanged already
+            -- catches every way a control's detentIndex can change, so this
+            -- is the one place that covers all of them, not just PREV/NEXT.
+            _applySolvedColorsToCurrentCombination()
         end
         local combIndex = _schematicCombIndex
         local combTotal = _schematicCombTotal
-        local combText = string.format("[%d/%d]", combIndex, combTotal)
-        if combText ~= _prevSchematicCombText then
-            _prevSchematicCombText = combText
-            gdsGui_outputTxtBox_setText("schematicCombLabel", combText)
-        end
-
         -- Not gated behind _schematicCombControlsChanged above — a snapshot
         -- capture/delete changes canvas.snapshots without changing any
         -- control's id/detentIndex/numDetents, so this stays a fresh,
         -- cheap (O(1) hash lookup) check every frame off of _schematicCombSig.
         local hasSnap = gdsGui_schematic_hasSnapshot("mainCanvas", _schematicCombSig)
+        -- "(PREDICTED)" (Phase 5) only ever applies when there's no exact
+        -- authored snapshot for this combination at all — an authored
+        -- snapshot always wins outright (resolveColor's tier 1/2), so
+        -- checking isColorPredicted would be redundant/never true there.
+        local isPredicted = not hasSnap and _currentCombinationHasPredictedColor("mainCanvas", _schematicCombSig)
+        local combText = string.format("[%d/%d]", combIndex, combTotal) .. (isPredicted and " (PREDICTED)" or "")
+        -- Also re-fits on every resize, not just a text change — see
+        -- schematicSnapshotLabel's own resize-refit comment further down,
+        -- same reasoning applies to every one of these three readouts.
+        if combText ~= _prevSchematicCombText or globApp.resizeDetected then
+            _prevSchematicCombText = combText
+            _setHeaderReadoutText("schematicCombLabel", combText, 8)
+        end
         if hasSnap ~= _prevSchematicCombHasSnapshot then
             _prevSchematicCombHasSnapshot = hasSnap
             gdsGui_outputTxtBox_setBgSprite("schematicCombCheckIcon",
@@ -3303,10 +5123,17 @@ function love.update(dt)
             gdsGui_button_setState("schematicCombNextBtn", state)
         end
 
+        -- Also re-fits on every resize (not just a count change): a resize
+        -- narrows/widens schematicSnapshotLabel's own frame (see
+        -- outputTxtBox_gdsGuiLib.lua's _recalculate_textBox), but that pass
+        -- only re-wraps at whatever font is CURRENTLY set — it never re-
+        -- shrinks/re-grows it, so without this the label could still wrap
+        -- after the window is resized smaller than whatever width it was
+        -- last fit to.
         local snapCount = gdsGui_schematic_countSnapshots("mainCanvas")
-        if snapCount ~= _prevSchematicSnapshotCount then
+        if snapCount ~= _prevSchematicSnapshotCount or globApp.resizeDetected then
             _prevSchematicSnapshotCount = snapCount
-            gdsGui_outputTxtBox_setText("schematicSnapshotLabel", "SNAPSHOTS: " .. snapCount)
+            _setSnapshotLabelText(snapCount)
         end
     end
 
@@ -3318,6 +5145,7 @@ function love.update(dt)
 
     -- Update GUI
     gdsGui_update(dt)
+    _syncAiPanelInputBlock()
 
     -- Fires the one-time-per-APP_VERSION schematic data compatibility notice
     -- (built in love.load(), see _buildSchematicCompatNotice) the first
@@ -3422,6 +5250,9 @@ function love.draw()
     -- Same reasoning as PAINT's palette above — a non-modal slide-out panel,
     -- not a dimmed modal like the menu overlay.
     gdsGui_schematic_drawAnnunciatorPanelOverlay(gdsGui_page_currentName())
+    -- Same non-modal reasoning as the two immediately above — see
+    -- drawSchematicAiPanel's own comment.
+    drawSchematicAiPanel()
     gdsGui_schematicGallery_drawMenuOverlay(gdsGui_page_currentName())
     -- The text-entry prompt and the option-list menu are each a single global
     -- modal (not page-scoped), drawn above everything else when open. Only
@@ -3442,24 +5273,41 @@ end
 -- schematicFullScreenTogglePressed) shows/edits the same live mainCanvas as
 -- SystemSchematic, just reassigned to its own page — so it needs the same
 -- save-on-quit/background coverage.
+-- Every page that's part of the schematic flow, i.e. reachable from the
+-- footer dock icon without leaving it. SchematicFullScreen maps back onto
+-- "SystemSchematic" below — it's the same live canvas on its own page, not a
+-- distinct place to resume into.
+local _SCHEMATIC_FLOW_PAGES = {
+    SystemSchematic        = true,
+    SchematicFullScreen    = true,
+    SchematicHome          = true,
+    AircraftGallery        = true,
+    SchematicManageGallery = true,
+}
+
 local function _isOnSchematicPage()
-    local name = gdsGui_page_currentName()
-    return name == "SystemSchematic" or name == "SchematicFullScreen"
+    return _SCHEMATIC_FLOW_PAGES[gdsGui_page_currentName()] == true
 end
 
 -- Called from both love.quit() and love.focus(false) below — same "the app
--- is about to stop running right now" moment either covers. Persists
--- schematicResumeActive alongside the content save so a later cold boot
--- (see love.load()'s own resume check) knows whether to land straight back
--- on the schematic page or fall through to the normal MainMenu start.
--- schematicStore.currentAircraftId/currentSystemId and appSettings.
--- schematicEditMode already track WHICH system/mode to reopen — this is only
--- the "were they actually looking at it when they left" bit on top of that.
+-- is about to stop running right now" moment either covers. Persists exactly
+-- which schematic-flow page (if any) was on screen, alongside the content
+-- save, so a later cold boot (see love.load()'s own resume check) knows
+-- whether to land straight back on that same page or fall through to the
+-- normal MainMenu start. schematicStore.currentAircraftId/currentSystemId
+-- and appSettings.schematicEditMode already track WHICH aircraft/system/mode
+-- to reopen — this is only the "which screen were they actually looking at"
+-- bit on top of that.
 local function _saveSchematicResumeState()
+    local pageName = gdsGui_page_currentName()
     local onSchematic = _isOnSchematicPage()
-    if onSchematic then _saveCurrentSystem() end
-    if appSettings.schematicResumeActive ~= onSchematic then
-        appSettings.schematicResumeActive = onSchematic
+    if pageName == "SystemSchematic" or pageName == "SchematicFullScreen" then
+        _saveCurrentSystem()
+        pageName = "SystemSchematic"
+    end
+    local newLastPage = onSchematic and pageName or false
+    if appSettings.schematicLastPage ~= newLastPage then
+        appSettings.schematicLastPage = newLastPage
         _saveAppSettings()
     end
 end
@@ -3917,6 +5765,20 @@ function navBackToSchematicHome()
         gdsGui_page_switch("LoadingPaywall", 8, 2, false)
         return
     end
+    -- An update was just installed over the previous build, and no system
+    -- was ever opened last session — land on AircraftGallery instead of the
+    -- aircraft picker, so existing aircraft are immediately visible (see
+    -- _schematicJustUpdatedNoSystemOpen). Cleared immediately after use: this
+    -- function is also AircraftGallery's own back-button callback, so if the
+    -- flag stayed set it would just bounce the user right back to
+    -- AircraftGallery instead of actually stepping up to SchematicHome.
+    if _schematicJustUpdatedNoSystemOpen then
+        _schematicJustUpdatedNoSystemOpen = false
+        gdsGui_schematicGallery_setItems("aircraftGallery", _aircraftGalleryItems())
+        _navSyncAll("AircraftGallery")
+        gdsGui_page_switch("LoadingAircraftGallery", 12, 2, false)
+        return
+    end
     _refreshSchematicHomeAvailability()
     _navSyncAll("SchematicHome")
     gdsGui_page_switch("LoadingSchematicHome", 9, 2, false)
@@ -4024,6 +5886,9 @@ function schematicModeToggled(newState)
     gdsGui_button_setHidden("schematicPaintBtn", not designing)
     gdsGui_button_setState("schematicAnnunciatorBtn", designing and "released" or "deactivated")
     gdsGui_button_setHidden("schematicAnnunciatorBtn", not designing)
+    gdsGui_button_setState("schematicAiBtn", designing and "released" or "deactivated")
+    gdsGui_button_setHidden("schematicAiBtn", not designing)
+    if not designing then _aiPanelOpen = false end
     gdsGui_button_setState("schematicFullScreenToggle", designing and "deactivated" or "released")
     _saveAppSettings()
 end
@@ -4075,6 +5940,21 @@ end
 -- Captures the current control-position combination's element/wire colors as
 -- a snapshot rule. If a snapshot already exists for this exact combination
 -- with DIFFERENT colors, that's a contradiction: prompt before overwriting.
+-- Otherwise, if the about-to-be-captured colors contain a provable
+-- MISMATCH — a node/wire whose color contradicts the only source that can
+-- possibly reach it, same flat-contradiction check _computeAiPanelStats'
+-- own structuralColorMismatches runs AFTER the fact on an already-saved
+-- snapshot, just run here BEFORE commit instead — warns and requires
+-- confirmation rather than silently saving a provably-wrong color. Failing
+-- that, if the combination has any genuinely-ambiguous, rule-uncovered
+-- color showing right now, prompts to confirm those are correct before
+-- committing them — capturing one as-is bakes its current guessed color in
+-- exactly as if it had been hand-painted (gdsGui_schematic_resolveColor's
+-- predictedColor tier is what prepareSnapshot already reads for an
+-- unpainted node — there's no separate "confirmed" flag, so "capture as
+-- shown" and "paint this exact same color first" produce byte-identical
+-- snapshot data), which is exactly what lets a correct guess count as real
+-- evidence without forcing a redundant repaint.
 function captureSchematicSnapshot()
     -- Same guard as schematicContextButtonPressed above: don't clobber an
     -- in-progress ADD ELEMENT/CONTROL cascade (or any other open canvas
@@ -4085,13 +5965,146 @@ function captureSchematicSnapshot()
         _pendingSnapshotPlan = plan
         gdsGui_schematic_openMenu("mainCanvas", "CONFLICTS WITH EXISTING SNAPSHOT",
             {"OVERWRITE", "CANCEL"}, "schematicSnapshotConflictResolved", "schematicSnapshotConflictResolved", 1)
-    else
-        gdsGui_schematic_commitSnapshot("mainCanvas", plan)
-        gdsGui_outputTxtBox_setText("schematicSnapshotLabel", "SNAPSHOTS: " .. gdsGui_schematic_countSnapshots("mainCanvas"))
-        _requestSchematicSave()
-        if appSettings.hapticsEnabled and love.system.vibrate then love.system.vibrate(0.1) end
-        if appSettings.soundEnabled and singleChimeSound then love.audio.play(singleChimeSound) end
+        return
     end
+
+    local canvas = _findSchematicCanvas()
+    -- Every powered node in the LIVE current combination whose displayed
+    -- color is a genuinely-ambiguous, rule-uncovered guess (the same
+    -- "confidence 0" case _aiColorAttributionConfidence flags), OR a
+    -- provable single-source MISMATCH against the PLAN's own
+    -- about-to-be-captured color. Mirrors _solveCurrentSchematic's own
+    -- canvas.rules-aware branching and open-gate wire-anchor logic so
+    -- neither list ever disagrees with what's actually on screen.
+    local ambiguous, mismatches = {}, {}
+    if canvas then
+        local componentTypes = _buildComponentTypeMap(canvas)
+        if next(componentTypes) ~= nil then
+            local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes)
+            local sourceStates = _currentSourceStates(canvas, componentTypes)
+            local gateStates = _currentGateStates(canvas, componentTypes)
+
+            local nodeStates
+            if canvas.rules and next(canvas.rules) ~= nil then
+                local rulesByGate = {}
+                for gateId, rule in pairs(canvas.rules) do
+                    if rule and (rule.status == "learned" or rule.status == "locked") and not gateStates[gateId] then
+                        rulesByGate[gateId] = rule
+                    end
+                end
+                nodeStates = ModelSolver.solveWithRules(graph, sourceStates, gateStates, rulesByGate).nodeStates
+            else
+                nodeStates = ModelSolver.solve(graph, sourceStates, gateStates)
+            end
+
+            local attribution = ModelSolver.solveSourceAttribution(graph, sourceStates, gateStates)
+            local labelsById = _labelsByIdForCanvas(canvas)
+
+            for id, state in pairs(nodeStates) do
+                if state == ModelSolver.POWERED and _aiColorAttributionConfidence(canvas, attribution, nodeStates, id, gateStates, sourceStates) == 0 then
+                    local contributorIds = {}
+                    for sourceId in pairs(attribution[id] or {}) do table.insert(contributorIds, sourceId) end
+                    table.sort(contributorIds)
+                    local contributorLabels = {}
+                    for _, sourceId in ipairs(contributorIds) do
+                        table.insert(contributorLabels, labelsById[sourceId] or sourceId)
+                    end
+                    table.insert(ambiguous, (labelsById[id] or id) .. " (currently showing "
+                        .. table.concat(contributorLabels, "/") .. "'s guess)")
+                end
+            end
+            table.sort(ambiguous)
+
+            local function colorsEqual(a, b)
+                if not a or not b then return false end
+                for i = 1, 3 do if math.abs((a[i] or 0) - (b[i] or 0)) > 0.02 then return false end end
+                return true
+            end
+            -- nil when contributingIds isn't provably a single source
+            -- (genuinely ambiguous, or that one source has no registered
+            -- voltage to compare against) — left to the AMBIGUOUS check
+            -- above instead, never flagged here as a flat contradiction.
+            local function expectedColorAndSource(contributingIds)
+                if not contributingIds or _isGenuinelyColorAmbiguous(canvas, contributingIds) then return nil end
+                local onlySourceId
+                for sourceId in pairs(contributingIds) do onlySourceId = sourceId end
+                if not onlySourceId then return nil end
+                local entity = _findSourceEntity(canvas, onlySourceId)
+                local voltage = entity and entity.voltage
+                if not voltage then return nil end
+                return _colorForVoltage(canvas, voltage, ELECTRICAL_MEDIUM.style.powered), onlySourceId
+            end
+
+            for _, e in ipairs(canvas.elements) do
+                if nodeStates[e.id] == ModelSolver.POWERED then
+                    local expected, sourceId = expectedColorAndSource(attribution[e.id])
+                    local painted = plan.elements[e.id]
+                    if expected and painted and not colorsEqual(expected, painted) then
+                        table.insert(mismatches, (labelsById[e.id] or e.id)
+                            .. " (expected " .. (labelsById[sourceId] or sourceId) .. "'s color)")
+                    end
+                end
+            end
+            for _, c in ipairs(canvas.controls) do
+                -- An open gate's or off source's own body always displays
+                -- flat unpowered gray regardless of attribution (see
+                -- _solveCurrentSchematic's own isOpenGate/isOffSource
+                -- override) — checking it against its source's color would
+                -- be a false positive, not a real contradiction.
+                local isOpenGate = componentTypes[c.id] == "gate" and not _isActivePosition(c)
+                local isOffSource = componentTypes[c.id] == "source" and not sourceStates[c.id]
+                if nodeStates[c.id] == ModelSolver.POWERED and not isOpenGate and not isOffSource then
+                    local expected, sourceId = expectedColorAndSource(attribution[c.id])
+                    local painted = plan.controls[c.id]
+                    if expected and painted and not colorsEqual(expected, painted) then
+                        table.insert(mismatches, (labelsById[c.id] or c.id)
+                            .. " (expected " .. (labelsById[sourceId] or sourceId) .. "'s color)")
+                    end
+                end
+            end
+            for _, w in ipairs(canvas.wires) do
+                local fromState, toState = nodeStates[w.fromElementId], nodeStates[w.toElementId]
+                if fromState == ModelSolver.POWERED and toState == ModelSolver.POWERED then
+                    local fromIsOpenGate = componentTypes[w.fromElementId] == "gate" and gateStates[w.fromElementId] ~= "closed"
+                    local toIsOpenGate = componentTypes[w.toElementId] == "gate" and gateStates[w.toElementId] ~= "closed"
+                    local anchorId = (fromIsOpenGate and not toIsOpenGate) and w.toElementId or w.fromElementId
+                    local expected, sourceId = expectedColorAndSource(attribution[anchorId])
+                    local painted = plan.wires[w.id]
+                    if expected and painted and not colorsEqual(expected, painted) then
+                        table.insert(mismatches, (labelsById[w.id] or w.id)
+                            .. " (expected " .. (labelsById[sourceId] or sourceId) .. "'s color)")
+                    end
+                end
+            end
+            table.sort(mismatches)
+        end
+    end
+
+    if #mismatches > 0 then
+        _pendingSnapshotPlan = plan
+        gdsGui_schematic_openMenu("mainCanvas",
+            "WARNING — contradicts the only possible source: " .. table.concat(mismatches, "; ")
+                .. " — capture anyway, or cancel to fix the paint first",
+            {"CAPTURE ANYWAY", "CANCEL"}, "schematicAmbiguousColorConfirmed", "schematicAmbiguousColorConfirmed", nil, 0.9)
+        return
+    end
+
+    if #ambiguous > 0 then
+        _pendingSnapshotPlan = plan
+        gdsGui_schematic_openMenu("mainCanvas",
+            "AMBIGUOUS: " .. table.concat(ambiguous, "; ")
+                .. " — capture as shown if correct, or cancel to repaint first",
+            {"CAPTURE AS SHOWN", "CANCEL"}, "schematicAmbiguousColorConfirmed", "schematicAmbiguousColorConfirmed", nil, 0.9)
+        return
+    end
+
+    gdsGui_schematic_commitSnapshot("mainCanvas", plan)
+    _recomputeDeducedGateStates()
+    _setSnapshotLabelText(gdsGui_schematic_countSnapshots("mainCanvas"))
+    _requestSchematicSave()
+    if appSettings.hapticsEnabled and love.system.vibrate then love.system.vibrate(0.1) end
+    if appSettings.soundEnabled and singleChimeSound then love.audio.play(singleChimeSound) end
+    _flagLockedRuleContradictionIfAny("mainCanvas")
 end
 
 -- Shared onSelect/onCancel for the conflict-confirm menu: cancel (tap outside,
@@ -4100,11 +6113,34 @@ end
 function schematicSnapshotConflictResolved(canvasName, index, optionText)
     if optionText == "OVERWRITE" and _pendingSnapshotPlan then
         gdsGui_schematic_commitSnapshot(canvasName, _pendingSnapshotPlan)
-        gdsGui_outputTxtBox_setText("schematicSnapshotLabel", "SNAPSHOTS: " .. gdsGui_schematic_countSnapshots(canvasName))
+        _recomputeDeducedGateStates()
+        _setSnapshotLabelText(gdsGui_schematic_countSnapshots(canvasName))
         _requestSchematicSave()
+        _flagLockedRuleContradictionIfAny(canvasName)
     end
     _pendingSnapshotPlan = nil
 end
+
+-- Shared by both the AMBIGUOUS and WARNING (structural mismatch) confirm
+-- menus above — CAPTURE AS SHOWN/CAPTURE ANYWAY both commit the plan
+-- exactly as prepareSnapshot already resolved it (see
+-- captureSchematicSnapshot's own comment on why that's enough to count a
+-- correct guess as real evidence, and why a mismatch still needs an
+-- explicit override rather than being silently saved). CANCEL (or tapping
+-- outside) falls through without committing either way, leaving the PAINT
+-- tool as the way to fix/assert a different color instead.
+function schematicAmbiguousColorConfirmed(canvasName, index, optionText)
+    if (optionText == "CAPTURE AS SHOWN" or optionText == "CAPTURE ANYWAY") and _pendingSnapshotPlan then
+        gdsGui_schematic_commitSnapshot(canvasName, _pendingSnapshotPlan)
+        _recomputeDeducedGateStates()
+        _setSnapshotLabelText(gdsGui_schematic_countSnapshots(canvasName))
+        _requestSchematicSave()
+        _flagLockedRuleContradictionIfAny(canvasName)
+    end
+    _pendingSnapshotPlan = nil
+end
+
+function schematicRuleContradictionDismissed() end
 
 -- COMBINATION PREV/NEXT — steps to the next/previous control-position
 -- combination (gdsGui_schematic_stepCombination), which also resets every
@@ -4118,6 +6154,7 @@ function schematicCombPrevPressed()
     if gdsGui_schematic_isMenuOpen("mainCanvas") then return end
     gdsGui_schematic_pushUndo("mainCanvas")
     gdsGui_schematic_stepCombination("mainCanvas", -1)
+    _applySolvedColorsToCurrentCombination()
     _requestSchematicSave()
 end
 
@@ -4125,7 +6162,296 @@ function schematicCombNextPressed()
     if gdsGui_schematic_isMenuOpen("mainCanvas") then return end
     gdsGui_schematic_pushUndo("mainCanvas")
     gdsGui_schematic_stepCombination("mainCanvas", 1)
+    _applySolvedColorsToCurrentCombination()
     _requestSchematicSave()
+end
+
+-- GATE RULES list row tapped — index maps back to _sortedGateIds' own
+-- deterministic order (see that function's comment), RETURN steps back up
+-- to DESIGN ACTIONS.
+function schematicGateRulesListChosen(canvasName, index, optionText)
+    if optionText == "RETURN" then
+        _openDesignActionsMenu(canvasName)
+        return
+    end
+    local canvas = _findSchematicCanvas()
+    if not canvas then return end
+    local gateId = _sortedGateIds(canvas)[index]
+    if gateId then _openGateRuleDetailMenu(canvasName, gateId) end
+end
+
+-- LOCK THIS RULE / RETURN from one gate's detail view — both reopen the
+-- (now possibly refreshed) list rather than dropping all the way back to
+-- DESIGN ACTIONS, so locking several gates in a row doesn't require
+-- re-opening the menu from scratch each time.
+function schematicGateRuleDetailChosen(canvasName, index, optionText)
+    local canvas = _findSchematicCanvas()
+    if optionText == "LOCK THIS RULE" and canvas and _pendingGateRuleGateId then
+        _lockGateRule(canvas, _pendingGateRuleGateId)
+        _requestSchematicSave()
+    end
+    _pendingGateRuleGateId = nil
+    if canvas then _openGateRulesListMenu(canvasName) end
+end
+
+function schematicGateRuleDetailCancelled()
+    _pendingGateRuleGateId = nil
+end
+
+-- ATTRIBUTION RULES list row tapped — index maps back to
+-- _sortedAmbiguousNodeIds' own deterministic order, RETURN steps back up
+-- to DESIGN ACTIONS. Same shape as schematicGateRulesListChosen above.
+function schematicAttributionRulesListChosen(canvasName, index, optionText)
+    if optionText == "RETURN" then
+        _openDesignActionsMenu(canvasName)
+        return
+    end
+    local canvas = _findSchematicCanvas()
+    if not canvas then return end
+    local nodeId = _sortedAmbiguousNodeIds(canvas)[index]
+    if nodeId then _openAttributionRuleDetailMenu(canvasName, nodeId) end
+end
+
+-- LOCK THIS RULE / RETURN from one node's detail view — same "reopen the
+-- list, not DESIGN ACTIONS" shape as schematicGateRuleDetailChosen above.
+function schematicAttributionRuleDetailChosen(canvasName, index, optionText)
+    local canvas = _findSchematicCanvas()
+    if optionText == "LOCK THIS RULE" and canvas and _pendingAttributionRuleNodeId then
+        _lockAttributionRule(canvas, _pendingAttributionRuleNodeId)
+        _requestSchematicSave()
+    end
+    _pendingAttributionRuleNodeId = nil
+    if canvas then _openAttributionRulesListMenu(canvasName) end
+end
+
+function schematicAttributionRuleDetailCancelled()
+    _pendingAttributionRuleNodeId = nil
+end
+
+-- APPLY jumps the live combination straight to the suggested detents (same
+-- level of directness gdsGui_schematic_stepCombination already uses
+-- internally for c.detentIndex) and re-solves/re-saves exactly like
+-- PREV/NEXT above; CANCEL (or tapping outside) leaves the combination
+-- untouched.
+function schematicSuggestNextSnapshotChosen(canvasName, index, optionText)
+    if optionText == "APPLY" and _pendingSuggestedDetents then
+        local canvas = _findSchematicCanvas()
+        if canvas then
+            gdsGui_schematic_pushUndo(canvasName)
+            for _, c in ipairs(canvas.controls) do
+                local detentIndex = _pendingSuggestedDetents[c.id]
+                if detentIndex then c.detentIndex = detentIndex end
+            end
+            _applySolvedColorsToCurrentCombination()
+            _requestSchematicSave()
+        end
+    end
+    _pendingSuggestedDetents = nil
+end
+
+function schematicSuggestNextSnapshotDismissed()
+    _pendingSuggestedDetents = nil
+end
+
+function schematicElectricalColorsChosen(canvasName, index, optionText)
+    if optionText == "POWERED COLOR" then
+        gdsGui_schematic_openGenericColorPicker(canvasName,
+            "POWERED COLOR (snapshots already painted in the old color will need repainting to keep being learned from)",
+            "schematicPoweredColorChosen", nil)
+    elseif optionText == "UNPOWERED COLOR" then
+        gdsGui_schematic_openGenericColorPicker(canvasName,
+            "UNPOWERED COLOR (snapshots already painted in the old color will need repainting to keep being learned from)",
+            "schematicUnpoweredColorChosen", nil)
+    elseif optionText == "PER-SOURCE SETTINGS" then
+        _openPerSourceSettingsListMenu(canvasName)
+    elseif optionText == "RETURN" then
+        _openDesignActionsMenu(canvasName)
+    end
+end
+
+-- PER-SOURCE SETTINGS list row tapped — index maps back to _sortedSourceIds'
+-- own deterministic order, RETURN steps back up to ELECTRICAL COLORS.
+function schematicPerSourceSettingsListChosen(canvasName, index, optionText)
+    if optionText == "RETURN" then
+        _openElectricalColorsMenu(canvasName)
+        return
+    end
+    local canvas = _findSchematicCanvas()
+    if not canvas then return end
+    local sourceId = _sortedSourceIds(canvas)[index]
+    if sourceId then _openPerSourceSettingDetailMenu(canvasName, sourceId) end
+end
+
+-------------------------------------------------------------------------------
+-- SYSTEM SCHEMATIC — VOLTAGE -> COLOR REGISTRATION: the single place a
+-- voltage's powered color actually gets picked. Shared by both the
+-- initial-placement flow further down (schematicSourceElementPlaced) and
+-- PER-SOURCE SETTINGS' own VOLTAGE edit just below — either path lands
+-- here once a source's voltage is known, and either registers that voltage
+-- a NEW color on THIS system (first use) or silently reuses whatever this
+-- system already has registered for it (every use after the first), which
+-- is the whole point of keying color by voltage instead of by individual
+-- source. Lives on canvas.voltageColors, NOT an appSettings global — a
+-- fresh system (new, or re-created after deleting it or its whole
+-- aircraft) starts with nothing registered, same as it starts with no
+-- snapshots/rules taught, so every voltage has to be taught again. Declared
+-- ahead of every caller below since _ensureVoltageHasColor is a local
+-- (upvalue, not a by-name global callback) — Lua doesn't hoist local
+-- functions.
+-------------------------------------------------------------------------------
+
+-- Which voltage the open swatch picker (armed by _ensureVoltageHasColor
+-- below) is registering a color FOR — only one such pick is ever in
+-- flight at a time, same convention as _pendingPerSourceTargetId.
+local _pendingVoltageColorPickValue = nil
+
+local function _resolveAndSaveSchematic()
+    _requestSchematicSave()
+    _applySolvedColorsToCurrentCombination()
+end
+
+local function _ensureVoltageHasColor(canvasName, voltage)
+    local canvas = _findSchematicCanvas()
+    if canvas and canvas.voltageColors[voltage] then
+        _resolveAndSaveSchematic()
+        return
+    end
+    _pendingVoltageColorPickValue = voltage
+    gdsGui_schematic_openGenericColorPicker(canvasName,
+        voltage .. "V POWERED COLOR (every source at this voltage, on this system, will share it)",
+        "schematicVoltageColorChosen", "schematicVoltageColorCancelled")
+end
+
+function schematicVoltageColorChosen(canvasName, index)
+    local color = gdsGui_schematic_getColorPaletteEntry(index)
+    local canvas = _findSchematicCanvas()
+    if color and canvas and _pendingVoltageColorPickValue then
+        canvas.voltageColors[_pendingVoltageColorPickValue] = color
+    end
+    _pendingVoltageColorPickValue = nil
+    _resolveAndSaveSchematic()
+end
+
+function schematicVoltageColorCancelled(canvasName)
+    -- The voltage itself is already set on the source either way — it'll
+    -- just show the system-wide default POWERED COLOR (see
+    -- _colorForPoweredNode's defaultColor fallback) until a color is
+    -- registered for it some other time (PER-SOURCE SETTINGS > VOLTAGE,
+    -- re-entering the same value, revisits this picker).
+    _pendingVoltageColorPickValue = nil
+    _resolveAndSaveSchematic()
+end
+
+function schematicPerSourceSettingDetailChosen(canvasName, index, optionText)
+    if optionText == "VOLTAGE" and _pendingPerSourceTargetId then
+        local canvas = _findSchematicCanvas()
+        local entity = canvas and _findSourceEntity(canvas, _pendingPerSourceTargetId)
+        gdsGui_textPrompt_open("SOURCE VOLTAGE (NUMBER)", entity and entity.voltage and tostring(entity.voltage) or "",
+            6, "schematicPerSourceVoltageConfirmed", nil)
+        return -- keep _pendingPerSourceTargetId set for the text-prompt's own callback
+    elseif optionText == "RETURN" then
+        _pendingPerSourceTargetId = nil
+        _openPerSourceSettingsListMenu(canvasName)
+        return
+    end
+    _pendingPerSourceTargetId = nil
+end
+
+function schematicPerSourceSettingDetailCancelled()
+    _pendingPerSourceTargetId = nil
+end
+
+-- Writes straight onto the targeted source's own element/control table
+-- (voltage — see _openPerSourceSettingsListMenu's own comment), then makes
+-- sure that voltage has a registered color (_ensureVoltageHasColor, which
+-- itself re-solves/re-saves once it's done — see that function's own
+-- comment) so the canvas reflects the change right away, same as the
+-- system-wide POWERED COLOR/UNPOWERED COLOR callbacks above.
+function schematicPerSourceVoltageConfirmed(text)
+    local canvas = _findSchematicCanvas()
+    local entity = canvas and _pendingPerSourceTargetId and _findSourceEntity(canvas, _pendingPerSourceTargetId)
+    _pendingPerSourceTargetId = nil
+    if not entity or not canvas then return end
+    local voltage = tonumber(text)
+    entity.voltage = voltage -- nil (cleared) if text wasn't a valid number, same as an empty field
+    if voltage then
+        _ensureVoltageHasColor(canvas.name, voltage)
+    else
+        _requestSchematicSave()
+        _applySolvedColorsToCurrentCombination()
+    end
+end
+
+-------------------------------------------------------------------------------
+-- SYSTEM SCHEMATIC — NEW SOURCE PLACEMENT: a freshly-placed "source"-role
+-- element/control (BATTERY, GENERATOR, ...) is prompted for its nominal
+-- VOLTAGE immediately, via mainCanvas.onElementPlaced (wired in love.load())
+-- — required, since a source with no voltage can never get an automatic
+-- powered color of its own (see _colorForPoweredNode's defaultColor
+-- fallback). The element/control already exists on the canvas by the time
+-- this fires (the library's placement commit runs first), so cancelling out
+-- of the prompt just leaves its voltage unset rather than undoing the
+-- placement — there'd be nothing left to put it back the way it was.
+-------------------------------------------------------------------------------
+
+-- Which newly-placed source the open VOLTAGE prompt belongs to — only one
+-- placement is ever in flight at a time, same convention as
+-- _pendingPerSourceTargetId.
+local _pendingNewSourceId = nil
+
+function schematicSourceElementPlaced(canvasName, kind, newId, componentType)
+    if componentType ~= "source" then return end
+    _pendingNewSourceId = newId
+    gdsGui_textPrompt_open("SOURCE VOLTAGE (NUMBER)", "", 6,
+        "schematicNewSourceVoltageConfirmed", "schematicNewSourceVoltageCancelled")
+end
+
+function schematicNewSourceVoltageConfirmed(text)
+    local voltage = tonumber(text)
+    if not voltage then
+        gdsGui_textPrompt_open("VOLTAGE REQUIRED (NUMBER), TRY AGAIN", text or "", 6,
+            "schematicNewSourceVoltageConfirmed", "schematicNewSourceVoltageCancelled")
+        return
+    end
+    local canvas = _findSchematicCanvas()
+    local entity = canvas and _pendingNewSourceId and _findSourceEntity(canvas, _pendingNewSourceId)
+    _pendingNewSourceId = nil
+    if not entity or not canvas then return end
+    entity.voltage = voltage
+    _ensureVoltageHasColor(canvas.name, voltage)
+end
+
+function schematicNewSourceVoltageCancelled()
+    _pendingNewSourceId = nil
+end
+
+-- Both callbacks below: ELECTRICAL_MEDIUM.style is the ONE table both
+-- _solveCurrentSchematic (forward prediction) and _stateForColor (backward
+-- deduction, see model/learner.lua) read — overwriting one entry here keeps
+-- paint/predict/deduce all using the same color from this point forward,
+-- with no separate "teach it" step. Re-solving and re-deducing immediately
+-- (rather than waiting for the next snapshot/combination change) means the
+-- canvas reflects the new color right away, including for any gate whose
+-- rule depended on evidence that's about to stop matching (see this
+-- section's own comment above _openElectricalColorsMenu).
+function schematicPoweredColorChosen(canvasName, index)
+    local color = gdsGui_schematic_getColorPaletteEntry(index)
+    if not color then return end
+    ELECTRICAL_MEDIUM.style.powered = color
+    appSettings.electricalPoweredColor = color
+    _saveAppSettings()
+    _recomputeDeducedGateStates()
+    _applySolvedColorsToCurrentCombination()
+end
+
+function schematicUnpoweredColorChosen(canvasName, index)
+    local color = gdsGui_schematic_getColorPaletteEntry(index)
+    if not color then return end
+    ELECTRICAL_MEDIUM.style.unpowered = color
+    appSettings.electricalUnpoweredColor = color
+    _saveAppSettings()
+    _recomputeDeducedGateStates()
+    _applySolvedColorsToCurrentCombination()
 end
 
 -------------------------------------------------------------------------------
@@ -4135,6 +6461,342 @@ end
 -- (numbers/strings/booleans) to match this app's existing test-harness
 -- convention of comparing flattened values, not tables, by equality.
 -------------------------------------------------------------------------------
+
+function schematicGetColorPaletteEntryTest()
+    local color, name = gdsGui_schematic_getColorPaletteEntry(3) -- GREEN, per _COLOR_PALETTE's own order
+    return color[1], color[2], color[3], name
+end
+
+-- _colorForPoweredNode tests (voltage-keyed powered colors, see that
+-- function's own comment above _solveCurrentSchematic). Hand-built
+-- {elements=..., controls=..., voltageColors=...} tables, not a real
+-- schematic canvas -- _colorForPoweredNode/_findSourceEntity only ever
+-- read .id/.voltage off elements/controls, and voltageColors directly
+-- (canvas.voltageColors is per-system, not an appSettings global — see
+-- _ensureVoltageHasColor's own comment).
+local _TEST_RED, _TEST_YELLOW, _TEST_DEFAULT = { 1, 0, 0, 1 }, { 1, 1, 0, 1 }, { 0.9, 0.9, 0.9, 1 }
+
+function colorForPoweredNode_singleSourceOwnColorTest()
+    local canvas = { elements = { { id = "batt1", voltage = 24 } }, controls = {}, voltageColors = { [24] = _TEST_RED } }
+    local color = _colorForPoweredNode("bus1", { bus1 = { batt1 = true } }, canvas, _TEST_DEFAULT)
+    return color[1], color[2], color[3]
+end
+
+function colorForPoweredNode_singleSourceNoColorFallsBackTest()
+    local canvas = { elements = { { id = "batt1" } }, controls = {}, voltageColors = {} } -- no voltage -> no registered color
+    local color = _colorForPoweredNode("bus1", { bus1 = { batt1 = true } }, canvas, _TEST_DEFAULT)
+    return color[1], color[2], color[3]
+end
+
+function colorForPoweredNode_tieHigherVoltageWinsTest()
+    local canvas = {
+        elements = { { id = "batt1", voltage = 24 } },
+        controls = { { id = "gen1", voltage = 28 } },
+        voltageColors = { [24] = _TEST_RED, [28] = _TEST_YELLOW },
+    }
+    local color = _colorForPoweredNode("bus1", { bus1 = { batt1 = true, gen1 = true } }, canvas, _TEST_DEFAULT)
+    return color[1], color[2], color[3]
+end
+
+function colorForPoweredNode_tieNoVoltageDashesTest()
+    local canvas = {
+        elements = { { id = "batt1" } }, -- no voltage
+        controls = { { id = "gen1", voltage = 28 } },
+        voltageColors = { [28] = _TEST_YELLOW },
+    }
+    local color = _colorForPoweredNode("bus1", { bus1 = { batt1 = true, gen1 = true } }, canvas, _TEST_DEFAULT)
+    if type(color[1]) ~= "table" then return "not a sequence" end
+    return #color
+end
+
+-- Equal voltages no longer need a dashed fallback at all: both contributors
+-- share the IDENTICAL registered color for that voltage now, so this
+-- asserts a single flat color instead of the old 2-entry dashed sequence —
+-- the exact behavior change this refactor (color keyed by voltage, not by
+-- individual source) was for.
+function colorForPoweredNode_tieEqualVoltageSameColorTest()
+    local canvas = {
+        elements = { { id = "batt1", voltage = 24 } },
+        controls = { { id = "gen1", voltage = 24 } },
+        voltageColors = { [24] = _TEST_RED },
+    }
+    local color = _colorForPoweredNode("bus1", { bus1 = { batt1 = true, gen1 = true } }, canvas, _TEST_DEFAULT)
+    if type(color[1]) == "table" then return "unexpected sequence" end
+    return color[1], color[2], color[3]
+end
+
+-- Full-stack integration: two real sources (BATT 1 element, GEN 1 control)
+-- both wired into the same bus, GEN 1's 28V beating BATT 1's 24V end to
+-- end through buildGraph -> solve -> solveSourceAttribution ->
+-- _colorForPoweredNode.
+function schematicVoltageTieBreakIntegrationTest()
+    gdsGui_schematic_delete("unitTestCanvas24")
+    gdsGui_schematic_create("unitTestCanvas24", "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_addElement("unitTestCanvas24", "batt1", "rect", 0, 0, 0.1, 0.1, "BATT 1", nil, nil, nil, nil, "source")
+    gdsGui_schematic_addControl("unitTestCanvas24", "gen1", 0.3, 0, {"OFF", "ON"}, 1, "GEN 1", nil,
+        1, nil, nil, nil, nil, nil, "source")
+    gdsGui_schematic_addElement("unitTestCanvas24", "bus1", "rect", 0.6, 0, 0.1, 0.1, "BUS 1", nil, nil, nil, nil, "path")
+    gdsGui_schematic_addWire("unitTestCanvas24", "w1", "batt1", "bus1", nil)
+    gdsGui_schematic_addWire("unitTestCanvas24", "w2", "gen1", "bus1", nil)
+
+    local canvas = nil
+    for _, c in ipairs(globApp.objects.schematics) do
+        if c.name == "unitTestCanvas24" then canvas = c end
+    end
+    if not canvas then return "fail: canvas not found" end
+
+    canvas.voltageColors = { [24] = _TEST_RED, [28] = _TEST_YELLOW } -- per-system, not an appSettings global
+    canvas.elements[1].voltage = 24
+    canvas.controls[1].voltage = 28
+
+    local componentTypes = _buildComponentTypeMap(canvas)
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes)
+    local sourceStates = _currentSourceStates(canvas, componentTypes)
+    local gateStates = _currentGateStates(canvas, componentTypes)
+    local nodeStates = ModelSolver.solve(graph, sourceStates, gateStates)
+    if nodeStates.bus1 ~= "powered" then return "fail: bus1 not powered" end
+
+    local attribution = ModelSolver.solveSourceAttribution(graph, sourceStates, gateStates)
+    local color = _colorForPoweredNode("bus1", attribution, canvas, ELECTRICAL_MEDIUM.style.powered)
+    return color[1], color[2], color[3]
+end
+
+-- A "gate"-role control's (SWITCH, ...) own display color: OPEN always
+-- reads as the flat unpowered gray even though solve() itself still marks
+-- the switch's own node POWERED (its input terminal genuinely is hot, fed
+-- straight off BATT 1 — see solver.lua's own comment, and the wire test
+-- below: w1 batt1->sw1 reads hot right up to the open contact). That's
+-- purely a display-layer override (main.lua's own isOpenGate check below)
+-- — logically, the node stays "powered" so a feeding wire can still show
+-- correctly, and so deduction/rule-learning keep seeing real reachability
+-- data. CLOSED takes its color from the highest-voltage source reaching
+-- it, same as any other powered node. Mirrors _solveCurrentSchematic's
+-- own controls-loop override against a throwaway canvas (same "full
+-- Phase 1 adapter path, still isolated from mainCanvas" convention as
+-- schematicVoltageTieBreakIntegrationTest above — _solveCurrentSchematic
+-- itself only ever operates on the real mainCanvas, so can't be called
+-- directly from a test).
+function schematicOpenGateShowsUnpoweredColorTest()
+    gdsGui_schematic_delete("unitTestCanvas25")
+    gdsGui_schematic_create("unitTestCanvas25", "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_addElement("unitTestCanvas25", "batt1", "rect", 0, 0, 0.1, 0.1, "BATT 1", nil, nil, nil, nil, "source")
+    gdsGui_schematic_addControl("unitTestCanvas25", "sw1", 0.3, 0, {"OFF", "ON"}, 1, "SW 1", nil,
+        1, nil, nil, nil, nil, nil, "gate")
+    gdsGui_schematic_addElement("unitTestCanvas25", "bus1", "rect", 0.6, 0, 0.1, 0.1, "BUS 1", nil, nil, nil, nil, "path")
+    gdsGui_schematic_addWire("unitTestCanvas25", "w1", "batt1", "sw1", nil)
+    gdsGui_schematic_addWire("unitTestCanvas25", "w2", "sw1", "bus1", nil)
+
+    local canvas = nil
+    for _, c in ipairs(globApp.objects.schematics) do
+        if c.name == "unitTestCanvas25" then canvas = c end
+    end
+    if not canvas then return "fail: canvas not found" end
+
+    canvas.voltageColors = { [24] = _TEST_RED } -- per-system, not an appSettings global
+    canvas.elements[1].voltage = 24
+
+    local componentTypes = _buildComponentTypeMap(canvas)
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes)
+    local sourceStates = _currentSourceStates(canvas, componentTypes)
+
+    local function displayColorForSw1()
+        local gateStates = _currentGateStates(canvas, componentTypes)
+        local nodeStates = ModelSolver.solve(graph, sourceStates, gateStates)
+        local attribution = ModelSolver.solveSourceAttribution(graph, sourceStates, gateStates)
+        local isOpenGate = componentTypes.sw1 == "gate" and not _isActivePosition(canvas.controls[1])
+        local color = (nodeStates.sw1 == ModelSolver.POWERED and not isOpenGate)
+            and _colorForPoweredNode("sw1", attribution, canvas, ELECTRICAL_MEDIUM.style.powered)
+            or ELECTRICAL_MEDIUM.style.unpowered
+        return color, nodeStates.sw1
+    end
+
+    canvas.controls[1].detentIndex = 1 -- "ON" (closed)
+    local closedColor = displayColorForSw1()
+    canvas.controls[1].detentIndex = 0 -- "OFF" (open)
+    local openColor, openNodeState = displayColorForSw1()
+
+    local closedIsRed = closedColor[1] == 1 and closedColor[2] == 0 and closedColor[3] == 0
+    local openIsGray = openColor[1] == ELECTRICAL_MEDIUM.style.unpowered[1]
+        and openColor[2] == ELECTRICAL_MEDIUM.style.unpowered[2]
+        and openColor[3] == ELECTRICAL_MEDIUM.style.unpowered[3]
+    return closedIsRed, openIsGray, openNodeState -- openNodeState: "powered" proves the input terminal is still physically hot
+end
+
+-- Full pipeline test for learned attribution rules (model/learner.lua's
+-- findAttributionRule + main.lua's _recomputeAttributionRules/
+-- _attributionRuleWinner/_aiColorAttributionConfidence).
+--
+-- Topology: battA(24V) -- gate1(open) -- busX -- genB(28V) -- gate1's own
+-- node is ambiguous (2 contributors) whenever open, same single-shared-
+-- node case as a real open switch — mirrors Aircraft 15's own SWITCH_57/
+-- BATT_2/GENR_1 scenario. A second, independent branch — battA -- gate2 --
+-- sinkC — gives a condition whose REAL solved state (not just a label)
+-- tracks gate2's own open/closed position: sinkC is only reached (and so
+-- only "powered") when gate2 actually conducts. Two snapshots teach "gate2
+-- open -> battA wins at gate1" and "gate2 closed -> genB wins at gate1" by
+-- painting gate1 each source's own registered color and sinkC its real
+-- resulting state.
+--
+-- Verifies: (1) a rule gets learned at all; (2) applying it to a NEW,
+-- never-snapshotted combination at EACH gate2 position (via the real
+-- solve()/solveSourceAttribution() path, not a snapshot lookup) picks the
+-- taught winner instead of the unverified highest-voltage default (which
+-- would always pick genB, 28V, regardless of gate2); (3) color-attribution
+-- confidence is now > 0 at an ambiguous node once a rule covers it —
+-- the exact gap flagged by the Aircraft 15 bug report.
+function schematicAttributionRuleLearnedAndAppliedTest()
+    gdsGui_schematic_delete("unitTestCanvas26")
+    gdsGui_schematic_create("unitTestCanvas26", "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_addElement("unitTestCanvas26", "battA", "rect", 0, 0, 0.1, 0.1, "BATT A", nil, nil, nil, nil, "source")
+    gdsGui_schematic_addElement("unitTestCanvas26", "genB", "rect", 0.8, 0, 0.1, 0.1, "GEN B", nil, nil, nil, nil, "source")
+    gdsGui_schematic_addElement("unitTestCanvas26", "busX", "rect", 0.6, 0, 0.1, 0.1, "BUS X", nil, nil, nil, nil, "path")
+    gdsGui_schematic_addElement("unitTestCanvas26", "sinkC", "rect", 0.3, 0.5, 0.1, 0.1, "SINK C", nil, nil, nil, nil, "sink")
+    gdsGui_schematic_addControl("unitTestCanvas26", "gate1", 0.3, 0, {"OFF", "ON"}, 0, "GATE 1", nil,
+        1, nil, nil, nil, nil, nil, "gate")
+    gdsGui_schematic_addControl("unitTestCanvas26", "gate2", 0.3, 0.3, {"OFF", "ON"}, 0, "GATE 2", nil,
+        1, nil, nil, nil, nil, nil, "gate")
+    gdsGui_schematic_addWire("unitTestCanvas26", "w1", "battA", "gate1", nil)
+    gdsGui_schematic_addWire("unitTestCanvas26", "w2", "gate1", "busX", nil)
+    gdsGui_schematic_addWire("unitTestCanvas26", "w3", "busX", "genB", nil)
+    gdsGui_schematic_addWire("unitTestCanvas26", "w4", "battA", "gate2", nil)
+    gdsGui_schematic_addWire("unitTestCanvas26", "w5", "gate2", "sinkC", nil)
+
+    local canvas = nil
+    for _, c in ipairs(globApp.objects.schematics) do
+        if c.name == "unitTestCanvas26" then canvas = c end
+    end
+    if not canvas then return "fail: canvas not found" end
+
+    canvas.elements[1].voltage = 24 -- battA
+    canvas.elements[2].voltage = 28 -- genB
+    canvas.voltageColors = { [24] = _TEST_RED, [28] = _TEST_YELLOW }
+
+    local componentTypes = _buildComponentTypeMap(canvas)
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes)
+
+    local POWERED, UNPOWERED = ELECTRICAL_MEDIUM.style.powered, ELECTRICAL_MEDIUM.style.unpowered
+    local function paintAndCommit(gate2Detent, gate1Winner, sinkState)
+        canvas.controls[1].detentIndex = 0 -- gate1 always OFF (open) -- its own ambiguity doesn't depend on its position
+        canvas.controls[2].detentIndex = gate2Detent
+        canvas.elements[1].pendingColor = _TEST_RED    -- battA: its own registered color
+        canvas.elements[2].pendingColor = _TEST_YELLOW -- genB: its own registered color
+        canvas.elements[3].pendingColor = POWERED      -- busX: always fed by genB
+        canvas.elements[4].pendingColor = sinkState    -- sinkC: the taught condition
+        canvas.controls[1].pendingColor = gate1Winner  -- gate1: the taught winner's color
+        canvas.controls[2].pendingColor = POWERED      -- gate2: its own node is always reached from battA regardless of position
+        gdsGui_schematic_commitSnapshot("unitTestCanvas26", gdsGui_schematic_prepareSnapshot("unitTestCanvas26"))
+    end
+    paintAndCommit(0, _TEST_RED, UNPOWERED)    -- gate2 OFF (open): sinkC unreached -> battA wins
+    paintAndCommit(1, _TEST_YELLOW, POWERED)   -- gate2 ON (closed): sinkC reached -> genB wins
+
+    _recomputeAttributionRules(canvas, graph)
+    local rule = canvas.attributionRules["gate1"]
+    if not rule or rule.status ~= "learned" then return "fail: rule not learned, status=" .. tostring(rule and rule.status) end
+
+    -- Apply to a live (never-snapshotted-at-this-exact-signature) combination
+    -- via the real solve()/solveSourceAttribution() path, exactly like
+    -- _solveCurrentSchematic does, not a snapshot lookup.
+    local sourceStates = _currentSourceStates(canvas, componentTypes)
+    local function liveColorAndConfidence()
+        local gateStates = _currentGateStates(canvas, componentTypes)
+        local nodeStates = ModelSolver.solve(graph, sourceStates, gateStates)
+        local attribution = ModelSolver.solveSourceAttribution(graph, sourceStates, gateStates)
+        local color = _colorForPoweredNode("gate1", attribution, canvas, { 0.9, 0.9, 0.9, 1 }, nodeStates)
+        local confidence = _aiColorAttributionConfidence(canvas, attribution, nodeStates, "gate1")
+        return color, confidence
+    end
+
+    canvas.controls[2].detentIndex = 1 -- gate2 ON
+    local colorWhenOn, confidenceWhenOn = liveColorAndConfidence()
+    canvas.controls[2].detentIndex = 0 -- gate2 OFF
+    local colorWhenOff, confidenceWhenOff = liveColorAndConfidence()
+
+    local onIsGenB = colorWhenOn[1] == _TEST_YELLOW[1] and colorWhenOn[2] == _TEST_YELLOW[2] and colorWhenOn[3] == _TEST_YELLOW[3]
+    local offIsBattA = colorWhenOff[1] == _TEST_RED[1] and colorWhenOff[2] == _TEST_RED[2] and colorWhenOff[3] == _TEST_RED[3]
+
+    return onIsGenB, offIsBattA, confidenceWhenOn > 0, confidenceWhenOff > 0
+end
+
+-- Regression test for the real Aircraft 15 report: a bus fed by a 24V
+-- battery (direct, no gate) plus two 28V generators (each through its own
+-- closed switch) is reached by THREE sources at once, but the top voltage
+-- (28V) is shared by two of them — a true parallel tie, not a genuine
+-- "which one wins" guess (see _isGenuinelyColorAmbiguous's own comment).
+-- Before that check existed, EVERY multi-source node scored 0 confidence
+-- unconditionally, which made whole combinations read 0% even though
+-- nothing about them was actually uncertain. Verifies: (1) the bus's
+-- color is still deterministically the tied-top-voltage color (28V
+-- green); (2) its confidence is now 1 (not 0) with NO rule involved at
+-- all; (3) a snapshot painted at this exact combination produces NO
+-- attribution-rule training example for the bus (nothing genuine to
+-- learn from a tie — see _deduceAttributionWinnersForSnapshot's own
+-- comment).
+function schematicTiedVoltageAttributionConfidenceTest()
+    gdsGui_schematic_delete("unitTestCanvas27")
+    gdsGui_schematic_create("unitTestCanvas27", "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_addElement("unitTestCanvas27", "battA", "rect", 0, 0, 0.1, 0.1, "BATT A", nil, nil, nil, nil, "source")
+    gdsGui_schematic_addElement("unitTestCanvas27", "busX", "rect", 0.3, 0, 0.1, 0.1, "BUS X", nil, nil, nil, nil, "path")
+    gdsGui_schematic_addControl("unitTestCanvas27", "gate1", 0.5, 0, {"OFF", "ON"}, 1, "GATE 1", nil,
+        1, nil, nil, nil, nil, nil, "source")
+    gdsGui_schematic_addControl("unitTestCanvas27", "gate2", 0.5, 0.3, {"OFF", "ON"}, 1, "GATE 2", nil,
+        1, nil, nil, nil, nil, nil, "source")
+    gdsGui_schematic_addWire("unitTestCanvas27", "w1", "battA", "busX", nil)
+    gdsGui_schematic_addWire("unitTestCanvas27", "w2", "gate1", "busX", nil)
+    gdsGui_schematic_addWire("unitTestCanvas27", "w3", "gate2", "busX", nil)
+
+    local canvas = nil
+    for _, c in ipairs(globApp.objects.schematics) do
+        if c.name == "unitTestCanvas27" then canvas = c end
+    end
+    if not canvas then return "fail: canvas not found" end
+
+    canvas.elements[1].voltage = 24  -- battA
+    canvas.controls[1].voltage = 28  -- gate1 (a source control, e.g. a generator)
+    canvas.controls[2].voltage = 28  -- gate2 (ditto, tied with gate1)
+    canvas.voltageColors = { [24] = _TEST_RED, [28] = _TEST_YELLOW }
+
+    local componentTypes = _buildComponentTypeMap(canvas)
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes)
+    local sourceStates = _currentSourceStates(canvas, componentTypes) -- both controls ON (detentIndex 1)
+    local gateStates = _currentGateStates(canvas, componentTypes)
+    local nodeStates = ModelSolver.solve(graph, sourceStates, gateStates)
+    local attribution = ModelSolver.solveSourceAttribution(graph, sourceStates, gateStates)
+
+    local color = _colorForPoweredNode("busX", attribution, canvas, { 0.9, 0.9, 0.9, 1 }, nodeStates)
+    local confidence = _aiColorAttributionConfidence(canvas, attribution, nodeStates, "busX")
+    local isTiedVoltageColor = color[1] == _TEST_YELLOW[1] and color[2] == _TEST_YELLOW[2] and color[3] == _TEST_YELLOW[3]
+
+    -- A snapshot painted at exactly this combination must not generate an
+    -- attribution-rule example for busX -- there's nothing genuine to teach.
+    local snapshot = { elements = { busX = _TEST_YELLOW, battA = _TEST_RED },
+        controls = { gate1 = _TEST_YELLOW, gate2 = _TEST_YELLOW } }
+    local signature = gdsGui_schematic_buildSignature({
+        { id = "gate1", detentIndex = 1 }, { id = "gate2", detentIndex = 1 },
+    })
+    local winners = _deduceAttributionWinnersForSnapshot(canvas, graph, signature, snapshot)
+
+    return isTiedVoltageColor, confidence == 1, winners.busX == nil
+end
+
+-- Changing ELECTRICAL_MEDIUM.style.powered (what
+-- schematicPoweredColorChosen actually does) must make _stateForColor
+-- recognize the NEW color as "powered" and stop recognizing the OLD one —
+-- the exact trade-off called out in this section's own comment above
+-- _openElectricalColorsMenu: paint/predict/deduce all move together, but a
+-- snapshot painted under the old color needs repainting to keep being
+-- learned from.
+function schematicElectricalColorOverride_stateForColorTest()
+    local originalPowered = ELECTRICAL_MEDIUM.style.powered
+    local oldColor = { 1, 1, 0, 1 }
+    local newColor = { 0, 1, 0, 1 }
+
+    ELECTRICAL_MEDIUM.style.powered = newColor
+    local recognizesNew = _stateForColor(newColor) == "powered"
+    local recognizesOld = _stateForColor(oldColor) == "powered"
+    ELECTRICAL_MEDIUM.style.powered = originalPowered -- restore before any other test runs
+
+    return recognizesNew, recognizesOld
+end
 
 function schematicCascadeDeleteTest()
     gdsGui_schematic_delete("unitTestCanvas")
@@ -4303,140 +6965,6 @@ function schematicCompatNotice_gatesOncePerVersionTest()
     return 0
 end
 
--- _jsonEscapeString must backslash-escape embedded quotes and backslashes.
--- Built from single-character q/bs variables rather than one dense escaped
--- literal, so both the input and the expected output stay easy to verify by
--- eye without a Lua runtime to check an escaping arithmetic mistake against.
-function jsonEscapeString_escapesQuotesAndBackslashesTest()
-    local q, bs = '"', '\\'
-    local input    = "He said " .. q .. "hi" .. q .. bs .. "ok"
-    local expected = q .. "He said " .. bs .. q .. "hi" .. bs .. q .. bs .. bs .. "ok" .. q
-    if _jsonEscapeString(input) == expected then return 1 end
-    return 0
-end
-
--- _toJSON must tell an array apart from an object -- the two shapes every
--- piece of schematic data (elements/wires/controls/snapshots) actually
--- mixes together -- and nest an array value correctly inside an object.
-function toJSON_encodesArraysNestedInObjectsTest()
-    local encoded = _toJSON({ positions = {"OFF", "ON"}, detentIndex = 0 }, "  ")
-    local hasArrayOpen  = encoded:find("%[") ~= nil
-    local hasArrayClose = encoded:find("%]") ~= nil
-    local hasObjectOpen = encoded:find("{") ~= nil
-    local hasBothValues = encoded:find("OFF") ~= nil and encoded:find("ON") ~= nil
-    local hasDetent      = encoded:find("detentIndex") ~= nil and encoded:find(": 0") ~= nil
-    if hasArrayOpen and hasArrayClose and hasObjectOpen and hasBothValues and hasDetent then return 1 end
-    return 0
-end
-
--- End-to-end EXPORT: writes a real file via _exportAircraftToJSON against a
--- throwaway in-memory aircraft (never one of the user's real aircraft,
--- never schematicStore itself), checks the file landed and contains the
--- aircraft's own data, then deletes it -- an export test must never leave
--- stray files in the user's real save directory.
-function schematicExport_writesAircraftJsonFileTest()
-    local savedRealStore = schematicStore
-    schematicStore = { aircraft = {
-        { id = "unitTestExportAircraft", name = "UnitTestExportAircraft", systems = {
-            { id = "sys1", name = "Electrical",
-              elements = { { id = "el_1", label = "GEN 1" } },
-              wires = {}, controls = {}, annunciators = {}, snapshots = {} },
-        } },
-    } }
-
-    local fileName = _exportAircraftToJSON("unitTestExportAircraft")
-    local contents = fileName and love.filesystem.read(fileName)
-    schematicStore = savedRealStore
-    if fileName then love.filesystem.remove(fileName) end
-
-    if contents and contents:find("UnitTestExportAircraft") and contents:find("GEN 1")
-       and contents:find("\"exportFormatVersion\"") then
-        return 1
-    end
-    return 0
-end
-
--- _fromJSON must read back exactly what _toJSON wrote: nested
--- objects/arrays, a string needing escaping, and a number.
-function fromJSON_roundTripsToJSONOutputTest()
-    local original = {
-        label = 'SW "1"',
-        positions = {"OFF", "ON"},
-        detentIndex = 2,
-    }
-    local decoded = _fromJSON(_toJSON(original, "  "))
-    if decoded.label == original.label and decoded.detentIndex == original.detentIndex
-       and decoded.positions[1] == "OFF" and decoded.positions[2] == "ON" then
-        return 1
-    end
-    return 0
-end
-
--- End-to-end IMPORT into a fresh store: export one throwaway aircraft from
--- store A, import that file into unrelated throwaway store B (never the
--- real schematicStore, and the internal save goes to a throwaway filename —
--- see _importAircraftFromJSONFile's saveFileName param), and confirm the
--- aircraft actually landed with its system intact.
-function schematicImport_addsAircraftFromExportFileTest()
-    local savedRealStore = schematicStore
-    local testSaveFile = "unitTestImportStore.lua"
-
-    schematicStore = { aircraft = {
-        { id = "unitTestImportSource", name = "UnitTestImportSource", systems = {
-            { id = "sys1", name = "Fuel", elements = {}, wires = {}, controls = {}, annunciators = {} },
-        } },
-    } }
-    local exportFile = _exportAircraftToJSON("unitTestImportSource")
-
-    schematicStore = { aircraft = {} }
-    local imported, err = _importAircraftFromJSONFile(exportFile, testSaveFile)
-    local aircraftCount = #schematicStore.aircraft
-
-    schematicStore = savedRealStore
-    if exportFile then love.filesystem.remove(exportFile) end
-    love.filesystem.remove(testSaveFile)
-    love.filesystem.remove(testSaveFile .. ".tmp")
-    love.filesystem.remove(testSaveFile .. ".bak")
-
-    if imported and err == nil and aircraftCount == 1
-       and imported.name == "UnitTestImportSource" and #imported.systems == 1 then
-        return 1
-    end
-    return 0
-end
-
--- Importing a file whose aircraft id collides with one already in the
--- target store must rename the imported copy (via _verifyAndRepairSchematicStore,
--- same as a corrupted/duplicated save already gets on load) rather than
--- overwrite or merge with the existing one — both must survive.
-function schematicImport_dedupesCollidingAircraftIdTest()
-    local savedRealStore = schematicStore
-    local testSaveFile = "unitTestImportCollideStore.lua"
-
-    schematicStore = { aircraft = {
-        { id = "unitTestCollideId", name = "ExportedCopy", systems = {} },
-    } }
-    local exportFile = _exportAircraftToJSON("unitTestCollideId")
-
-    schematicStore = { aircraft = {
-        { id = "unitTestCollideId", name = "OriginalAircraft", systems = {} },
-    } }
-    local imported = _importAircraftFromJSONFile(exportFile, testSaveFile)
-    local aircraftCount = #schematicStore.aircraft
-    local idsDiffer = aircraftCount == 2 and schematicStore.aircraft[1].id ~= schematicStore.aircraft[2].id
-    local originalIntact = schematicStore.aircraft[1].name == "OriginalAircraft"
-        and schematicStore.aircraft[1].id == "unitTestCollideId"
-
-    schematicStore = savedRealStore
-    if exportFile then love.filesystem.remove(exportFile) end
-    love.filesystem.remove(testSaveFile)
-    love.filesystem.remove(testSaveFile .. ".tmp")
-    love.filesystem.remove(testSaveFile .. ".bak")
-
-    if imported and idsDiffer and originalIntact then return 1 end
-    return 0
-end
-
 -- A wire's resolved color comes from its OWN snapshot entry, independent of
 -- the colors of the elements it connects.
 function schematicResolveColorIndependenceTest()
@@ -4560,6 +7088,457 @@ function schematicPendingColorOverrideTest()
     gdsGui_schematic_setPendingColor("unitTestCanvas7", "element", "e1", {0, 1, 1, 1})
     local r = gdsGui_schematic_resolveColor("unitTestCanvas7", "element", "e1")
     return r
+end
+
+-------------------------------------------------------------------------------
+-- INFERENCE MODEL TESTS
+-- model/graph.lua + model/solver.lua are pure Lua and need no canvas at all
+-- — hand-built node/edge tables exercise them directly, same "pure logic
+-- tested directly" convention _toJSON-style helpers elsewhere in this file
+-- use. The integration test below instead exercises the real main.lua
+-- adapter helpers (_buildComponentTypeMap/_currentGateStates/
+-- _currentSourceStates, which DO take an explicit canvas table) against a
+-- throwaway canvas fetched the same way every other schematic test here
+-- does, composed with the same model calls and
+-- gdsGui_schematic_applySolvedColors/resolveColor the real
+-- _solveCurrentSchematic uses — full Phase 1 adapter path, still isolated
+-- from "mainCanvas".
+-------------------------------------------------------------------------------
+
+function modelSolverClosedGatePowersSinkTest()
+    local elements = { {id = "s1"}, {id = "sink1"} }
+    local controls = { {id = "g1"} }
+    local wires = {
+        { id = "w1", fromElementId = "s1", toElementId = "g1" },
+        { id = "w2", fromElementId = "g1", toElementId = "sink1" },
+    }
+    local componentTypes = { s1 = "source", g1 = "gate", sink1 = "sink" }
+    local graph = ModelGraph.buildGraph(elements, controls, wires, componentTypes)
+    local states = ModelSolver.solve(graph, { s1 = true }, { g1 = "closed" })
+    return states.sink1
+end
+
+function modelSolverOpenGateBlocksSinkTest()
+    local elements = { {id = "s1"}, {id = "sink1"} }
+    local controls = { {id = "g1"} }
+    local wires = {
+        { id = "w1", fromElementId = "s1", toElementId = "g1" },
+        { id = "w2", fromElementId = "g1", toElementId = "sink1" },
+    }
+    local componentTypes = { s1 = "source", g1 = "gate", sink1 = "sink" }
+    local graph = ModelGraph.buildGraph(elements, controls, wires, componentTypes)
+    local states = ModelSolver.solve(graph, { s1 = true }, { g1 = "open" })
+    return states.sink1
+end
+
+-- bus2 is reachable from the source two ways: through g1, and directly via
+-- w4 — so it must still have an alternate path once w3 (the edge out of
+-- g1) is excluded.
+function modelGraphHasAltPathTest()
+    local elements = { {id = "s1"}, {id = "bus1"}, {id = "bus2"} }
+    local controls = { {id = "g1"} }
+    local wires = {
+        { id = "w1", fromElementId = "s1", toElementId = "bus1" },
+        { id = "w2", fromElementId = "bus1", toElementId = "g1" },
+        { id = "w3", fromElementId = "g1", toElementId = "bus2" },
+        { id = "w4", fromElementId = "s1", toElementId = "bus2" },
+    }
+    local componentTypes = { s1 = "source", bus1 = "path", bus2 = "path", g1 = "gate" }
+    local graph = ModelGraph.buildGraph(elements, controls, wires, componentTypes)
+    return ModelGraph.hasAltPath(graph, "bus2", "w3")
+end
+
+-- s1 (on) feeds bus1 directly; s2 (off, e.g. an off generator) also sits on
+-- bus1, with sink2 wired only through s2. s2's own terminal must read
+-- powered (the real wire from bus1 carries voltage right up to it, same as
+-- a gate's input terminal) but it must still block propagation PAST
+-- itself, same as a gate blocks onward when open — so sink2, reachable
+-- only through s2, must stay unpowered.
+function modelSolverOffSourceReachedButBlocksPastTest()
+    local elements = { {id = "bus1"}, {id = "sink2"} }
+    local controls = { {id = "s1"}, {id = "s2"} }
+    local wires = {
+        { id = "w1", fromElementId = "s1", toElementId = "bus1" },
+        { id = "w2", fromElementId = "bus1", toElementId = "s2" },
+        { id = "w3", fromElementId = "s2", toElementId = "sink2" },
+    }
+    local componentTypes = { s1 = "source", s2 = "source", bus1 = "path", sink2 = "sink" }
+    local graph = ModelGraph.buildGraph(elements, controls, wires, componentTypes)
+    local states = ModelSolver.solve(graph, { s1 = true, s2 = false }, {})
+    return states.s2, states.sink2
+end
+
+-- Full Phase 1 adapter path against a throwaway canvas: GEN 1 (source,
+-- control) -> SW 1 (gate, control) -> BUS 1 (path, element), switch ON,
+-- never a single snapshot painted. If propagation is wiring correctly, BUS
+-- 1 resolves straight to the electrical medium's "powered" color via the
+-- predictedColor tier — this is Phase 1's whole point.
+function schematicComponentTypePropagationTest()
+    gdsGui_schematic_delete("unitTestCanvas20")
+    gdsGui_schematic_create("unitTestCanvas20", "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_addControl("unitTestCanvas20", "gen1", 0, 0, {"OFF", "ON"}, 1, "GEN 1", nil,
+        1, nil, nil, nil, nil, nil, "source")
+    gdsGui_schematic_addControl("unitTestCanvas20", "sw1", 0.3, 0, {"OFF", "ON"}, 1, "SW 1", nil,
+        1, nil, nil, nil, nil, nil, "gate")
+    gdsGui_schematic_addElement("unitTestCanvas20", "bus1", "rect", 0.6, 0, 0.1, 0.1, "BUS 1", nil,
+        nil, nil, nil, "path")
+    gdsGui_schematic_addWire("unitTestCanvas20", "w1", "gen1", "sw1", nil)
+    gdsGui_schematic_addWire("unitTestCanvas20", "w2", "sw1", "bus1", nil)
+
+    local canvas = nil
+    for _, c in ipairs(globApp.objects.schematics) do
+        if c.name == "unitTestCanvas20" then canvas = c end
+    end
+    if not canvas then return "canvas not found" end
+
+    local componentTypes = _buildComponentTypeMap(canvas)
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes)
+    local sourceStates = _currentSourceStates(canvas, componentTypes)
+    local gateStates = _currentGateStates(canvas, componentTypes)
+    local nodeStates = ModelSolver.solve(graph, sourceStates, gateStates)
+
+    gdsGui_schematic_applySolvedColors("unitTestCanvas20",
+        { elements = { bus1 = ELECTRICAL_MEDIUM.style[nodeStates.bus1] }, wires = {}, controls = {} })
+    local r = gdsGui_schematic_resolveColor("unitTestCanvas20", "element", "bus1")
+    return r
+end
+
+-- Same source -> gate -> sink topology as the solver tests above, but this
+-- time the gate itself is reached (powered) and the sink is ALSO powered
+-- with no alternate path to the source — the only way that's consistent
+-- is a closed gate.
+function modelLearnerInferGateClosedTest()
+    local elements = { {id = "s1"}, {id = "sink1"} }
+    local controls = { {id = "g1"} }
+    local wires = {
+        { id = "w1", fromElementId = "s1", toElementId = "g1" },
+        { id = "w2", fromElementId = "g1", toElementId = "sink1" },
+    }
+    local componentTypes = { s1 = "source", g1 = "gate", sink1 = "sink" }
+    local graph = ModelGraph.buildGraph(elements, controls, wires, componentTypes)
+    local nodeStates = { s1 = "powered", g1 = "powered", sink1 = "powered" }
+    return ModelLearner.inferGate("g1", nodeStates, graph)
+end
+
+-- Same topology, gate reached (powered) but the sink is unpowered — the
+-- only way that's consistent is an open gate.
+function modelLearnerInferGateOpenTest()
+    local elements = { {id = "s1"}, {id = "sink1"} }
+    local controls = { {id = "g1"} }
+    local wires = {
+        { id = "w1", fromElementId = "s1", toElementId = "g1" },
+        { id = "w2", fromElementId = "g1", toElementId = "sink1" },
+    }
+    local componentTypes = { s1 = "source", g1 = "gate", sink1 = "sink" }
+    local graph = ModelGraph.buildGraph(elements, controls, wires, componentTypes)
+    local nodeStates = { s1 = "powered", g1 = "powered", sink1 = "unpowered" }
+    return ModelLearner.inferGate("g1", nodeStates, graph)
+end
+
+-- The gate was never even reached in this snapshot (everything unpowered)
+-- — there's no evidence either way, so this must stay "unknown", never a
+-- guess.
+function modelLearnerInferGateUnknownWhenUnreachedTest()
+    local elements = { {id = "s1"}, {id = "sink1"} }
+    local controls = { {id = "g1"} }
+    local wires = {
+        { id = "w1", fromElementId = "s1", toElementId = "g1" },
+        { id = "w2", fromElementId = "g1", toElementId = "sink1" },
+    }
+    local componentTypes = { s1 = "source", g1 = "gate", sink1 = "sink" }
+    local graph = ModelGraph.buildGraph(elements, controls, wires, componentTypes)
+    local nodeStates = { s1 = "unpowered", g1 = "unpowered", sink1 = "unpowered" }
+    return ModelLearner.inferGate("g1", nodeStates, graph)
+end
+
+-- Integration test against a throwaway canvas: source -> gate (a real,
+-- user-toggled control here, same as Phase 1's test — inferGate doesn't
+-- care HOW the gate's position was set, only what the painted colors show)
+-- -> sink. Captures two real snapshots via the actual prepareSnapshot/
+-- commitSnapshot path (one with the gate closed, one open), each hand-
+-- painted via pendingColor exactly like the PAINT tool's _applyPaint does
+-- internally, then asserts model/learner.lua deduces the right state for
+-- each snapshot purely from its own colors.
+function schematicDeducedGateStatesFromSnapshotsTest()
+    gdsGui_schematic_delete("unitTestCanvas21")
+    gdsGui_schematic_create("unitTestCanvas21", "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_addElement("unitTestCanvas21", "s1", "rect", 0, 0, 0.1, 0.1, "SRC", nil, nil, nil, nil, "source")
+    gdsGui_schematic_addControl("unitTestCanvas21", "g1", 0.3, 0, {"OPEN", "CLOSED"}, 0, "G1", nil,
+        1, nil, nil, nil, nil, nil, "gate")
+    gdsGui_schematic_addElement("unitTestCanvas21", "snk1", "rect", 0.6, 0, 0.1, 0.1, "SNK", nil, nil, nil, nil, "sink")
+    gdsGui_schematic_addWire("unitTestCanvas21", "w1", "s1", "g1", nil)
+    gdsGui_schematic_addWire("unitTestCanvas21", "w2", "g1", "snk1", nil)
+
+    local canvas = nil
+    for _, c in ipairs(globApp.objects.schematics) do
+        if c.name == "unitTestCanvas21" then canvas = c end
+    end
+    if not canvas then return false end
+
+    local POWERED, UNPOWERED = ELECTRICAL_MEDIUM.style.powered, ELECTRICAL_MEDIUM.style.unpowered
+
+    -- Snapshot 1: gate at detent 1 ("CLOSED"), everything painted powered.
+    canvas.controls[1].detentIndex = 1
+    canvas.elements[1].pendingColor = POWERED -- s1
+    canvas.controls[1].pendingColor = POWERED -- g1
+    canvas.elements[2].pendingColor = POWERED -- snk1
+    gdsGui_schematic_commitSnapshot("unitTestCanvas21", gdsGui_schematic_prepareSnapshot("unitTestCanvas21"))
+    local sigClosed = gdsGui_schematic_computeSignature("unitTestCanvas21")
+
+    -- Snapshot 2: gate at detent 0 ("OPEN") — still energized at its own
+    -- input, but the sink it feeds is unreached.
+    canvas.controls[1].detentIndex = 0
+    canvas.elements[1].pendingColor = POWERED
+    canvas.controls[1].pendingColor = POWERED
+    canvas.elements[2].pendingColor = UNPOWERED
+    gdsGui_schematic_commitSnapshot("unitTestCanvas21", gdsGui_schematic_prepareSnapshot("unitTestCanvas21"))
+    local sigOpen = gdsGui_schematic_computeSignature("unitTestCanvas21")
+
+    local componentTypes = _buildComponentTypeMap(canvas)
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes)
+    local closedStates = ModelLearner.deduceAllGates(graph, _snapshotToNodeStates(canvas.snapshots[sigClosed], graph))
+    local openStates = ModelLearner.deduceAllGates(graph, _snapshotToNodeStates(canvas.snapshots[sigOpen], graph))
+
+    return closedStates.g1 == "closed" and openStates.g1 == "open"
+end
+
+-- A condition that perfectly predicts the gate's result in both examples
+-- -> a learned single-condition rule naming that exact condition.
+function modelLearnerFindRuleSingleConditionTest()
+    local examples = {
+        { nodeStates = { cond = "powered" }, result = "closed" },
+        { nodeStates = { cond = "unpowered" }, result = "open" },
+    }
+    local rule = ModelLearner.findSimplestRule("g1", examples, { "cond" })
+    if rule.status ~= "learned" then return "fail:" .. tostring(rule.status) end
+    return rule.conditionIds[1], rule.resultState
+end
+
+-- The only candidate condition contradicts itself (same state, different
+-- results across examples) -- never guess, report no consistent rule.
+function modelLearnerFindRuleContradictionTest()
+    local examples = {
+        { nodeStates = { cond = "powered" }, result = "closed" },
+        { nodeStates = { cond = "powered" }, result = "open" },
+    }
+    local rule = ModelLearner.findSimplestRule("g1", examples, { "cond" })
+    return rule.status
+end
+
+-- Neither condition alone explains the gate (each contradicts itself in
+-- isolation), but the PAIR together does -- single-condition search must
+-- exhaust before falling through to pairs.
+function modelLearnerFindRulePairConditionTest()
+    local examples = {
+        { nodeStates = { condA = "powered", condB = "powered" }, result = "closed" },
+        { nodeStates = { condA = "powered", condB = "unpowered" }, result = "open" },
+        { nodeStates = { condA = "unpowered", condB = "powered" }, result = "open" },
+    }
+    local rule = ModelLearner.findSimplestRule("g1", examples, { "condA", "condB" })
+    if rule.status ~= "learned" then return "fail:" .. tostring(rule.status) end
+    return #rule.conditionIds
+end
+
+-- Integration test: two independently-toggled gates (g1 feeding sink1,
+-- swA feeding busA, no wire between the two branches at all) painted
+-- across two snapshots so that g1's deduced state tracks busA's power
+-- exactly, while every other node (s1, s2, swA, sink1 by itself) is
+-- either constant or IS the gate's own direct effect — proving the
+-- learner picks the genuinely correlated, independent busA over those,
+-- purely from candidate order (busA sorts first alphabetically here).
+function schematicGateRuleLearnedFromSnapshotsTest()
+    gdsGui_schematic_delete("unitTestCanvas22")
+    gdsGui_schematic_create("unitTestCanvas22", "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_addElement("unitTestCanvas22", "s1", "rect", 0, 0, 0.1, 0.1, "S1", nil, nil, nil, nil, "source")
+    gdsGui_schematic_addElement("unitTestCanvas22", "sink1", "rect", 0.6, 0, 0.1, 0.1, "SNK", nil, nil, nil, nil, "sink")
+    gdsGui_schematic_addElement("unitTestCanvas22", "s2", "rect", 0, 0.3, 0.1, 0.1, "S2", nil, nil, nil, nil, "source")
+    gdsGui_schematic_addElement("unitTestCanvas22", "busA", "rect", 0.6, 0.3, 0.1, 0.1, "BUSA", nil, nil, nil, nil, "path")
+    gdsGui_schematic_addControl("unitTestCanvas22", "g1", 0.3, 0, {"OPEN", "CLOSED"}, 0, "G1", nil,
+        1, nil, nil, nil, nil, nil, "gate")
+    gdsGui_schematic_addControl("unitTestCanvas22", "swA", 0.3, 0.3, {"OPEN", "CLOSED"}, 0, "SWA", nil,
+        1, nil, nil, nil, nil, nil, "gate")
+    gdsGui_schematic_addWire("unitTestCanvas22", "w1", "s1", "g1", nil)
+    gdsGui_schematic_addWire("unitTestCanvas22", "w2", "g1", "sink1", nil)
+    gdsGui_schematic_addWire("unitTestCanvas22", "w3", "s2", "swA", nil)
+    gdsGui_schematic_addWire("unitTestCanvas22", "w4", "swA", "busA", nil)
+
+    local canvas = nil
+    for _, c in ipairs(globApp.objects.schematics) do
+        if c.name == "unitTestCanvas22" then canvas = c end
+    end
+    if not canvas then return "fail: canvas not found" end
+
+    local POWERED, UNPOWERED = ELECTRICAL_MEDIUM.style.powered, ELECTRICAL_MEDIUM.style.unpowered
+
+    -- Snapshot 1: both gates CLOSED -- g1 closed (sink powered), busA powered.
+    canvas.controls[1].detentIndex = 1 -- g1
+    canvas.controls[2].detentIndex = 1 -- swA
+    canvas.elements[1].pendingColor = POWERED   -- s1
+    canvas.controls[1].pendingColor = POWERED   -- g1
+    canvas.elements[2].pendingColor = POWERED   -- sink1
+    canvas.elements[3].pendingColor = POWERED   -- s2
+    canvas.controls[2].pendingColor = POWERED   -- swA
+    canvas.elements[4].pendingColor = POWERED   -- busA
+    gdsGui_schematic_commitSnapshot("unitTestCanvas22", gdsGui_schematic_prepareSnapshot("unitTestCanvas22"))
+
+    -- Snapshot 2: both gates OPEN -- g1 open (sink unpowered), busA unpowered.
+    canvas.controls[1].detentIndex = 0
+    canvas.controls[2].detentIndex = 0
+    canvas.elements[1].pendingColor = POWERED
+    canvas.controls[1].pendingColor = POWERED
+    canvas.elements[2].pendingColor = UNPOWERED
+    canvas.elements[3].pendingColor = POWERED
+    canvas.controls[2].pendingColor = POWERED
+    canvas.elements[4].pendingColor = UNPOWERED
+    gdsGui_schematic_commitSnapshot("unitTestCanvas22", gdsGui_schematic_prepareSnapshot("unitTestCanvas22"))
+
+    local componentTypes = _buildComponentTypeMap(canvas)
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes)
+
+    local examples = {}
+    for _, snapshot in pairs(canvas.snapshots) do
+        local nodeStates = _snapshotToNodeStates(snapshot, graph)
+        local gateStates = ModelLearner.deduceAllGates(graph, nodeStates)
+        if gateStates.g1 ~= ModelLearner.UNKNOWN then
+            table.insert(examples, { nodeStates = nodeStates, result = gateStates.g1 })
+        end
+    end
+
+    local candidateIds = {}
+    for id in pairs(graph.nodes) do
+        if id ~= "g1" then table.insert(candidateIds, id) end
+    end
+    table.sort(candidateIds)
+
+    local rule = ModelLearner.findSimplestRule("g1", examples, candidateIds)
+    if rule.status ~= "learned" then return "fail: " .. tostring(rule.status) end
+    if rule.conditionIds[1] ~= "busA" then return "fail: conditionId=" .. tostring(rule.conditionIds[1]) end
+    return rule.resultState
+end
+
+-- An independent bus (busX) is always powered regardless of g1 -- the
+-- rule's verdict never changes, so the feedback loop settles immediately.
+function modelSolverSolveWithRulesConvergesTest()
+    local elements = { {id="s1"}, {id="sink1"}, {id="sX"}, {id="busX"} }
+    local controls = { {id="g1"} }
+    local wires = {
+        { id="w1", fromElementId="s1", toElementId="g1" },
+        { id="w2", fromElementId="g1", toElementId="sink1" },
+        { id="w3", fromElementId="sX", toElementId="busX" },
+    }
+    local componentTypes = { s1="source", g1="gate", sink1="sink", sX="source", busX="path" }
+    local graph = ModelGraph.buildGraph(elements, controls, wires, componentTypes)
+    local rule = { status="learned", conditionIds={"busX"}, conditionStates={busX="powered"}, resultState="closed" }
+    local result = ModelSolver.solveWithRules(graph, { s1=true, sX=true }, {}, { g1=rule })
+    return result.converged, result.gateStates.g1
+end
+
+-- g1 is told to close exactly when the one bus it SOLELY feeds is
+-- unpowered -- i.e. exactly when g1 itself is currently open -- so every
+-- re-evaluation flips it. No fixed point exists; must report non-convergence.
+function modelSolverSolveWithRulesDetectsOscillationTest()
+    local elements = { {id="s1"}, {id="busA"} }
+    local controls = { {id="g1"} }
+    local wires = {
+        { id="w1", fromElementId="s1", toElementId="g1" },
+        { id="w2", fromElementId="g1", toElementId="busA" },
+    }
+    local componentTypes = { s1="source", g1="gate", busA="path" }
+    local graph = ModelGraph.buildGraph(elements, controls, wires, componentTypes)
+    local rule = { status="learned", conditionIds={"busA"}, conditionStates={busA="unpowered"}, resultState="closed" }
+    local result = ModelSolver.solveWithRules(graph, { s1=true }, {}, { g1=rule })
+    return result.converged
+end
+
+function formatRuleTextLearnedSingleConditionTest()
+    local rule = { status="learned", conditionIds={"busA"}, conditionStates={busA="powered"}, resultState="closed" }
+    return _formatRuleText("g1", rule, { g1="RELAY 1", busA="BUS A" })
+end
+
+function formatRuleTextNoRuleYetTest()
+    return _formatRuleText("g1", { status="noRule" }, { g1="RELAY 1" })
+end
+
+-- _labelsByIdForCanvas (the live-canvas adapter) feeding straight into
+-- _formatRuleText, against real elements/controls with their own labels.
+function schematicFormatRuleTextUsesCanvasLabelsTest()
+    gdsGui_schematic_delete("unitTestCanvas23")
+    gdsGui_schematic_create("unitTestCanvas23", "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_addElement("unitTestCanvas23", "busA", "rect", 0, 0, 0.1, 0.1, "BUS A", nil, nil, nil, nil, "path")
+    gdsGui_schematic_addControl("unitTestCanvas23", "g1", 0.3, 0, {"OPEN", "CLOSED"}, 0, "RELAY 1", nil,
+        1, nil, nil, nil, nil, nil, "gate")
+
+    local canvas = nil
+    for _, c in ipairs(globApp.objects.schematics) do
+        if c.name == "unitTestCanvas23" then canvas = c end
+    end
+    if not canvas then return "fail: canvas not found" end
+
+    local rule = { status="learned", conditionIds={"busA"}, conditionStates={busA="powered"}, resultState="closed" }
+    return _formatRuleText("g1", rule, _labelsByIdForCanvas(canvas))
+end
+
+-- _lockGateRule must flip a learned rule to locked (so _recomputeGateRules
+-- will never relearn over it), and must leave a non-learned rule alone.
+function schematicLockGateRuleTest()
+    local canvasA = { rules = { g1 = { status="learned", conditionIds={}, conditionStates={}, resultState="closed" } } }
+    _lockGateRule(canvasA, "g1")
+    local lockedResult = canvasA.rules.g1.status
+
+    local canvasB = { rules = { g1 = { status="noRule" } } }
+    _lockGateRule(canvasB, "g1")
+    local noRuleResult = canvasB.rules.g1.status
+
+    return lockedResult, noRuleResult
+end
+
+function suggestNextSnapshotNoCapturesYetTest()
+    local controls = { {id="a", numDetents=2}, {id="b", numDetents=2} }
+    local suggestion = ModelSuggest.suggestNextSnapshot(controls, {})
+    return suggestion.signature
+end
+
+function suggestNextSnapshotOneFlipFromCapturedTest()
+    local controls = { {id="a", numDetents=2}, {id="b", numDetents=2} }
+    local captured = { ["a=0,b=0"] = true }
+    local suggestion = ModelSuggest.suggestNextSnapshot(controls, captured)
+    return suggestion.signature, suggestion.flippedControlId
+end
+
+function suggestNextSnapshotNilWhenFullyCapturedTest()
+    local controls = { {id="a", numDetents=2} }
+    local captured = { ["a=0"] = true, ["a=1"] = true }
+    local suggestion = ModelSuggest.suggestNextSnapshot(controls, captured)
+    if suggestion == nil then return "nil" end
+    return suggestion.signature
+end
+
+-- "a" is iterated before "b" in controls, so a=1,b=0 is the FIRST
+-- untested neighbor suggestNextSnapshot's own "first one wins" shortcut
+-- would return -- scoreFn instead rates the SECOND-considered a=0,b=1
+-- higher, proving suggestTargetedSnapshot keeps searching and picks the
+-- best-scored candidate rather than stopping at the first.
+function suggestTargetedSnapshotPicksHighestScoringCandidateTest()
+    local controls = { {id="a", numDetents=2}, {id="b", numDetents=2} }
+    local captured = { ["a=0,b=0"] = true }
+    local function scoreFn(candidate)
+        if candidate.b == 1 then return 2 end
+        return 1
+    end
+    local suggestion = ModelSuggest.suggestTargetedSnapshot(controls, captured, scoreFn)
+    return suggestion.signature
+end
+
+-- A scoreFn that never returns a truthy score (every candidate is
+-- genuinely useless to the caller's own goal) must yield nil, not an
+-- arbitrary untested neighbor -- the caller (main.lua's AI panel) relies
+-- on nil to know it should fall back to plain suggestNextSnapshot instead.
+function suggestTargetedSnapshotNilWhenScoreFnNeverScoresTest()
+    local controls = { {id="a", numDetents=2}, {id="b", numDetents=2} }
+    local captured = { ["a=0,b=0"] = true }
+    local suggestion = ModelSuggest.suggestTargetedSnapshot(controls, captured, function() return nil end)
+    if suggestion == nil then return "nil" end
+    return suggestion.signature
 end
 
 -------------------------------------------------------------------------------
@@ -4852,6 +7831,203 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcParameters"]={0},
         ["funcExpctOutput"]={0}}
 
+    --------------------------------------------------------------------------
+    --  inference model (model/graph.lua, model/solver.lua) — Phase 1
+    --------------------------------------------------------------------------
+    gdsGui_dev_testExecute {["id"]="modelSolver_closedGate_powersSink",
+        ["funcName"]={"modelSolverClosedGatePowersSinkTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"powered"}}
+
+    gdsGui_dev_testExecute {["id"]="modelSolver_openGate_blocksSink",
+        ["funcName"]={"modelSolverOpenGateBlocksSinkTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"unpowered"}}
+
+    gdsGui_dev_testExecute {["id"]="modelGraph_hasAltPath_findsBypassAroundGate",
+        ["funcName"]={"modelGraphHasAltPathTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={true}}
+
+    gdsGui_dev_testExecute {["id"]="modelSolver_offSource_reachedButBlocksPast",
+        ["funcName"]={"modelSolverOffSourceReachedButBlocksPastTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"powered", "unpowered"}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_componentType_propagatesWithoutPaintedSnapshot",
+        ["funcName"]={"schematicComponentTypePropagationTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+
+    --------------------------------------------------------------------------
+    --  inference model (model/learner.lua) — Phase 2
+    --------------------------------------------------------------------------
+    gdsGui_dev_testExecute {["id"]="modelLearner_inferGate_closedFromBothSidesPowered",
+        ["funcName"]={"modelLearnerInferGateClosedTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"closed"}}
+
+    gdsGui_dev_testExecute {["id"]="modelLearner_inferGate_openFromUnpoweredSink",
+        ["funcName"]={"modelLearnerInferGateOpenTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"open"}}
+
+    gdsGui_dev_testExecute {["id"]="modelLearner_inferGate_unknownWhenGateUnreached",
+        ["funcName"]={"modelLearnerInferGateUnknownWhenUnreachedTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"unknown"}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_deducedGateStates_matchPaintedSnapshots",
+        ["funcName"]={"schematicDeducedGateStatesFromSnapshotsTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={true}}
+
+    --------------------------------------------------------------------------
+    --  rule learner (model/learner.lua's findSimplestRule) — Phase 3
+    --------------------------------------------------------------------------
+    gdsGui_dev_testExecute {["id"]="modelLearner_findSimplestRule_singleCondition",
+        ["funcName"]={"modelLearnerFindRuleSingleConditionTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"cond", "closed"}}
+
+    gdsGui_dev_testExecute {["id"]="modelLearner_findSimplestRule_contradictionYieldsNoRule",
+        ["funcName"]={"modelLearnerFindRuleContradictionTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"noRule"}}
+
+    gdsGui_dev_testExecute {["id"]="modelLearner_findSimplestRule_fallsThroughToPairCondition",
+        ["funcName"]={"modelLearnerFindRulePairConditionTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={2}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_gateRule_learnedFromSnapshots",
+        ["funcName"]={"schematicGateRuleLearnedFromSnapshotsTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"closed"}}
+
+    --------------------------------------------------------------------------
+    --  feedback-loop solving (model/solver.lua's solveWithRules) — Phase 4
+    --------------------------------------------------------------------------
+    gdsGui_dev_testExecute {["id"]="modelSolver_solveWithRules_convergesOnIndependentCondition",
+        ["funcName"]={"modelSolverSolveWithRulesConvergesTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={true, "closed"}}
+
+    gdsGui_dev_testExecute {["id"]="modelSolver_solveWithRules_detectsSelfReferentialOscillation",
+        ["funcName"]={"modelSolverSolveWithRulesDetectsOscillationTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={false}}
+
+    --------------------------------------------------------------------------
+    --  rule text / lock / suggest-next-snapshot — Phase 5 (logic layer only;
+    --  no dock tool, menu entry, or badge UI wired up yet)
+    --------------------------------------------------------------------------
+    gdsGui_dev_testExecute {["id"]="formatRuleText_learnedSingleCondition",
+        ["funcName"]={"formatRuleTextLearnedSingleConditionTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"RELAY 1 is closed when BUS A is powered"}}
+
+    gdsGui_dev_testExecute {["id"]="formatRuleText_noRuleYet",
+        ["funcName"]={"formatRuleTextNoRuleYetTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"RELAY 1: no rule learned yet"}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_formatRuleText_usesCanvasLabels",
+        ["funcName"]={"schematicFormatRuleTextUsesCanvasLabelsTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"RELAY 1 is closed when BUS A is powered"}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_lockGateRule_locksLearnedLeavesNoRuleAlone",
+        ["funcName"]={"schematicLockGateRuleTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"locked", "noRule"}}
+
+    gdsGui_dev_testExecute {["id"]="suggestNextSnapshot_noCapturesYet_baseline",
+        ["funcName"]={"suggestNextSnapshotNoCapturesYetTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"a=0,b=0"}}
+
+    gdsGui_dev_testExecute {["id"]="suggestNextSnapshot_oneFlipFromCaptured",
+        ["funcName"]={"suggestNextSnapshotOneFlipFromCapturedTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"a=1,b=0", "a"}}
+
+    gdsGui_dev_testExecute {["id"]="suggestNextSnapshot_nilWhenFullyCaptured",
+        ["funcName"]={"suggestNextSnapshotNilWhenFullyCapturedTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"nil"}}
+
+    gdsGui_dev_testExecute {["id"]="suggestTargetedSnapshot_picksHighestScoringCandidate",
+        ["funcName"]={"suggestTargetedSnapshotPicksHighestScoringCandidateTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"a=0,b=1"}}
+
+    gdsGui_dev_testExecute {["id"]="suggestTargetedSnapshot_nilWhenScoreFnNeverScores",
+        ["funcName"]={"suggestTargetedSnapshotNilWhenScoreFnNeverScoresTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"nil"}}
+
+    --------------------------------------------------------------------------
+    --  user-configurable ELECTRICAL powered/unpowered colors
+    --------------------------------------------------------------------------
+    gdsGui_dev_testExecute {["id"]="schematic_getColorPaletteEntry_green",
+        ["funcName"]={"schematicGetColorPaletteEntryTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={0, 1, 0, "GREEN"}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_electricalColorOverride_stateForColorTracksCurrentStyle",
+        ["funcName"]={"schematicElectricalColorOverride_stateForColorTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={true, false}}
+
+    --------------------------------------------------------------------------
+    --  voltage-keyed powered colors + voltage tie-break
+    --------------------------------------------------------------------------
+    gdsGui_dev_testExecute {["id"]="colorForPoweredNode_singleSourceOwnColor",
+        ["funcName"]={"colorForPoweredNode_singleSourceOwnColorTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1, 0, 0}}
+
+    gdsGui_dev_testExecute {["id"]="colorForPoweredNode_singleSourceNoColorFallsBack",
+        ["funcName"]={"colorForPoweredNode_singleSourceNoColorFallsBackTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={0.9, 0.9, 0.9}}
+
+    gdsGui_dev_testExecute {["id"]="colorForPoweredNode_tieHigherVoltageWins",
+        ["funcName"]={"colorForPoweredNode_tieHigherVoltageWinsTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1, 1, 0}}
+
+    gdsGui_dev_testExecute {["id"]="colorForPoweredNode_tieNoVoltageDashes",
+        ["funcName"]={"colorForPoweredNode_tieNoVoltageDashesTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={2}}
+
+    gdsGui_dev_testExecute {["id"]="colorForPoweredNode_tieEqualVoltageSameColor",
+        ["funcName"]={"colorForPoweredNode_tieEqualVoltageSameColorTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1, 0, 0}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_voltageTieBreak_integration",
+        ["funcName"]={"schematicVoltageTieBreakIntegrationTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1, 1, 0}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_openGate_showsUnpoweredColor",
+        ["funcName"]={"schematicOpenGateShowsUnpoweredColorTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={true, true, "powered"}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_attributionRule_learnedAndApplied",
+        ["funcName"]={"schematicAttributionRuleLearnedAndAppliedTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={true, true, true, true}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_tiedVoltage_attributionConfidence",
+        ["funcName"]={"schematicTiedVoltageAttributionConfidenceTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={true, true, true}}
+
     gdsGui_dev_testExecute {["id"]="unlockSchematicFeature_setsEntitlementFlag",
         ["funcName"]={"unlockSchematicFeatureTest"},
         ["funcParameters"]={0},
@@ -4889,36 +8065,6 @@ gdsGui_unitTests_registerSuite("app", function()
 
     gdsGui_dev_testExecute {["id"]="schematicStore_compatNotice_gatesOncePerVersion",
         ["funcName"]={"schematicCompatNotice_gatesOncePerVersionTest"},
-        ["funcParameters"]={0},
-        ["funcExpctOutput"]={1}}
-
-    gdsGui_dev_testExecute {["id"]="jsonEscapeString_escapesQuotesAndBackslashes",
-        ["funcName"]={"jsonEscapeString_escapesQuotesAndBackslashesTest"},
-        ["funcParameters"]={0},
-        ["funcExpctOutput"]={1}}
-
-    gdsGui_dev_testExecute {["id"]="toJSON_encodesArraysNestedInObjects",
-        ["funcName"]={"toJSON_encodesArraysNestedInObjectsTest"},
-        ["funcParameters"]={0},
-        ["funcExpctOutput"]={1}}
-
-    gdsGui_dev_testExecute {["id"]="schematicExport_writesAircraftJsonFile",
-        ["funcName"]={"schematicExport_writesAircraftJsonFileTest"},
-        ["funcParameters"]={0},
-        ["funcExpctOutput"]={1}}
-
-    gdsGui_dev_testExecute {["id"]="fromJSON_roundTripsToJSONOutput",
-        ["funcName"]={"fromJSON_roundTripsToJSONOutputTest"},
-        ["funcParameters"]={0},
-        ["funcExpctOutput"]={1}}
-
-    gdsGui_dev_testExecute {["id"]="schematicImport_addsAircraftFromExportFile",
-        ["funcName"]={"schematicImport_addsAircraftFromExportFileTest"},
-        ["funcParameters"]={0},
-        ["funcExpctOutput"]={1}}
-
-    gdsGui_dev_testExecute {["id"]="schematicImport_dedupesCollidingAircraftId",
-        ["funcName"]={"schematicImport_dedupesCollidingAircraftIdTest"},
         ["funcParameters"]={0},
         ["funcExpctOutput"]={1}}
 

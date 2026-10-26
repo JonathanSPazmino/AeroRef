@@ -42,7 +42,7 @@ globApp.objects.schematics = {}
 --------------------------------------------------------------------------------
 
 local _CONTROL_RADIUS_FRAC   = 0.045   -- control hit/draw radius, as a fraction of min(canvas.contentW, canvas.contentH)
-local _GRID_SPACING_PX       = 3  -- world units between grid lines; also the element/control placement snap pitch (see _snapToGrid)
+local _GRID_SPACING_PX       = 2.1  -- world units between grid lines; also the element/control placement snap pitch (see _snapToGrid)
 local _MIN_ZOOM               = 1      -- fully zoomed out: the whole canvas box fits exactly in the viewport
 local _MAX_ZOOM               = 6
 -- Element/control labels are invisible from _MIN_ZOOM through
@@ -411,7 +411,7 @@ local function _commitNamedPlacement(canvas, pending, trimmed)
         local wFrac, hFrac = _pendingElementSizeFrac(canvas, pending)
         gdsGui_schematic_addElement(pending.canvasName, pending.newId, pending.shapeType,
             pending.fracX, pending.fracY, wFrac, hFrac,
-            trimmed, pending.defaultColor, properties, nil, pending.spritePath)
+            trimmed, pending.defaultColor, properties, nil, pending.spritePath, pending.componentType)
         canvas.snapshots = {}
         _notifyChanged(canvas)
     else
@@ -419,9 +419,18 @@ local function _commitNamedPlacement(canvas, pending, trimmed)
         gdsGui_schematic_addControl(pending.canvasName, pending.newId, pending.fracX, pending.fracY,
             pending.positions, 0, trimmed, pending.callbackFunc,
             (1 / _EDIT_MODE_INITIAL_ZOOM) * (pending.radiusMul or 1), pending.spritePaths,
-            nil, pending.overlaySpritePath, nil, pending.colorDarkenMul)
+            nil, pending.overlaySpritePath, nil, pending.colorDarkenMul, pending.componentType)
         canvas.snapshots = {}
         _notifyChanged(canvas)
+    end
+    -- Lets the app layer react to a freshly-placed element/control right
+    -- away (e.g. prompting a "source"-role item for its voltage the instant
+    -- it's named) without this library needing to know what componentType
+    -- actually means — same callback-by-name convention as canvas.onChange
+    -- above, just fired with the new item's own kind/id/componentType too.
+    if canvas.onElementPlaced then
+        local fn = _G[canvas.onElementPlaced]
+        if fn then fn(pending.canvasName, pending.kind, pending.newId, pending.componentType) end
     end
 end
 
@@ -976,16 +985,59 @@ function gdsGui_schematic_getZoom(canvasName)
     return canvas.zoom
 end
 
+-- The canvas's own on-screen draw rectangle (pixels) — x, y, w, h — same
+-- fields the library's own grid/content-clipping math uses internally (see
+-- e.g. the grid overlay's x0,y0,x1,y1). Lets app-layer code draw its own
+-- overlay positioned relative to the live canvas (e.g. a panel pinned to
+-- its bottom edge) without reaching into the canvas table's internals
+-- directly.
+function gdsGui_schematic_getCanvasRect(canvasName)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return nil end
+    return canvas.x, canvas.y, canvas.w, canvas.h
+end
+
+-- Registers (or, passing nil, clears) a screen-space dead zone — a tap
+-- landing inside {x, y, w, h} is consumed outright by
+-- gdsGui_schematic_pressed (see its own check) before reaching any canvas
+-- interaction (pan/select/drag/paint/...), same "takes priority" treatment
+-- the library's own modal menu and annunciator panel already get. Lets
+-- app-layer code (e.g. a non-library overlay like main.lua's AI info
+-- panel) inhibit canvas interaction under its own drawn footprint without
+-- the library needing to know anything about what's actually there or why
+-- — purely geometric, re-set every frame by whatever owns it (the app
+-- layer, not this library, is responsible for keeping it in sync with
+-- wherever its overlay is actually drawn this frame, including clearing it
+-- once that overlay closes).
+-- wheelCallbackFuncName (optional): a by-name callback (resolved via
+-- _G[...], same convention as every other string-registered callback in
+-- this library), called as fn(delta, isDrag) instead of the usual zoom/pan
+-- whenever a mouse wheel event's position falls inside the SAME rect (see
+-- gdsGui_schematic_wheelZoom's own check — isDrag false, delta the wheel's
+-- own notch-count dy), or whenever a touch that PRESSED inside the rect
+-- then drags (see gdsGui_schematic_moved's own check — isDrag true, delta
+-- a raw pixel Y offset since the last move, not a notch count). Lets the
+-- app's overlay (e.g. a scrollable text panel) claim both the wheel and a
+-- touch-drag over its own footprint, without this library needing to know
+-- it's scrolling anything — the app's own callback decides how to scale
+-- each delta kind.
+function gdsGui_schematic_setInputBlockRect(canvasName, rect, wheelCallbackFuncName)
+    local canvas = _findCanvas(canvasName)
+    if canvas then
+        canvas.inputBlockRect = rect
+        canvas.inputBlockWheelCallback = rect and wheelCallbackFuncName or nil
+    end
+end
+
 function gdsGui_schematic_setMode(canvasName, mode)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     canvas.mode = mode
     -- pendingColor is a design-mode-only preview (see resolveColor) — left
-    -- set (e.g. the gray placeholder gdsGui_schematic_resetColorsToDefault
-    -- leaves on an uncaptured combination, or a picked-but-never-captured
-    -- color) it would otherwise leak into control mode, where resolveColor
-    -- checks it BEFORE the signature-matched snapshot and so masks every
-    -- snapshot cycled to with that stale preview instead of replaying it.
+    -- set (e.g. a picked-but-never-captured color) it would otherwise leak
+    -- into control mode, where resolveColor checks it BEFORE the
+    -- signature-matched snapshot and so masks every snapshot cycled to with
+    -- that stale preview instead of replaying it.
     for _, e in ipairs(canvas.elements) do e.pendingColor = nil end
     for _, w in ipairs(canvas.wires) do w.pendingColor = nil end
     for _, c in ipairs(canvas.controls) do c.pendingColor = nil end
@@ -1009,6 +1061,14 @@ function gdsGui_schematic_setMode(canvasName, mode)
     canvas._pendingDragUndoSnapshot = nil
     canvas.selectionMoveModeActive = false
     canvas.rotateModeActive = false
+    -- Selection is a design-mode-only concept (every selection-driven drag/
+    -- menu branch above gates on canvas.mode == "design") -- leaving an
+    -- element/wire selected while switching into control mode would keep it
+    -- drawn with its selection highlight there with no way to clear it.
+    if mode == "control" then
+        canvas.selectedElementId = nil
+        canvas.selectedWireId    = nil
+    end
 end
 
 function gdsGui_schematic_getMode(canvasName)
@@ -1105,13 +1165,20 @@ end
 -- item.thumbnailPath; the library never interprets what it depicts. The
 -- element's resolved color (base/pending/snapshot, same as any other
 -- shapeType) still tints it, so color-coding by snapshot still works.
-function gdsGui_schematic_addElement(canvasName, id, shapeType, x, y, w, h, label, defaultColor, properties, rotation, spritePath)
+-- componentType (optional, nil by default): an opaque string the app layer
+-- assigns — never interpreted here, same arm's-length relationship as
+-- spritePath — naming this element's role in the inference model's graph
+-- (e.g. "source" | "path" | "gate" | "directionalGate" | "sink"; see
+-- model/graph.lua). nil means untagged/excluded from solving, so every
+-- element placed before this feature existed keeps working unchanged.
+function gdsGui_schematic_addElement(canvasName, id, shapeType, x, y, w, h, label, defaultColor, properties, rotation, spritePath, componentType)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     table.insert(canvas.elements, {
         id = id, shapeType = shapeType, x = x, y = y, w = w, h = h,
         label = label, defaultColor = defaultColor or _DEFAULT_COLOR, pendingColor = nil,
         properties = properties or {}, rotation = rotation or 0, spritePath = spritePath,
+        componentType = componentType, predictedColor = nil,
     })
     _resyncPlacementCounter(canvas, id)
 end
@@ -1172,7 +1239,7 @@ function gdsGui_schematic_addWire(canvasName, id, fromElementId, toElementId, de
     table.insert(canvas.wires, {
         id = id, fromElementId = fromElementId, toElementId = toElementId,
         defaultColor = defaultColor or _DEFAULT_COLOR, pendingColor = nil,
-        directionOverride = directionOverride,
+        directionOverride = directionOverride, predictedColor = nil,
     })
 end
 
@@ -1223,7 +1290,11 @@ end
 -- colorDarkenMul (optional, defaults to 1): flat multiplier on this
 -- control's own resolved r/g/b at draw time, for a control whose icon
 -- should read darker than its assigned color.
-function gdsGui_schematic_addControl(canvasName, id, x, y, positions, initialDetentIndex, label, callbackFunc, radiusScale, spritePaths, rotation, overlaySpritePath, defaultColor, colorDarkenMul)
+-- componentType (optional, nil by default): see gdsGui_schematic_addElement
+-- above — the same opaque app-assigned graph-role string, for a control
+-- that's an interactive source or gate (e.g. a generator switch or a
+-- breaker) rather than a passive element.
+function gdsGui_schematic_addControl(canvasName, id, x, y, positions, initialDetentIndex, label, callbackFunc, radiusScale, spritePaths, rotation, overlaySpritePath, defaultColor, colorDarkenMul, componentType)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     local numDetents = math.max(2, #positions)
@@ -1234,6 +1305,7 @@ function gdsGui_schematic_addControl(canvasName, id, x, y, positions, initialDet
         spritePaths = spritePaths, rotation = rotation or 0, overlaySpritePath = overlaySpritePath,
         defaultColor = defaultColor or _DEFAULT_COLOR, pendingColor = nil,
         colorDarkenMul = colorDarkenMul or 1,
+        componentType = componentType, predictedColor = nil,
     })
     _resyncPlacementCounter(canvas, id)
 end
@@ -1330,7 +1402,10 @@ end
 -- exactly match a freshly-placed GENERATOR-style control's own on-screen
 -- diameter instead of any sizeMul of the default — see
 -- _commitNamedPlacement's own comment for the exact formula.
-function gdsGui_schematic_armElementPlacement(canvasName, shapeType, label, defaultColor, idPrefix, defaultPropertyKeys, spritePath, sizeMul, matchControlSize)
+-- componentType (optional): see gdsGui_schematic_addElement — threaded
+-- through unchanged, onto canvas.pendingPlacement, for _commitNamedPlacement
+-- to pass on to the real addElement call once the user names the placement.
+function gdsGui_schematic_armElementPlacement(canvasName, shapeType, label, defaultColor, idPrefix, defaultPropertyKeys, spritePath, sizeMul, matchControlSize, componentType)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     -- At most one of pendingPlacement/pendingConnectorColor/
@@ -1342,7 +1417,8 @@ function gdsGui_schematic_armElementPlacement(canvasName, shapeType, label, defa
     gdsGui_schematic_cancelPlacement(canvasName)
     canvas.pendingPlacement = { kind = "element", shapeType = shapeType, label = label,
         defaultColor = defaultColor, idPrefix = idPrefix or label, defaultPropertyKeys = defaultPropertyKeys,
-        spritePath = spritePath, sizeMul = sizeMul, matchControlSize = matchControlSize }
+        spritePath = spritePath, sizeMul = sizeMul, matchControlSize = matchControlSize,
+        componentType = componentType }
 end
 
 -- spritePaths, overlaySpritePath (both optional): see
@@ -1353,13 +1429,16 @@ end
 -- reads too large at the shared default control size.
 -- colorDarkenMul (optional, defaults to 1): see gdsGui_schematic_addControl
 -- — threaded through unchanged.
-function gdsGui_schematic_armControlPlacement(canvasName, positions, label, callbackFunc, idPrefix, spritePaths, overlaySpritePath, radiusMul, colorDarkenMul)
+-- componentType (optional): see gdsGui_schematic_addElement above —
+-- threaded through unchanged, same as the other arm-time options here.
+function gdsGui_schematic_armControlPlacement(canvasName, positions, label, callbackFunc, idPrefix, spritePaths, overlaySpritePath, radiusMul, colorDarkenMul, componentType)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     gdsGui_schematic_cancelPlacement(canvasName)
     canvas.pendingPlacement = { kind = "control", positions = positions, label = label,
         callbackFunc = callbackFunc, idPrefix = idPrefix or label, spritePaths = spritePaths,
-        overlaySpritePath = overlaySpritePath, radiusMul = radiusMul, colorDarkenMul = colorDarkenMul }
+        overlaySpritePath = overlaySpritePath, radiusMul = radiusMul, colorDarkenMul = colorDarkenMul,
+        componentType = componentType }
 end
 
 -- Arms a one-shot "draw the next wire/pipe/etc." gesture: tap one element,
@@ -1458,10 +1537,13 @@ end
 -- currently loaded, instead of opening its edit menu — replacing that menu's
 -- own embedded color-swatch row (see gdsGui_schematic_openElementEditMenu and
 -- its wire/control siblings, which no longer offer one). Stays armed across
--- any number of paints until explicitly disarmed via the brush button again
--- (gdsGui_schematic_disarmPaintMode) or a tap on empty canvas space (see
--- gdsGui_schematic_pressed) — never one-shot on a hit, unlike
--- pendingColorAssignPick above.
+-- any number of paints — a miss on empty canvas space just pans the view
+-- instead (see gdsGui_schematic_pressed), same as outside paint mode — until
+-- explicitly disarmed via the brush button again
+-- (gdsGui_schematic_disarmPaintMode); never one-shot on a hit, unlike
+-- pendingColorAssignPick above. A "source"-role element/control is excluded
+-- from painting entirely (see gdsGui_schematic_pressed's paintMode branch)
+-- — its color is app-layer-automatic now, derived from its own voltage.
 --------------------------------------------------------------------------------
 
 function gdsGui_schematic_armPaintMode(canvasName)
@@ -1866,6 +1948,28 @@ function gdsGui_schematic_openColorPicker(canvasName, targetKind, targetId, titl
         "gdsGui_schematic_internal_onColorPicked", "gdsGui_schematic_internal_onColorPickCancelled")
 end
 
+-- Same swatch-style picker as gdsGui_schematic_openColorPicker above, but
+-- not tied to writing any one element/wire/control's pendingColor — the
+-- app layer's own onSelectFuncName (resolved by name, called as
+-- (canvasName, index), same signature gdsGui_schematic_internal_onColorPicked
+-- itself gets) decides what the chosen color means. Lets app-layer code
+-- (e.g. an inference-model medium's user-configurable powered/unpowered
+-- display colors) reuse the same swatch UI without the library needing to
+-- know anything about what's being colored.
+function gdsGui_schematic_openGenericColorPicker(canvasName, title, onSelectFuncName, onCancelFuncName)
+    _openSwatchColorMenu(canvasName, title or "PICK COLOR", {}, onSelectFuncName, onCancelFuncName)
+end
+
+-- Read-only lookup into the same 5-entry _COLOR_PALETTE every swatch picker
+-- draws from, by the 1-based index a swatch picker's onSelect callback
+-- receives. Returns color, name (both nil if index is out of range) — lets
+-- app-layer code resolve what was actually picked, the same way
+-- gdsGui_schematic_internal_onColorPicked does internally.
+function gdsGui_schematic_getColorPaletteEntry(index)
+    local entry = _COLOR_PALETTE[index]
+    return entry and entry.color, entry and entry.name
+end
+
 function gdsGui_schematic_setPendingColor(canvasName, targetKind, targetId, color)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
@@ -1941,9 +2045,9 @@ end
 -- defaultColor — the same permanent-appearance semantics the removed
 -- per-item edit-menu color swatches used (see gdsGui_schematic_
 -- internal_onElementEditChosen's own comment on why pendingColor is also
--- set: without it, a forced-gray placeholder left by
--- gdsGui_schematic_resetColorsToDefault would mask the pick until the next
--- combination change).
+-- set: without it, resolveColor would fall through past this pick — to a
+-- snapshot, a model-layer prediction, or the bare default — until the next
+-- combination change forces a re-resolve).
 local function _applyPaint(canvas, targetKind, targetId, color)
     local target = _findByKind(canvas, targetKind, targetId)
     if not target then return end
@@ -2955,6 +3059,15 @@ function gdsGui_schematic_computeSignature(canvasName)
     return gdsGui_schematic_buildSignature(states)
 end
 
+-- Public wrapper around _parseSignature above — the inverse of
+-- gdsGui_schematic_buildSignature ("a=0,b=1" -> {a=0, b=1}), exposed so
+-- app-layer code can recover a PAST snapshot's own control positions
+-- straight from its signature key rather than relying on canvas.controls'
+-- current (possibly since-moved-on) detentIndex values.
+function gdsGui_schematic_parseSignature(signature)
+    return _parseSignature(signature)
+end
+
 local function _colorEquals(c1, c2)
     if not c1 or not c2 then return false end
     return c1[1] == c2[1] and c1[2] == c2[2] and c1[3] == c2[3] and c1[4] == c2[4]
@@ -2990,9 +3103,28 @@ end
 
 -- targetKind: "element" | "wire" | "control". Returns r,g,b,a for the
 -- entity's live resolved color: 1) a pending color-picker override, else 2)
--- the snapshot matching the current control-position signature, else 3) the
+-- the snapshot matching the current control-position signature, else 2.5) a
+-- model-layer predicted color (see predictedColor below), else 3) the
 -- entity's default (gray) color.
-function gdsGui_schematic_resolveColor(canvasName, targetKind, targetId)
+-- cachedSignature is an optional precomputed gdsGui_schematic_computeSignature
+-- result — every caller that resolves many colors off the SAME signature in
+-- one pass (the main per-frame draw loop below, over every element/wire/
+-- control) should pass it in once rather than paying computeSignature's
+-- table.sort + string-concat cost again per entity for a value that can't
+-- have changed mid-pass. Falls back to computing it fresh when omitted, so
+-- every other caller (a one-off resolve, or a unit test) is unaffected.
+--
+-- predictedColor (tier 2.5): unlike pendingColor/the snapshot bucket, this
+-- is never written by the paint tool or commitSnapshot — it's an optional
+-- field the app layer's inference model sets (see
+-- gdsGui_schematic_applySolvedColors) when it has solved a color for a
+-- control combination nobody has hand-painted yet. Sitting below the
+-- snapshot tier keeps an authored capture permanently authoritative over a
+-- prediction for the exact same combination; sitting above the bare
+-- default lets an unpainted-but-solvable combination show something better
+-- than flat gray. See gdsGui_schematic_isColorPredicted to tell which case
+-- actually fired, e.g. to badge a guess visually.
+function gdsGui_schematic_resolveColor(canvasName, targetKind, targetId, cachedSignature)
     local canvas = _findCanvas(canvasName)
     if not canvas then return _DEFAULT_COLOR[1], _DEFAULT_COLOR[2], _DEFAULT_COLOR[3], _DEFAULT_COLOR[4] end
     local target = _findByKind(canvas, targetKind, targetId)
@@ -3003,7 +3135,7 @@ function gdsGui_schematic_resolveColor(canvasName, targetKind, targetId)
         return c[1], c[2], c[3], c[4]
     end
 
-    local signature = gdsGui_schematic_computeSignature(canvasName)
+    local signature = cachedSignature or gdsGui_schematic_computeSignature(canvasName)
     local snap = canvas.snapshots[signature]
     if snap then
         local bucket = _snapshotBucket(snap, targetKind)
@@ -3011,8 +3143,106 @@ function gdsGui_schematic_resolveColor(canvasName, targetKind, targetId)
         if c then return c[1], c[2], c[3], c[4] end
     end
 
+    if target.predictedColor then
+        local c = target.predictedColor
+        return c[1], c[2], c[3], c[4]
+    end
+
     local dc = target.defaultColor or _DEFAULT_COLOR
     return dc[1], dc[2], dc[3], dc[4]
+end
+
+-- True if resolveColor's predictedColor tier (2.5) is the one that would
+-- actually fire for this entity right now — i.e. there's no pending paint
+-- override and no snapshot for the current combination, but the model
+-- layer has set a predicted color. Lets a draw function badge a guess
+-- (e.g. a dashed outline) without having to re-derive the same priority
+-- chain or compare colors by equality.
+function gdsGui_schematic_isColorPredicted(canvasName, targetKind, targetId, cachedSignature)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return false end
+    local target = _findByKind(canvas, targetKind, targetId)
+    if not target or not target.predictedColor or target.pendingColor then return false end
+    local signature = cachedSignature or gdsGui_schematic_computeSignature(canvasName)
+    local snap = canvas.snapshots[signature]
+    if snap then
+        local bucket = _snapshotBucket(snap, targetKind)
+        if bucket and bucket[targetId] then return false end
+    end
+    return true
+end
+
+-- Writes solvedColors (shaped like a snapshot bucket: {elements={id=color},
+-- wires={...}, controls={...}}) into every matching entity's predictedColor
+-- — never into pendingColor/defaultColor, so this can never shadow an
+-- authored paint-in-progress or a captured snapshot (see resolveColor's
+-- tier order above). An entity solvedColors doesn't cover is left with no
+-- prediction, falling through to its bare default. The app-layer model
+-- adapter is the only intended caller — see _solveCurrentSchematic in
+-- main.lua — called after gdsGui_schematic_stepCombination lands on a
+-- combination with no captured snapshot, and once after a system loads.
+-- solvedColors.{elements,wires,controls}[id] is normally a flat {r,g,b,a}
+-- color (c[1] a number) -- but may instead be a SEQUENCE of 2+ such colors
+-- (c[1] itself a table, see model/solver.lua's solveSourceAttribution and
+-- the per-source-color tie-break in _solveCurrentSchematic) when more than
+-- one active source reaches that node at once and neither one's voltage
+-- settles it. A sequence sets BOTH predictedColor (its first entry, kept
+-- as the single representative color every existing consumer --
+-- resolveColor, isColorPredicted, snapshot capture -- already expects) AND
+-- predictedColorSequence (consulted only by the draw functions, to render
+-- an alternating dash pattern instead of a flat fill). Nested (not a
+-- top-level local) purely to stay under this file's 200-local ceiling —
+-- it has exactly one caller.
+function gdsGui_schematic_applySolvedColors(canvasName, solvedColors)
+    local canvas = _findCanvas(canvasName)
+    if not canvas or not solvedColors then return end
+    local function applyOne(target, c)
+        if c and type(c[1]) == "table" then
+            target.predictedColor = { c[1][1], c[1][2], c[1][3], c[1][4] }
+            local seq = {}
+            for i, color in ipairs(c) do seq[i] = { color[1], color[2], color[3], color[4] } end
+            target.predictedColorSequence = seq
+        elseif c then
+            target.predictedColor = { c[1], c[2], c[3], c[4] }
+            target.predictedColorSequence = nil
+        else
+            target.predictedColor = nil
+            target.predictedColorSequence = nil
+        end
+    end
+    for _, e in ipairs(canvas.elements) do
+        applyOne(e, solvedColors.elements and solvedColors.elements[e.id])
+    end
+    for _, w in ipairs(canvas.wires) do
+        applyOne(w, solvedColors.wires and solvedColors.wires[w.id])
+    end
+    for _, ctl in ipairs(canvas.controls) do
+        applyOne(ctl, solvedColors.controls and solvedColors.controls[ctl.id])
+    end
+end
+
+-- Like resolveColor, but for a node whose CURRENT prediction is a
+-- multi-color tie rather than one flat color (see
+-- gdsGui_schematic_applySolvedColors' own comment above). Returns nil
+-- whenever there's no sequence actually in play right now -- an authored
+-- pendingColor or an exact-signature snapshot always wins outright over
+-- ANY prediction, same priority resolveColor's own tier chain uses, so
+-- this intentionally mirrors that precedence (see isColorPredicted,
+-- just below resolveColor, for the equivalent single-color check this
+-- parallels). The draw functions fall through to plain resolveColor
+-- whenever this returns nil.
+function gdsGui_schematic_resolveColorSequence(canvasName, targetKind, targetId, cachedSignature)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return nil end
+    local target = _findByKind(canvas, targetKind, targetId)
+    if not target or not target.predictedColorSequence or target.pendingColor then return nil end
+    local signature = cachedSignature or gdsGui_schematic_computeSignature(canvasName)
+    local snap = canvas.snapshots[signature]
+    if snap then
+        local bucket = _snapshotBucket(snap, targetKind)
+        if bucket and bucket[targetId] then return nil end
+    end
+    return target.predictedColorSequence
 end
 
 -- Like resolveColor above, but this is the one actually drawn on the canvas
@@ -3020,14 +3250,16 @@ end
 -- in DESIGN mode so repositioning a control to set up a capture target
 -- couldn't silently replay a different combination's snapshot. That's now
 -- handled upstream instead — gdsGui_schematic_stepCombination (the only way
--- a control's position changes in design mode) force-resets every pendingColor
--- to gray the instant the combination changes, via resetColorsToDefault — so
--- deferring to the full resolveColor here is safe, and necessary: once
--- commitSnapshot bakes a pick in (clearing pendingColor), this needs to fall
--- through to the snapshot it just wrote, not all the way to bare defaultColor,
--- or the canvas would look like the capture silently reverted.
-function gdsGui_schematic_resolveDisplayColor(canvasName, targetKind, targetId)
-    local r, g, b, a = gdsGui_schematic_resolveColor(canvasName, targetKind, targetId)
+-- a control's position changes in design mode) clears every pendingColor
+-- (and predictedColor) the instant the combination changes, via
+-- resetColorsToDefault — so deferring to the full resolveColor here is
+-- safe, and necessary: once commitSnapshot bakes a pick in (clearing
+-- pendingColor), this needs to fall through to the snapshot it just wrote,
+-- not all the way to bare defaultColor, or the canvas would look like the
+-- capture silently reverted.
+-- cachedSignature: see gdsGui_schematic_resolveColor above.
+function gdsGui_schematic_resolveDisplayColor(canvasName, targetKind, targetId, cachedSignature)
+    local r, g, b, a = gdsGui_schematic_resolveColor(canvasName, targetKind, targetId, cachedSignature)
     return _themedPaletteColor(r, g, b, a)
 end
 
@@ -3228,17 +3460,27 @@ function gdsGui_schematic_getCombinationIndex(canvasName)
     return idx + 1
 end
 
--- Sets every element/wire/control's pendingColor to the flat default gray —
--- the same "nothing captured yet" look a brand-new entity starts with (see
--- resolveColor's pendingColor-first priority) — so a freshly-cycled-to
--- combination always presents a blank slate instead of silently replaying
--- whatever a previously captured snapshot for it looked like.
+-- Clears every element/wire/control's pendingColor AND predictedColor — the
+-- "nothing captured, nothing solved yet" blank slate — so a freshly-cycled-
+-- to combination never silently replays a previously captured snapshot's
+-- (or a stale prediction's) colors. Falls through to resolveColor's tier 3
+-- (each entity's own defaultColor, gray for virtually everything in
+-- practice) rather than forcing one flat shared gray, so an entity with a
+-- genuinely custom default color keeps showing it here same as it would
+-- anywhere else resolveColor is consulted.
+--
+-- Deliberately does NOT re-populate pendingColor with gray the way it used
+-- to: resolveColor's pendingColor tier sits ABOVE the predictedColor tier,
+-- so if this still force-set pendingColor here, a model-layer prediction
+-- written afterward via gdsGui_schematic_applySolvedColors could never be
+-- seen — see resolveColor's own comment on the predictedColor tier, and the
+-- call site below, which is the only caller.
 function gdsGui_schematic_resetColorsToDefault(canvasName)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
-    for _, e in ipairs(canvas.elements) do e.pendingColor = { _DEFAULT_COLOR[1], _DEFAULT_COLOR[2], _DEFAULT_COLOR[3], _DEFAULT_COLOR[4] } end
-    for _, w in ipairs(canvas.wires) do w.pendingColor = { _DEFAULT_COLOR[1], _DEFAULT_COLOR[2], _DEFAULT_COLOR[3], _DEFAULT_COLOR[4] } end
-    for _, c in ipairs(canvas.controls) do c.pendingColor = { _DEFAULT_COLOR[1], _DEFAULT_COLOR[2], _DEFAULT_COLOR[3], _DEFAULT_COLOR[4] } end
+    for _, e in ipairs(canvas.elements) do e.pendingColor = nil; e.predictedColor = nil end
+    for _, w in ipairs(canvas.wires) do w.pendingColor = nil; w.predictedColor = nil end
+    for _, c in ipairs(canvas.controls) do c.pendingColor = nil; c.predictedColor = nil end
 end
 
 -- Seeds every element/wire/control's pendingColor from `snapshot` instead of
@@ -3350,6 +3592,44 @@ local function _loadElementSprite(path)
         _elementSpriteCache[path] = love.graphics.newImage(path)
     end
     return _elementSpriteCache[path]
+end
+
+-- Calls drawFn(r, g, b, a) once per entry in colors, each time scissored to
+-- one band of (boundsX, boundsY, boundsW, boundsH) -- an "unresolved tie"
+-- indicator for a node fed by more than one active source at once with no
+-- clear voltage winner (see model/solver.lua's solveSourceAttribution and
+-- gdsGui_schematic_resolveColorSequence just above). drawFn is whatever the
+-- caller would normally call ONCE with a single resolved color -- reusing
+-- it under each band means every shape (sprite-tinted or hand-drawn)
+-- stripes correctly with no shape-specific duplication.
+--
+-- horizontalBands (optional): bands stack top-to-bottom instead of sitting
+-- side-by-side left-to-right — pick whichever axis has the greater extent
+-- so a dash pattern is actually visible regardless of a wire's own
+-- orientation (see _drawWire). Scissor coordinates are always screen-space
+-- in LÖVE regardless of the current transform, so this always stripes in
+-- SCREEN-space bands, not rotated with the element — a deliberate
+-- simplification (this is a rare ambiguity indicator, not core rendering)
+-- rather than computing a rotated bounding box. The caller's own scissor
+-- (if any — e.g. the canvas's own viewport clip) is restored afterward,
+-- but is itself REPLACED (not intersected) while a band is active, same
+-- caveat as any nested love.graphics.setScissor call.
+-- 6: inlined rather than a named constant purely to stay under this
+-- file's 200-local ceiling.
+local function _drawColorSequenceStriped(boundsX, boundsY, boundsW, boundsH, colors, drawFn, horizontalBands)
+    local prevScX, prevScY, prevScW, prevScH = love.graphics.getScissor()
+    for i = 0, 6 - 1 do
+        local c = colors[(i % #colors) + 1]
+        if horizontalBands then
+            local bandH = boundsH / 6
+            love.graphics.setScissor(boundsX, boundsY + i * bandH, boundsW, bandH + 1)
+        else
+            local bandW = boundsW / 6
+            love.graphics.setScissor(boundsX + i * bandW, boundsY, bandW + 1, boundsH)
+        end
+        drawFn(c[1], c[2], c[3], c[4] or 1)
+    end
+    if prevScX then love.graphics.setScissor(prevScX, prevScY, prevScW, prevScH) else love.graphics.setScissor() end
 end
 
 -- Draws a spritePath image (an element's own, or a control's spritePaths
@@ -3549,41 +3829,55 @@ local function _commonElementSelectionRadius(canvas)
     return canvas.controlRadius * canvas.zoom * (1 / _EDIT_MODE_INITIAL_ZOOM) + 4
 end
 
-local function _drawElement(canvas, e, commonSelRad)
+local function _drawElement(canvas, e, commonSelRad, signature)
     local ex, ey, ew, eh = _elementPixelRect(canvas, e)
     -- Drawn exactly as resolved (no extra darken), so an element shows the
     -- same palette color — default gray included — as a wire or control.
-    local r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "element", e.id)
-    love.graphics.setColor(r, g, b, a)
-    if e.spritePath then
-        _drawElementSprite(e.spritePath, ex, ey, ew, eh, r, g, b, a, e.rotation)
-        love.graphics.setColor(1, 1, 1, 1)
-    elseif e.shapeType == "circle" then
-        -- Every shapeType is rotatable now (move/rotate mode applies
-        -- uniformly — see gdsGui_schematic_pressed's toggle), so an
-        -- off-square ellipse (ew ~= eh) visibly turns too, same
-        -- push/translate/rotate-around-center convention as the diode
-        -- symbol below.
-        love.graphics.push()
-        love.graphics.translate(ex + ew / 2, ey + eh / 2)
-        love.graphics.rotate(math.rad(e.rotation or 0))
-        love.graphics.ellipse("fill", 0, 0, ew / 2, eh / 2)
-        love.graphics.setColor(1, 1, 1, 1)
-        love.graphics.ellipse("line", 0, 0, ew / 2, eh / 2)
-        love.graphics.pop()
-    elseif e.shapeType == "diode" then
-        _drawDiodeSymbol(ex + ew / 2, ey + eh / 2, ew, eh, e.rotation, r, g, b, a)
-        love.graphics.setColor(1, 1, 1, 1)
-    else
-        -- Plain rect, same rotation treatment as circle above.
-        love.graphics.push()
-        love.graphics.translate(ex + ew / 2, ey + eh / 2)
-        love.graphics.rotate(math.rad(e.rotation or 0))
-        love.graphics.rectangle("fill", -ew / 2, -eh / 2, ew, eh)
-        love.graphics.setColor(1, 1, 1, 1)
-        love.graphics.rectangle("line", -ew / 2, -eh / 2, ew, eh)
-        love.graphics.pop()
+    local function drawShapeWithColor(r, g, b, a)
+        love.graphics.setColor(r, g, b, a)
+        if e.spritePath then
+            _drawElementSprite(e.spritePath, ex, ey, ew, eh, r, g, b, a, e.rotation)
+            love.graphics.setColor(1, 1, 1, 1)
+        elseif e.shapeType == "circle" then
+            -- Every shapeType is rotatable now (move/rotate mode applies
+            -- uniformly — see gdsGui_schematic_pressed's toggle), so an
+            -- off-square ellipse (ew ~= eh) visibly turns too, same
+            -- push/translate/rotate-around-center convention as the diode
+            -- symbol below.
+            love.graphics.push()
+            love.graphics.translate(ex + ew / 2, ey + eh / 2)
+            love.graphics.rotate(math.rad(e.rotation or 0))
+            love.graphics.ellipse("fill", 0, 0, ew / 2, eh / 2)
+            love.graphics.setColor(1, 1, 1, 1)
+            love.graphics.ellipse("line", 0, 0, ew / 2, eh / 2)
+            love.graphics.pop()
+        elseif e.shapeType == "diode" then
+            _drawDiodeSymbol(ex + ew / 2, ey + eh / 2, ew, eh, e.rotation, r, g, b, a)
+            love.graphics.setColor(1, 1, 1, 1)
+        else
+            -- Plain rect, same rotation treatment as circle above.
+            love.graphics.push()
+            love.graphics.translate(ex + ew / 2, ey + eh / 2)
+            love.graphics.rotate(math.rad(e.rotation or 0))
+            love.graphics.rectangle("fill", -ew / 2, -eh / 2, ew, eh)
+            love.graphics.setColor(1, 1, 1, 1)
+            love.graphics.rectangle("line", -ew / 2, -eh / 2, ew, eh)
+            love.graphics.pop()
+        end
     end
+
+    -- A sequence (2+ colors — a node fed by more than one active source at
+    -- once with no clear voltage winner, see model/solver.lua's
+    -- solveSourceAttribution) draws the shape N times, each scissored to
+    -- one band, instead of the normal single resolved color.
+    local sequence = gdsGui_schematic_resolveColorSequence(canvas.name, "element", e.id, signature)
+    if sequence then
+        _drawColorSequenceStriped(ex, ey, ew, eh, sequence, drawShapeWithColor)
+    else
+        local r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "element", e.id, signature)
+        drawShapeWithColor(r, g, b, a)
+    end
+
     if canvas.selectedElementId == e.id then
         -- Magenta once the 2-second hold has unlocked drag/rotate for it
         -- (see gdsGui_schematic_update's long-press timer) — yellow is
@@ -4506,7 +4800,7 @@ local function _hitWire(canvas, px, py)
     return nil
 end
 
-local function _drawWire(canvas, w, plan)
+local function _drawWire(canvas, w, plan, signature)
     if not plan then return end
     local wireWidth = _WIRE_WIDTH_PX * canvas.zoom
     if canvas.selectedWireId == w.id then
@@ -4524,14 +4818,51 @@ local function _drawWire(canvas, w, plan)
         love.graphics.setLineWidth(wireWidth + 2.4 * canvas.zoom)
         _drawWirePlanSegments(plan, canvas.zoom)
     end
-    local r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "wire", w.id)
-    love.graphics.setColor(r, g, b, a)
-    love.graphics.setLineWidth(wireWidth)
-    _drawWirePlanSegments(plan, canvas.zoom)
+
+    -- Same "stripe it instead of filling solid" treatment as _drawElement —
+    -- see its own comment and gdsGui_schematic_resolveColorSequence. A
+    -- dash pattern along a wire's own path (rather than a filled shape)
+    -- needs stripe bands oriented along whichever axis the wire actually
+    -- runs — a vertical wire striped by X would never show the
+    -- alternation at all — so this picks bands by the plan's own
+    -- bounding box instead of always using vertical bands like
+    -- _drawElement/_drawControl do.
+    local sequence = gdsGui_schematic_resolveColorSequence(canvas.name, "wire", w.id, signature)
+    if sequence then
+        -- Screen-space bounding box of every segment endpoint — used only
+        -- to pick stripe bands below, not for hit-testing/layout, so a
+        -- cheap min/max over the already-resolved coordinates is enough.
+        -- Nested (not a top-level local) purely to stay under this file's
+        -- 200-local ceiling — it has exactly one caller.
+        local bx, by, bw, bh
+        do
+            local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
+            for _, seg in ipairs(plan.segments) do
+                minX = math.min(minX, seg[1], seg[3])
+                maxX = math.max(maxX, seg[1], seg[3])
+                minY = math.min(minY, seg[2], seg[4])
+                maxY = math.max(maxY, seg[2], seg[4])
+            end
+            if minX == math.huge then minX, minY, maxX, maxY = 0, 0, 0, 0 end
+            bx, by, bw, bh = minX, minY, maxX - minX, maxY - minY
+        end
+        local padding = wireWidth * 2
+        _drawColorSequenceStriped(bx - padding, by - padding, bw + padding * 2, bh + padding * 2, sequence,
+            function(r, g, b, a)
+                love.graphics.setColor(r, g, b, a)
+                love.graphics.setLineWidth(wireWidth)
+                _drawWirePlanSegments(plan, canvas.zoom)
+            end, bw < bh)
+    else
+        local r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "wire", w.id, signature)
+        love.graphics.setColor(r, g, b, a)
+        love.graphics.setLineWidth(wireWidth)
+        _drawWirePlanSegments(plan, canvas.zoom)
+    end
     love.graphics.setLineWidth(1)
 end
 
-local function _drawControl(canvas, c)
+local function _drawControl(canvas, c, signature)
     local cx, cy = _toPixel(canvas, c.x, c.y)
     local rad = canvas.controlRadius * canvas.zoom * (c.radiusScale or 1)
     if canvas.selectedControlId == c.id then
@@ -4557,25 +4888,41 @@ local function _drawControl(canvas, c)
     -- signature-matched snapshot, then defaultColor) as an element/wire — see
     -- gdsGui_schematic_resolveDisplayColor and ASSIGN COLOR/the design-mode
     -- edit menu's swatch picker below.
-    local r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "control", c.id)
     local darkenMul = c.colorDarkenMul or 1
-    r, g, b = r * darkenMul, g * darkenMul, b * darkenMul
     local spritePath = c.spritePaths and c.spritePaths[c.detentIndex + 1]
-    if spritePath then
-        _drawElementSprite(spritePath, cx - rad, cy - rad, rad * 2, rad * 2, r, g, b, a, c.rotation)
-    else
-        love.graphics.setColor(r, g, b, a)
-        love.graphics.circle("line", cx, cy, rad)
-        -- The detent-position angle and the control's own manual rotation
-        -- (see gdsGui_schematic_addControl) both spin the same indicator
-        -- line — combined, not one overriding the other, so rotating a
-        -- control (e.g. to line up with the wires it connects to) doesn't
-        -- lose which position it's showing.
-        local angle = (c.detentIndex / c.numDetents) * math.pi * 2 + math.rad(c.rotation or 0)
-        love.graphics.setLineWidth(3)
-        love.graphics.line(cx, cy, cx + math.sin(angle) * rad, cy - math.cos(angle) * rad)
-        love.graphics.setLineWidth(1)
+    local function drawBodyWithColor(rr, gg, bb, aa)
+        rr, gg, bb = rr * darkenMul, gg * darkenMul, bb * darkenMul
+        if spritePath then
+            _drawElementSprite(spritePath, cx - rad, cy - rad, rad * 2, rad * 2, rr, gg, bb, aa, c.rotation)
+        else
+            love.graphics.setColor(rr, gg, bb, aa)
+            love.graphics.circle("line", cx, cy, rad)
+            -- The detent-position angle and the control's own manual rotation
+            -- (see gdsGui_schematic_addControl) both spin the same indicator
+            -- line — combined, not one overriding the other, so rotating a
+            -- control (e.g. to line up with the wires it connects to) doesn't
+            -- lose which position it's showing.
+            local angle = (c.detentIndex / c.numDetents) * math.pi * 2 + math.rad(c.rotation or 0)
+            love.graphics.setLineWidth(3)
+            love.graphics.line(cx, cy, cx + math.sin(angle) * rad, cy - math.cos(angle) * rad)
+            love.graphics.setLineWidth(1)
+        end
     end
+
+    -- Same "stripe it instead of filling solid" treatment as _drawElement
+    -- — see its own comment and gdsGui_schematic_resolveColorSequence.
+    local r, g, b, a
+    local sequence = gdsGui_schematic_resolveColorSequence(canvas.name, "control", c.id, signature)
+    if sequence then
+        r, g, b, a = sequence[1][1], sequence[1][2], sequence[1][3], sequence[1][4]
+        _drawColorSequenceStriped(cx - rad, cy - rad, rad * 2, rad * 2, sequence, drawBodyWithColor)
+    else
+        r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "control", c.id, signature)
+        drawBodyWithColor(r, g, b, a)
+    end
+    -- overlaySpritePath below reuses this same (darkened) representative
+    -- color regardless of path, same as before this split.
+    r, g, b = r * darkenMul, g * darkenMul, b * darkenMul
     if c.overlaySpritePath then
         -- Spins only in control mode AND while the control sits in its last
         -- ("ON"/flowing/conducting) position — same last-position-means-on
@@ -4643,11 +4990,17 @@ function gdsGui_schematic_draw(pageName)
             _drawCanvasBackground(canvas)
             if canvas.mode == "design" then _drawGrid(canvas) end
 
+            -- Computed once per canvas per frame and threaded through every
+            -- element/wire/control draw call below, rather than each of them
+            -- separately calling gdsGui_schematic_computeSignature on its own
+            -- (a table.sort + string-concat over every control, repeated once
+            -- per drawn entity for a value that cannot change mid-frame).
+            local signature = gdsGui_schematic_computeSignature(canvas.name)
             local wirePlans = _computeWirePlans(canvas)
-            for _, w in ipairs(canvas.wires) do _drawWire(canvas, w, wirePlans[w.id]) end
+            for _, w in ipairs(canvas.wires) do _drawWire(canvas, w, wirePlans[w.id], signature) end
             local commonSelRad = _commonElementSelectionRadius(canvas)
-            for _, e in ipairs(canvas.elements) do _drawElement(canvas, e, commonSelRad) end
-            for _, c in ipairs(canvas.controls) do _drawControl(canvas, c) end
+            for _, e in ipairs(canvas.elements) do _drawElement(canvas, e, commonSelRad, signature) end
+            for _, c in ipairs(canvas.controls) do _drawControl(canvas, c, signature) end
             _drawAnnunciators(canvas)
 
             if canvas.wireTool.fromId then
@@ -4758,6 +5111,19 @@ function gdsGui_schematic_wheelZoom(x, y, dy)
     if dy == 0 then return end
     local activePageName = _getActivePageName()
     for _, canvas in ipairs(globApp.objects.schematics) do
+        -- Same dead zone gdsGui_schematic_pressed's own check consumes taps
+        -- against — a wheel event over it scrolls the app's overlay
+        -- instead of zooming the canvas underneath.
+        if canvas.page == activePageName and canvas.inputBlockRect then
+            local r = canvas.inputBlockRect
+            if x >= r.x and x <= r.x + r.w and y >= r.y and y <= r.y + r.h then
+                if canvas.inputBlockWheelCallback then
+                    local fn = _G[canvas.inputBlockWheelCallback]
+                    if fn then fn(dy, false) end
+                end
+                return
+            end
+        end
         if canvas.page == activePageName and not canvas.menu
            and x >= canvas.x and x <= canvas.x + canvas.w
            and y >= canvas.y and y <= canvas.y + canvas.h then
@@ -4841,6 +5207,24 @@ function gdsGui_schematic_pressed(touchId, x, y)
         -- MODE specifically).
         if _hitsFloatingButton(activePageName, x, y) then goto continue end
 
+        -- An app-registered dead zone (see gdsGui_schematic_
+        -- setInputBlockRect) — e.g. main.lua's AI info panel, an
+        -- app-layer overlay the library itself knows nothing about —
+        -- consumes the tap outright, same "takes priority" treatment as
+        -- canvas.menu/the annunciator panel below, just opaque to WHY.
+        -- Also starts tracking this touch for drag-to-scroll forwarding
+        -- (see gdsGui_schematic_moved/_released below) — the SAME
+        -- inputBlockWheelCallback the mouse-wheel path uses, just fed a
+        -- pixel delta instead of a wheel notch count.
+        if canvas.inputBlockRect then
+            local r = canvas.inputBlockRect
+            if x >= r.x and x <= r.x + r.w and y >= r.y and y <= r.y + r.h then
+                canvas.inputBlockTouchId = touchId
+                canvas.inputBlockTouchY = y
+                goto continue
+            end
+        end
+
         -- Same "takes priority, consumes the tap" treatment as canvas.menu
         -- above — see _handleAnnunciatorPanelPress's own comment for why.
         if canvas.annunciatorPanelOpen then
@@ -4911,6 +5295,19 @@ function gdsGui_schematic_pressed(touchId, x, y)
                 overlaySpritePath = canvas.pendingPlacement.overlaySpritePath,
                 sizeMul = canvas.pendingPlacement.sizeMul,
                 matchControlSize = canvas.pendingPlacement.matchControlSize,
+                -- Was missing entirely -- _commitNamedPlacement reads all
+                -- three of these off `pending` (componentType for
+                -- addElement/addControl's own trailing param, radiusMul/
+                -- colorDarkenMul for a control's radiusScale/dim factor),
+                -- but nothing ever copied them from canvas.pendingPlacement
+                -- into this struct, so every catalog-placed element/control
+                -- silently got componentType=nil (opting it out of the
+                -- inference model's graph entirely) and every control was
+                -- placed at a flat radiusScale/colorDarkenMul regardless of
+                -- its catalog entry's own radiusMul/colorDarkenMul.
+                componentType = canvas.pendingPlacement.componentType,
+                radiusMul = canvas.pendingPlacement.radiusMul,
+                colorDarkenMul = canvas.pendingPlacement.colorDarkenMul,
             }
             _openPlacementNamePrompt("NAME THIS " .. canvas.pendingPlacement.kind:upper(),
                 _suggestedPlacementName(canvas, canvas.pendingPlacement.label))
@@ -4962,6 +5359,18 @@ function gdsGui_schematic_pressed(touchId, x, y)
             local target, targetKind = _hitElement(canvas, x, y), "element"
             if not target then target, targetKind = _hitWire(canvas, x, y), "wire" end
             if not target then target, targetKind = _hitControl(canvas, x, y), "control" end
+            -- A "source"-role element/control (BATTERY, GENERATOR, ...)
+            -- isn't a paintable target: its powered-state color is now
+            -- fully automatic (app-layer, keyed off its own VOLTAGE — see
+            -- main.lua's PER-SOURCE SETTINGS), and a brush pick here would
+            -- write a permanent pendingColor that outranks that derived
+            -- color in resolveColor's own tier chain, silently freezing the
+            -- source's appearance out of sync with its voltage forever. A
+            -- tap on one falls through to the plain-miss/pan branch below,
+            -- same as tapping empty canvas space. Wires between sources
+            -- stay paintable as normal — only the source node itself is
+            -- excluded.
+            if target and target.componentType == "source" then target = nil end
             if target then
                 canvas.focusTouchId = touchId
                 canvas.dragKind     = "paint"
@@ -4970,11 +5379,16 @@ function gdsGui_schematic_pressed(touchId, x, y)
                 canvas.dragMoved    = false
                 canvas._paintTarget = { kind = targetKind, id = target.id }
             else
-                -- A miss (empty canvas space, no item drawn there) exits
-                -- paint mode — the app layer's per-frame poll then releases
-                -- the PAINT button and restores its dock (see main.lua's
-                -- _exitSchematicTool). Consumed, so it doesn't also pan.
-                canvas.paintMode = nil
+                -- A miss (empty canvas space, no item drawn there) pans the
+                -- view instead, same as a plain miss outside paint mode —
+                -- only the PAINT dock button itself
+                -- (gdsGui_schematic_disarmPaintMode) disarms paint mode now.
+                canvas.focusTouchId = touchId
+                canvas.dragKind     = "pan"
+                canvas.dragStartX   = x
+                canvas.dragStartY   = y
+                canvas.panStartX    = canvas.panX
+                canvas.panStartY    = canvas.panY
             end
             goto continue
         end
@@ -5180,6 +5594,18 @@ function gdsGui_schematic_moved(touchId, x, y)
             _handleAnnunciatorPanelMove(canvas, touchId, x, y)
             goto continue
         end
+        -- Drag-to-scroll forwarding for the dead zone a press started
+        -- inside (see gdsGui_schematic_pressed's own inputBlockRect
+        -- branch) — a raw pixel delta, unlike the wheel path's notch
+        -- count; the app's own callback decides how to scale it.
+        if canvas.inputBlockTouchId == touchId then
+            if canvas.inputBlockWheelCallback then
+                local fn = _G[canvas.inputBlockWheelCallback]
+                if fn then fn(canvas.inputBlockTouchY - y, true) end
+            end
+            canvas.inputBlockTouchY = y
+            goto continue
+        end
 
         if canvas.touches[touchId] then
             canvas.touches[touchId].x = x
@@ -5378,6 +5804,11 @@ function gdsGui_schematic_released(touchId, x, y)
         if canvas.page ~= activePageName then goto continue end
         canvas.touches[touchId] = nil
         _endPinchIfBelowTwo(canvas)
+
+        if canvas.inputBlockTouchId == touchId then
+            canvas.inputBlockTouchId = nil
+            goto continue
+        end
 
         if canvas.menu then
             -- A menu opened by something OTHER than this touch (e.g. the
