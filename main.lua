@@ -1012,6 +1012,34 @@ local function _buildComponentTypeMap(canvas)
     return map
 end
 
+-- {id -> {x, y, rotation}} for every element AND control on canvas, fed to
+-- ModelGraph.buildGraph as its optional 5th param so it can resolve a
+-- "directionalGate" (DIODE, DPST SWITCH) edge's real conducting direction
+-- geometrically — from the diode's own rotation and which side of it a
+-- neighbor physically sits on — instead of from whichever element the wire
+-- happened to be DRAWN from first (model/graph.lua's own prior, admittedly
+-- fragile convention; see its own comment). x/y is each node's own CENTER,
+-- in the same 0-1-of-canvas fractional space every element/control is
+-- already stored in: an element's x/y is its box's top-left corner (so
+-- center = x + w/2, y + h/2), while a control's x/y already IS its center
+-- (see schematic_gdsGuiLib.lua's own _anchorCenter, same "element box vs.
+-- control point" split, just in fraction space here rather than pixels —
+-- fine for this purpose since only the SIGN of a same-axis delta ever
+-- matters, never true distance). rotation defaults to 0 (nil-safe) and is
+-- only ever consulted for a "directionalGate" node — carried for every
+-- node uniformly rather than filtered, since it's cheap and harmless for
+-- every other role.
+local function _nodePositionsForGraph(canvas)
+    local positions = {}
+    for _, e in ipairs(canvas.elements) do
+        positions[e.id] = { x = e.x + (e.w or 0) / 2, y = e.y + (e.h or 0) / 2, rotation = e.rotation or 0 }
+    end
+    for _, c in ipairs(canvas.controls) do
+        positions[c.id] = { x = c.x, y = c.y, rotation = c.rotation or 0 }
+    end
+    return positions
+end
+
 -- The live element OR control table for id, whichever array it's actually
 -- in — a "source" node can be either (BATTERY is an element, GENERATOR is
 -- a control). Used by _colorForPoweredNode's per-source color/voltage
@@ -1238,7 +1266,7 @@ local function _solveCurrentSchematic()
     local componentTypes = _buildComponentTypeMap(canvas)
     if next(componentTypes) == nil then return nil end
 
-    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes)
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes, _nodePositionsForGraph(canvas))
     local sourceStates = _currentSourceStates(canvas, componentTypes)
     local gateStates = _currentGateStates(canvas, componentTypes)
 
@@ -1343,16 +1371,49 @@ local function _solveCurrentSchematic()
     -- edge conducts. Anchoring off that end instead is still the same
     -- approximation, just picking whichever end it's actually accurate
     -- for.
+    --
+    -- A wire touching a "directionalGate" node (DIODE, DPST SWITCH) is a
+    -- DIFFERENT case from the open-gate one above, not an extension of
+    -- it: the gate's own graph node is a single powered/unpowered value
+    -- that can't represent its two real-world leads being at DIFFERENT
+    -- states at once -- exactly the normal case for a reverse-biased
+    -- diode (cathode lead hot off a live bus, anode lead cold because the
+    -- diode is correctly blocking that bus from backfeeding through it).
+    -- Requiring BOTH ends powered off that single shared value, same as
+    -- every ordinary wire, would leave the cathode-side wire gray even
+    -- though the bus it's directly, un-gatedly wired to is live. So
+    -- instead: this wire's hotness and color are taken ENTIRELY from its
+    -- own non-gate endpoint's own state/attribution (never the gate
+    -- node's) -- correct for either leg, since solve()'s own forward-only
+    -- traversal (model/solver.lua) already guarantees an entry/anode-side
+    -- neighbor only reads powered when something is actually feeding IN,
+    -- and an exit/cathode-side neighbor only reads powered when something
+    -- is actually live on it (independently or fed forward through the
+    -- gate) -- this is just trusting that neighbor's own already-correct
+    -- answer instead of re-deriving it through the lossy single-node
+    -- diode value.
     for _, w in ipairs(canvas.wires) do
-        local fromState, toState = nodeStates[w.fromElementId], nodeStates[w.toElementId]
-        if fromState and toState and not oscillatingIds[w.fromElementId] and not oscillatingIds[w.toElementId] then
-            if fromState == ModelSolver.POWERED and toState == ModelSolver.POWERED then
-                local fromIsOpenGate = componentTypes[w.fromElementId] == "gate" and finalGateStates[w.fromElementId] ~= "closed"
-                local toIsOpenGate = componentTypes[w.toElementId] == "gate" and finalGateStates[w.toElementId] ~= "closed"
-                local anchorId = (fromIsOpenGate and not toIsOpenGate) and w.toElementId or w.fromElementId
-                result.wires[w.id] = _colorForPoweredNode(anchorId, attribution, canvas, ELECTRICAL_MEDIUM.style.powered, nodeStates)
-            else
-                result.wires[w.id] = ELECTRICAL_MEDIUM.style.unpowered
+        local fromIsDirectionalGate = componentTypes[w.fromElementId] == "directionalGate"
+        local toIsDirectionalGate = componentTypes[w.toElementId] == "directionalGate"
+        if fromIsDirectionalGate or toIsDirectionalGate then
+            local otherId = fromIsDirectionalGate and w.toElementId or w.fromElementId
+            local otherState = nodeStates[otherId]
+            if otherState and not oscillatingIds[otherId] then
+                result.wires[w.id] = (otherState == ModelSolver.POWERED)
+                    and _colorForPoweredNode(otherId, attribution, canvas, ELECTRICAL_MEDIUM.style.powered, nodeStates)
+                    or ELECTRICAL_MEDIUM.style.unpowered
+            end
+        else
+            local fromState, toState = nodeStates[w.fromElementId], nodeStates[w.toElementId]
+            if fromState and toState and not oscillatingIds[w.fromElementId] and not oscillatingIds[w.toElementId] then
+                if fromState == ModelSolver.POWERED and toState == ModelSolver.POWERED then
+                    local fromIsOpenGate = componentTypes[w.fromElementId] == "gate" and finalGateStates[w.fromElementId] ~= "closed"
+                    local toIsOpenGate = componentTypes[w.toElementId] == "gate" and finalGateStates[w.toElementId] ~= "closed"
+                    local anchorId = (fromIsOpenGate and not toIsOpenGate) and w.toElementId or w.fromElementId
+                    result.wires[w.id] = _colorForPoweredNode(anchorId, attribution, canvas, ELECTRICAL_MEDIUM.style.powered, nodeStates)
+                else
+                    result.wires[w.id] = ELECTRICAL_MEDIUM.style.unpowered
+                end
             end
         end
     end
@@ -1694,7 +1755,7 @@ local function _flagLockedRuleContradictionIfAny(canvasName)
     if not canvas then return end
     local componentTypes = _buildComponentTypeMap(canvas)
     if next(componentTypes) == nil then return end
-    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes)
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes, _nodePositionsForGraph(canvas))
     local signature = gdsGui_schematic_computeSignature(canvasName)
     local brokenGateId = _findLockedRuleContradiction(canvas, graph, signature)
     if brokenGateId then
@@ -1780,7 +1841,7 @@ local function _recomputeDeducedGateStates()
     if not canvas then return end
     local componentTypes = _buildComponentTypeMap(canvas)
     if next(componentTypes) == nil then return end
-    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes)
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes, _nodePositionsForGraph(canvas))
     for signature, snapshot in pairs(canvas.snapshots) do
         local nodeStates = _snapshotToNodeStates(snapshot, graph)
         _deducedGateStatesBySignature[signature] = ModelLearner.deduceAllGates(graph, nodeStates)
@@ -1987,7 +2048,7 @@ local function _computeAiPanelStats()
     local componentTypes = _buildComponentTypeMap(canvas)
     if next(componentTypes) == nil then return stats end -- untyped/non-ELECTRICAL: nothing to infer
 
-    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes)
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes, _nodePositionsForGraph(canvas))
     local sourceStates = _currentSourceStates(canvas, componentTypes)
     local gateStates = _currentGateStates(canvas, componentTypes)
 
@@ -2186,11 +2247,26 @@ local function _computeAiPanelStats()
             end
         end
         for _, w in ipairs(canvas.wires) do
-            local fromState, toState = nodeStatesForSig[w.fromElementId], nodeStatesForSig[w.toElementId]
-            if fromState == ModelSolver.POWERED and toState == ModelSolver.POWERED then
+            -- A directionalGate-touching wire is checked off its own
+            -- non-gate endpoint alone, same "the gate's single shared node
+            -- can't represent its two leads independently" reasoning
+            -- _solveCurrentSchematic's own live wire loop uses — never
+            -- both-ends-powered, which would simply never fire for a
+            -- correctly-blocking diode's cathode-side wire at all.
+            local fromIsDirectionalGate = componentTypes[w.fromElementId] == "directionalGate"
+            local toIsDirectionalGate = componentTypes[w.toElementId] == "directionalGate"
+            local powered, anchorId
+            if fromIsDirectionalGate or toIsDirectionalGate then
+                anchorId = fromIsDirectionalGate and w.toElementId or w.fromElementId
+                powered = nodeStatesForSig[anchorId] == ModelSolver.POWERED
+            else
+                local fromState, toState = nodeStatesForSig[w.fromElementId], nodeStatesForSig[w.toElementId]
+                powered = fromState == ModelSolver.POWERED and toState == ModelSolver.POWERED
                 local fromIsOpenGate = componentTypes[w.fromElementId] == "gate" and gateStatesForSig[w.fromElementId] ~= "closed"
                 local toIsOpenGate = componentTypes[w.toElementId] == "gate" and gateStatesForSig[w.toElementId] ~= "closed"
-                local anchorId = (fromIsOpenGate and not toIsOpenGate) and w.toElementId or w.fromElementId
+                anchorId = (fromIsOpenGate and not toIsOpenGate) and w.toElementId or w.fromElementId
+            end
+            if powered then
                 local expected, sourceId = expectedColorAndSource(anchorId)
                 local painted = snapshot.wires and snapshot.wires[w.id]
                 if expected and painted and not colorsEqual(expected, painted) then
@@ -5980,7 +6056,7 @@ function captureSchematicSnapshot()
     if canvas then
         local componentTypes = _buildComponentTypeMap(canvas)
         if next(componentTypes) ~= nil then
-            local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes)
+            local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes, _nodePositionsForGraph(canvas))
             local sourceStates = _currentSourceStates(canvas, componentTypes)
             local gateStates = _currentGateStates(canvas, componentTypes)
 
@@ -6063,11 +6139,27 @@ function captureSchematicSnapshot()
                 end
             end
             for _, w in ipairs(canvas.wires) do
-                local fromState, toState = nodeStates[w.fromElementId], nodeStates[w.toElementId]
-                if fromState == ModelSolver.POWERED and toState == ModelSolver.POWERED then
+                -- A directionalGate-touching wire is checked off its own
+                -- non-gate endpoint alone, same "the gate's single shared
+                -- node can't represent its two leads independently"
+                -- reasoning _solveCurrentSchematic's own live wire loop
+                -- uses — never both-ends-powered, which would simply
+                -- never fire for a correctly-blocking diode's cathode-side
+                -- wire at all.
+                local fromIsDirectionalGate = componentTypes[w.fromElementId] == "directionalGate"
+                local toIsDirectionalGate = componentTypes[w.toElementId] == "directionalGate"
+                local powered, anchorId
+                if fromIsDirectionalGate or toIsDirectionalGate then
+                    anchorId = fromIsDirectionalGate and w.toElementId or w.fromElementId
+                    powered = nodeStates[anchorId] == ModelSolver.POWERED
+                else
+                    local fromState, toState = nodeStates[w.fromElementId], nodeStates[w.toElementId]
+                    powered = fromState == ModelSolver.POWERED and toState == ModelSolver.POWERED
                     local fromIsOpenGate = componentTypes[w.fromElementId] == "gate" and gateStates[w.fromElementId] ~= "closed"
                     local toIsOpenGate = componentTypes[w.toElementId] == "gate" and gateStates[w.toElementId] ~= "closed"
-                    local anchorId = (fromIsOpenGate and not toIsOpenGate) and w.toElementId or w.fromElementId
+                    anchorId = (fromIsOpenGate and not toIsOpenGate) and w.toElementId or w.fromElementId
+                end
+                if powered then
                     local expected, sourceId = expectedColorAndSource(attribution[anchorId])
                     local painted = plan.wires[w.id]
                     if expected and painted and not colorsEqual(expected, painted) then
@@ -6550,7 +6642,7 @@ function schematicVoltageTieBreakIntegrationTest()
     canvas.controls[1].voltage = 28
 
     local componentTypes = _buildComponentTypeMap(canvas)
-    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes)
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes, _nodePositionsForGraph(canvas))
     local sourceStates = _currentSourceStates(canvas, componentTypes)
     local gateStates = _currentGateStates(canvas, componentTypes)
     local nodeStates = ModelSolver.solve(graph, sourceStates, gateStates)
@@ -6596,7 +6688,7 @@ function schematicOpenGateShowsUnpoweredColorTest()
     canvas.elements[1].voltage = 24
 
     local componentTypes = _buildComponentTypeMap(canvas)
-    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes)
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes, _nodePositionsForGraph(canvas))
     local sourceStates = _currentSourceStates(canvas, componentTypes)
 
     local function displayColorForSw1()
@@ -6672,7 +6764,7 @@ function schematicAttributionRuleLearnedAndAppliedTest()
     canvas.voltageColors = { [24] = _TEST_RED, [28] = _TEST_YELLOW }
 
     local componentTypes = _buildComponentTypeMap(canvas)
-    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes)
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes, _nodePositionsForGraph(canvas))
 
     local POWERED, UNPOWERED = ELECTRICAL_MEDIUM.style.powered, ELECTRICAL_MEDIUM.style.unpowered
     local function paintAndCommit(gate2Detent, gate1Winner, sinkState)
@@ -6756,7 +6848,7 @@ function schematicTiedVoltageAttributionConfidenceTest()
     canvas.voltageColors = { [24] = _TEST_RED, [28] = _TEST_YELLOW }
 
     local componentTypes = _buildComponentTypeMap(canvas)
-    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes)
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes, _nodePositionsForGraph(canvas))
     local sourceStates = _currentSourceStates(canvas, componentTypes) -- both controls ON (detentIndex 1)
     local gateStates = _currentGateStates(canvas, componentTypes)
     local nodeStates = ModelSolver.solve(graph, sourceStates, gateStates)
@@ -7168,6 +7260,115 @@ function modelSolverOffSourceReachedButBlocksPastTest()
     return states.s2, states.sink2
 end
 
+-- A diode (d1, rotation 0 -- its own artwork points +x, see
+-- schematic_gdsGuiLib.lua's _drawDiodeSymbol) sits between "left" and
+-- "right", BOTH wires deliberately drawn pointing OUT of the diode
+-- (d1->left, d1->right) -- the exact "inconsistent per-wire draw order"
+-- bug class reported against the old convention. With real positions
+-- supplied, geometry must override that draw order entirely: current
+-- should flow left->right (matching the diode's rotation), never the
+-- reverse, regardless of how either wire was drawn.
+function modelGraphDiodeDirectionFromRotationTest()
+    local elements = { {id = "left"}, {id = "right"}, {id = "d1"} }
+    local controls = {}
+    local wires = {
+        { id = "w1", fromElementId = "d1", toElementId = "left" },
+        { id = "w2", fromElementId = "d1", toElementId = "right" },
+    }
+    local positions = {
+        left = { x = 0.2, y = 0.5, rotation = 0 },
+        d1 = { x = 0.5, y = 0.5, rotation = 0 },
+        right = { x = 0.8, y = 0.5, rotation = 0 },
+    }
+    local forwardTypes = { left = "source", right = "sink", d1 = "directionalGate" }
+    local forwardGraph = ModelGraph.buildGraph(elements, controls, wires, forwardTypes, positions)
+    local rightPowered = ModelSolver.solve(forwardGraph, { left = true }, {}).right
+
+    local reverseTypes = { left = "sink", right = "source", d1 = "directionalGate" }
+    local reverseGraph = ModelGraph.buildGraph(elements, controls, wires, reverseTypes, positions)
+    local leftPowered = ModelSolver.solve(reverseGraph, { right = true }, {}).left
+
+    return rightPowered, leftPowered
+end
+
+-- The exact real-world layout that broke a plain sign-of-cosine test: a
+-- source (e.g. an off generator) wired in from dead BELOW a diode (a
+-- perpendicular bearing relative to the diode's own rotation-0/pointing-
+-- right axis) whose wire then bends sideways to a bus up and to the
+-- right. The connection is drawn correctly; only the diode's sibling
+-- comparison (see _resolveDirectionalEdges) can tell that "perpendicular"
+-- neighbor is still the relatively-more-behind one of the two, and so the
+-- entry/anode side. Mirrors GENR_1/DIODE_7/BUS_3 from a real saved
+-- schematic.
+function modelGraphDiodeDirectionIgnoresPerpendicularBendTest()
+    local elements = { {id = "bus1"}, {id = "d1"} }
+    local controls = { {id = "gen1"} }
+    local wires = {
+        { id = "w1", fromElementId = "gen1", toElementId = "d1" },
+        { id = "w2", fromElementId = "d1", toElementId = "bus1" },
+    }
+    local componentTypes = { bus1 = "path", d1 = "directionalGate", gen1 = "source" }
+    local positions = {
+        gen1 = { x = 0.4416, y = 0.4871, rotation = 0 },  -- straight below d1: perpendicular bearing
+        d1   = { x = 0.4416, y = 0.4403, rotation = 0 },
+        bus1 = { x = 0.5415, y = 0.4169, rotation = 0 },  -- up and to the right: on-axis
+    }
+    local graph = ModelGraph.buildGraph(elements, controls, wires, componentTypes, positions)
+    local poweredFromGenerator = ModelSolver.solve(graph, { gen1 = true }, {}).bus1
+    local backfeedIntoGenerator = ModelSolver.solve(graph, { gen1 = false }, {}).gen1
+    return poweredFromGenerator, backfeedIntoGenerator
+end
+
+-- Integration test for the directionalGate wire-coloring fix
+-- (_solveCurrentSchematic's own wire loop, reproduced manually here since
+-- that function is hardcoded to "mainCanvas" only — same reason
+-- schematicComponentTypePropagationTest below reproduces its solve step
+-- by hand): a diode (rotation 270, so it conducts upward) sits between an
+-- OFF generator below it and a bus above it that's ALSO independently fed
+-- by an always-on battery, wired straight to the bus with no gate between
+-- them. The diode's own node must stay unpowered (nothing feeds its
+-- anode/generator side) but the wire from the diode to the bus must still
+-- read powered -- it's directly wired to an already-hot bus, and the
+-- diode's single shared node can't represent its two leads (hot cathode,
+-- cold anode) independently. Without the fix, requiring both wire ends
+-- powered off that single node would leave this wire gray forever.
+function schematicDiodeCathodeWireFollowsBusTest()
+    gdsGui_schematic_delete("unitTestCanvas22")
+    gdsGui_schematic_create("unitTestCanvas22", "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_addControl("unitTestCanvas22", "gen1", 0.3, 0.6, {"OFF", "ON"}, 0, "GEN 1", nil,
+        1, nil, 0, nil, nil, nil, "source")
+    gdsGui_schematic_addElement("unitTestCanvas22", "diode1", "diode", 0.28, 0.4, 0.05, 0.05, "D1", nil,
+        nil, 270, nil, "directionalGate")
+    gdsGui_schematic_addElement("unitTestCanvas22", "bus1", "rect", 0.3, 0.1, 0.1, 0.1, "BUS 1", nil,
+        nil, 0, nil, "path")
+    gdsGui_schematic_addElement("unitTestCanvas22", "batt1", "rect", 0.6, 0.1, 0.1, 0.1, "BATT 1", nil,
+        nil, 0, nil, "source")
+    gdsGui_schematic_addWire("unitTestCanvas22", "w1", "gen1", "diode1", nil)
+    gdsGui_schematic_addWire("unitTestCanvas22", "w2", "diode1", "bus1", nil)
+    gdsGui_schematic_addWire("unitTestCanvas22", "w3", "batt1", "bus1", nil)
+
+    local canvas = nil
+    for _, c in ipairs(globApp.objects.schematics) do
+        if c.name == "unitTestCanvas22" then canvas = c end
+    end
+    if not canvas then return "canvas not found" end
+
+    local componentTypes = _buildComponentTypeMap(canvas)
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes,
+        _nodePositionsForGraph(canvas))
+    local sourceStates = _currentSourceStates(canvas, componentTypes)
+    local gateStates = _currentGateStates(canvas, componentTypes)
+    local nodeStates = ModelSolver.solve(graph, sourceStates, gateStates)
+
+    local w2 = nil
+    for _, w in ipairs(canvas.wires) do if w.id == "w2" then w2 = w end end
+    local fromIsGate = componentTypes[w2.fromElementId] == "directionalGate"
+    local otherId = fromIsGate and w2.toElementId or w2.fromElementId
+    local wirePowered = nodeStates[otherId] == ModelSolver.POWERED
+
+    return nodeStates.diode1, wirePowered
+end
+
 -- Full Phase 1 adapter path against a throwaway canvas: GEN 1 (source,
 -- control) -> SW 1 (gate, control) -> BUS 1 (path, element), switch ON,
 -- never a single snapshot painted. If propagation is wiring correctly, BUS
@@ -7192,7 +7393,7 @@ function schematicComponentTypePropagationTest()
     if not canvas then return "canvas not found" end
 
     local componentTypes = _buildComponentTypeMap(canvas)
-    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes)
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes, _nodePositionsForGraph(canvas))
     local sourceStates = _currentSourceStates(canvas, componentTypes)
     local gateStates = _currentGateStates(canvas, componentTypes)
     local nodeStates = ModelSolver.solve(graph, sourceStates, gateStates)
@@ -7295,7 +7496,7 @@ function schematicDeducedGateStatesFromSnapshotsTest()
     local sigOpen = gdsGui_schematic_computeSignature("unitTestCanvas21")
 
     local componentTypes = _buildComponentTypeMap(canvas)
-    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes)
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes, _nodePositionsForGraph(canvas))
     local closedStates = ModelLearner.deduceAllGates(graph, _snapshotToNodeStates(canvas.snapshots[sigClosed], graph))
     local openStates = ModelLearner.deduceAllGates(graph, _snapshotToNodeStates(canvas.snapshots[sigOpen], graph))
 
@@ -7393,7 +7594,7 @@ function schematicGateRuleLearnedFromSnapshotsTest()
     gdsGui_schematic_commitSnapshot("unitTestCanvas22", gdsGui_schematic_prepareSnapshot("unitTestCanvas22"))
 
     local componentTypes = _buildComponentTypeMap(canvas)
-    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes)
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes, _nodePositionsForGraph(canvas))
 
     local examples = {}
     for _, snapshot in pairs(canvas.snapshots) do
@@ -7853,6 +8054,21 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcName"]={"modelSolverOffSourceReachedButBlocksPastTest"},
         ["funcParameters"]={0},
         ["funcExpctOutput"]={"powered", "unpowered"}}
+
+    gdsGui_dev_testExecute {["id"]="modelGraph_diodeDirection_derivedFromRotationNotDrawOrder",
+        ["funcName"]={"modelGraphDiodeDirectionFromRotationTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"powered", "unpowered"}}
+
+    gdsGui_dev_testExecute {["id"]="modelGraph_diodeDirection_resolvesPerpendicularBendBySiblingRanking",
+        ["funcName"]={"modelGraphDiodeDirectionIgnoresPerpendicularBendTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"powered", "unpowered"}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_diodeCathodeWire_followsIndependentlyPoweredBus",
+        ["funcName"]={"schematicDiodeCathodeWireFollowsBusTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"unpowered", true}}
 
     gdsGui_dev_testExecute {["id"]="schematic_componentType_propagatesWithoutPaintedSnapshot",
         ["funcName"]={"schematicComponentTypePropagationTest"},

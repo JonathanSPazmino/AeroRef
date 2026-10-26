@@ -5581,6 +5581,61 @@ end
 
 function gdsGui_schematic_moved(touchId, x, y)
     local activePageName = _getActivePageName()
+    -- For a "directionalGate" element (DIODE, DPST SWITCH) being rotated
+    -- below: which cardinal AXIS ("h" or "v") its own connected wires
+    -- predominantly run along, by summing each connected neighbor's own
+    -- |dx|/|dy| offset from the element's center across every wire
+    -- touching it — nil when it has no wires at all (nothing to sense
+    -- yet; the rotate-drag branch below falls back to every cardinal
+    -- direction in that case, same as any other rotatable element). Lets
+    -- that branch restrict itself to just the 2 rotations that keep the
+    -- diode's own conducting axis lined up with how it's ACTUALLY wired —
+    -- only 2 of the 4 cardinal rotations could ever make physical sense
+    -- once it's wired to something; the other 2 would point its
+    -- conducting direction crosswise to both its own leads. Nested (not a
+    -- top-level local, which this file's handlers otherwise all are)
+    -- purely to stay under this file's 200-local ceiling — both of these
+    -- have exactly one caller, below.
+    local function directionalGateWireAxis(canvas, elem)
+        local cx, cy = _anchorCenter(canvas, elem)
+        local sumAbsDx, sumAbsDy, count = 0, 0, 0
+        for _, w in ipairs(canvas.wires) do
+            local otherId
+            if w.fromElementId == elem.id then otherId = w.toElementId
+            elseif w.toElementId == elem.id then otherId = w.fromElementId end
+            if otherId then
+                local other = _findAnchor(canvas, otherId)
+                if other then
+                    local ox, oy = _anchorCenter(canvas, other)
+                    sumAbsDx = sumAbsDx + math.abs(ox - cx)
+                    sumAbsDy = sumAbsDy + math.abs(oy - cy)
+                    count = count + 1
+                end
+            end
+        end
+        if count == 0 then return nil end
+        return (sumAbsDy > sumAbsDx) and "v" or "h"
+    end
+
+    -- Same job as _snapRotationDegrees above, but restricted to just the
+    -- 2 cardinal rotations axis allows ("v" -> 90/270, "h" -> 0/180) —
+    -- picks whichever of those 2 the raw drag angle is actually closer
+    -- to, so the gesture still tracks the finger/cursor naturally, it
+    -- just can never land on the other axis's pair.
+    local function snapRotationDegreesToAxis(angleRad, axis)
+        local candidates = (axis == "v") and {90, 270} or {0, 180}
+        local twoPi = math.pi * 2
+        local a = angleRad % twoPi
+        if a < 0 then a = a + twoPi end
+        local bestDeg, bestDiff
+        for _, deg in ipairs(candidates) do
+            local diff = math.abs(a - math.rad(deg))
+            diff = math.min(diff, twoPi - diff)
+            if not bestDiff or diff < bestDiff then bestDiff, bestDeg = diff, deg end
+        end
+        return bestDeg
+    end
+
     for _, canvas in ipairs(globApp.objects.schematics) do
         -- Without this, a finger still down when the user navigates away
         -- (e.g. via a footer nav button while mid-drag) keeps applying
@@ -5665,7 +5720,8 @@ function gdsGui_schematic_moved(touchId, x, y)
             if elem then
                 local cx, cy = _elementCenter(canvas, elem)
                 local rawAngle = math.atan2(y - cy, x - cx) - canvas.rotateGrabAngleOffset
-                elem.rotation = _snapRotationDegrees(rawAngle)
+                local axis = elem.componentType == "directionalGate" and directionalGateWireAxis(canvas, elem)
+                elem.rotation = axis and snapRotationDegreesToAxis(rawAngle, axis) or _snapRotationDegrees(rawAngle)
             end
             if not canvas.dragMoved and
                (math.abs(x - canvas.dragStartX) > _ELEMENT_TAP_SLOP_PX or
