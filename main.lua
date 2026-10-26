@@ -301,17 +301,18 @@ end
 -- it's painted.
 
 -- Shared by every binary (2-position) switch/valve control below: index 1
--- (the "off"/blocked/non-conducting position, always listed first in that
+-- (the "open"/blocked/non-conducting position, always listed first in that
 -- control's own presets) gets the open/disconnected-looking icon, index 2
--- (the "on"/flowing/conducting position) gets the closed/connected-looking
--- one — true for every one of these presets even though the words differ
--- (a SWITCH's OFF vs a VALVE's CLOSED), since what's actually drawn tracks
--- MEANING (does current/fluid flow through it), not the position's name. Not
--- used for MODE SWITCH (AUTO/MANUAL) — that's a mode selector, not a
--- connected/disconnected state, so these icons wouldn't read correctly
--- there. A 3-position preset (SWITCH's OFF/ON/STBY) just has no 3rd entry,
--- falling back to the plain vector icon for STBY only (see
--- gdsGui_schematic_addControl's spritePaths param).
+-- (the "closed"/flowing/conducting position) gets the closed/connected-
+-- looking one — true for every one of these presets even when a given
+-- item's own words differ (e.g. FUEL/BLEED SWITCH still say OFF/ON), since
+-- what's actually drawn tracks MEANING (does current/fluid flow through
+-- it), not the position's name. Not used for MODE SWITCH (AUTO/MANUAL) —
+-- that's a mode selector, not a connected/disconnected state, so these
+-- icons wouldn't read correctly there. A 3-position preset (SWITCH's
+-- OPEN/CLOSED/STBY) just has no 3rd entry, falling back to the plain
+-- vector icon for STBY only (see gdsGui_schematic_addControl's
+-- spritePaths param).
 local _SWITCH_SPRITE_PATHS = {"Sprites/control_switchOpen.png", "Sprites/control_switchClosed.png"}
 
 -- A generator's housing is the same icon for OFF and ON (unlike a SWITCH's
@@ -352,7 +353,7 @@ local SCHEMATIC_CATALOG = {
         { label = "DIODE", abbrev = "DIOD",     kind = "element", shapeType = "diode", spritePath = "Sprites/element_diode.png",
           sizeMul = 7 / 30, componentType = "directionalGate" },
         -- radiusMul 0.7: shrunk 30% from the shared default control size.
-        { label = "SWITCH", abbrev = "SWCH",    kind = "control", presets = { {"OFF", "ON"}, {"OFF", "ON", "STBY"} },
+        { label = "SWITCH", abbrev = "SWCH",    kind = "control", presets = { {"OPEN", "CLOSED"}, {"OPEN", "CLOSED", "STBY"} },
           spritePaths = _SWITCH_SPRITE_PATHS, radiusMul = 0.7, componentType = "gate" },
         -- Double pole, single throw: two mechanically-ganged switch poles
         -- (the dashed link drawn between them in the artwork) each feeding
@@ -1123,11 +1124,16 @@ end
 -- The color registered for a given nominal voltage on THIS system
 -- (canvas.voltageColors, keyed by the plain voltage number — see
 -- _ensureVoltageHasColor), or defaultColor if that voltage has none yet
--- registered on this particular system (or voltage is nil, i.e. the source
--- was never given one at all). Deliberately per-system, not an appSettings
--- global — see canvas.voltageColors' own comment in _clearMainCanvas.
+-- registered on this particular system. voltage == nil (the source was
+-- never assigned one at all, e.g. a freshly-placed BATTERY whose VOLTAGE
+-- prompt hasn't been answered yet) is a DIFFERENT case from that —
+-- there's no "powered, color just not picked yet" state to show; it reads
+-- as the flat unpowered gray outright, same as a source that's actually
+-- off, rather than defaultColor (every production caller passes
+-- ELECTRICAL_MEDIUM.style.powered there, which would otherwise show an
+-- unassigned source as a generic energized yellow it hasn't earned yet).
 local function _colorForVoltage(canvas, voltage, defaultColor)
-    if not voltage then return defaultColor end
+    if not voltage then return ELECTRICAL_MEDIUM.style.unpowered end
     local registered = canvas.voltageColors and canvas.voltageColors[voltage]
     return registered or defaultColor
 end
@@ -4791,6 +4797,9 @@ function love.load()
     -- VOLTAGE prompt for a "source"-role item (BATTERY, GENERATOR, ...) and
     -- ignores everything else.
     _findSchematicCanvas().onElementPlaced = "schematicSourceElementPlaced"
+    -- Appends the sensed-voltage reading (schematicElementVoltageMenuSuffix
+    -- below) to an element's edit-menu title the moment it's tapped.
+    _findSchematicCanvas().elementMenuTitleSuffix = "schematicElementVoltageMenuSuffix"
     -- Starts empty: the canvas is only ever populated by an explicit NEW
     -- SYSTEM or OPEN action from the aircraft flow (see _openSystemIntoCanvas above).
     _schematicCanvasNormalLayout = { x = schCanvasXFrac, y = schCanvasYFrac, anchorPoint = "LT", wFrac = schCanvasWFrac, hFrac = schCanvasHFrac }
@@ -6434,12 +6443,37 @@ function schematicVoltageColorCancelled(canvasName)
     _resolveAndSaveSchematic()
 end
 
+-- Reverse of the registration above: "24V" when elementId's CURRENTLY
+-- DISPLAYED color (gdsGui_schematic_resolveColor — the exact same tiered
+-- pendingColor/snapshot/predictedColor/default lookup the live canvas
+-- itself paints with, so this can never disagree with what's actually on
+-- screen) matches one of this system's own registered voltageColors
+-- entries, else nil — an unpowered element (flat gray), an untyped/non-
+-- ELECTRICAL system (no voltageColors concept at all), or a multi-source
+-- dashed sequence with no single flat color all read as "no one sensed
+-- voltage to report," same as the hook simply returning nothing.
+-- schematic_gdsGuiLib.lua's own canvas.elementMenuTitleSuffix hook (wired
+-- up once in love.load()) calls this by name just before an element's
+-- edit menu opens.
+function schematicElementVoltageMenuSuffix(canvasName, elementId)
+    local canvas = _findSchematicCanvas()
+    if not canvas or not canvas.voltageColors then return nil end
+    local r, g, b, a = gdsGui_schematic_resolveColor(canvasName, "element", elementId)
+    for voltage, color in pairs(canvas.voltageColors) do
+        if math.abs(color[1] - r) < 0.01 and math.abs(color[2] - g) < 0.01
+           and math.abs(color[3] - b) < 0.01 and math.abs((color[4] or 1) - a) < 0.01 then
+            return voltage .. "V"
+        end
+    end
+    return nil
+end
+
 function schematicPerSourceSettingDetailChosen(canvasName, index, optionText)
     if optionText == "VOLTAGE" and _pendingPerSourceTargetId then
         local canvas = _findSchematicCanvas()
         local entity = canvas and _findSourceEntity(canvas, _pendingPerSourceTargetId)
         gdsGui_textPrompt_open("SOURCE VOLTAGE (NUMBER)", entity and entity.voltage and tostring(entity.voltage) or "",
-            6, "schematicPerSourceVoltageConfirmed", nil)
+            6, "schematicPerSourceVoltageConfirmed", nil, true)
         return -- keep _pendingPerSourceTargetId set for the text-prompt's own callback
     elseif optionText == "RETURN" then
         _pendingPerSourceTargetId = nil
@@ -6495,14 +6529,14 @@ function schematicSourceElementPlaced(canvasName, kind, newId, componentType)
     if componentType ~= "source" then return end
     _pendingNewSourceId = newId
     gdsGui_textPrompt_open("SOURCE VOLTAGE (NUMBER)", "", 6,
-        "schematicNewSourceVoltageConfirmed", "schematicNewSourceVoltageCancelled")
+        "schematicNewSourceVoltageConfirmed", "schematicNewSourceVoltageCancelled", true)
 end
 
 function schematicNewSourceVoltageConfirmed(text)
     local voltage = tonumber(text)
     if not voltage then
         gdsGui_textPrompt_open("VOLTAGE REQUIRED (NUMBER), TRY AGAIN", text or "", 6,
-            "schematicNewSourceVoltageConfirmed", "schematicNewSourceVoltageCancelled")
+            "schematicNewSourceVoltageConfirmed", "schematicNewSourceVoltageCancelled", true)
         return
     end
     local canvas = _findSchematicCanvas()

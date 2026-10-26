@@ -63,8 +63,8 @@ local _ELEMENT_DEFAULT_H_FRAC = 0.05
 local _PINCH_MIN_DIST_PX      = 1      -- guards against a near-zero divisor right as a pinch begins
 local _WIRE_WIDTH_PX         = 2 / 3   -- half of the previous 4/3px width
 local _WIRE_CROSS_HOP_RADIUS_PX = 2.5   -- radius of the little arc hop drawn where a wire crosses an unrelated one
-local _WIRE_PARALLEL_GAP_PX     = _WIRE_WIDTH_PX * 3   -- spacing between adjacent lanes when 2+ wires' paths overlap (fully or partially) — 3x the connector's own line width
-local _WIRE_PARALLEL_STUB_PX    = 8   -- unsplit length kept right at each anchor before a parallel lane's offset begins
+local _WIRE_BUNDLE_WIDTH_MULT   = 2     -- a "twisted bundle" (see _drawWireBundleSegment) draws this many times as thick as one normal wire
+local _WIRE_BUNDLE_STRIPE_LEN_PX = 6    -- length of one wire's own diagonal color band along a bundle
 local _CONNECTOR_RELEASE_SLOP_PX = 16  -- forgiveness margin for "which element did the wire-drag land on", since exact-rectangle precision is unreliable on a touchscreen
 local _CONNECTOR_TARGET_RADIUS_PX = 9  -- drawn radius of the green "valid connection point" reticle shown at each element's center while a wire is being dragged
 local _CONNECTOR_SNAP_COLOR  = {0.25, 0.95, 0.35, 1}
@@ -655,6 +655,43 @@ local function _anchorCenter(canvas, anchor)
         return _elementCenter(canvas, anchor)
     end
     return _toPixel(canvas, anchor.x, anchor.y)
+end
+
+-- True if a candidate footprint (cx,cy = pixel-space center, halfX,halfY =
+-- pixel-space half-extents) would overlap any EXISTING element or control
+-- other than excludeId (the one actually being placed/dragged, if it
+-- already exists on the canvas — nil for a brand-new placement, nothing
+-- to exclude). Wires are completely exempt from this — only elements and
+-- controls (see gdsGui_schematic_pressed's pendingPlacement branch and
+-- _moved's "element"/"control" dragKinds, the only two callers) can never
+-- sit on top of each other; two+ WIRES sharing the same path are exactly
+-- what the "twisted bundle" draws (see _computeWirePlans), a deliberate
+-- opposite rule for a completely different kind of entity. Every shape (a
+-- control's circle included) is checked as its own axis-aligned bounding
+-- box — simpler than a true circle-vs-rect test, and only ever more
+-- conservative (a control placed exactly diagonal to another, just
+-- outside true circle-to-circle contact, could still be flagged here),
+-- never less safe.
+local function _footprintOverlapsAnother(canvas, cx, cy, halfX, halfY, excludeId)
+    for _, e in ipairs(canvas.elements) do
+        if e.id ~= excludeId then
+            local ex, ey, ew, eh = _elementPixelRect(canvas, e)
+            local ecx, ecy, ehalfX, ehalfY = ex + ew / 2, ey + eh / 2, ew / 2, eh / 2
+            if math.abs(cx - ecx) < halfX + ehalfX and math.abs(cy - ecy) < halfY + ehalfY then
+                return true
+            end
+        end
+    end
+    for _, c in ipairs(canvas.controls) do
+        if c.id ~= excludeId then
+            local ccx, ccy = _toPixel(canvas, c.x, c.y)
+            local crad = canvas.controlRadius * canvas.zoom * (c.radiusScale or 1)
+            if math.abs(cx - ccx) < halfX + crad and math.abs(cy - ccy) < halfY + crad then
+                return true
+            end
+        end
+    end
+    return false
 end
 
 -- Pivot point for the "spin to set direction" drag on an already-selected
@@ -2649,7 +2686,21 @@ function gdsGui_schematic_openElementEditMenu(canvasName, elementId)
     if not el then return end
     canvas._elementEditTargetId = elementId
     local options = {"ADD WIRE", "RENAME", "PROPERTIES", "DELETE"}
-    gdsGui_schematic_openMenu(canvasName, el.label or elementId, options,
+    local title = el.label or elementId
+    -- canvas.elementMenuTitleSuffix (optional, by-name like every other
+    -- string-registered hook): called as fn(canvasName, elementId) just
+    -- before this menu opens, for a line to APPEND to its title — e.g.
+    -- the inference model's own sensed voltage reading (main.lua's
+    -- schematicElementVoltageMenuSuffix). The library never interprets
+    -- what comes back; nil/"" means nothing extra to show, same as the
+    -- hook simply not being registered at all (an untyped/non-ELECTRICAL
+    -- system, say).
+    if canvas.elementMenuTitleSuffix then
+        local fn = _G[canvas.elementMenuTitleSuffix]
+        local suffix = fn and fn(canvasName, elementId)
+        if suffix and suffix ~= "" then title = title .. "  (" .. suffix .. ")" end
+    end
+    gdsGui_schematic_openMenu(canvasName, title, options,
         "gdsGui_schematic_internal_onElementEditChosen", "gdsGui_schematic_internal_onElementEditCancelled", #options)
 end
 
@@ -4167,24 +4218,6 @@ local function _clampedOrthogonalSegments(canvas, fromAnchor, x1, y1, toAnchor, 
     end
 end
 
--- Fixed, deterministic perpendicular direction for an axis-aligned segment
--- (up for horizontal, left for vertical) — used both for the parallel-lane
--- offset and the crossing hop's bulge, so everything reads as "the same
--- side" consistently across the whole canvas.
-local function _segmentPerp(y1, y2)
-    if y1 == y2 then return 0, -1 end
-    return -1, 0
-end
-
--- Unit travel direction of an axis-aligned segment (+1/-1 along whichever
--- axis it runs on) — used below to derive each bend segment's own SAFE
--- perpendicular lane direction, as opposed to _segmentPerp's single
--- canvas-wide convention.
-local function _segDir(seg)
-    if seg[2] == seg[4] then return (seg[3] > seg[1]) and 1 or -1, 0 end
-    return 0, (seg[4] > seg[2]) and 1 or -1
-end
-
 -- Do two perpendicular (one horizontal, one vertical) segments cross at a
 -- point strictly inside both — i.e. a true mid-path crossing, not merely
 -- touching at one of their own endpoints (a shared anchor or bend corner)?
@@ -4236,52 +4269,33 @@ end
 
 -- Draws one straight axis-aligned segment, inserting a small semicircular
 -- hop at each distance in hopDistances (the conventional "not electrically
--- connected" symbol for two crossing wires), and/or a perpendicular offset
--- over each {lo, hi, offset} zone in offsetRanges — with a short unsplit
--- stub at whichever end(s) touch a real anchor (stubStart/stubEnd) — how
--- colocated/overlapping parallel wires are kept from merging into one
--- indistinguishable line. Zones don't have to span the whole segment (see
--- _computeWirePlans: two wires may only share part of their path), so any
--- distance not covered by a zone draws at zero offset. Hops and the lane
--- offset compose naturally: a hop's arc is centered on whatever point this
--- segment would otherwise be drawn at (offset or not), since both go
--- through the same pointAt().
-local function _drawSegmentWithHopsAndOffset(x1, y1, x2, y2, hopDistances, offsetRanges, stubStart, stubEnd, zoom)
+-- connected" symbol for two crossing wires) and leaving a gap entirely
+-- over each {lo, hi} zone in bundledRanges — a bundledRanges zone means
+-- some OTHER call has already drawn (or will draw) a _drawWireBundleSegment
+-- there covering this same stretch, so this wire's own solo line has
+-- nothing left to do over that zone. Zones don't have to span the whole
+-- segment (see _computeWirePlans: two wires may only share part of their
+-- path), so any distance not covered by a bundle zone draws solo as
+-- normal. No offset/lane math at all — every segment always draws at its
+-- own true, unmoved position; see _computeWirePlans' own comment for why
+-- that's enough now that overlapping wires draw as one shared bundle
+-- instead of being nudged apart into separate parallel lines.
+local function _drawSegmentWithHopsAndGaps(x1, y1, x2, y2, hopDistances, bundledRanges, zoom)
     zoom = zoom or 1
-    local stubPx = _WIRE_PARALLEL_STUB_PX * zoom
     local hopRadiusPx = _WIRE_CROSS_HOP_RADIUS_PX * zoom
     local horiz = (y1 == y2)
     local dirX, dirY
     if horiz then dirX, dirY = (x2 > x1) and 1 or -1, 0
     else          dirX, dirY = 0, (y2 > y1) and 1 or -1 end
     local length = horiz and math.abs(x2 - x1) or math.abs(y2 - y1)
-    offsetRanges = offsetRanges or {}
+    bundledRanges = bundledRanges or {}
 
-    local function offsetAt(d)
-        if #offsetRanges == 0 then return 0, 0 end
-        if stubStart and d < stubPx then return 0, 0 end
-        if stubEnd and d > length - stubPx then return 0, 0 end
-        for _, r in ipairs(offsetRanges) do
-            if d >= r.lo - 0.01 and d <= r.hi + 0.01 then
-                return r.offX, r.offY
-            end
-        end
-        return 0, 0
-    end
-
-    local function pointAt(d)
-        local offX, offY = offsetAt(d)
-        return x1 + dirX * d + offX, y1 + dirY * d + offY
-    end
+    local function pointAt(d) return x1 + dirX * d, y1 + dirY * d end
 
     local cuts = { 0, length }
-    if #offsetRanges > 0 then
-        for _, r in ipairs(offsetRanges) do
-            if r.lo > 0 and r.lo < length then table.insert(cuts, r.lo) end
-            if r.hi > 0 and r.hi < length then table.insert(cuts, r.hi) end
-        end
-        if stubStart and stubPx < length then table.insert(cuts, stubPx) end
-        if stubEnd and length - stubPx > 0 then table.insert(cuts, length - stubPx) end
+    for _, r in ipairs(bundledRanges) do
+        if r.lo > 0 and r.lo < length then table.insert(cuts, r.lo) end
+        if r.hi > 0 and r.hi < length then table.insert(cuts, r.hi) end
     end
     local hopRanges = {}
     for _, d in ipairs(hopDistances or {}) do
@@ -4301,64 +4315,103 @@ local function _drawSegmentWithHopsAndOffset(x1, y1, x2, y2, hopDistances, offse
     for i = 1, #cuts - 1 do
         local a, b = cuts[i], cuts[i + 1]
         local mid = (a + b) / 2
-        local inHop = nil
-        for _, hr in ipairs(hopRanges) do
-            if mid >= hr.lo and mid <= hr.hi then inHop = hr end
+        local inBundle = false
+        for _, r in ipairs(bundledRanges) do
+            if mid >= r.lo and mid <= r.hi then inBundle = true break end
         end
-        if inHop then
-            local cxp, cyp = pointAt(inHop.center)
-            local startAngle, endAngle
-            if horiz then startAngle, endAngle = math.pi, math.pi * 2
-            else          startAngle, endAngle = math.pi / 2, math.pi * 1.5 end
-            love.graphics.arc("line", "open", cxp, cyp, hopRadiusPx, startAngle, endAngle)
-        else
-            local ax, ay = pointAt(a)
-            local bx, by = pointAt(b)
-            love.graphics.line(ax, ay, bx, by)
+        if not inBundle then
+            local inHop = nil
+            for _, hr in ipairs(hopRanges) do
+                if mid >= hr.lo and mid <= hr.hi then inHop = hr end
+            end
+            if inHop then
+                local cxp, cyp = pointAt(inHop.center)
+                local startAngle, endAngle
+                if horiz then startAngle, endAngle = math.pi, math.pi * 2
+                else          startAngle, endAngle = math.pi / 2, math.pi * 1.5 end
+                love.graphics.arc("line", "open", cxp, cyp, hopRadiusPx, startAngle, endAngle)
+            else
+                local ax, ay = pointAt(a)
+                local bx, by = pointAt(b)
+                love.graphics.line(ax, ay, bx, by)
+            end
         end
     end
 
-    -- This segment's actual (post-offset) drawn start/end, for
-    -- _drawWirePlanSegments/_drawClampedOrthogonalLine below to bridge the
-    -- gap a shared bend corner would otherwise leave — see their own
-    -- comments for why that gap exists.
+    -- This segment's true start/end, for _drawWirePlanSegments/
+    -- _drawClampedOrthogonalLine below to patch the sharp-corner cap LÖVE
+    -- otherwise leaves where two separately-drawn segments meet.
     local startX, startY = pointAt(0)
     local endX, endY = pointAt(length)
     return startX, startY, endX, endY
 end
 
--- Draws every segment of a precomputed wire plan (see _computeWirePlans),
--- applying that wire's own hop points and lane-offset zones per segment.
--- Each segment only carries its OWN lane offset along its OWN axis (a
--- vertical segment's offset shifts its x; a horizontal one shifts its y —
--- see _drawSegmentWithHopsAndOffset), so a lane that isn't exactly centered
--- has the previous segment's real (post-offset) end land at a different
--- point than the next one's real start, with nothing drawn between them.
--- _bridgeSegmentJoint below connects them with the natural right-angle
--- corner (the previous segment's own offset axis combined with the next
--- one's) so overlapping lanes read as the nested, staggered-corner bends
--- real parallel bus routing uses instead of a gap or a diagonal cut corner.
+-- Draws one straight axis-aligned BUNDLE segment (x1,y1)-(x2,y2) as a
+-- single line _WIRE_BUNDLE_WIDTH_MULT times a normal wire's width, with
+-- each entry in colors (one per wire sharing this stretch, in creation
+-- order) repeating as a diagonal band along it — the "twisted cable" look
+-- replacing the old per-wire parallel-lane offset (see _computeWirePlans'
+-- own comment): instead of N separate thin lines nudged apart, every wire
+-- sharing this exact stretch draws as ONE thick shared line instead, with
+-- color alone (not position) showing which wires are in it. 3 colors
+-- bundled draws color1,color2,color3,color1,... all the way down. The
+-- band at either end is whatever fraction of a full
+-- _WIRE_BUNDLE_STRIPE_LEN_PX band fits there — no attempt to center the
+-- pattern or evenly divide it into the segment's exact length, same as a
+-- real twisted bundle just gets cut wherever it ends.
+local function _drawWireBundleSegment(x1, y1, x2, y2, colors, zoom)
+    local length = math.sqrt((x2 - x1) ^ 2 + (y2 - y1) ^ 2)
+    if length < 0.01 or #colors == 0 then return end
+    local thickness = _WIRE_WIDTH_PX * _WIRE_BUNDLE_WIDTH_MULT * zoom
+    local stripeLen = _WIRE_BUNDLE_STRIPE_LEN_PX * zoom
+    love.graphics.push()
+    love.graphics.translate(x1, y1)
+    love.graphics.rotate(math.atan2(y2 - y1, x2 - x1))
+    local d, i = 0, 0
+    while d < length do
+        local d2 = math.min(d + stripeLen, length)
+        local c = colors[(i % #colors) + 1]
+        love.graphics.setColor(c[1], c[2], c[3], c[4] or 1)
+        love.graphics.polygon("fill",
+            d, -thickness / 2,
+            d2, -thickness / 2,
+            d2 - thickness, thickness / 2,
+            d - thickness, thickness / 2)
+        d, i = d2, i + 1
+    end
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.pop()
+end
+
+-- Patches the sharp-corner butt-cap gap LÖVE's line rendering otherwise
+-- leaves where two separately-drawn segments of one bend meet — every
+-- segment now always draws at its own true, unmoved position (see
+-- _computeWirePlans' own comment on why bundling replaced per-wire lane
+-- offsets), so prevEnd and the next segment's start are always the exact
+-- same point; this just squares off that one shared joint.
 local function _bridgeSegmentJoint(prevEndX, prevEndY, prevVertical, startX, startY, halfW)
     local cornerX = prevVertical and prevEndX or startX
     local cornerY = prevVertical and startY or prevEndY
     -- One connected 3-point polyline, not two separate love.graphics.line()
     -- calls, so its own internal corner joins cleanly; each of its two
     -- junctions against the segments' own separate line draws still gets
-    -- the same small square patch _drawSegmentWithHopsAndOffset's own
+    -- the same small square patch _drawSegmentWithHopsAndGaps's own
     -- butt-cap notch needs (see its comment).
     love.graphics.line(prevEndX, prevEndY, cornerX, cornerY, startX, startY)
     love.graphics.rectangle("fill", prevEndX - halfW, prevEndY - halfW, halfW * 2, halfW * 2)
     love.graphics.rectangle("fill", startX - halfW, startY - halfW, halfW * 2, halfW * 2)
 end
 
+-- Draws every segment of a precomputed wire plan (see _computeWirePlans),
+-- applying that wire's own hop points and bundle gaps per segment (see
+-- _drawSegmentWithHopsAndGaps) — the bundle zones themselves are drawn
+-- separately, once per bundle, by _drawWireBundleSegment.
 local function _drawWirePlanSegments(plan, zoom)
-    local n = #plan.segments
     local halfW = love.graphics.getLineWidth() / 2
     local prevEndX, prevEndY, prevVertical
     for idx, seg in ipairs(plan.segments) do
-        local stubStart, stubEnd = (idx == 1), (idx == n)
-        local startX, startY, endX, endY = _drawSegmentWithHopsAndOffset(
-            seg[1], seg[2], seg[3], seg[4], plan.hopDistances[idx], plan.offsetRanges[idx], stubStart, stubEnd, zoom)
+        local startX, startY, endX, endY = _drawSegmentWithHopsAndGaps(
+            seg[1], seg[2], seg[3], seg[4], plan.hopDistances[idx], plan.bundledRanges[idx], zoom)
         if idx > 1 then
             _bridgeSegmentJoint(prevEndX, prevEndY, prevVertical, startX, startY, halfW)
         end
@@ -4368,7 +4421,7 @@ local function _drawWirePlanSegments(plan, zoom)
 end
 
 -- Draws an orthogonal connector line between two anchors' centers, clamped
--- to each anchor's own edge, with no hop/lane-offset treatment — used by the
+-- to each anchor's own edge, with no hop/bundle treatment — used by the
 -- live wire-drag preview and the (unrelated-to-other-wires) selection
 -- highlight pass, neither of which need the cross-wire analysis below.
 local function _drawClampedOrthogonalLine(canvas, fromAnchor, x1, y1, toAnchor, x2, y2)
@@ -4377,11 +4430,9 @@ local function _drawClampedOrthogonalLine(canvas, fromAnchor, x1, y1, toAnchor, 
     local prevEndX, prevEndY, prevVertical
     for idx, seg in ipairs(segments) do
         local startX, startY, endX, endY =
-            _drawSegmentWithHopsAndOffset(seg[1], seg[2], seg[3], seg[4], nil, nil, false, false, canvas.zoom)
+            _drawSegmentWithHopsAndGaps(seg[1], seg[2], seg[3], seg[4], nil, nil, canvas.zoom)
         -- Same bend-corner joint bridge as _drawWirePlanSegments above —
-        -- see its comment (collapses to a no-op here in practice, since
-        -- this preview has no lane offsets to bridge between, but kept for
-        -- the same stray butt-cap notch at a plain, unoffset corner).
+        -- see its comment.
         if idx > 1 then
             _bridgeSegmentJoint(prevEndX, prevEndY, prevVertical, startX, startY, halfW)
         end
@@ -4391,29 +4442,30 @@ local function _drawClampedOrthogonalLine(canvas, fromAnchor, x1, y1, toAnchor, 
 end
 
 -- Precomputes, for every wire on the canvas, the crossing-hop points and/or
--- parallel-lane offset zones needed to render the two conventional "these
--- are not the same connection" cues:
+-- bundle zones needed to render the two conventional "these are not
+-- necessarily one single connection" cues:
 --   - ANY two (or more) segments — from any wires, not just ones sharing
---     both anchors — that run along the exact same line and overlap are
---     split into evenly-spaced parallel lanes (see _WIRE_PARALLEL_GAP_PX)
---     over just the overlapping stretch, instead of overlapping into one
---     indistinguishable line. A classic duplicate connector (same two
+--     both anchors — that run along the exact same line and overlap draw
+--     as ONE shared "twisted bundle" line (see _drawWireBundleSegment)
+--     over just the overlapping stretch, instead of each wire separately
+--     drawing its own line there. A classic duplicate connector (same two
 --     anchors on both wires) is just the special case where the overlap
 --     happens to span each wire's entire path;
 --   - any OTHER pair of wires whose paths cross at a true interior point
 --     gets a small arc hop on the later-added wire (by creation order in
 --     canvas.wires), the standard "not electrically connected" symbol.
--- Three+-way overlap groups are handled (evenly spaced, not just pairwise),
--- and since the offset is computed per overlapping sub-range rather than
--- once for the whole wire, a wire's lane count/position can change partway
--- along its path if which other wires it overlaps changes there. A wire
--- that's simultaneously in an overlap group AND crosses some unrelated
--- third wire still gets both treatments correctly (see
--- _drawSegmentWithHopsAndOffset).
+-- Unlike that crossing hop, a bundle zone needs no per-wire lane ranking
+-- or offset math at all — every wire sharing a stretch just contributes
+-- its own color band to the ONE shared line drawn there, in creation
+-- order (see _drawWireBundleSegment) — the simplification over this
+-- module's previous approach of nudging every overlapping wire into its
+-- own separate parallel lane. A wire that's simultaneously in a bundle
+-- AND crosses some unrelated third wire still gets both treatments
+-- correctly (see _drawSegmentWithHopsAndGaps).
 -- Detects whether anything _computeWirePlans' result depends on (every
 -- anchor's position/rotation, the wire list itself, and the view transform)
 -- changed since the last call, so gdsGui_schematic_draw can skip the
--- expensive O(wires^2 * segments^2) crossing/parallel-lane analysis below on
+-- expensive O(wires^2 * segments^2) crossing/bundle analysis below on
 -- frames where nothing actually changed (the common case: a canvas just
 -- sitting on screen). Compares live values directly against scalars cached
 -- in canvas._wpSig (reused across frames, mutated in place) rather than
@@ -4493,30 +4545,17 @@ local function _wireForceAxis(w)
     return nil
 end
 
--- Offset at distance d along a segment of the given length, honoring the
--- same stub/offsetRanges rules _drawSegmentWithHopsAndOffset uses to draw it
--- — kept in sync with that function's offsetAt() so a wire hit-tests exactly
--- where it's actually drawn, lane offset included.
-local function _offsetAtDistance(d, length, offsetRanges, stubPx, stubStart, stubEnd)
-    if not offsetRanges or #offsetRanges == 0 then return 0, 0 end
-    if stubStart and d < stubPx then return 0, 0 end
-    if stubEnd and d > length - stubPx then return 0, 0 end
-    for _, r in ipairs(offsetRanges) do
-        if d >= r.lo - 0.01 and d <= r.hi + 0.01 then return r.offX, r.offY end
-    end
-    return 0, 0
-end
 
 local function _computeWirePlans(canvas)
     local changed = _wirePlansChanged(canvas)
     if canvas._wirePlansCache and not changed then
-        return canvas._wirePlansCache
+        return canvas._wirePlansCache, canvas._wireBundlesCache
     end
 
     local plans = {}
     -- Segments grouped by the exact line they run along (key "H:<y>" or
     -- "V:<x>", nearest-pixel rounded), each entry recording the segment's
-    -- own along-line absolute range — the input to the overlap sweep below.
+    -- own along-line absolute range — the input to the bundle sweep below.
     local lineGroups = {}
     for order, w in ipairs(canvas.wires) do
         local fromE, toE = _findAnchor(canvas, w.fromElementId), _findAnchor(canvas, w.toElementId)
@@ -4524,8 +4563,7 @@ local function _computeWirePlans(canvas)
             local x1, y1 = _anchorCenter(canvas, fromE)
             local x2, y2 = _anchorCenter(canvas, toE)
             local segments = _clampedOrthogonalSegments(canvas, fromE, x1, y1, toE, x2, y2, _wireForceAxis(w))
-            local numSegs = #segments
-            plans[w.id] = { segments = segments, hopDistances = {}, offsetRanges = {} }
+            plans[w.id] = { segments = segments, hopDistances = {}, bundledRanges = {} }
             for segIdx, seg in ipairs(segments) do
                 local horiz = (seg[2] == seg[4])
                 local loAbs, hiAbs
@@ -4534,52 +4572,8 @@ local function _computeWirePlans(canvas)
                 if hiAbs - loAbs > 0.01 then
                     local key = (horiz and "H:" or "V:") .. _roundPx(horiz and seg[2] or seg[1])
                     lineGroups[key] = lineGroups[key] or {}
-                    -- Where this segment DIVERGES from a shared bundle, used
-                    -- below to rank parallel lanes by real position instead
-                    -- of arbitrary creation order (see the sweep's sort).
-                    -- _clampedOrthogonalSegments always walks a wire's
-                    -- segments from fromAnchor toward toAnchor, so segment 1
-                    -- of a multi-segment plan starts AT a real anchor (the
-                    -- shared/bundled end) and ends at a bend — divergence is
-                    -- at its end. The last segment ends AT a real anchor
-                    -- instead — divergence is at its start. A single-segment
-                    -- (direct) wire is both at once; the "end" convention
-                    -- wins, same as any other non-final segment.
-                    local divergeCoord
-                    -- The lane direction that's actually safe for THIS
-                    -- segment — i.e. won't, at any offset magnitude, drift
-                    -- into the corridor swept out by the wire's OWN other
-                    -- segment on the far side of the bend (see the sweep's
-                    -- offset computation below for why a fixed canvas-wide
-                    -- convention like _segmentPerp can't guarantee that).
-                    -- A segment with a NEXT segment (bends away afterward)
-                    -- is safe opposite the direction that next segment
-                    -- travels in — moving that way instead would walk this
-                    -- segment's lane straight toward where the next one
-                    -- sweeps. A segment with only a PREVIOUS one (it's the
-                    -- last leg, bent into FROM that previous segment) is
-                    -- safe in that previous segment's own travel direction
-                    -- — continuing past the bend instead of doubling back
-                    -- toward where that leg came from. A single-segment
-                    -- (direct, no bend) wire has neither, so there's no
-                    -- corridor to avoid — kept on the old fixed convention.
-                    local safeDirX, safeDirY
-                    if segIdx == numSegs then
-                        divergeCoord = horiz and seg[1] or seg[2]
-                        if numSegs > 1 then
-                            safeDirX, safeDirY = _segDir(segments[segIdx - 1])
-                        else
-                            safeDirX, safeDirY = _segmentPerp(seg[2], seg[4])
-                        end
-                    else
-                        divergeCoord = horiz and seg[3] or seg[4]
-                        local ndx, ndy = _segDir(segments[segIdx + 1])
-                        safeDirX, safeDirY = -ndx, -ndy
-                    end
                     table.insert(lineGroups[key], {
                         wireId = w.id, order = order, seg = seg, segIdx = segIdx, loAbs = loAbs, hiAbs = hiAbs,
-                        divergeCoord = divergeCoord, numSegs = numSegs,
-                        safeDirX = safeDirX, safeDirY = safeDirY,
                     })
                 end
             end
@@ -4587,9 +4581,12 @@ local function _computeWirePlans(canvas)
     end
 
     -- Sweep each line's entries: break it into sub-ranges at every entry's
-    -- own start/end, then for each sub-range rank whichever entries actually
-    -- cover it (by divergeCoord, so lane order matches each wire's real
-    -- bend/anchor position — see its computation above) and evenly space them.
+    -- own start/end, then wherever 2+ entries actually cover a sub-range,
+    -- record ONE bundle zone there (member wires in creation order) —
+    -- see _drawWireBundleSegment, the only consumer of bundles below. No
+    -- lane ranking/offset math needed: every member just contributes its
+    -- own color band to that one shared line at draw time.
+    local bundles = {}
     for _, entries in pairs(lineGroups) do
         if #entries > 1 then
             local breakpoints = {}
@@ -4604,46 +4601,6 @@ local function _computeWirePlans(canvas)
             end
             breakpoints = dedup
 
-            -- Decided once for the WHOLE shared line, not re-derived per
-            -- sub-range below: if every sub-range instead asked "does
-            -- whichever subset happens to be active HERE include a bend",
-            -- a dead-straight wire bundled with one bent wire over only
-            -- PART of its length would flip from the one-sided formula
-            -- (while the bent wire is still present) to the centered one
-            -- (once it drops out) — two formulas with unrelated offset
-            -- scales, so the straight wire's own lane visibly jumped
-            -- sideways exactly where the bent wire's span ended, even
-            -- though the straight wire itself never changed. One decision
-            -- for the whole group keeps every entry on a single formula
-            -- for its entire run.
-            local hasBend = false
-            for _, e in ipairs(entries) do
-                if e.numSegs > 1 then hasBend = true break end
-            end
-            -- Same reasoning for the one-sided formula's lane rank: fixed
-            -- once across every entry sharing this line, not recomputed
-            -- from whichever subset is active in a given sub-range, so a
-            -- wire's lane doesn't shift just because some OTHER wire's
-            -- (possibly unrelated) span happens to start or end nearby.
-            -- Ranked by where each wire actually diverges (its real
-            -- bend/anchor position), not by draw/creation order, so a wire
-            -- that's the "leftmost"/"outermost" of the bundle stays on that
-            -- same side all the way to its own bend instead of being
-            -- assigned an arbitrary lane that forces it to cross the others
-            -- on the way out. Ties (same divergeCoord, e.g. two wires
-            -- bending at the exact same point) fall back to creation order
-            -- for determinism.
-            local globalRank = {}
-            if hasBend then
-                local ranked = {}
-                for _, e in ipairs(entries) do table.insert(ranked, e) end
-                table.sort(ranked, function(x, y)
-                    if x.divergeCoord ~= y.divergeCoord then return x.divergeCoord < y.divergeCoord end
-                    return x.order < y.order
-                end)
-                for rank, e in ipairs(ranked) do globalRank[e] = rank end
-            end
-
             for bi = 1, #breakpoints - 1 do
                 local a, b = breakpoints[bi], breakpoints[bi + 1]
                 local mid = (a + b) / 2
@@ -4651,48 +4608,22 @@ local function _computeWirePlans(canvas)
                 for _, e in ipairs(entries) do
                     if e.loAbs <= mid and e.hiAbs >= mid then table.insert(active, e) end
                 end
-                local n = #active
-                if n > 1 then
-                    table.sort(active, function(x, y)
-                        if x.divergeCoord ~= y.divergeCoord then return x.divergeCoord < y.divergeCoord end
-                        return x.order < y.order
-                    end)
-                    -- A bend segment (part of a wire with more than one
-                    -- segment) can't use the old symmetric split-around-
-                    -- center offset — half the lanes would land on the
-                    -- "positive" side of center, which for a bend segment is
-                    -- exactly the direction its OWN other segment sweeps
-                    -- through, walking that lane straight across the other
-                    -- segment's corridor right where the two would
-                    -- otherwise meet cleanly (the crossing this whole
-                    -- function exists to avoid). Instead every bend lane is
-                    -- pushed the same safe way (see safeDirX/Y above), by a
-                    -- one-sided, zero-based magnitude — lane 1 sits exactly
-                    -- on the true unshifted path (the "inside" of the turn,
-                    -- shortest route) and each lane after it is pushed
-                    -- further out (the "outside", a longer route), nesting
-                    -- without ever crossing. A plain straight overlap (every
-                    -- active entry single-segment, no bend involved) keeps
-                    -- the old centered split instead — nothing to avoid
-                    -- there, and it reads better centered on the true line.
-                    for k, e in ipairs(active) do
-                        local offX, offY
-                        if hasBend then
-                            local mag = (globalRank[e] - 1) * _WIRE_PARALLEL_GAP_PX * canvas.zoom
-                            offX, offY = e.safeDirX * mag, e.safeDirY * mag
-                        else
-                            local mag = (k - (n + 1) / 2) * _WIRE_PARALLEL_GAP_PX * canvas.zoom
-                            local perpX, perpY = _segmentPerp(e.seg[2], e.seg[4])
-                            offX, offY = perpX * mag, perpY * mag
-                        end
-                        local ax, ay = _pointOnLine(e.seg, a)
-                        local bx, by = _pointOnLine(e.seg, b)
-                        local dA, dB = _distAlongSegment(e.seg, ax, ay), _distAlongSegment(e.seg, bx, by)
-                        local lo, hi = math.min(dA, dB), math.max(dA, dB)
-                        local ranges = plans[e.wireId].offsetRanges
+                if #active > 1 then
+                    table.sort(active, function(x, y) return x.order < y.order end)
+                    local ref = active[1]
+                    local ax, ay = _pointOnLine(ref.seg, a)
+                    local bx, by = _pointOnLine(ref.seg, b)
+                    local wireIds = {}
+                    for _, e in ipairs(active) do
+                        table.insert(wireIds, e.wireId)
+                        local eax, eay = _pointOnLine(e.seg, a)
+                        local ebx, eby = _pointOnLine(e.seg, b)
+                        local dA, dB = _distAlongSegment(e.seg, eax, eay), _distAlongSegment(e.seg, ebx, eby)
+                        local ranges = plans[e.wireId].bundledRanges
                         ranges[e.segIdx] = ranges[e.segIdx] or {}
-                        table.insert(ranges[e.segIdx], { lo = lo, hi = hi, offX = offX, offY = offY })
+                        table.insert(ranges[e.segIdx], { lo = math.min(dA, dB), hi = math.max(dA, dB) })
                     end
+                    table.insert(bundles, { x1 = ax, y1 = ay, x2 = bx, y2 = by, wireIds = wireIds })
                 end
             end
         end
@@ -4721,80 +4652,34 @@ local function _computeWirePlans(canvas)
     end
 
     canvas._wirePlansCache = plans
-    return plans
+    canvas._wireBundlesCache = bundles
+    return plans, bundles
 end
 
--- Straight-line pieces approximating a wire's ACTUAL drawn path: each
--- segment's own per-lane perpendicular offset from a precomputed plan (see
--- _computeWirePlans) is applied, so two+ wires bundled along the same path
--- produce visually (and now hit-test-ably) distinct pieces instead of all
--- collapsing onto the same raw anchor-to-anchor bend. Falls back to the raw
--- bend when there's no plan (e.g. a dangling wire mid-undo). Ignores the
--- small crossing-hop arcs — a straight line through where the arc would be
--- is close enough for tap tolerance.
-local function _wireOffsetPieces(canvas, w, plan)
-    local fromA, toA = _findAnchor(canvas, w.fromElementId), _findAnchor(canvas, w.toElementId)
-    if not (fromA and toA) then return {} end
-    if not plan then
-        local x1, y1 = _anchorCenter(canvas, fromA)
-        local x2, y2 = _anchorCenter(canvas, toA)
-        return { { x1, y1, x2, y2 } }
-    end
-    local pieces = {}
-    local n = #plan.segments
-    local stubPx = _WIRE_PARALLEL_STUB_PX * canvas.zoom
-    for idx, seg in ipairs(plan.segments) do
-        local x1, y1, x2, y2 = seg[1], seg[2], seg[3], seg[4]
-        local horiz = (y1 == y2)
-        local dirX, dirY
-        if horiz then dirX, dirY = (x2 > x1) and 1 or -1, 0
-        else          dirX, dirY = 0, (y2 > y1) and 1 or -1 end
-        local length = horiz and math.abs(x2 - x1) or math.abs(y2 - y1)
-        local offsetRanges = plan.offsetRanges[idx] or {}
-        local stubStart, stubEnd = (idx == 1), (idx == n)
-
-        local cuts = { 0, length }
-        for _, r in ipairs(offsetRanges) do
-            if r.lo > 0 and r.lo < length then table.insert(cuts, r.lo) end
-            if r.hi > 0 and r.hi < length then table.insert(cuts, r.hi) end
-        end
-        if stubStart and stubPx < length then table.insert(cuts, stubPx) end
-        if stubEnd and length - stubPx > 0 then table.insert(cuts, length - stubPx) end
-        table.sort(cuts)
-        local dedup = {}
-        for _, c in ipairs(cuts) do
-            if #dedup == 0 or (c - dedup[#dedup]) > 0.01 then table.insert(dedup, c) end
-        end
-        cuts = dedup
-
-        local function pointAt(d)
-            local offX, offY = _offsetAtDistance(d, length, offsetRanges, stubPx, stubStart, stubEnd)
-            return x1 + dirX * d + offX, y1 + dirY * d + offY
-        end
-
-        for i = 1, #cuts - 1 do
-            local a, b = cuts[i], cuts[i + 1]
-            local ax, ay = pointAt(a)
-            local bx, by = pointAt(b)
-            table.insert(pieces, { ax, ay, bx, by })
-        end
-    end
-    return pieces
-end
-
--- Topmost wire whose ACTUAL drawn path (lane offset included — see
--- _wireOffsetPieces) passes within _WIRE_TAP_SLOP_PX of the point.
--- Last-added wins, matching _hitElement. Using the raw anchor-to-anchor bend
--- here (as this used to) made every wire bundled along the same path
--- hit-test identically, so only the last-added one was ever selectable —
--- lane-offset-aware hit-testing is what makes the others tappable too.
+-- Topmost wire whose segment path passes within _WIRE_TAP_SLOP_PX of the
+-- point. Last-added wins, matching _hitElement — a bundled stretch (see
+-- _computeWirePlans) no longer nudges overlapping wires into visually
+-- distinct lanes, so every wire sharing it sits at the exact same screen
+-- position; "last added" is also which one draws its color band on top at
+-- that point, so the two stay consistent with each other. Falls back to
+-- the raw anchor-to-anchor bend when a wire has no plan yet (e.g. a
+-- dangling wire mid-undo).
 local function _hitWire(canvas, px, py)
     local plans = _computeWirePlans(canvas)
     for i = #canvas.wires, 1, -1 do
         local w = canvas.wires[i]
-        for _, piece in ipairs(_wireOffsetPieces(canvas, w, plans[w.id])) do
-            local dist = _distPointToSegment(px, py, piece[1], piece[2], piece[3], piece[4])
-            if dist <= _WIRE_TAP_SLOP_PX then return w end
+        local plan = plans[w.id]
+        if plan then
+            for _, seg in ipairs(plan.segments) do
+                if _distPointToSegment(px, py, seg[1], seg[2], seg[3], seg[4]) <= _WIRE_TAP_SLOP_PX then return w end
+            end
+        else
+            local fromA, toA = _findAnchor(canvas, w.fromElementId), _findAnchor(canvas, w.toElementId)
+            if fromA and toA then
+                local x1, y1 = _anchorCenter(canvas, fromA)
+                local x2, y2 = _anchorCenter(canvas, toA)
+                if _distPointToSegment(px, py, x1, y1, x2, y2) <= _WIRE_TAP_SLOP_PX then return w end
+            end
         end
     end
     return nil
@@ -4996,8 +4881,20 @@ function gdsGui_schematic_draw(pageName)
             -- (a table.sort + string-concat over every control, repeated once
             -- per drawn entity for a value that cannot change mid-frame).
             local signature = gdsGui_schematic_computeSignature(canvas.name)
-            local wirePlans = _computeWirePlans(canvas)
+            local wirePlans, wireBundles = _computeWirePlans(canvas)
             for _, w in ipairs(canvas.wires) do _drawWire(canvas, w, wirePlans[w.id], signature) end
+            -- Each bundle zone (see _computeWirePlans) draws as ONE thick
+            -- line with its member wires' own colors, resolved fresh here
+            -- (not cached in the plan) same as every other entity's color —
+            -- see _drawWireBundleSegment.
+            for _, bundle in ipairs(wireBundles) do
+                local colors = {}
+                for _, wireId in ipairs(bundle.wireIds) do
+                    local r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "wire", wireId, signature)
+                    table.insert(colors, { r, g, b, a })
+                end
+                _drawWireBundleSegment(bundle.x1, bundle.y1, bundle.x2, bundle.y2, colors, canvas.zoom)
+            end
             local commonSelRad = _commonElementSelectionRadius(canvas)
             for _, e in ipairs(canvas.elements) do _drawElement(canvas, e, commonSelRad, signature) end
             for _, c in ipairs(canvas.controls) do _drawControl(canvas, c, signature) end
@@ -5276,12 +5173,38 @@ function gdsGui_schematic_pressed(touchId, x, y)
         -- design mode
         if canvas.pendingPlacement then
             local fracX, fracY = _toFraction(canvas, x, y)
-            if canvas.pendingPlacement.kind == "element" then
-                local wFrac, hFrac = _pendingElementSizeFrac(canvas, canvas.pendingPlacement)
+            local isElementPlacement = canvas.pendingPlacement.kind == "element"
+            local wFrac, hFrac
+            if isElementPlacement then
+                wFrac, hFrac = _pendingElementSizeFrac(canvas, canvas.pendingPlacement)
                 fracX, fracY = _snapElementToGrid(canvas, fracX, fracY, wFrac, hFrac)
             else
                 fracX, fracY = _snapToGrid(canvas, fracX, fracY)
             end
+
+            -- Same "can't overlap an existing element/control" rule the
+            -- drag handlers enforce (see _footprintOverlapsAnother) —
+            -- checked here at the tap itself so an invalid spot never
+            -- even reaches the "NAME THIS..." prompt. pendingPlacement
+            -- stays armed either way — a rejected tap is simply ignored,
+            -- same as missing the canvas entirely, so the user can just
+            -- try a different spot right away.
+            local candCx, candCy, candHalfX, candHalfY
+            if isElementPlacement then
+                local px, py = _toPixel(canvas, fracX, fracY)
+                local pw, ph = wFrac * canvas.contentW * canvas.zoom, hFrac * canvas.contentH * canvas.zoom
+                candCx, candCy, candHalfX, candHalfY = px + pw / 2, py + ph / 2, pw / 2, ph / 2
+            else
+                candCx, candCy = _toPixel(canvas, fracX, fracY)
+                candHalfX = canvas.controlRadius * canvas.zoom * (canvas.pendingPlacement.radiusMul or 1)
+                candHalfY = candHalfX
+            end
+            if _footprintOverlapsAnother(canvas, candCx, candCy, candHalfX, candHalfY, nil) then
+                gdsGui_schematic_openMenu(canvas.name, "CAN'T PLACE HERE — IT OVERLAPS ANOTHER ELEMENT.", {"OK"},
+                    "gdsGui_schematic_internal_onPlacementOverlapDismissed", nil)
+                goto continue
+            end
+
             canvas._placementCounter = canvas._placementCounter + 1
             local newId = canvas.pendingPlacement.idPrefix .. "_" .. canvas._placementCounter
             _pendingNamedPlacement = {
@@ -5704,7 +5627,17 @@ function gdsGui_schematic_moved(touchId, x, y)
             local elem = _findElement(canvas, canvas.selectedElementId)
             if elem then
                 local fracX, fracY = _toFraction(canvas, x - canvas.dragOffsetX, y - canvas.dragOffsetY)
-                elem.x, elem.y = _snapElementToGrid(canvas, fracX, fracY, elem.w, elem.h)
+                local candX, candY = _snapElementToGrid(canvas, fracX, fracY, elem.w, elem.h)
+                -- Elements (unlike wires — see _footprintOverlapsAnother's
+                -- own comment) can never overlap: simply don't apply the
+                -- candidate position at all when it would, so the element
+                -- just stops following the finger right at the obstacle's
+                -- edge instead of passing through it.
+                local px, py = _toPixel(canvas, candX, candY)
+                local pw, ph = elem.w * canvas.contentW * canvas.zoom, elem.h * canvas.contentH * canvas.zoom
+                if not _footprintOverlapsAnother(canvas, px + pw / 2, py + ph / 2, pw / 2, ph / 2, elem.id) then
+                    elem.x, elem.y = candX, candY
+                end
             end
             if not canvas.dragMoved and
                (math.abs(x - canvas.dragStartX) > _ELEMENT_TAP_SLOP_PX or
@@ -5754,7 +5687,14 @@ function gdsGui_schematic_moved(touchId, x, y)
             local ctrl = _findControl(canvas, canvas.selectedControlId)
             if ctrl then
                 local fracX, fracY = _toFraction(canvas, x - canvas.dragOffsetX, y - canvas.dragOffsetY)
-                ctrl.x, ctrl.y = _snapToGrid(canvas, fracX, fracY)
+                local candX, candY = _snapToGrid(canvas, fracX, fracY)
+                -- Same "just stop at the obstacle" treatment as the
+                -- element drag above — see _footprintOverlapsAnother.
+                local px, py = _toPixel(canvas, candX, candY)
+                local rad = canvas.controlRadius * canvas.zoom * (ctrl.radiusScale or 1)
+                if not _footprintOverlapsAnother(canvas, px, py, rad, rad, ctrl.id) then
+                    ctrl.x, ctrl.y = candX, candY
+                end
             end
             if not canvas.dragMoved and
                (math.abs(x - canvas.dragStartX) > _ELEMENT_TAP_SLOP_PX or
@@ -5825,6 +5765,19 @@ function gdsGui_schematic_internal_onWireCreateConfirmed(canvasName, index, opti
     end
 end
 
+-- Purely dismisses the "2-terminal device already has its max 2 wires"
+-- notice (see gdsGui_schematic_released's twoTerminalAnchorAtWireLimit
+-- check) — the connector itself was never created, so there's nothing
+-- left to do.
+function gdsGui_schematic_internal_onTwoTerminalWireLimitDismissed()
+end
+
+-- Purely dismisses the "can't place here, overlaps another element"
+-- notice (see gdsGui_schematic_pressed's pendingPlacement branch) — the
+-- placement was never created, so there's nothing left to do.
+function gdsGui_schematic_internal_onPlacementOverlapDismissed()
+end
+
 -- A press that lands on empty canvas space while a catalog placement is
 -- armed (canvas.pendingPlacement) synchronously opens the "NAME THIS
 -- ELEMENT/CONTROL" textPrompt right there inside gdsGui_schematic_pressed —
@@ -5856,6 +5809,32 @@ end
 
 function gdsGui_schematic_released(touchId, x, y)
     local activePageName = _getActivePageName()
+    -- True if anchorId is a simple 2-terminal device -- a gate-role
+    -- control with exactly 2 positions (OFF/ON, CLOSED/OPEN, ..., the
+    -- "two-way switch" case) OR a directionalGate-role element (DIODE,
+    -- DPST SWITCH -- the same 2-lead "anode in, cathode out" component
+    -- model/graph.lua's own _resolveDirectionalEdges assumes throughout)
+    -- -- and it ALREADY has 2 wires touching it, the physical maximum
+    -- either kind of 2-terminal device can ever actually have wired to
+    -- it. A 3-position switch (numDetents ~= 2), any other control role
+    -- (e.g. GENERATOR, "source" -- a real output terminal can
+    -- legitimately feed more than one bus), or any other element role
+    -- isn't limited here at all. Nested (not a top-level local, which
+    -- this file's handlers otherwise all are) purely to stay under this
+    -- file's 200-local ceiling -- it has exactly one caller, below.
+    local function twoTerminalAnchorAtWireLimit(canvas, anchorId)
+        local ctrl = _findControl(canvas, anchorId)
+        local elem = not ctrl and _findElement(canvas, anchorId)
+        local isTwoTerminal = (ctrl and ctrl.componentType == "gate" and ctrl.numDetents == 2)
+            or (elem and elem.componentType == "directionalGate")
+        if not isTwoTerminal then return false end
+        local count = 0
+        for _, w in ipairs(canvas.wires) do
+            if w.fromElementId == anchorId or w.toElementId == anchorId then count = count + 1 end
+        end
+        return count >= 2
+    end
+
     for _, canvas in ipairs(globApp.objects.schematics) do
         if canvas.page ~= activePageName then goto continue end
         canvas.touches[touchId] = nil
@@ -5904,33 +5883,40 @@ function gdsGui_schematic_released(touchId, x, y)
             elseif canvas.wireTool.fromId then
                 local toElem = _connectorSnapTarget(canvas)
                 if toElem then
-                    -- wireTool.color: an explicit per-gesture override (set
-                    -- only by a still-armed gdsGui_schematic_armConnectorPlacement
-                    -- color, nil for ADD WIRE). defaultConnectorColor: the
-                    -- per-canvas fallback ADD WIRE actually relies on — see
-                    -- gdsGui_schematic_setDefaultConnectorColor.
-                    local pendingColor = canvas.wireTool.color or canvas.defaultConnectorColor or _DEFAULT_COLOR
-                    -- A new connector wipes every existing snapshot (same as
-                    -- a new element/control — see _commitNamedPlacement)
-                    -- — worth an explicit "are you sure" only when there's
-                    -- actually something to lose.
-                    local snapshotCount = gdsGui_schematic_countSnapshots(canvas.name)
-                    if snapshotCount > 0 then
-                        _pendingWireCreation = {
-                            canvasName = canvas.name, fromId = canvas.wireTool.fromId,
-                            toId = toElem.id, color = pendingColor,
-                        }
+                    if twoTerminalAnchorAtWireLimit(canvas, canvas.wireTool.fromId)
+                       or twoTerminalAnchorAtWireLimit(canvas, toElem.id) then
                         gdsGui_schematic_openMenu(canvas.name,
-                            "ADDING A NEW CONNECTOR WILL DELETE ALL " .. snapshotCount .. " SNAPSHOT(S). CONTINUE?",
-                            {"CONTINUE", "CANCEL"},
-                            "gdsGui_schematic_internal_onWireCreateConfirmed",
-                            "gdsGui_schematic_internal_onWireCreateConfirmed", 1)
+                            "A 2-POSITION SWITCH OR DIODE CAN HAVE AT MOST 2 WIRES.", {"OK"},
+                            "gdsGui_schematic_internal_onTwoTerminalWireLimitDismissed", nil)
                     else
-                        local baseId = canvas.wireTool.fromId .. "_to_" .. toElem.id
-                        gdsGui_schematic_addWire(canvas.name, _uniqueWireId(canvas, baseId),
-                            canvas.wireTool.fromId, toElem.id, pendingColor)
-                        canvas.snapshots = {}
-                        _notifyChanged(canvas)
+                        -- wireTool.color: an explicit per-gesture override (set
+                        -- only by a still-armed gdsGui_schematic_armConnectorPlacement
+                        -- color, nil for ADD WIRE). defaultConnectorColor: the
+                        -- per-canvas fallback ADD WIRE actually relies on — see
+                        -- gdsGui_schematic_setDefaultConnectorColor.
+                        local pendingColor = canvas.wireTool.color or canvas.defaultConnectorColor or _DEFAULT_COLOR
+                        -- A new connector wipes every existing snapshot (same as
+                        -- a new element/control — see _commitNamedPlacement)
+                        -- — worth an explicit "are you sure" only when there's
+                        -- actually something to lose.
+                        local snapshotCount = gdsGui_schematic_countSnapshots(canvas.name)
+                        if snapshotCount > 0 then
+                            _pendingWireCreation = {
+                                canvasName = canvas.name, fromId = canvas.wireTool.fromId,
+                                toId = toElem.id, color = pendingColor,
+                            }
+                            gdsGui_schematic_openMenu(canvas.name,
+                                "ADDING A NEW CONNECTOR WILL DELETE ALL " .. snapshotCount .. " SNAPSHOT(S). CONTINUE?",
+                                {"CONTINUE", "CANCEL"},
+                                "gdsGui_schematic_internal_onWireCreateConfirmed",
+                                "gdsGui_schematic_internal_onWireCreateConfirmed", 1)
+                        else
+                            local baseId = canvas.wireTool.fromId .. "_to_" .. toElem.id
+                            gdsGui_schematic_addWire(canvas.name, _uniqueWireId(canvas, baseId),
+                                canvas.wireTool.fromId, toElem.id, pendingColor)
+                            canvas.snapshots = {}
+                            _notifyChanged(canvas)
+                        end
                     end
                 end
                 -- A catalog-armed connector is one-shot: disarm it once this

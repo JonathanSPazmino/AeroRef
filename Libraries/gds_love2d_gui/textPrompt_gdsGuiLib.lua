@@ -31,7 +31,15 @@ local function _geometry()
     return x, y, w, h
 end
 
-function gdsGui_textPrompt_open(title, initialText, maxChars, onConfirmFunc, onCancelFunc)
+-- numericOnly (optional, false by default): when true, every character
+-- typed via gdsGui_textPrompt_textinput below that isn't a digit, or a
+-- SECOND "." (one decimal point is allowed), is silently dropped instead
+-- of appended — rather than letting anything through and validating
+-- after the fact, so the field can never even contain something like
+-- "24V" or "abc" to begin with. initialText is NOT filtered (the caller's
+-- own responsibility — every current numericOnly caller already only
+-- ever seeds it with "" or a known-numeric tostring(...) value).
+function gdsGui_textPrompt_open(title, initialText, maxChars, onConfirmFunc, onCancelFunc, numericOnly)
     -- A prompt already open gets its own onCancel fired before being
     -- replaced, rather than silently discarded with no callback at all —
     -- any app-level state tied to it (e.g. a pending rename target) would
@@ -39,7 +47,7 @@ function gdsGui_textPrompt_open(title, initialText, maxChars, onConfirmFunc, onC
     if _prompt then gdsGui_textPrompt_cancel() end
     _prompt = {
         title = title, buffer = initialText or "", maxChars = maxChars or _MAX_CHARS_DEFAULT,
-        onConfirm = onConfirmFunc, onCancel = onCancelFunc,
+        onConfirm = onConfirmFunc, onCancel = onCancelFunc, numericOnly = numericOnly or false,
     }
     local x, y, w, h = _geometry()
     love.keyboard.setTextInput(true, x, y, w, h)
@@ -71,6 +79,15 @@ end
 -- Called from love.textinput when a prompt is open (general_gdsGuiLib.lua).
 function gdsGui_textPrompt_textinput(t)
     if not _prompt then return end
+    -- numericOnly: reject anything that isn't a digit, or a second "." —
+    -- checked per INPUT EVENT (t can be more than one character on some
+    -- input methods), not per codepoint, so a whole paste/IME commit is
+    -- accepted or rejected as one unit rather than silently keeping just
+    -- its digits.
+    if _prompt.numericOnly then
+        if t:find("[^%d%.]") then return end
+        if t:find("%.") and _prompt.buffer:find("%.") then return end
+    end
     -- maxChars counts codepoints, not bytes, so a multi-byte UTF-8 buffer
     -- near the limit is measured the same way deletion below measures it
     -- (via utf8.offset) rather than letting #buffer undercount and allow
