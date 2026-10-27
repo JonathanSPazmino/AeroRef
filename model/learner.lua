@@ -282,8 +282,72 @@ local function findAttributionRule(examples, candidateConditionIds)
     return { status = "noRule", reason = "no_consistent_explanation", exampleCount = #examples }
 end
 
+-- Generalizes findAttributionRule's winner-picking ACROSS every ambiguous
+-- node in the system at once, rather than teaching one specific node id in
+-- isolation. findAttributionRule's per-node rule only ever answers "what
+-- wins at THIS node" — a freshly-added battery elsewhere on the same bus
+-- starts from zero confidence even after a structurally identical backfeed
+-- has already been captured and confirmed at some OTHER node. This instead
+-- tests a single, system-wide hypothesis: does "the single highest-voltage
+-- contributor wins" (the unverified fallback _colorForPoweredNode already
+-- applies by default) actually hold, anywhere, ever, in this particular
+-- system?
+--
+-- examples: an array of plain booleans, one per CAPTURED SNAPSHOT that
+-- resolved at least one ambiguous node's winner against a well-defined
+-- single highest-voltage contributor (same "painted color uniquely
+-- matches one contributor's registered voltage color" discipline
+-- findAttributionRule's own caller applies, AND exactly one contributor
+-- strictly the highest-voltage one — the caller's job, same condition
+-- _isGenuinelyColorAmbiguous checks) — true if every such node in that
+-- snapshot agreed the highest-voltage contributor won, false if even one
+-- disagreed, i.e. proof the heuristic does NOT hold uniformly on this
+-- system (e.g. an isolating diode/relay the model doesn't otherwise
+-- know about). One boolean per SNAPSHOT, not per node: a single capture
+-- routinely resolves several ambiguous nodes at once (a bus, the battery
+-- it backfeeds, the switch between them...) that are really the same one
+-- real-world event, not independent trials — the caller (main.lua's
+-- _recomputeAttributionRules) collapses them before calling this.
+--
+-- Unlike findAttributionRule, there's no condition set to search for: the
+-- "condition" is just the ambiguity itself, already guaranteed by the
+-- caller to have exactly one well-defined highest-voltage pick, so this is
+-- really a single yes/no hypothesis test, not a multi-candidate search —
+-- one confirming instance is real (if generic) evidence FOR it, unlike a
+-- per-node rule's own >=2-examples floor (there, 2+ is needed only because
+-- a single example can't distinguish WHICH of many candidate conditions
+-- actually explains it; here there's only ever the one hypothesis being
+-- tested at all). A single contradiction anywhere is still fatal and
+-- permanent, though — same "never a wrong guess" discipline as every other
+-- rule here, just with no fallback condition set left to retry once the
+-- one and only explanation is disproved.
+--
+-- confidence here is kept only for shape-parity with findSimplestRule/
+-- findAttributionRule's own {confidence, exampleCount} pair (both equal
+-- #examples) — the caller (_aiColorAttributionConfidence) does NOT scale
+-- it against the fixed _AI_CONFIDENT_EXAMPLE_COUNT the way a per-node
+-- rule's confidence is; it instead divides exampleCount by the actual
+-- count of every OTHER combination that could have tested this same
+-- global hypothesis (canvas.voltageDominanceRule.teachableTotal, a
+-- separate field the caller attaches after calling this), since a single
+-- universal constant can't mean the same thing across wildly different
+-- circuit sizes the way a real "fraction of all possible tests" can.
+local function findVoltageDominanceRule(examples)
+    examples = examples or {}
+    if #examples == 0 then
+        return { status = "noRule", reason = "insufficient_examples", exampleCount = 0 }
+    end
+    for _, confirmed in ipairs(examples) do
+        if not confirmed then
+            return { status = "noRule", reason = "no_consistent_explanation", exampleCount = #examples }
+        end
+    end
+    return { status = "learned", confidence = #examples, exampleCount = #examples }
+end
+
 return {
     inferGate = inferGate, deduceAllGates = deduceAllGates, findSimplestRule = findSimplestRule,
-    findAttributionRule = findAttributionRule, buildConditionKey = buildConditionKey,
+    findAttributionRule = findAttributionRule, findVoltageDominanceRule = findVoltageDominanceRule,
+    buildConditionKey = buildConditionKey,
     OPEN = OPEN, CLOSED = CLOSED, UNKNOWN = UNKNOWN,
 }

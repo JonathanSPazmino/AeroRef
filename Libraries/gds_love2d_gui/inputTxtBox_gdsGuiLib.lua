@@ -1,7 +1,17 @@
 -- Copyright (c) 2025-2026 Gateway Dynamic Software, LLC. All rights reserved.
 --[[textBox_logic.lua]]
 
+local utf8 = require("utf8")
+
 textBoxes = {}
+
+-- How long a textbox's input frame flashes red after a rejected keystroke
+-- (invalid character, pattern mismatch, or the maxChrNum cap) — see
+-- gdsGui_inputTxtBox_textUpdate's "add" branch and
+-- gdsGui_inputTxtBox_rejectFlashUpdate. Previously a rejected keystroke only
+-- logged to the console (which the user never sees) with nothing on screen
+-- to explain why typing didn't land.
+local _REJECT_FLASH_SECONDS = 0.35
 
 CurrentPageTxtBoxValues = {}
 
@@ -53,6 +63,7 @@ function gdsGui_inputTxtBox_create (txtBxId, page, tblTextSpecs, theme_focus, th
 	end
 	nitb.unCoursedCustomText = nitb.customText
 	nitb.collectedData = ""
+	nitb.rejectFlash = 0
 	nitb.textFont = love.graphics.newFont(fontSize)
 
 	nitb.frame = {}
@@ -319,6 +330,16 @@ function gdsGui_inputTxtBox_update(txtBxId,anchorPoint, myx, myy, myWidth, myHei
 
 end
 
+-- Called from gdsGui_update(dt) (general_gdsGuiLib.lua) to decay every
+-- textbox's reject-flash timer, set by gdsGui_inputTxtBox_textUpdate.
+function gdsGui_inputTxtBox_rejectFlashUpdate(dt)
+	for _, w in ipairs(textBoxes) do
+		if w.rejectFlash and w.rejectFlash > 0 then
+			w.rejectFlash = math.max(0, w.rejectFlash - dt)
+		end
+	end
+end
+
 function gdsGui_inputTxtBox_delete (txtBxId,page)
 
 	for i = #textBoxes,1,-1 do
@@ -496,7 +517,18 @@ function gdsGui_inputTxtBox_draw (txtBxId, page, tblTextSpecs, theme_focus, them
 					love.graphics.printf(x.lable.text.text, x.lable.text.x, x.lable.text.y, x.lable.text.width,"center", 0)
 
 				end
-				
+
+				-- Flashes red for _REJECT_FLASH_SECONDS right after a rejected
+				-- keystroke (see gdsGui_inputTxtBox_textUpdate's "add" branch)
+				-- instead of the keystroke just silently not landing with
+				-- nothing on screen to explain why.
+				if x.rejectFlash and x.rejectFlash > 0 then
+					love.graphics.setColor(1, 0.2, 0.2, x.rejectFlash / _REJECT_FLASH_SECONDS)
+					love.graphics.setLineWidth(2)
+					love.graphics.rectangle("line", x.userInput.frame.x, x.userInput.frame.y, x.userInput.frame.width, x.userInput.frame.height, rx, ry, segments)
+					love.graphics.setLineWidth(1)
+				end
+
 				love.graphics.reset()
 			end
 
@@ -654,17 +686,20 @@ function gdsGui_inputTxtBox_textUpdate (mode,t, key)
 
 				if mode == "add" then
 					if isFirstCharEmpty == false then
-						if gdsGui_inputTxtBox_isCharInvalid (t, w.textSpecs, string.len(w.customText), w.collectedData) == false and string.len(w.customText) <= (w.maxChrNum - 1)  then
-							w.customText = w.customText .. t 
+						local currentChrCount = utf8.len(w.customText) or string.len(w.customText)
+						local incomingChrCount = utf8.len(t) or string.len(t)
+						if gdsGui_inputTxtBox_isCharInvalid (t, w.textSpecs, currentChrCount, w.collectedData) == false and (currentChrCount + incomingChrCount) <= w.maxChrNum  then
+							w.customText = w.customText .. t
 							w.collectedData = w.customText
 							w.unCoursedCustomText = w.collectedData
 							w.cursoredCustomText = w.unCoursedCustomText .. w.cursor
 							newText = w.cursoredCustomText
-						else 
+						else
 
 							erroMessage = ("( " .. t .. " ) is not allowed!")
 
 							gdsGui_generateConsoleMessage ("error", erroMessage)
+							w.rejectFlash = _REJECT_FLASH_SECONDS
 							w.customText = w.customText
 							w.collectedData = w.customText
 							w.unCoursedCustomText = w.collectedData
@@ -676,12 +711,12 @@ function gdsGui_inputTxtBox_textUpdate (mode,t, key)
 
 				elseif mode == "remove" and (key == "backspace" or key == "delete") then
 
-					local utf8 = require("utf8")
-
-				    if key == "backspace" then
+				    if key == "backspace" or key == "delete" then
 				        -- get the byte offset to the last UTF-8 character in the string.
+				        -- (no mid-text cursor exists in this widget, so both keys remove
+				        -- the last character rather than "delete" wiping the whole field)
 				        local byteoffset = utf8.offset(w.customText, -1)
-				 
+
 				        if byteoffset then
 				            --[[remove the last UTF-8 character.string.sub operates on bytes rather than UTF-8 characters, so we couldn't do string.sub(customText, 1, -2).]]
 				            w.customText = string.sub(w.customText, 1, byteoffset - 1)
@@ -690,16 +725,6 @@ function gdsGui_inputTxtBox_textUpdate (mode,t, key)
 				            w.cursoredCustomText = w.unCoursedCustomText .. w.cursor
 				            newText = w.cursoredCustomText
 				        end
-
-				    end
-
-				    if key == "delete" then
-
-				    	w.customText = ""
-				    	w.collectedData = ""
-				    	w.unCoursedCustomText = ""
-				    	w.cursoredCustomText = w.cursor
-				    	newText = w.cursoredCustomText
 
 				    end
 
@@ -1048,76 +1073,98 @@ function gdsGui_inputTxtBox_isCharInvalid (newCharacter, tblTextSpecs, currentCh
 	local currentCharCount = string.len(curText)
 	local hypttclText = curText .. newCharacter
 
-	local hypttclTextCharCount = string.len(hypttclText)
+	-- utf8.len returns nil on malformed byte sequences, which we also treat as invalid
+	local hypttclTextCharCount = utf8.len(hypttclText)
+	if hypttclTextCharCount == nil then
+		invalidChar = true
+		hypttclTextCharCount = string.len(hypttclText)
+	end
 
 	if currentChrCount >= tblTextSpecs["maxCharCount"] then
 		invalidChar = true
 	end
 
+	-- newCharacter can be more than one character (IME commits, paste), so the
+	-- whole-field cap must be checked against the length AFTER appending it, not
+	-- just the length before.
+	if hypttclTextCharCount > tblTextSpecs["maxCharCount"] then
+		invalidChar = true
+	end
+
 	if tblTextSpecs["invalCharacters"] ~= nil then
-		for b, ic in pairs (tblTextSpecs["invalCharacters"]) do
-			if newCharacter == ic then
-				invalidChar = true
-			end
-		end
-	end 
-
-
-	local testPatterSimbolsIdex = {}
-
-	for d=1, 3, 1 do 
-
-		for x=1, string.len(pattern), 1 do
-			if string.sub(pattern, x, x) == "%" then
-				testPatterSimbolsIdex[x] = "simbol"
-			else 
-				testPatterSimbolsIdex[x] = "string"
-			end
-		end
-
-		if d == 1 then
-			stringCounter = 0
-			for p, c in ipairs (testPatterSimbolsIdex)do
-				if c == "string" then
-					stringCounter = stringCounter + 1
+		-- newCharacter can contain multiple codepoints in one event; check each one
+		-- individually instead of comparing the whole chunk against a single-char entry.
+		for _, codepoint in utf8.codes(newCharacter) do
+			local singleChar = utf8.char(codepoint)
+			for b, ic in pairs (tblTextSpecs["invalCharacters"]) do
+				if singleChar == ic then
+					invalidChar = true
 				end
 			end
 		end
+	end
 
-		if d == 2 then
-			local reps = math.floor((tblTextSpecs["maxCharCount"] / stringCounter) + 0.5 )
-			-- print (reps)
-			if stringCounter > 1 then
-				if reps > 1 then
-					for x=1, reps, 1 do
-						pattern = pattern .."%s" ..cpyOrigPattern
+
+	if pattern ~= nil and pattern ~= "" then
+
+		local testPatterSimbolsIdex = {}
+
+		for d=1, 3, 1 do
+
+			for x=1, string.len(pattern), 1 do
+				if string.sub(pattern, x, x) == "%" then
+					testPatterSimbolsIdex[x] = "simbol"
+				else
+					testPatterSimbolsIdex[x] = "string"
+				end
+			end
+
+			if d == 1 then
+				stringCounter = 0
+				for p, c in ipairs (testPatterSimbolsIdex)do
+					if c == "string" then
+						stringCounter = stringCounter + 1
+					end
+				end
+			end
+
+			if d == 2 then
+				local reps = math.floor((tblTextSpecs["maxCharCount"] / stringCounter) + 0.5 )
+				-- print (reps)
+				if stringCounter > 1 then
+					if reps > 1 then
+						for x=1, reps, 1 do
+							pattern = pattern .."%s" ..cpyOrigPattern
+						end
 					end
 				end
 			end
 		end
-	end
 
-	local remainChars = hypttclTextCharCount
-	local iteratorCounter = 0
-	
-	for x, h in pairs (testPatterSimbolsIdex) do
-		simbReset = false
-		if remainChars > 0 then
-			if h == "simbol" then
-				iteratorCounter = iteratorCounter + 1
-			elseif h == "string" then
-				remainChars = remainChars - 1
-				iteratorCounter = iteratorCounter + 1
+		local remainChars = hypttclTextCharCount
+		local iteratorCounter = 0
+
+		for x, h in pairs (testPatterSimbolsIdex) do
+			simbReset = false
+			if remainChars > 0 then
+				if h == "simbol" then
+					iteratorCounter = iteratorCounter + 1
+				elseif h == "string" then
+					remainChars = remainChars - 1
+					iteratorCounter = iteratorCounter + 1
+				end
 			end
 		end
+
+		local howShouldStringLookByNow = string.sub(pattern, 1, iteratorCounter)
+		if string.find(hypttclText, howShouldStringLookByNow) ~= nil then
+			-- print ("yes, text is valid, " .. hypttclText)
+		else
+			-- print ("incorrect character, try other")
+			invalidChar = true
+		end
+
 	end
 
-	local howShouldStringLookByNow = string.sub(pattern, 1, iteratorCounter)
-	if string.find(hypttclText, howShouldStringLookByNow) ~= nil then 
-		-- print ("yes, text is valid, " .. hypttclText)
-	else
-		-- print ("incorrect character, try other")
-		invalidChar = true
-	end
 	return invalidChar
-end 
+end

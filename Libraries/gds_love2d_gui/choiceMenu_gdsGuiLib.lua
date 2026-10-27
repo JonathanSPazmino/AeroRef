@@ -85,6 +85,10 @@ end
 
 function gdsGui_choiceMenu_open(title, options, onSelectFunc, onCancelFunc)
     _cancelExistingMenu()
+    -- if the just-fired onCancel itself opened a new menu (chaining), _menu
+    -- is already set at this point — let that one win rather than
+    -- unconditionally overwriting it with the menu THIS call was about to open.
+    if _menu then return end
     _menu = { title = title, options = options, onSelect = onSelectFunc, onCancel = onCancelFunc,
         isImagePicker = false, extraOptions = {} }
 end
@@ -100,6 +104,9 @@ function gdsGui_choiceMenu_openImagePicker(title, images, extraOptions, onSelect
     -- would make that a division by zero, corrupting every cell's geometry.
     if not images or #images == 0 then return end
     _cancelExistingMenu()
+    -- see gdsGui_choiceMenu_open's matching comment: a chained open() from
+    -- within onCancel already claimed _menu by this point — don't clobber it.
+    if _menu then return end
     local options = {}
     for _, img in ipairs(images) do table.insert(options, img.label) end
     for _, opt in ipairs(extraOptions or {}) do table.insert(options, opt) end

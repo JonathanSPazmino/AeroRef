@@ -18,8 +18,14 @@ local ModelSolver = require("model.solver")
 local ModelLearner = require("model.learner")
 local ModelSuggest = require("model.suggest")
 local ELECTRICAL_MEDIUM = require("model.media.electrical")
+-- Self-registering media (see model/media/registry.lua) -- no local needed,
+-- loading them once for the side effect is enough for _currentMedium()'s
+-- own require("model.media.registry").get(systemType) to find them later.
+require("model.media.hydraulic")
+require("model.media.fuel")
+require("model.media.bleedAir")
 
-APP_VERSION = "1.0.23"
+APP_VERSION = "1.0.26"
 
 -- Shape version of schematicProjects.lua's data, independent of APP_VERSION
 -- (an app update can ship with no data-shape change at all, or vice versa).
@@ -177,6 +183,20 @@ function format_time(s)
     return string.format("%02d:%02d", minutes, seconds)
 end
 
+-- Required descent/climb rate is undefined at zero minutes unless the
+-- altitude change is also zero (nothing to do either way) -- shown as
+-- "N/A" rather than a plain "0", which reads as "no rate needed" instead
+-- of "this isn't a computable answer".
+function _formatRequiredFPM(altitude, time)
+    if time > 0 then
+        return "REQ FPM:\n" .. math.ceil(altitude / time)
+    elseif altitude == 0 then
+        return "REQ FPM:\n0"
+    else
+        return "REQ FPM:\nN/A"
+    end
+end
+
 local _THEME_DARK = {
     app         = {0.20, 0.20, 0.20, 1},
     bg          = {0.18, 0.18, 0.18, 1},
@@ -271,6 +291,33 @@ local _LEARN_SETTINGS_RAW = {
     {text="FONT SIZE", sub=true},
     {text="Drag the scrollbar to set the display font size between 12 pt and 16 pt. The change is applied immediately and saved between sessions."},
 }
+-- Global, not local like the other _LEARN_*_RAW tables above -- this file
+-- is already at Lua's 200-top-level-local ceiling (see the "Nested here...
+-- to stay under this file's 200-local ceiling" comment elsewhere in this
+-- file for the same constraint), and the handful of reads this table gets
+-- work exactly as well through a global.
+_LEARN_SCHEMATIC_RAW = {
+    {text="WHAT IT IS", sub=true},
+    {text="The System Schematics tool lets you draw a simplified wiring/plumbing diagram for any aircraft system — electrical, hydraulic, fuel, bleed air, or pressurization — out of a small shared set of building blocks, then simulate it and paint what's live.\n"},
+    {text="SOURCE", sub=true},
+    {text="Where power, pressure, or flow originates — a battery, generator, pump, or fuel tank. Some sources are always on once placed (a battery, a fuel tank); others are switched by the pilot (a generator, a pump switch).\n"},
+    {text="PATH", sub=true},
+    {text="Just carries whatever reaches it, with no logic of its own — a bus, manifold, or duct.\n"},
+    {text="GATE", sub=true},
+    {text="Can block or allow flow through itself — a switch, breaker, or shutoff valve. Closed lets it through; open blocks it.\n"},
+    {text="ONE-WAY GATE", sub=true},
+    {text="Lets flow pass in only one direction — a diode or check valve. Which direction is set by how the symbol is rotated on the diagram, the same way the real part only ever conducts the one way.\n"},
+    {text="SINK", sub=true},
+    {text="Where flow ends up and gets used — a light, motor, or engine.\n"},
+    {text="INDEPENDENT SYSTEMS", sub=true},
+    {text="Each system is modeled entirely on its own. A hydraulic schematic has no effect on, and no knowledge of, the electrical one — every system's wiring, switch positions, and captured snapshots are kept separate.\n"},
+    {text="HOW IT LEARNS", sub=true},
+    {text="Every time you CAPTURE a snapshot — the current switch/valve positions plus the colors you've painted to show what's live — the app studies it. After a few snapshots with different positions, it starts noticing patterns, e.g. \"this relay is closed exactly when that bus is powered and that switch is off,\" and turns a confirmed pattern into a rule it applies automatically from then on.\n"},
+    {text="NEVER A GUESS", sub=true},
+    {text="If the evidence is incomplete or contradicts itself, the app says so rather than making something up — a rule only forms once your own captured snapshots actually confirm it, and each one shows how many snapshots back it.\n"},
+    {text="FOR REFERENCE ONLY", sub=true},
+    {text="A modeling and training aid, not a certified systems diagram. Always verify against your aircraft's actual wiring diagrams and AFM/POH."},
+}
 
 local function _learnSegsColored(rawSegs, isDark)
     local sc = isDark and {1, 0, 0, 1}          or {0.00, 0.12, 0.40, 1}
@@ -331,59 +378,139 @@ local SCHEMATIC_CATALOG = {
         -- (model/graph.lua) — "source" | "path" | "gate" | "directionalGate"
         -- | "sink" — see schematicCatalogItemChosen/PresetChosen below,
         -- which pass it straight through to armElementPlacement/
-        -- armControlPlacement. Only ELECTRICAL is tagged for now (the
-        -- inference-schematic-assistance plan's Phase 1 is electrical-only
-        -- in scope); other systems' items are untagged (componentType nil)
-        -- until a later phase extends this.
+        -- armControlPlacement. Every system below is tagged now (the
+        -- model/media/registry.lua medium registry is what makes a second
+        -- tagged system safe — see that file's own header comment) — each
+        -- system's own elements/wires/controls are a separate canvas
+        -- (schematicStore.aircraft[].systems[].{elements,wires,controls}),
+        -- so one aircraft's HYDRAULIC schematic and its ELECTRICAL
+        -- schematic are solved/deduced completely independently; nothing
+        -- here lets a gate or rule in one system see, let alone affect,
+        -- another's state. PRESSURIZATION's CONTROLLER and MODE SWITCH are
+        -- the one deliberate exception, left untagged below — neither is a
+        -- flow/propagation node (a mode selector and an avionics box, not
+        -- something current/fluid/air passes through), so forcing a
+        -- source/path/gate/sink role onto either would just be wrong, not
+        -- merely incomplete (see that entry's own comment).
+        -- gridSize: diameter in grid units (see schematic_gdsGuiLib.lua's
+        -- _GRID_SPACING_PX) — every element/control size in this catalog is
+        -- authored this way now, not as a multiplier on some shared default.
         { label = "GENERATOR", abbrev = "GENR", kind = "control", presets = { {"OFF", "ON"} },
           spritePaths = _GENERATOR_SPRITE_PATHS, overlaySpritePath = _GENERATOR_OVERLAY_SPRITE_PATH,
-          componentType = "source" },
-        -- matchControlSize: same on-screen footprint as a freshly-placed
-        -- GENERATOR control (see gdsGui_schematic_armElementPlacement's own
-        -- comment for the exact formula), rather than the shared default
-        -- element size every other rect/circle item here still uses.
-        { label = "BATTERY", abbrev = "BATT",   kind = "element", shapeType = "rect", matchControlSize = true,
+          gridSize = 2, componentType = "source" },
+        { label = "BATTERY", abbrev = "BATT",   kind = "element", shapeType = "rect",
           defaultProperties = {"VOLTAGE", "CURRENT"}, spritePath = "Sprites/element_battery.png",
-          componentType = "source" },
+          gridW = 2, gridH = 3, componentType = "source" },
         { label = "BUS", abbrev = "BUS",       kind = "element", shapeType = "rect",
           defaultProperties = {"VOLTAGE", "CURRENT"}, spritePath = "Sprites/element_bus.png",
-          componentType = "path" },
-        -- sizeMul 7/30: the diode symbol reads oversized at the shared
-        -- default element size (1/3), shrunk a further 30% on top of that.
+          gridW = 4, gridH = 2, componentType = "path" },
         { label = "DIODE", abbrev = "DIOD",     kind = "element", shapeType = "diode", spritePath = "Sprites/element_diode.png",
-          sizeMul = 7 / 30, componentType = "directionalGate" },
-        -- radiusMul 0.7: shrunk 30% from the shared default control size.
+          gridW = 2, gridH = 2, componentType = "directionalGate" },
         { label = "SWITCH", abbrev = "SWCH",    kind = "control", presets = { {"OPEN", "CLOSED"}, {"OPEN", "CLOSED", "STBY"} },
-          spritePaths = _SWITCH_SPRITE_PATHS, radiusMul = 0.7, componentType = "gate" },
+          spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate" },
         -- Double pole, single throw: two mechanically-ganged switch poles
         -- (the dashed link drawn between them in the artwork) each feeding
         -- its own diode before reaching its own "ending" terminal — a fixed
         -- static symbol (kind = "element", like DIODE/BATTERY/BUS above),
         -- not an interactive on/off control.
         { label = "DPST SWITCH", abbrev = "DPST", kind = "element", shapeType = "rect",
-          spritePath = "Sprites/element_dpstDiode.png", componentType = "directionalGate" },
+          spritePath = "Sprites/element_dpstDiode.png", gridW = 3, gridH = 4, componentType = "directionalGate" },
     }},
     { system = "HYDRAULIC", items = {
-        { label = "PUMP", abbrev = "PUMP",         kind = "element", shapeType = "circle" },
-        { label = "VALVE", abbrev = "VALV",        kind = "element", shapeType = "circle" },
-        { label = "RESERVOIR", abbrev = "RSVR",    kind = "element", shapeType = "circle" },
-        { label = "VALVE SWITCH", abbrev = "VSWT", kind = "control", presets = { {"CLOSED", "OPEN"} },
-          spritePaths = _SWITCH_SPRITE_PATHS },
+        -- ACCUMULATOR/PUMP mirror BATTERY/GENERATOR's own split exactly: a
+        -- passive always-pressurized element (stored residual pressure,
+        -- present whenever placed, like a battery) plus a pilot-switchable
+        -- source control (reuses GENERATOR's own spinning-gear-overlay
+        -- affordance — a motor/engine-driven pump "spinning up" reads the
+        -- same way a generator does). Placing either prompts for its
+        -- nominal PRESSURE the same way a new electrical source prompts
+        -- for VOLTAGE (model/media/hydraulic.lua's own magnitudeLabel —
+        -- see schematicSourceElementPlaced).
+        { label = "ACCUMULATOR", abbrev = "ACUM", kind = "element", shapeType = "rect",
+          defaultProperties = {"PRESSURE"}, gridW = 2, gridH = 3, componentType = "source" },
+        { label = "PUMP", abbrev = "PUMP", kind = "control", presets = { {"OFF", "ON"} },
+          spritePaths = _GENERATOR_SPRITE_PATHS, overlaySpritePath = _GENERATOR_OVERLAY_SPRITE_PATH,
+          gridSize = 2, componentType = "source" },
+        { label = "MANIFOLD", abbrev = "MNFD", kind = "element", shapeType = "rect",
+          defaultProperties = {"PRESSURE"}, gridW = 4, gridH = 2, componentType = "path" },
+        -- Non-user-operated, one-way flow — same role/geometry-derived
+        -- conduction direction as ELECTRICAL's own DIODE above (see
+        -- model/graph.lua's _resolveDirectionalEdges), just reusing that
+        -- same vector symbol for a check valve rather than a dedicated
+        -- fluid-power glyph (no art asset for one exists yet).
+        { label = "CHECK VALVE", abbrev = "CVLV", kind = "element", shapeType = "diode",
+          gridW = 2, gridH = 2, componentType = "directionalGate" },
+        -- A 3rd AUTO position (e.g. a PTU/priority valve) behaves exactly
+        -- like SWITCH's own STBY above — not "CLOSED", so it reads as the
+        -- inactive/open position for gate-blocking purposes, just a named
+        -- 3rd detent rather than a special case.
+        { label = "SHUTOFF VALVE", abbrev = "HSOV", kind = "control",
+          presets = { {"CLOSED", "OPEN"}, {"CLOSED", "OPEN", "AUTO"} },
+          spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate" },
+        { label = "RESERVOIR", abbrev = "RSVR", kind = "element", shapeType = "circle",
+          gridW = 3, gridH = 3, componentType = "sink" },
     }},
     { system = "FUEL", items = {
-        { label = "FUEL TANK", abbrev = "FTNK",   kind = "element", shapeType = "circle" },
-        { label = "FUEL PUMP", abbrev = "FPMP",  kind = "element", shapeType = "circle" },
-        { label = "FUEL SWITCH", abbrev = "FSWT", kind = "control", presets = { {"OFF", "ON"} }, spritePaths = _SWITCH_SPRITE_PATHS },
+        { label = "FUEL TANK", abbrev = "FTNK", kind = "element", shapeType = "circle",
+          defaultProperties = {"QUANTITY"}, gridW = 3, gridH = 3, componentType = "source" },
+        -- Boost pump: mirrors HYDRAULIC's own PUMP control above (and
+        -- ELECTRICAL's GENERATOR) — a pilot-switchable source, not the
+        -- always-present FUEL TANK itself.
+        { label = "FUEL PUMP", abbrev = "FPMP", kind = "control", presets = { {"OFF", "ON"} },
+          spritePaths = _GENERATOR_SPRITE_PATHS, overlaySpritePath = _GENERATOR_OVERLAY_SPRITE_PATH,
+          gridSize = 2, componentType = "source" },
+        { label = "FUEL MANIFOLD", abbrev = "FMFD", kind = "element", shapeType = "rect",
+          defaultProperties = {"PRESSURE"}, gridW = 4, gridH = 2, componentType = "path" },
+        -- Same non-user-operated, one-way role as HYDRAULIC's own CHECK
+        -- VALVE above (e.g. an anti-siphon or crossfeed check valve).
+        { label = "CHECK VALVE", abbrev = "CKVL", kind = "element", shapeType = "diode",
+          gridW = 2, gridH = 2, componentType = "directionalGate" },
+        { label = "FUEL SHUTOFF VALVE", abbrev = "FSOV", kind = "control",
+          presets = { {"CLOSED", "OPEN"}, {"CLOSED", "OPEN", "AUTO"} },
+          spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate" },
+        { label = "ENGINE", abbrev = "ENGN", kind = "element", shapeType = "rect",
+          defaultProperties = {"FUEL FLOW"}, gridW = 3, gridH = 2, componentType = "sink" },
     }},
     { system = "BLEED AIR", items = {
-        { label = "BLEED VALVE", abbrev = "BVLV", kind = "element", shapeType = "circle" },
-        { label = "BLEED SWITCH", abbrev = "BSWT", kind = "control", presets = { {"OFF", "ON"} }, spritePaths = _SWITCH_SPRITE_PATHS },
+        -- The engine/APU's own bleed air supply — always "there" whenever
+        -- the engine's running, same always-on-when-placed role as BATTERY/
+        -- FUEL TANK above (this system has no separate switchable-source
+        -- control; bleed is throttled downstream by BLEED VALVE instead).
+        { label = "BLEED AIR SOURCE", abbrev = "BSRC", kind = "element", shapeType = "circle",
+          defaultProperties = {"PRESSURE"}, gridW = 3, gridH = 3, componentType = "source" },
+        { label = "DUCT", abbrev = "DUCT", kind = "element", shapeType = "rect",
+          defaultProperties = {"PRESSURE"}, gridW = 4, gridH = 2, componentType = "path" },
+        -- Same non-user-operated, one-way role as the other systems' own
+        -- CHECK VALVE above (e.g. an engine-to-engine isolation check
+        -- valve preventing backflow).
+        { label = "CHECK VALVE", abbrev = "BCVL", kind = "element", shapeType = "diode",
+          gridW = 2, gridH = 2, componentType = "directionalGate" },
+        -- The pilot-operated shutoff itself, same single-item pattern as
+        -- ELECTRICAL's own SWITCH (the valve body IS the control; there's
+        -- no separate static "valve element" + "switch control" pair).
+        { label = "BLEED VALVE", abbrev = "BVLV", kind = "control", presets = { {"CLOSED", "OPEN"} },
+          spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate" },
     }},
     { system = "PRESSURIZATION", items = {
-        { label = "OUTFLOW VALVE", abbrev = "OFVL", kind = "element", shapeType = "circle" },
-        { label = "CONTROLLER", abbrev = "CTLR",    kind = "element", shapeType = "rect",
-          defaultProperties = {"CABIN ALT", "RATE"} },
-        { label = "MODE SWITCH", abbrev = "MSWT",   kind = "control", presets = { {"AUTO", "MANUAL"} } },
+        -- Converted from a static element to a control (like ELECTRICAL's
+        -- own SWITCH) — a real outflow valve IS pilot-operable in MANUAL
+        -- mode, not a fixed symbol. componentType = "gate": open lets
+        -- cabin air escape, closed holds pressure, same role SHUTOFF
+        -- VALVE/BLEED VALVE play in their own systems.
+        { label = "OUTFLOW VALVE", abbrev = "OFVL", kind = "control", presets = { {"CLOSED", "OPEN"} },
+          spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate" },
+        -- Deliberately untagged: an avionics logic box, not a flow node —
+        -- nothing current/fluid/air passes THROUGH a controller the way it
+        -- does through every componentType above, so no source/path/gate/
+        -- sink role fits it (see this system's own header comment).
+        { label = "CONTROLLER", abbrev = "CTLR", kind = "element", shapeType = "rect",
+          defaultProperties = {"CABIN ALT", "RATE"}, gridW = 4, gridH = 3 },
+        -- Deliberately untagged: AUTO/MANUAL is a mode selector (which
+        -- logic drives OUTFLOW VALVE), not a connected/disconnected flow
+        -- state — same reasoning the file's own shared-sprite-table
+        -- comment above _SWITCH_SPRITE_PATHS already gives for why this
+        -- item was excluded from that icon convention.
+        { label = "MODE SWITCH", abbrev = "MSWT", kind = "control", presets = { {"AUTO", "MANUAL"} }, gridSize = 2 },
     }},
 }
 
@@ -572,10 +699,18 @@ end
 -- short key is persisted on the aircraft record (aircraft.thumbnail); the
 -- generic schematicGallery widget just wants an image path (see
 -- _aircraftGalleryItems), not this domain-specific naming.
+-- helicopter/propeller point at their own CANVAS_BACKGROUND_BY_TYPE
+-- watermark art (below) rather than a dedicated aircraftThumb_*.png — those
+-- two dedicated files wouldn't render in the live picker (content verified
+-- correct on disk, still blank/not showing in-app after a full restart), so
+-- these reuse art already confirmed working elsewhere in the running app.
+-- jet has no CANVAS_BACKGROUND_BY_TYPE entry of its own (falls back to
+-- CANVAS_BACKGROUND_DEFAULT, not jet-specific), so it keeps its own
+-- dedicated thumbnail file, which does render correctly.
 local AIRCRAFT_THUMBNAILS = {
-    { key = "helicopter", label = "HELICOPTER", path = "Sprites/aircraftThumb_helicopter.png" },
+    { key = "helicopter", label = "HELICOPTER", path = "Sprites/bg_schematicCanvas_helicopter.png" },
     { key = "jet",        label = "JET",        path = "Sprites/aircraftThumb_jet.png" },
-    { key = "propeller",  label = "PROP PLANE",  path = "Sprites/aircraftThumb_propeller.png" },
+    { key = "propeller",  label = "PROP PLANE",  path = "Sprites/bg_schematicCanvas_propeller.png" },
 }
 
 local function _aircraftThumbnailPath(key)
@@ -622,6 +757,24 @@ local function _findSystem(systemId)
         if s.id == systemId then return s end
     end
     return nil
+end
+
+-- The active medium for whichever system is currently open — looked up by
+-- that system's own systemType against model/media/registry.lua's
+-- {systemType -> medium} registry, which is the seam
+-- model/media/electrical.lua's own header comment anticipates for a future
+-- hydraulic.lua/fuel.lua: every caller below resolves "the" medium through
+-- here instead of naming ELECTRICAL_MEDIUM directly, so plugging in a
+-- second medium only ever means registering it, never touching this
+-- function's callers. Falls back to ELECTRICAL_MEDIUM -- the same default
+-- this app had unconditionally before the registry existed -- whenever no
+-- system is open yet (schematicStore nil/currentSystemId unset, e.g. every
+-- existing unit test building a throwaway canvas outside schematicStore
+-- entirely) or that system's systemType has no registered medium, so
+-- nothing already working regresses.
+local function _currentMedium()
+    local sys = schematicStore and _findSystem(schematicStore.currentSystemId)
+    return (sys and require("model.media.registry").get(sys.systemType)) or ELECTRICAL_MEDIUM
 end
 
 -- Per-systemType gallery tile thumbnail, keyed by SCHEMATIC_CATALOG's own
@@ -1130,10 +1283,10 @@ end
 -- there's no "powered, color just not picked yet" state to show; it reads
 -- as the flat unpowered gray outright, same as a source that's actually
 -- off, rather than defaultColor (every production caller passes
--- ELECTRICAL_MEDIUM.style.powered there, which would otherwise show an
+-- _currentMedium().style.powered there, which would otherwise show an
 -- unassigned source as a generic energized yellow it hasn't earned yet).
 local function _colorForVoltage(canvas, voltage, defaultColor)
-    if not voltage then return ELECTRICAL_MEDIUM.style.unpowered end
+    if not voltage then return _currentMedium().style.unpowered end
     local registered = canvas.voltageColors and canvas.voltageColors[voltage]
     return registered or defaultColor
 end
@@ -1191,6 +1344,11 @@ local function _isGenuinelyColorAmbiguous(canvas, contributingIds)
     if not allHaveVoltage then return true end
     return maxCount == 1
 end
+
+-- (The single-highest-voltage-contributor pick this same reasoning needs
+-- for canvas.voltageDominanceRule lives as a nested local inside
+-- _recomputeAttributionRules below — its only caller — rather than here
+-- at file scope, to stay under this file's 200-local ceiling.)
 
 -- Which color (or, when genuinely ambiguous — see below — which SEQUENCE
 -- of colors) a powered node should show, given attribution[nodeId] (the
@@ -1271,6 +1429,7 @@ local function _solveCurrentSchematic()
     if not canvas then return nil end
     local componentTypes = _buildComponentTypeMap(canvas)
     if next(componentTypes) == nil then return nil end
+    local medium = _currentMedium()
 
     local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes, _nodePositionsForGraph(canvas))
     local sourceStates = _currentSourceStates(canvas, componentTypes)
@@ -1331,8 +1490,8 @@ local function _solveCurrentSchematic()
         local state = nodeStates[e.id]
         if state and not oscillatingIds[e.id] then
             result.elements[e.id] = state == ModelSolver.POWERED
-                and _colorForPoweredNode(e.id, attribution, canvas, ELECTRICAL_MEDIUM.style.powered, nodeStates)
-                or ELECTRICAL_MEDIUM.style.unpowered
+                and _colorForPoweredNode(e.id, attribution, canvas, medium.style.powered, nodeStates)
+                or medium.style.unpowered
         end
     end
     for _, c in ipairs(canvas.controls) do
@@ -1353,8 +1512,8 @@ local function _solveCurrentSchematic()
             local isOpenGate = componentTypes[c.id] == "gate" and not _isActivePosition(c)
             local isOffSource = componentTypes[c.id] == "source" and not sourceStates[c.id]
             result.controls[c.id] = (state == ModelSolver.POWERED and not isOpenGate and not isOffSource)
-                and _colorForPoweredNode(c.id, attribution, canvas, ELECTRICAL_MEDIUM.style.powered, nodeStates)
-                or ELECTRICAL_MEDIUM.style.unpowered
+                and _colorForPoweredNode(c.id, attribution, canvas, medium.style.powered, nodeStates)
+                or medium.style.unpowered
         end
     end
     -- A wire's predicted color is a conservative "both ends powered"
@@ -1406,8 +1565,8 @@ local function _solveCurrentSchematic()
             local otherState = nodeStates[otherId]
             if otherState and not oscillatingIds[otherId] then
                 result.wires[w.id] = (otherState == ModelSolver.POWERED)
-                    and _colorForPoweredNode(otherId, attribution, canvas, ELECTRICAL_MEDIUM.style.powered, nodeStates)
-                    or ELECTRICAL_MEDIUM.style.unpowered
+                    and _colorForPoweredNode(otherId, attribution, canvas, medium.style.powered, nodeStates)
+                    or medium.style.unpowered
             end
         else
             local fromState, toState = nodeStates[w.fromElementId], nodeStates[w.toElementId]
@@ -1416,9 +1575,9 @@ local function _solveCurrentSchematic()
                     local fromIsOpenGate = componentTypes[w.fromElementId] == "gate" and finalGateStates[w.fromElementId] ~= "closed"
                     local toIsOpenGate = componentTypes[w.toElementId] == "gate" and finalGateStates[w.toElementId] ~= "closed"
                     local anchorId = (fromIsOpenGate and not toIsOpenGate) and w.toElementId or w.fromElementId
-                    result.wires[w.id] = _colorForPoweredNode(anchorId, attribution, canvas, ELECTRICAL_MEDIUM.style.powered, nodeStates)
+                    result.wires[w.id] = _colorForPoweredNode(anchorId, attribution, canvas, medium.style.powered, nodeStates)
                 else
-                    result.wires[w.id] = ELECTRICAL_MEDIUM.style.unpowered
+                    result.wires[w.id] = medium.style.unpowered
                 end
             end
         end
@@ -1437,6 +1596,14 @@ end
 local function _applySolvedColorsToCurrentCombination()
     gdsGui_schematic_applySolvedColors("mainCanvas", _solveCurrentSchematic())
 end
+
+-- Forward-declared (defined/assigned below, near _recomputeGateRules/
+-- _recomputeAttributionRules) purely so schematicCanvasChanged just below
+-- can call it — a plain "local function" there would textually postdate
+-- this point, putting it out of lexical scope for THIS closure specifically
+-- (globals don't care about definition order, but this is a local upvalue).
+-- Same single-local cost either way, just split across two statements.
+local _recomputeDeducedGateStates
 
 -- Resolved by name via _G[...] from gdsGui_schematic's _notifyChanged, the
 -- same string-callback pattern used for buttons/scrollbars elsewhere in this
@@ -1460,6 +1627,15 @@ function schematicCanvasChanged()
     -- right place to also keep predicted colors in sync — safe to call even
     -- when there's nothing to solve yet (see _applySolvedColorsToCurrentCombination).
     _applySolvedColorsToCurrentCombination()
+    -- The AI panel's confidence score is driven by canvas.rules/
+    -- attributionRules, which are only ever rebuilt by
+    -- _recomputeDeducedGateStates (see its own comment) — without this
+    -- call here, adding/removing an element/control/wire left every
+    -- existing rule's confidence stale (still scored off evidence that,
+    -- for a structural edit, was just invalidated — element/wire/control
+    -- deletion also wipes canvas.snapshots outright, see e.g.
+    -- gdsGui_schematic_internal_onElementEditChosen's DELETE branch).
+    _recomputeDeducedGateStates()
     _requestSchematicSave()
 end
 
@@ -1483,16 +1659,16 @@ local function _currentCombinationHasPredictedColor(canvasName, signature)
 end
 
 -- Reverse-maps one snapshot's painted colors back into {id -> "powered"|
--- "unpowered"} for every graph node, via an exact-match lookup against
--- ELECTRICAL_MEDIUM.style -- the same colors _solveCurrentSchematic writes
--- forward. A color that doesn't exactly match either style entry (a
+-- "unpowered"} for every graph node, via an exact-match lookup against the
+-- CURRENT medium's own style -- the same colors _solveCurrentSchematic
+-- writes forward. A color that doesn't exactly match either style entry (a
 -- manual pick that isn't flat gray/yellow) simply has no entry, same as a
 -- node the snapshot's buckets never mention -- model/learner.lua's
 -- inferGate already treats a missing/unmatched state as no evidence
 -- rather than guessing.
 local function _stateForColor(color)
     if not color then return nil end
-    for state, styleColor in pairs(ELECTRICAL_MEDIUM.style) do
+    for state, styleColor in pairs(_currentMedium().style) do
         if color[1] == styleColor[1] and color[2] == styleColor[2]
            and color[3] == styleColor[3] and color[4] == styleColor[4] then
             return state
@@ -1671,20 +1847,156 @@ end
 -- _deduceAttributionWinnersForSnapshot instead of inferGate. Also
 -- persisted (sys.attributionRules — see _captureCurrentSystemFromCanvas/
 -- _openSystemIntoCanvas) for the same reason: a lock is a user decision.
+--
+-- Also rebuilds canvas.voltageDominanceRule alongside the per-node table
+-- above — the GLOBAL counterpart (model/learner.lua's
+-- findVoltageDominanceRule): not keyed by node id at all, since it's
+-- testing one single system-wide hypothesis ("the highest-voltage
+-- contributor always wins") rather than learning a per-node mapping.
+-- Folded into this same function (rather than its own top-level local)
+-- purely to stay under this file's 200-local ceiling; it draws from the
+-- exact same per-snapshot `winners` this function already computes, just
+-- pooling every node's evidence together instead of splitting it out by
+-- id, paired with whether that winner was the single highest-voltage
+-- contributor's own pick (nil when that pick isn't well-defined — some
+-- contributor has no registered voltage, or the top voltage is tied
+-- across 2+ of them, same conditions _isGenuinelyColorAmbiguous's own
+-- "not allHaveVoltage"/"maxCount==1" checks test — every such case has no
+-- single "the heuristic's pick" to compare the winner against at all, so
+-- isn't informative about the global hypothesis either way). Purely a
+-- derived, in-memory value, same as _deducedGateStatesBySignature's own
+-- "cheap enough to just rebuild wholesale, never persisted" reasoning,
+-- and never locked — there's no per-node rule to protect from relearning
+-- here, just one yes/no hypothesis that either keeps holding or doesn't.
 local function _recomputeAttributionRules(canvas, graph)
     canvas.attributionRules = canvas.attributionRules or {}
 
+    local function singleHighestVoltageContributor(contributingIds)
+        local highestId, highestVoltage, maxCount, allHaveVoltage = nil, -math.huge, 0, true
+        for id in pairs(contributingIds) do
+            local entity = _findSourceEntity(canvas, id)
+            local voltage = entity and entity.voltage
+            if not voltage then
+                allHaveVoltage = false
+            elseif voltage > highestVoltage then
+                highestId, highestVoltage, maxCount = id, voltage, 1
+            elseif voltage == highestVoltage then
+                maxCount = maxCount + 1
+            end
+        end
+        if not allHaveVoltage or maxCount ~= 1 then return nil end
+        return highestId
+    end
+
     local examplesByNode = {}
+    local dominanceExamples = {}
+    local confirmedDominanceSignatures = {}
     for signature, snapshot in pairs(canvas.snapshots) do
         local winners = _deduceAttributionWinnersForSnapshot(canvas, graph, signature, snapshot)
         if next(winners) ~= nil then
             local nodeStates = _snapshotToNodeStates(snapshot, graph)
+            local gateStates, sourceStates = _pastGateAndSourceStates(canvas, graph, signature)
+            local attribution = ModelSolver.solveSourceAttribution(graph, sourceStates, gateStates)
+
+            -- One dominance example per SNAPSHOT, not per (node, snapshot)
+            -- pair — every ambiguous node this one snapshot resolves a
+            -- winner for is typically the SAME single real-world event
+            -- (one generator backfeeding one bus) seen from several
+            -- vantage points at once (a bus, the battery it backfeeds, the
+            -- switch between them...), not independent confirmations.
+            -- Counting each vantage point as its own example let a single
+            -- busy capture saturate _AI_CONFIDENT_EXAMPLE_COUNT outright,
+            -- reporting system-wide 100% certainty off one combination —
+            -- collapsing them to one boolean per snapshot (AND across its
+            -- own nodes: any contradiction anywhere in it voids the whole
+            -- snapshot's vote) requires that many SEPARATE combinations be
+            -- captured before the global rule can saturate, same
+            -- discipline examplesByNode below already applies per node id.
+            local sawConfirmed, sawContradicted = false, false
             for nodeId, sourceId in pairs(winners) do
                 examplesByNode[nodeId] = examplesByNode[nodeId] or {}
                 table.insert(examplesByNode[nodeId], { nodeStates = nodeStates, result = sourceId })
+
+                local highestId = singleHighestVoltageContributor(attribution[nodeId])
+                if highestId then
+                    if sourceId == highestId then sawConfirmed = true else sawContradicted = true end
+                end
+            end
+            if sawContradicted then
+                table.insert(dominanceExamples, false)
+            elseif sawConfirmed then
+                table.insert(dominanceExamples, true)
+                table.insert(confirmedDominanceSignatures, signature)
             end
         end
     end
+
+    -- teachableTotal: every combination in the ENTIRE combination space
+    -- (captured or not) where the global hypothesis is even testable at
+    -- all — at least one node is genuinely ambiguous
+    -- (_isGenuinelyColorAmbiguous) AND not forced to a flat, unattributed
+    -- display (an open gate's or off source's own body always shows plain
+    -- gray regardless of attribution — see _aiColorAttributionConfidence's
+    -- own short-circuits — so painting one of those never actually
+    -- asserts a color there is anything to learn from). Brute-force
+    -- enumerated — the app's own COMBINATION: X/Y counter already assumes
+    -- this whole space is small enough for a human to step through one at
+    -- a time, so it's small enough to walk here too — only on a recompute
+    -- (snapshot capture/system load), never per frame. Lets
+    -- _aiColorAttributionConfidence turn exampleCount into a fraction of
+    -- every OTHER combination that could have confirmed or refuted this
+    -- exact hypothesis, rather than against an arbitrary fixed constant —
+    -- see its own comment.
+    local function teachableCombosTotal()
+        local sortedIds, numDetentsById = {}, {}
+        for _, c in ipairs(canvas.controls) do
+            table.insert(sortedIds, c.id)
+            numDetentsById[c.id] = c.numDetents
+        end
+        local componentTypes = {}
+        for id, node in pairs(graph.nodes) do componentTypes[id] = node.role end
+
+        local detents = {}
+        for _, id in ipairs(sortedIds) do detents[id] = 0 end
+        local total = 0
+        while true do
+            local gateStates, sourceStates = _gateAndSourceStatesForDetents(canvas, componentTypes, detents)
+            local attribution = ModelSolver.solveSourceAttribution(graph, sourceStates, gateStates)
+            local teachable = false
+            for nodeId, contributingIds in pairs(attribution) do
+                if _isGenuinelyColorAmbiguous(canvas, contributingIds) then
+                    local role = graph.nodes[nodeId].role
+                    local isOpenGate = role == "gate" and gateStates[nodeId] ~= "closed"
+                    local isOffSource = role == "source" and not sourceStates[nodeId]
+                    if not isOpenGate and not isOffSource then
+                        teachable = true
+                        break
+                    end
+                end
+            end
+            if teachable then total = total + 1 end
+
+            local i = #sortedIds
+            while i >= 1 do
+                local id = sortedIds[i]
+                detents[id] = detents[id] + 1
+                if detents[id] < numDetentsById[id] then break end
+                detents[id] = 0
+                i = i - 1
+            end
+            if i == 0 then break end
+        end
+        return total
+    end
+
+    canvas.voltageDominanceRule = ModelLearner.findVoltageDominanceRule(dominanceExamples)
+    canvas.voltageDominanceRule.teachableTotal = teachableCombosTotal()
+    -- Which captured combinations actually backed a "learned" verdict, by
+    -- signature (converted to a combination NUMBER only at display time —
+    -- _combinationIndexForDetents isn't in scope yet this early in the
+    -- file) — so the AI panel can name them instead of just saying
+    -- "confirmed elsewhere".
+    canvas.voltageDominanceRule.confirmedSignatures = confirmedDominanceSignatures
 
     for nodeId, examples in pairs(examplesByNode) do
         local existing = canvas.attributionRules[nodeId]
@@ -1841,7 +2153,7 @@ local function _sortedSourceIds(canvas)
     return sourceIds
 end
 
-local function _recomputeDeducedGateStates()
+function _recomputeDeducedGateStates()
     _deducedGateStatesBySignature = {}
     local canvas = _findSchematicCanvas()
     if not canvas then return end
@@ -1853,7 +2165,7 @@ local function _recomputeDeducedGateStates()
         _deducedGateStatesBySignature[signature] = ModelLearner.deduceAllGates(graph, nodeStates)
     end
     _recomputeGateRules(canvas, graph)
-    _recomputeAttributionRules(canvas, graph)
+    _recomputeAttributionRules(canvas, graph) -- also rebuilds canvas.voltageDominanceRule, see its own comment
 end
 
 -------------------------------------------------------------------------------
@@ -1921,11 +2233,12 @@ end
 -- "learned" (not yet confirmed) one scales by its own example count, same
 -- shape _aiGateConfidence uses for gate rules; no rule, or one that
 -- doesn't cover this exact combination (buildConditionKey/mapping miss —
--- never seen in training), falls back to the unverified highest-voltage
--- heuristic and scores 0 — which is exactly the case that flagged this
--- check's own addition: a wire against an open switch's far side painted
--- the WRONG side's (higher-voltage) color with no rule yet to say
--- otherwise. A wire's own color is taken straight from its FROM node (see
+-- never seen in training), falls back to the GLOBAL voltage-dominance
+-- rule (see below) and only scores a flat 0 once THAT has nothing either —
+-- which is exactly the case that flagged this check's own addition: a
+-- wire against an open switch's far side painted the WRONG side's
+-- (higher-voltage) color with no rule yet to say otherwise. A wire's own
+-- color is taken straight from its FROM node (see
 -- _colorForPoweredNode's caller in _solveCurrentSchematic), so checking
 -- every powered element/control node already covers every wire's
 -- confidence too without a separate pass over canvas.wires.
@@ -1964,6 +2277,36 @@ local function _aiColorAttributionConfidence(canvas, attribution, nodeStates, no
             return math.min(1, (rule.confidence or 0) / _AI_CONFIDENT_EXAMPLE_COUNT)
         end
     end
+
+    -- No per-node rule covers nodeId specifically (there may be no rule at
+    -- all — e.g. nodeId has never been ambiguous in any captured snapshot,
+    -- a brand new battery on a bus other captures never touched) — fall
+    -- back to the GLOBAL voltage-dominance rule (canvas.voltageDominanceRule,
+    -- see _recomputeAttributionRules' own comment/model/learner.lua's
+    -- findVoltageDominanceRule): has "the single highest-voltage contributor
+    -- wins" actually been CONFIRMED (and never contradicted) anywhere else
+    -- in this system? If so, that's real evidence for THIS node too, even
+    -- though nobody ever painted it specifically.
+    --
+    -- Scaled differently than a per-node rule though: not against the
+    -- fixed _AI_CONFIDENT_EXAMPLE_COUNT constant, but as a fraction of
+    -- every OTHER combination in the whole combination space that could
+    -- have confirmed or refuted this same global hypothesis
+    -- (dominanceRule.teachableTotal, see its own comment) — "every other
+    -- possible test, not an arbitrary count" is a meaningful ceiling a
+    -- fixed constant can't be: it reaches 100% exactly when every
+    -- reachable alternative test has in fact been run and agreed (nothing
+    -- left that COULD still contradict it), and stays appropriately low
+    -- when many untested alternatives remain. teachableTotal always counts
+    -- THIS node's own current combination too (reaching this line already
+    -- proves nodeId itself is ambiguous and not forced-gray — the two
+    -- guard clauses above would have returned 1 otherwise — so it's
+    -- unconditionally one of the counted combinations), hence the -1.
+    local dominanceRule = canvas.voltageDominanceRule
+    if dominanceRule and dominanceRule.status == "learned" then
+        local otherTeachable = math.max(1, (dominanceRule.teachableTotal or 1) - 1)
+        return math.min(1, (dominanceRule.exampleCount or 0) / otherTeachable)
+    end
     return 0
 end
 
@@ -2000,51 +2343,49 @@ local function _capturedSignaturesSet(canvas)
 end
 
 -- {combinationIndex, combinationTotal, confidencePercent,
--- primaryReasonText, suggestedCombinationIndex, teachInstructionText,
--- supportingReasonText, snapshotImportancePercent} for whichever system
--- mainCanvas currently has open — confidencePercent/snapshotImportancePercent
--- are nil (rather than a misleading number) when there's genuinely
--- nothing to measure (an untyped/non-ELECTRICAL system for the former;
--- zero captured snapshots for the latter). nil entirely if there's no
+-- primaryReasonText, primaryReasonNodeId, suggestedCombinationIndex,
+-- fixInstructionText, teachCombos, snapshotImportancePercent} for
+-- whichever system mainCanvas currently has open — confidencePercent is
+-- nil (rather than a misleading number) when there's genuinely nothing to
+-- measure (an untyped/non-ELECTRICAL system); snapshotImportancePercent
+-- is nil when nothing anywhere in the space is teachable at all (so
+-- there's no maximum to be a fraction of). nil entirely if there's no
 -- canvas at all.
--- primaryReasonText is set alongside any confidencePercent < 100;
--- supportingReasonText is its positive counterpart, set alongside any
--- confidencePercent == 100 (see supportingReasonTextForFullConfidence
--- and the two trivial-100% cases below — an exact captured snapshot with
--- no structural mismatch, or nothing in this combination needing
--- inference at all) — exactly one of the two is ever set, never both,
--- never neither.
--- An exact captured snapshot is the ONE case primaryReasonText can be set
--- WITHOUT either suggestedCombinationIndex or teachInstructionText
--- alongside it: structuralColorMismatches below catches a captured
--- snapshot's own paint flatly contradicting a provable single-source
--- expectation — not a data gap a new combination or a confirmed guess
+-- primaryReasonNodeId is the element/control id primaryReasonText is
+-- actually about (always set alongside it) — drawSchematicAiPanel copies
+-- it onto canvas.aiCulpritId each frame so gdsGui_schematic_draw's own
+-- drawAiCulpritHighlight can ring it in gold; nothing else reads it.
+-- primaryReasonText is set alongside any confidencePercent < 100.
+-- fixInstructionText is the ONE case primaryReasonText can be set WITHOUT
+-- suggestedCombinationIndex alongside it: structuralColorMismatches below
+-- catches a captured snapshot's own paint flatly contradicting a
+-- provable single-source expectation — not a data gap a new combination
 -- could fix, but an outright mistake in THIS exact snapshot, so
--- teachInstructionText instead just says to repaint and re-capture it.
--- Otherwise, suggestedCombinationIndex and teachInstructionText are
--- mutually exclusive (at most one is ever set, alongside
--- primaryReasonText) — which one depends on what kind of factor the
--- confidenceEntries loop below picked as worst:
---   gateRule (or any oscillating factor)  -> suggestedCombinationIndex, a
---     genuinely missing COMBINATION worth navigating to: for a learnable
---     gate rule, model/suggest.lua's suggestTargetedSnapshot targets one
---     that would deduce a gate state not already seen in training (falls
---     back to its plain suggestNextSnapshot if no such candidate exists);
---     for an oscillating gate, any untested neighbor is as good as any
---     other (a stability problem, not a data-gap one), so the plain
---     heuristic is used directly.
---   attribution (not oscillating)  -> teachInstructionText instead: an
---     ambiguous-attribution node's problem isn't a missing combination at
---     all (THIS one already exercises the ambiguity) — it's a missing
---     DISAGREEING EXAMPLE, which no navigation target can supply; only
---     manually overriding the painted color before capture can (see that
---     branch's own comment below).
--- Either remedy excludes the current combination's own signature from
--- consideration (not in _openSuggestNextSnapshotMenu, where suggesting it
--- is fine): capturing the exact combination this panel is reporting low
--- confidence for would trivially jump to 100% via the exact-snapshot
--- short-circuit below, without anything having been learned, making
--- either remedy a circular/useless claim.
+-- fixInstructionText instead just says to repaint and re-capture it
+-- (OVERWRITE).
+-- Otherwise, suggestedCombinationIndex is set only for a gate-rule data
+-- gap (or any oscillating factor) worth navigating to: for a learnable
+-- gate rule, model/suggest.lua's suggestTargetedSnapshot targets one that
+-- would deduce a gate state not already seen in training (falls back to
+-- its plain suggestNextSnapshot if no such candidate exists); for an
+-- oscillating gate, any untested neighbor is as good as any other (a
+-- stability problem, not a data-gap one), so the plain heuristic is used
+-- directly. An ambiguous-attribution worst case gets neither: THIS
+-- combination already exercises the ambiguity, so there's no missing
+-- COMBINATION to navigate to — only a missing disagreeing EXAMPLE, which
+-- teachCombos (below) surfaces instead, system-wide rather than scoped to
+-- just this one factor.
+-- teachCombos is a persistent, GLOBAL checklist — always populated
+-- (possibly empty) whenever there's a graph at all, independent of
+-- confidencePercent: every combination NUMBER anywhere in the whole space
+-- that's teachable for at least one node (scanTeachableSpace below),
+-- each tagged with whether its own snapshot has already been captured —
+-- EXCEPT combinationIndex itself (this combination), excluded below: it's
+-- a checklist of combos to go CAPTURE, and you're already looking at this
+-- one, captured or not.
+-- snapshotImportancePercent ranks THIS combination's own value as a
+-- capture target against the single most valuable combination anywhere
+-- in the space (see scanTeachableSpace's own comment on "recurrence").
 local function _computeAiPanelStats()
     local canvas = _findSchematicCanvas()
     if not canvas then return nil end
@@ -2099,11 +2440,29 @@ local function _computeAiPanelStats()
         return examples
     end
 
-    -- Plain-English reason one rule isn't fully trusted yet, WITH the
-    -- specific captured combinations backing that reason named by number
-    -- and outcome — "existing snapshots give contradicting evidence" on
-    -- its own doesn't say WHICH captures disagree; this does. Shared by
-    -- both the gate-position and color-attribution confidence factors,
+    -- "7/8, 12/16" style list of the captured combinations that actually
+    -- back the GLOBAL voltage-dominance rule (canvas.voltageDominanceRule.
+    -- confirmedSignatures, see _recomputeAttributionRules' own comment) —
+    -- named by number so both the REASON and WHY lines below can say
+    -- WHICH combinations confirmed it instead of just "confirmed
+    -- elsewhere". Empty string (never nil) when there's nothing to list.
+    local function dominanceConfirmedComboList()
+        local indices = {}
+        for _, signature in ipairs((canvas.voltageDominanceRule or {}).confirmedSignatures or {}) do
+            table.insert(indices, _combinationIndexForDetents(canvas, gdsGui_schematic_parseSignature(signature)))
+        end
+        table.sort(indices)
+        local parts = {}
+        for _, idx in ipairs(indices) do table.insert(parts, idx .. "/" .. _schematicCombTotal) end
+        return table.concat(parts, ", ")
+    end
+
+    -- Plain-English reason one rule isn't fully trusted yet — deliberately
+    -- short (at most 2 short sentences: the shortfall, then an optional
+    -- dominance-credit sentence) rather than enumerating every backing
+    -- combination by number; that detail is still there to find via TRY
+    -- NEXT/TEACH, this line's only job is a quick, readable "why". Shared
+    -- by both the gate-position and color-attribution confidence factors,
     -- since both use the same model/learner.lua {status, reason,
     -- exampleCount} shape (see findSimplestRule/findAttributionRule's own
     -- comments). The caller only reaches here once it already knows
@@ -2112,69 +2471,49 @@ local function _computeAiPanelStats()
         local examples = (entry.kind == "gateRule")
             and gateExamplesByCombination(entry.id)
             or attributionExamplesByCombination(entry.id, labelsById)
-        local function listed()
-            local parts = {}
-            for _, ex in ipairs(examples) do
-                table.insert(parts, ex.index .. "/" .. _schematicCombTotal .. " (" .. ex.result .. ")")
-            end
-            return table.concat(parts, ", ")
+
+        -- An "attribution" entry with nothing learned for its OWN node id
+        -- can still carry partial credit from the GLOBAL voltage-dominance
+        -- rule (see _aiColorAttributionConfidence's own fallback) — named
+        -- here too so the reason text never undersells a confidence that
+        -- isn't actually a flat zero. Independent of whatever this node's
+        -- own per-node search concluded (even "no_consistent_explanation"
+        -- below): a changing set of CONTRIBUTORS between captures can make
+        -- one node's own literal winner differ across examples even while
+        -- the highest-voltage-wins hypothesis itself held in every one of
+        -- them, so the two aren't the same question.
+        local function dominanceClause()
+            local dominanceRule = entry.kind == "attribution" and canvas.voltageDominanceRule
+            if not (dominanceRule and dominanceRule.status == "learned") then return "" end
+            -- Same ratio _aiColorAttributionConfidence itself uses (every
+            -- OTHER combination that could have confirmed/refuted this —
+            -- see its own comment), kept in sync so this sentence's own
+            -- percent always matches the number shown above it.
+            local otherTeachable = math.max(1, (dominanceRule.teachableTotal or 1) - 1)
+            local percent = math.floor(math.min(1, (dominanceRule.exampleCount or 0) / otherTeachable) * 100 + 0.5)
+            return " \"Higher voltage wins\" confirmed at " .. dominanceConfirmedComboList()
+                .. ", worth " .. percent .. "% here already."
         end
 
         local rule = entry.rule
         if not rule or rule.status == "noRule" then
             local reason = rule and rule.reason
+            local base
             if reason == "insufficient_examples" then
-                return #examples == 0 and "no snapshots have taught this yet"
-                    or ("only " .. #examples .. " relevant snapshot captured so far (" .. listed()
-                        .. ") — needs at least 2 with different outcomes")
+                base = (#examples == 0) and "No snapshots have taught this yet."
+                    or ("Only " .. #examples .. " snapshot captured so far — needs at least 2 with different outcomes.")
             elseif reason == "no_variation" then
-                return "every relevant snapshot captured so far agrees (" .. listed()
-                    .. ") — needs one where the outcome differs"
+                base = "Every captured snapshot agrees so far — needs one with a different outcome."
             elseif reason == "no_consistent_explanation" then
-                return "conflicting evidence from " .. listed() .. " — no consistent switch pattern explains them yet"
+                base = "Captured snapshots disagree, with no consistent pattern yet."
+            else
+                base = "Nothing taught yet."
             end
-            return "nothing taught yet"
+            return base .. dominanceClause()
         elseif rule.status == "learned" then
-            return "learned from " .. #examples .. " snapshot(s) (" .. listed()
-                .. "), not yet confirmed — capture more agreeing snapshots, or LOCK it in via DESIGN ACTIONS"
+            return "Learned from " .. #examples .. " snapshot(s), not yet confirmed."
         end
-        return "nothing taught yet" -- locked: unreachable as a primary-reason source (full confidence instead)
-    end
-
-    -- Plain-English account of WHY a fully-confident (every entry already
-    -- at 1.0) confidenceEntries list earned that score — the positive
-    -- counterpart to reasonTextWithEvidence above, which only ever
-    -- explains a SHORTFALL. An entry needing no rule at all (already
-    -- unambiguous — one contributing source, or a tie that's not
-    -- genuinely ambiguous to begin with) isn't worth a line: nothing was
-    -- resolved there, so there's nothing to explain. Only a LOCKED rule
-    -- or a saturated LEARNED one (confidence == 1 via
-    -- _AI_CONFIDENT_EXAMPLE_COUNT examples, same scaling
-    -- _aiGateConfidence/_aiColorAttributionConfidence already use)
-    -- actually did work, so only those are named — a learned one lists
-    -- exactly which captured combinations (by number) backed it and how
-    -- much each contributed.
-    local function supportingReasonTextForFullConfidence(confidenceEntries, labelsById)
-        local perEachPercent = math.floor(100 / _AI_CONFIDENT_EXAMPLE_COUNT + 0.5)
-        local parts = {}
-        for _, e in ipairs(confidenceEntries) do
-            local label = labelsById[e.id] or e.id
-            if e.rule and e.rule.status == "locked" then
-                table.insert(parts, label .. ": rule locked (user-confirmed)")
-            elseif e.rule and e.rule.status == "learned" then
-                local examples = (e.kind == "gateRule")
-                    and gateExamplesByCombination(e.id)
-                    or attributionExamplesByCombination(e.id, labelsById)
-                local labeledCombos = {}
-                for _, ex in ipairs(examples) do table.insert(labeledCombos, ex.index .. "/" .. _schematicCombTotal) end
-                table.insert(parts, label .. ": learned from " .. #examples .. " snapshot(s) ("
-                    .. table.concat(labeledCombos, ", ") .. "), " .. perEachPercent .. "% each = 100%")
-            end
-        end
-        if #parts == 0 then
-            return "every color here traces back to exactly one source — nothing ambiguous to resolve"
-        end
-        return table.concat(parts, "; ")
+        return "Nothing taught yet." -- locked: unreachable as a primary-reason source (full confidence instead)
     end
 
     -- Every powered element/control/wire in signature's own captured
@@ -2220,7 +2559,7 @@ local function _computeAiPanelStats()
             local entity = _findSourceEntity(canvas, onlySourceId)
             local voltage = entity and entity.voltage
             if not voltage then return nil end
-            return _colorForVoltage(canvas, voltage, ELECTRICAL_MEDIUM.style.powered), onlySourceId
+            return _colorForVoltage(canvas, voltage, _currentMedium().style.powered), onlySourceId
         end
 
         local mismatches = {}
@@ -2296,15 +2635,14 @@ local function _computeAiPanelStats()
         local mismatches = structuralColorMismatches(currentSignature, snapshot)
         if #mismatches == 0 then
             stats.confidencePercent = 100
-            stats.supportingReasonText = "this exact combination was captured directly — nothing here was inferred"
         else
             stats.confidencePercent = 0
             local worst = mismatches[1]
-            stats.primaryReasonText = worst.label .. ": captured color doesn't match " .. worst.expectedSourceLabel
-                .. " (its only possible source here) — this snapshot's own paint looks wrong"
-                .. (#mismatches > 1 and (" (+" .. (#mismatches - 1) .. " more mismatch(es) in this same snapshot)") or "")
-            stats.teachInstructionText = "repaint " .. worst.label .. " to " .. worst.expectedSourceLabel
-                .. "'s color and re-capture this exact combination (OVERWRITE) to fix it"
+            stats.primaryReasonNodeId = worst.id
+            stats.primaryReasonText = worst.label .. ": wrong color, should be " .. worst.expectedSourceLabel .. "'s."
+                .. (#mismatches > 1 and (" (+" .. (#mismatches - 1) .. " more)") or "")
+            stats.fixInstructionText = "Repaint " .. worst.label .. " " .. worst.expectedSourceLabel
+                .. "'s color, then re-capture (OVERWRITE)."
         end
     else
         -- Only a gate NOT directly pinned by the user's own control
@@ -2357,7 +2695,6 @@ local function _computeAiPanelStats()
 
         if #confidenceEntries == 0 then
             stats.confidencePercent = 100 -- nothing powered, nothing rule-governed: genuinely nothing to guess
-            stats.supportingReasonText = "nothing in this combination needed inferring (no ambiguous colors, no relay positions to deduce)"
         else
             local total, worst = 0, nil
             for _, e in ipairs(confidenceEntries) do
@@ -2372,9 +2709,10 @@ local function _computeAiPanelStats()
                 local labelsById = _labelsByIdForCanvas(canvas)
                 local label = labelsById[worst.id] or worst.id
                 local why = worst.isOscillating
-                    and "this combination's relay feedback never settled to a stable answer (unstable) — try a nearby combination instead"
+                    and "Relay feedback never settled here (unstable)."
                     or reasonTextWithEvidence(worst, labelsById)
                 stats.primaryReasonText = label .. ": " .. why
+                stats.primaryReasonNodeId = worst.id
 
                 -- currentSignature is marked as if already captured so
                 -- neither remedy below ever points at the very combination
@@ -2385,36 +2723,16 @@ local function _computeAiPanelStats()
                 local excludedSignatures = _capturedSignaturesSet(canvas)
                 excludedSignatures[currentSignature] = true
 
-                if worst.kind == "attribution" and not worst.isOscillating then
-                    -- An ambiguous-attribution node's own worst case isn't
-                    -- a missing COMBINATION at all — THIS combination
-                    -- already exercises the ambiguity (that's exactly why
-                    -- it's the worst factor right now). What's missing is
-                    -- a disagreeing EXAMPLE: _deduceAttributionWinnersForSnapshot
-                    -- only ever learns from a snapshot whose painted color
-                    -- was manually asserted against one specific
-                    -- contributor — the auto-predicted color (whatever the
-                    -- display's own highest-voltage fallback already
-                    -- picked) agrees with that same fallback by
-                    -- construction, every time, so capturing it as-is can
-                    -- never produce the variation findAttributionRule
-                    -- needs. No combination to navigate to fixes that —
-                    -- only manually overriding the paint before capture
-                    -- does, so this says so directly instead of pointing
-                    -- at a navigation target that wouldn't help.
-                    local contributorIds = {}
-                    for sourceId in pairs(attribution[worst.id] or {}) do table.insert(contributorIds, sourceId) end
-                    table.sort(contributorIds)
-                    local contributorLabels = {}
-                    for _, sourceId in ipairs(contributorIds) do
-                        table.insert(contributorLabels, labelsById[sourceId] or sourceId)
-                    end
-                    stats.teachInstructionText = label .. " is ambiguous between "
-                        .. table.concat(contributorLabels, " and ")
-                        .. " right here — manually set its color to whichever one actually explains it, THEN capture"
-                        .. " (this combination already qualifies; its own auto-predicted color would just repeat"
-                        .. " the same unverified guess and teach nothing)"
-                else
+                -- An ambiguous-attribution worst case has no navigation
+                -- target at all — THIS combination already exercises the
+                -- ambiguity (that's exactly why it's the worst factor
+                -- right now), and what's missing is a disagreeing
+                -- EXAMPLE, not a missing combination (see TEACH's own
+                -- comment below, scanTeachableSpace, for where/how that
+                -- gets surfaced instead). A gate-rule data gap (or an
+                -- oscillating gate) IS a genuinely missing combination
+                -- though, so only that case gets a navigation suggestion.
+                if not (worst.kind == "attribution" and not worst.isOscillating) then
                     -- Gate-rule data gap (or an oscillating gate — see
                     -- below): a genuinely missing COMBINATION, so a
                     -- navigation suggestion actually helps here, unlike
@@ -2450,43 +2768,114 @@ local function _computeAiPanelStats()
                         stats.suggestedCombinationIndex = _combinationIndexForDetents(canvas, suggestion.detents)
                     end
                 end
-            else
-                stats.supportingReasonText =
-                    supportingReasonTextForFullConfidence(confidenceEntries, _labelsByIdForCanvas(canvas))
             end
         end
     end
 
-    -- A snapshot is "informative" if it taught the engine EITHER a
-    -- relay's position (only a gate NOT in canvas.controls can ever
-    -- actually need this — a control-kind switch's position is already
-    -- known directly, so deducing it, even successfully, is never
-    -- consulted by anything — see _solveCurrentSchematic's own
-    -- rulesByGate exclusion) OR a genuinely-ambiguous node's winning
-    -- source (see _deduceAttributionWinnersForSnapshot) — never dead
-    -- weight the learner silently ignored.
-    local controlIds = {}
-    for _, c in ipairs(canvas.controls) do controlIds[c.id] = true end
+    -- Persistent, GLOBAL teaching checklist — unlike the REASON/TRY NEXT
+    -- pair above (which only ever speak to whichever single factor is
+    -- worst for THIS combination), this scans the ENTIRE combination
+    -- space for every combo NUMBER that's teachable for AT LEAST ONE node
+    -- — same per-combo ambiguous-and-not-forced-flat test
+    -- teachableCombosTotal (above _recomputeAttributionRules) uses for
+    -- "any node at all" — paired with whether that combo's own snapshot
+    -- has already been captured, so the panel can show a standing
+    -- checklist (every one checked off eventually) rather than a list
+    -- that shrinks and loses its own history as captures happen.
+    --
+    -- SNAPSHOT IMPORTANCE reuses the same per-node scan to rank combos by
+    -- how many OTHER combos they'd help teach: a combo's "recurrence" is
+    -- the number of (node, other combo) pairs it shares a teach-set with
+    -- (every node where BOTH combos are genuinely ambiguous means
+    -- capturing either one teaches something relevant to the other). The
+    -- combo with the highest recurrence anywhere in the space is the
+    -- single most valuable one to capture (100%); every other combo's
+    -- importance — including whichever one is currently showing — is
+    -- just its own recurrence as a fraction of that maximum.
+    local function scanTeachableSpace()
+        local sortedIds, numDetentsById = {}, {}
+        for _, c in ipairs(canvas.controls) do
+            table.insert(sortedIds, c.id)
+            numDetentsById[c.id] = c.numDetents
+        end
+        local capturedSignatures = _capturedSignaturesSet(canvas)
+        local candDetents = {}
+        for _, id in ipairs(sortedIds) do candDetents[id] = 0 end
 
-    local snapshotCount = 0
-    for _ in pairs(canvas.snapshots) do snapshotCount = snapshotCount + 1 end
-    if snapshotCount > 0 then
-        local informativeCount = 0
-        for signature, snapshot in pairs(canvas.snapshots) do
-            local informative = false
-            local deduced = _deducedGateStatesBySignature[signature]
-            if deduced then
-                for gateId, state in pairs(deduced) do
-                    if state ~= ModelLearner.UNKNOWN and not controlIds[gateId] then informative = true; break end
+        local capturedByIndex, indicesByNode = {}, {}
+        while true do
+            local candGateStates, candSourceStates = _gateAndSourceStatesForDetents(canvas, componentTypes, candDetents)
+            local candAttribution = ModelSolver.solveSourceAttribution(graph, candSourceStates, candGateStates)
+            local idx = _combinationIndexForDetents(canvas, candDetents)
+            local teachableHere = false
+            for nodeId, contributingIds in pairs(candAttribution) do
+                if _isGenuinelyColorAmbiguous(canvas, contributingIds) then
+                    local role = graph.nodes[nodeId].role
+                    local isOpenGate = role == "gate" and candGateStates[nodeId] ~= "closed"
+                    local isOffSource = role == "source" and not candSourceStates[nodeId]
+                    if not isOpenGate and not isOffSource then
+                        teachableHere = true
+                        indicesByNode[nodeId] = indicesByNode[nodeId] or {}
+                        table.insert(indicesByNode[nodeId], idx)
+                    end
                 end
             end
-            if not informative then
-                local winners = _deduceAttributionWinnersForSnapshot(canvas, graph, signature, snapshot)
-                if next(winners) ~= nil then informative = true end
+            if teachableHere then
+                local candControlStates = {}
+                for _, id in ipairs(sortedIds) do
+                    table.insert(candControlStates, { id = id, detentIndex = candDetents[id] })
+                end
+                local candSignature = gdsGui_schematic_buildSignature(candControlStates)
+                capturedByIndex[idx] = capturedSignatures[candSignature] or false
             end
-            if informative then informativeCount = informativeCount + 1 end
+
+            local i = #sortedIds
+            while i >= 1 do
+                local id = sortedIds[i]
+                candDetents[id] = candDetents[id] + 1
+                if candDetents[id] < numDetentsById[id] then break end
+                candDetents[id] = 0
+                i = i - 1
+            end
+            if i == 0 then break end
         end
-        stats.snapshotImportancePercent = math.floor(informativeCount / snapshotCount * 100 + 0.5)
+
+        local teachableIndices = {}
+        for idx in pairs(capturedByIndex) do table.insert(teachableIndices, idx) end
+        table.sort(teachableIndices)
+
+        local recurrenceByIndex = {}
+        for _, indices in pairs(indicesByNode) do
+            local n = #indices
+            if n > 1 then
+                for _, idx in ipairs(indices) do
+                    recurrenceByIndex[idx] = (recurrenceByIndex[idx] or 0) + (n - 1)
+                end
+            end
+        end
+
+        return teachableIndices, capturedByIndex, recurrenceByIndex
+    end
+
+    local teachableIndices, capturedByIndex, recurrenceByIndex = scanTeachableSpace()
+
+    -- The combo currently showing is excluded from its own checklist — the
+    -- whole point of TEACH is "combos to go CAPTURE", and you're already
+    -- looking at this one, captured or not; listing it as something to go
+    -- navigate to would be pointing at yourself.
+    stats.teachCombos = {}
+    for _, idx in ipairs(teachableIndices) do
+        if idx ~= stats.combinationIndex then
+            table.insert(stats.teachCombos, { index = idx, captured = capturedByIndex[idx] })
+        end
+    end
+
+    local maxRecurrence = 0
+    for _, r in pairs(recurrenceByIndex) do
+        if r > maxRecurrence then maxRecurrence = r end
+    end
+    if maxRecurrence > 0 then
+        stats.snapshotImportancePercent = math.floor((recurrenceByIndex[stats.combinationIndex] or 0) / maxRecurrence * 100 + 0.5)
     end
 
     return stats
@@ -2572,14 +2961,22 @@ end
 -- open — skipped here whenever one is, so its bottom-of-canvas footprint
 -- never covers up menu options a modal is relying on being tappable.
 function drawSchematicAiPanel()
-    if not _aiPanelOpen then return end
-    if gdsGui_page_currentName() ~= "SystemSchematic" then return end
-    if gdsGui_schematic_isMenuOpen("mainCanvas") then return end
+    -- canvas.aiCulpritId (gold-ring highlight, see
+    -- gdsGui_schematic_draw's own drawAiCulpritHighlight) must never
+    -- outlive the panel it was computed for — cleared on every early-exit
+    -- below, same as the panel itself not drawing.
+    local culpritCanvas = _findSchematicCanvas()
+    local function clearCulprit() if culpritCanvas then culpritCanvas.aiCulpritId = nil end end
+
+    if not _aiPanelOpen then clearCulprit(); return end
+    if gdsGui_page_currentName() ~= "SystemSchematic" then clearCulprit(); return end
+    if gdsGui_schematic_isMenuOpen("mainCanvas") then clearCulprit(); return end
     local px, py, pw, ph = _aiPanelRect()
-    if not px then return end
+    if not px then clearCulprit(); return end
 
     local stats = _computeAiPanelStats()
-    if not stats then return end
+    if not stats then clearCulprit(); return end
+    if culpritCanvas then culpritCanvas.aiCulpritId = stats.primaryReasonNodeId end
 
     love.graphics.setColor(0, 0, 0, 0.72)
     love.graphics.rectangle("fill", px, py, pw, ph)
@@ -2589,28 +2986,37 @@ function drawSchematicAiPanel()
     if not _aiPanelFont then _aiPanelFont = love.graphics.newFont(13) end
     love.graphics.setFont(_aiPanelFont)
 
+    -- Each entry is either a plain string, or {text=, checkmark=true} for
+    -- one row of the vertical TEACH checklist below — checkmark draws a
+    -- green check mark at the row's right edge, for whichever combo
+    -- numbers already have a captured snapshot.
     local lines = {
         string.format("COMBINATION: %d / %d", stats.combinationIndex, stats.combinationTotal),
         "PREDICTION CONFIDENCE: " .. (stats.confidencePercent and (stats.confidencePercent .. "%") or "N/A"),
     }
-    -- REASON/TRY NEXT/TEACH only ever appear alongside a confidence
-    -- shortfall — see _computeAiPanelStats' own comment on why these
-    -- fields are only ever set together with confidencePercent < 100, and
-    -- on why TRY NEXT and TEACH are mutually exclusive. WHY is the
-    -- positive counterpart, only ever set alongside confidencePercent ==
-    -- 100 — so WHY and the other three are themselves mutually exclusive.
+    -- REASON/TRY NEXT only ever appear alongside a confidence shortfall —
+    -- see _computeAiPanelStats' own comment on why these fields are only
+    -- ever set together with confidencePercent < 100. TEACH (below) is
+    -- the one exception: a persistent, GLOBAL checklist shown regardless
+    -- of confidencePercent, replacing the old WHY line entirely.
     if stats.primaryReasonText then
         table.insert(lines, "REASON: " .. stats.primaryReasonText)
     end
     if stats.suggestedCombinationIndex then
-        table.insert(lines, string.format("TRY NEXT: COMBINATION %d / %d TO IMPROVE CONFIDENCE",
-            stats.suggestedCombinationIndex, stats.combinationTotal))
+        table.insert(lines, string.format("TRY NEXT: COMBINATION %d/%d", stats.suggestedCombinationIndex, stats.combinationTotal))
     end
-    if stats.teachInstructionText then
-        table.insert(lines, "TEACH: " .. stats.teachInstructionText)
+    if stats.fixInstructionText then
+        table.insert(lines, "FIX: " .. stats.fixInstructionText)
     end
-    if stats.supportingReasonText then
-        table.insert(lines, "WHY: " .. stats.supportingReasonText)
+    if stats.teachCombos then
+        if #stats.teachCombos == 0 then
+            table.insert(lines, "TEACH: N/A")
+        else
+            table.insert(lines, "TEACH:")
+            for _, combo in ipairs(stats.teachCombos) do
+                table.insert(lines, { text = tostring(combo.index), checkmark = combo.captured })
+            end
+        end
     end
     table.insert(lines, "SNAPSHOT IMPORTANCE: " .. (stats.snapshotImportancePercent and (stats.snapshotImportancePercent .. "%") or "N/A"))
 
@@ -2624,7 +3030,8 @@ function drawSchematicAiPanel()
     -- leaves a blank gap hanging at the bottom instead of snapping back.
     local lineCounts, totalH = {}, 0
     for i, line in ipairs(lines) do
-        local _, wrapped = _aiPanelFont:getWrap(line, wrapW)
+        local text = type(line) == "table" and line.text or line
+        local _, wrapped = _aiPanelFont:getWrap(text, wrapW)
         lineCounts[i] = math.max(1, #wrapped)
         totalH = totalH + lineCounts[i] * lineH
     end
@@ -2633,10 +3040,23 @@ function drawSchematicAiPanel()
     _aiPanelScrollY = math.max(0, math.min(maxScroll, _aiPanelScrollY))
 
     love.graphics.setScissor(px, py, pw, ph)
-    love.graphics.setColor(1, 1, 0, 1)
     local y = py + pad - _aiPanelScrollY
     for i, line in ipairs(lines) do
-        love.graphics.printf(line, px + pad, y, wrapW, "left")
+        local text = type(line) == "table" and line.text or line
+        love.graphics.setColor(1, 1, 0, 1)
+        love.graphics.printf(text, px + pad, y, wrapW, "left")
+        if type(line) == "table" and line.checkmark then
+            -- Drawn as two short line segments (not a text glyph — the
+            -- panel's default font has no guaranteed check-mark glyph) a
+            -- few characters to the right of the combo number itself,
+            -- vertically centered on its own line.
+            local cx = px + pad + _aiPanelFont:getWidth(text) + 14
+            local cy = y + _aiPanelFont:getHeight() / 2
+            love.graphics.setColor(0, 1, 0, 1)
+            love.graphics.setLineWidth(2)
+            love.graphics.line(cx - 6, cy, cx - 2, cy + 4, cx + 6, cy - 5)
+            love.graphics.setLineWidth(1)
+        end
         y = y + lineCounts[i] * lineH
     end
     love.graphics.setScissor()
@@ -2788,12 +3208,15 @@ function schematicDemoSwitchChanged(detentIndex)
 end
 
 -------------------------------------------------------------------------------
--- SYSTEM SCHEMATIC — DESIGN-MODE "ADD" CASCADING MENU (SYSTEM > TYPE > POSITIONS)
--- SELECT SYSTEM and POSITIONS each append a "RETURN" row so the user can step
--- back up the cascade instead of only being able to tap outside to cancel out
--- of it entirely. TYPE (the menu the "+" dock button actually opens for every
--- typed system) appends "ANNUNCIATOR" in that spot instead — see
--- _openTypeMenu's own comment for why it no longer needs a RETURN row.
+-- SYSTEM SCHEMATIC — DESIGN-MODE "ADD" CASCADING MENU
+-- (SYSTEM >) FUNDAMENTALS > TYPE > POSITIONS, with TYPE's own PATH list
+-- additionally branching into CONNECTOR > CONNECTOR FROM. SELECT SYSTEM,
+-- TYPE, POSITIONS, and CONNECTOR FROM each append a "RETURN" row so the
+-- user can step back up the cascade instead of only being able to tap
+-- outside to cancel out of it entirely. FUNDAMENTALS (the menu the "+"
+-- dock button actually opens for every typed system) appends "ANNUNCIATOR"
+-- in that spot instead — see _openFundamentalsMenu's own comment for why
+-- it no longer needs a RETURN row.
 -------------------------------------------------------------------------------
 
 local function _openDesignActionsMenu(canvasName)
@@ -2801,26 +3224,6 @@ local function _openDesignActionsMenu(canvasName)
     -- (schematicAddBtn, top-right of the canvas — see schematicAddBtnPressed)
     -- so starting the ADD cascade below no longer needs this menu at all.
     local options = {}
-    -- CLEAR SNAPSHOT only offered when the combination currently showing
-    -- actually has one recorded (see gdsGui_schematic_hasSnapshot) — nothing
-    -- to clear otherwise.
-    if gdsGui_schematic_hasSnapshot(canvasName, gdsGui_schematic_computeSignature(canvasName)) then
-        table.insert(options, "CLEAR SNAPSHOT")
-    end
-    -- SNAPSHOT RESET -- unlike CLEAR SNAPSHOT (just the current combination)
-    -- or RESET (CLEAR PAGE) further down (the whole diagram, snapshots
-    -- included), this wipes every snapshot AND every learned/locked gate
-    -- rule on the system while leaving the elements/wires/controls/
-    -- annunciators themselves untouched -- "start teaching the engine over"
-    -- without having to rebuild the diagram from scratch. Only offered when
-    -- there's actually something to reset. Routed through its own CONTINUE/
-    -- CANCEL confirm sub-menu (see _openSnapshotResetConfirmMenu) rather
-    -- than DESIGN ACTIONS' own single hold-to-confirm slot, which RESET
-    -- already occupies (gdsGui_schematic_openMenu only supports one
-    -- confirmIndex row per menu).
-    if gdsGui_schematic_countSnapshots(canvasName) > 0 then
-        table.insert(options, "SNAPSHOT RESET")
-    end
     if gdsGui_schematic_canUndo(canvasName) then table.insert(options, "UNDO LAST ACTION") end
     -- GATE RULES only offered once the canvas actually has a "gate"-role
     -- node to show a rule for (see model/learner.lua's findSimplestRule,
@@ -2842,56 +3245,50 @@ local function _openDesignActionsMenu(canvasName)
         end
         if #canvas.controls > 0 then table.insert(options, "SUGGEST NEXT SNAPSHOT") end
     end
-    -- ELECTRICAL COLORS lets the user pick their own powered/unpowered
-    -- display colors (default yellow/gray — see ELECTRICAL_MEDIUM.style)
-    -- instead of being stuck with the medium's built-in ones. Gated on the
-    -- CURRENT system's own systemType, not componentTypes (a system with
-    -- nothing tagged yet still has an ELECTRICAL color scheme worth being
-    -- able to set before placing anything).
+    -- <MEDIUM> COLORS lets the user pick their own powered/unpowered
+    -- display colors (default yellow/gray, or whatever this medium's own
+    -- style says — see _currentMedium) instead of being stuck with the
+    -- medium's built-in ones, plus per-source magnitude/color (PER-SOURCE
+    -- SETTINGS — see _openPerSourceSettingsListMenu). Shown for any
+    -- system, not just ELECTRICAL (every systemType has its own medium
+    -- now — see model/media/registry.lua), gated only on componentTypes,
+    -- not systemType (a system with nothing tagged yet still has a color
+    -- scheme worth being able to set before placing anything).
     local sys = _findSystem(schematicStore.currentSystemId)
-    if sys and sys.systemType == "ELECTRICAL" then table.insert(options, "ELECTRICAL COLORS") end
-    table.insert(options, "RESET (CLEAR PAGE)")
-    -- RESET is always the last row — its own hold-to-confirm gate (see
-    -- schematicDesignActionChosen's RESET branch below), not a separate
-    -- "CLEAR ENTIRE PAGE?" popup.
-    gdsGui_schematic_openMenu(canvasName, "DESIGN ACTIONS", options, "schematicDesignActionChosen", nil, #options)
-end
-
--- SNAPSHOT RESET's own confirm step (see _openDesignActionsMenu's own
--- comment on why this is a sub-menu rather than a second hold-to-confirm
--- row on DESIGN ACTIONS itself). Same CONTINUE/CANCEL shape as the
--- library's own "adding a new element/control would wipe every snapshot"
--- confirm (gdsGui_schematic_internal_onPlacementSnapshotWipeConfirmed) —
--- one function handles both onSelect and onCancel, since a cancel/tap-
--- outside lands here with optionText nil, which the CONTINUE check below
--- already treats as a no-op.
-local function _openSnapshotResetConfirmMenu(canvasName)
-    local count = gdsGui_schematic_countSnapshots(canvasName)
-    gdsGui_schematic_openMenu(canvasName,
-        "THIS WILL DELETE ALL " .. count .. " SNAPSHOT(S) AND EVERY LEARNED GATE/ATTRIBUTION RULE ON THIS SYSTEM " ..
-        "— THE SCHEMATIC ITSELF (ELEMENTS/WIRES/CONTROLS) IS NOT AFFECTED. CONTINUE?",
-        { "CONTINUE", "CANCEL" }, "schematicSnapshotResetConfirmed", "schematicSnapshotResetConfirmed", 1)
-end
-
-function schematicSnapshotResetConfirmed(canvasName, index, optionText)
-    if optionText ~= "CONTINUE" then return end
-    local canvas = _findSchematicCanvas()
-    if not canvas then return end
-    gdsGui_schematic_pushUndo(canvasName)
-    canvas.snapshots = {}
-    -- Cleared outright (not left to _recomputeDeducedGateStates' own
-    -- _recomputeGateRules/_recomputeAttributionRules passes below) --
-    -- specifically to override those passes' usual "never touch a LOCKED
-    -- rule" protection — a full snapshot reset is meant to wipe every
-    -- taught rule, confirmed or not, same as _clearMainCanvas' own
-    -- unconditional canvas.rules = {} on a full page RESET.
-    canvas.rules = {}
-    canvas.attributionRules = {}
-    _recomputeDeducedGateStates()
-    _applySolvedColorsToCurrentCombination()
-    _schematicDirty = true
-    _saveCurrentSystem()
-    _setSnapshotLabelText(0)
+    if sys then table.insert(options, (_currentMedium().name or "ELECTRICAL") .. " COLORS") end
+    -- Every row from here down is destructive and requires a sustained
+    -- press-and-hold instead of a plain tap — the hold itself IS the
+    -- confirmation (see _markConfirmMenu), so none of these pop up a
+    -- separate "are you sure?" sub-menu. Each is colored by how
+    -- destructive it actually is: yellow for CLEAR THIS SNAPSHOT (just the
+    -- current combination), red for CLEAR ALL SNAPSHOTS/CLEAR PAGE (every
+    -- snapshot, or the whole diagram). confirmRows tracks each one's
+    -- actual index as it's conditionally inserted, rather than assuming a
+    -- fixed position — gdsGui_schematic_openMenu's confirmIndex now
+    -- accepts a list of {index, color} entries for exactly this (see its
+    -- own comment).
+    local confirmRows = {}
+    -- CLEAR THIS SNAPSHOT only offered when the combination currently
+    -- showing actually has one recorded (see gdsGui_schematic_hasSnapshot)
+    -- — nothing to clear otherwise.
+    if gdsGui_schematic_hasSnapshot(canvasName, gdsGui_schematic_computeSignature(canvasName)) then
+        table.insert(options, "CLEAR THIS SNAPSHOT")
+        table.insert(confirmRows, { index = #options, color = { 1, 1, 0, 1 } })
+    end
+    -- CLEAR ALL SNAPSHOTS -- unlike CLEAR THIS SNAPSHOT (just the current
+    -- combination) or CLEAR PAGE just below (the whole diagram, snapshots
+    -- included), this wipes every snapshot AND every learned/locked gate
+    -- rule on the system while leaving the elements/wires/controls/
+    -- annunciators themselves untouched -- "start teaching the engine over"
+    -- without having to rebuild the diagram from scratch. Only offered when
+    -- there's actually something to reset.
+    if gdsGui_schematic_countSnapshots(canvasName) > 0 then
+        table.insert(options, "CLEAR ALL SNAPSHOTS")
+        table.insert(confirmRows, { index = #options })
+    end
+    table.insert(options, "CLEAR PAGE")
+    table.insert(confirmRows, { index = #options })
+    gdsGui_schematic_openMenu(canvasName, "DESIGN ACTIONS", options, "schematicDesignActionChosen", nil, confirmRows)
 end
 
 -------------------------------------------------------------------------------
@@ -3054,7 +3451,7 @@ end
 -------------------------------------------------------------------------------
 
 local function _openElectricalColorsMenu(canvasName)
-    gdsGui_schematic_openMenu(canvasName, "ELECTRICAL COLORS",
+    gdsGui_schematic_openMenu(canvasName, (_currentMedium().name or "ELECTRICAL") .. " COLORS",
         { "POWERED COLOR", "UNPOWERED COLOR", "PER-SOURCE SETTINGS", "RETURN" }, "schematicElectricalColorsChosen", nil)
 end
 
@@ -3105,11 +3502,12 @@ local function _openPerSourceSettingsListMenu(canvasName)
     local sourceIds = _sortedSourceIds(canvas)
     local labelsById = _labelsByIdForCanvas(canvas)
 
+    local unit = _currentMedium().magnitudeUnit or "V"
     local options = {}
     for _, id in ipairs(sourceIds) do
         local entity = _findSourceEntity(canvas, id)
         local voltage = entity and entity.voltage
-        local voltageDescription = voltage and (voltage .. "V") or "? V"
+        local voltageDescription = voltage and (voltage .. unit) or ("? " .. unit)
         local colorDescription = voltage and _voltageColorDescription(canvas, voltage) or "default"
         table.insert(options, (labelsById[id] or id) .. " (" .. voltageDescription .. ", " .. colorDescription .. ")")
     end
@@ -3122,7 +3520,8 @@ local function _openPerSourceSettingDetailMenu(canvasName, sourceId)
     local canvas = _findSchematicCanvas()
     local labelsById = canvas and _labelsByIdForCanvas(canvas) or {}
     gdsGui_schematic_openMenu(canvasName, labelsById[sourceId] or sourceId,
-        { "VOLTAGE", "RETURN" }, "schematicPerSourceSettingDetailChosen", "schematicPerSourceSettingDetailCancelled")
+        { _currentMedium().magnitudeLabel or "VOLTAGE", "RETURN" },
+        "schematicPerSourceSettingDetailChosen", "schematicPerSourceSettingDetailCancelled")
 end
 
 -- Full SELECT SYSTEM list — only ever shown for a system with no fixed
@@ -3134,20 +3533,94 @@ local function _openSystemSelectMenu(canvasName)
     gdsGui_schematic_openMenu(canvasName, "SELECT SYSTEM", names, "schematicCatalogSystemChosen", nil)
 end
 
--- ANNUNCIATOR is appended after every system's own items instead of a
--- RETURN row (RETURN's old spot) — it's a catalog-wide item, not nested
--- under any one system (see gdsGui_schematic_armAnnunciatorCreation), so it
--- shows the same regardless of which system's TYPE menu this is. There's
--- still a way back up: the dedicated ACTIONS button (schematicContextButtonPressed)
--- reaches _openDesignActionsMenu directly now, so this cascade no longer
--- needs its own RETURN row to get there.
-local function _openTypeMenu(canvasName, sys)
+-- 1st level of the ADD cascade now: one button per model/graph.lua node
+-- role that at least one of sys's own catalog items actually declares
+-- ("directionalGate" shown as FLOW — see the Learn page's own "ONE-WAY
+-- GATE" explanation of the same concept under friendlier words), in the
+-- order a user naturally thinks about a flow network: what starts it,
+-- what carries it, what blocks it, which way it's allowed, where it ends.
+-- A role with zero matching items for THIS system (ELECTRICAL/BLEED AIR
+-- have no "sink"-tagged item yet) just isn't offered — nothing to drill
+-- into. OTHER covers any catalog item with no role at all (PRESSURIZATION's
+-- CONTROLLER/MODE SWITCH — see those entries' own comments for why
+-- they're deliberately untagged), only shown when sys actually has one.
+-- ANNUNCIATOR is appended last instead of a RETURN row (RETURN's old
+-- spot) — it's a catalog-wide item, not nested under any one role (see
+-- gdsGui_schematic_armAnnunciatorCreation), so it shows the same
+-- regardless of sys. There's still a way back up: the dedicated ACTIONS
+-- button (schematicContextButtonPressed) reaches _openDesignActionsMenu
+-- directly, so this level doesn't need its own RETURN row to get there.
+-- Global, not local like its sibling helpers in this section — this file
+-- is already at Lua's 200-top-level-local ceiling (see _LEARN_SCHEMATIC_RAW's
+-- own comment on the same constraint), and this function's two callers
+-- (_openAddMenu, schematicCatalogSystemChosen) call it just as well
+-- through a global lookup.
+function _openFundamentalsMenu(canvasName, sys)
+    local roleOrder  = { "directionalGate", "source", "path", "gate", "sink" }
+    local roleLabels = { directionalGate = "FLOW", source = "SOURCE", path = "PATH", gate = "GATE", sink = "SINK" }
+    local present, hasOther = {}, false
+    for _, item in ipairs(sys.items) do
+        if item.componentType then present[item.componentType] = true else hasOther = true end
+    end
+    -- SINK always shows regardless of present["sink"] -- unlike the other
+    -- four roles, every system gets this button up front even before any
+    -- sink-tagged catalog item exists for it (ELECTRICAL/BLEED AIR don't
+    -- yet). Tapping it just opens _openTypeMenu's own empty-list-plus-
+    -- RETURN case until one does -- deliberately blank for now, not a bug.
+    present.sink = true
     local names = {}
-    for _, item in ipairs(sys.items) do table.insert(names, item.label) end
+    for _, role in ipairs(roleOrder) do
+        if present[role] then table.insert(names, roleLabels[role]) end
+    end
+    if hasOther then table.insert(names, "OTHER") end
     table.insert(names, "ANNUNCIATOR")
+    -- Half the default menu width (0.8 of the canvas) — a short list of
+    -- single-word button names doesn't need the full-width box.
+    gdsGui_schematic_openMenu(canvasName, "ADD:", names, "schematicFundamentalChosen", nil, nil, 0.4)
+end
+
+-- 2nd level: every one of sys's own catalog items whose componentType
+-- matches role ("OTHER" — see _openFundamentalsMenu above — matches an
+-- item with none at all). PATH's own list gets one extra CONNECTOR row
+-- appended, when the canvas actually has something to connect FROM (see
+-- schematicCatalogItemChosen's own CONNECTOR branch below) — a plain wire
+-- is itself a "path" in every sense that matters here, it just has no
+-- fixed element/control shape to place and so no catalog entry of its own
+-- (wires were never a catalog "kind" — see that same branch's comment).
+-- RETURN steps back up to the fundamentals menu.
+local function _openTypeMenu(canvasName, sys, role)
+    local names = {}
+    for _, item in ipairs(sys.items) do
+        local matches = (role == "OTHER" and not item.componentType) or item.componentType == role
+        if matches then table.insert(names, item.label) end
+    end
+    if role == "path" then
+        local canvas = _findSchematicCanvas()
+        if canvas and (#canvas.elements + #canvas.controls) > 0 then
+            table.insert(names, "CONNECTOR")
+        end
+    end
+    table.insert(names, "RETURN")
     -- Half the default menu width (0.8 of the canvas) — a short list of
     -- single-word item names doesn't need the full-width box.
     gdsGui_schematic_openMenu(canvasName, "ADD:", names, "schematicCatalogItemChosen", nil, nil, 0.4)
+end
+
+function schematicConnectorFromChosen(canvasName, index, optionText)
+    if optionText == "RETURN" then
+        if _catalogChosenSystem then _openTypeMenu(canvasName, _catalogChosenSystem, "path") end
+        return
+    end
+    local fromId = _controlMenuIds[index]
+    if not fromId then return end
+    local canvas = _findSchematicCanvas()
+    if not canvas then return end
+    -- Disarm any other pending placement/pick first (see
+    -- gdsGui_schematic_armElementPlacement's own comment on why), then arm
+    -- this one — same two-step order gdsGui_schematic_internal_
+    -- onElementEditChosen's own ADD WIRE branch uses.
+    gdsGui_schematic_cancelPlacement(canvasName)
+    canvas.pendingWireFromId = fromId
 end
 
 -- The catalog entry matching the currently-open system's fixed type, or nil
@@ -3158,14 +3631,14 @@ local function _currentSystemCatalogEntry()
 end
 
 -- ADD ELEMENT/CONTROL entry point: a typed system already knows which
--- catalog branch it belongs to, so it jumps straight to that TYPE menu
--- instead of making the user pick a system that's already decided. Only a
--- legacy/untyped system falls back to the full SELECT SYSTEM list.
+-- catalog branch it belongs to, so it jumps straight to that FUNDAMENTALS
+-- menu instead of making the user pick a system that's already decided.
+-- Only a legacy/untyped system falls back to the full SELECT SYSTEM list.
 local function _openAddMenu(canvasName)
     local entry = _currentSystemCatalogEntry()
     if entry then
         _catalogChosenSystem = entry
-        _openTypeMenu(canvasName, entry)
+        _openFundamentalsMenu(canvasName, entry)
     else
         _openSystemSelectMenu(canvasName)
     end
@@ -3179,27 +3652,89 @@ function schematicCatalogSystemChosen(canvasName, index, optionText)
     local sys = SCHEMATIC_CATALOG[index]
     if not sys then return end
     _catalogChosenSystem = sys
-    _openTypeMenu(canvasName, sys)
+    _openFundamentalsMenu(canvasName, sys)
 end
 
-function schematicCatalogItemChosen(canvasName, index, optionText)
-    -- Catalog-wide, not one of _catalogChosenSystem.items (see _openTypeMenu)
-    -- — jumps straight to the name prompt instead of arming a tap-to-place.
+-- FUNDAMENTALS button tapped: FLOW/SOURCE/PATH/GATE/SINK drill into that
+-- role's own item list (_openTypeMenu); OTHER drills into the untagged
+-- one; ANNUNCIATOR jumps straight to the name prompt instead (catalog-
+-- wide, not nested under any role — see _openFundamentalsMenu above).
+function schematicFundamentalChosen(canvasName, index, optionText)
     if optionText == "ANNUNCIATOR" then
         gdsGui_schematic_armAnnunciatorCreation(canvasName)
         return
     end
-    local item = _catalogChosenSystem and _catalogChosenSystem.items[index]
+    local sys = _catalogChosenSystem
+    if not sys then return end
+    if optionText == "OTHER" then
+        _openTypeMenu(canvasName, sys, "OTHER")
+        return
+    end
+    local roleByLabel = { FLOW = "directionalGate", SOURCE = "source", PATH = "path", GATE = "gate", SINK = "sink" }
+    local role = roleByLabel[optionText]
+    if not role then return end
+    _openTypeMenu(canvasName, sys, role)
+end
+
+function schematicCatalogItemChosen(canvasName, index, optionText)
+    if optionText == "RETURN" then
+        if _catalogChosenSystem then _openFundamentalsMenu(canvasName, _catalogChosenSystem) end
+        return
+    end
+    if optionText == "CONNECTOR" then
+        -- Lets the user pick ANY already-placed element or control as a
+        -- wire's starting point, without first having to tap that item's
+        -- own body and open its edit menu. Arms the exact same one-shot
+        -- "stay armed, drag the loose end to whatever it should connect
+        -- to" mechanism ADD WIRE on an element's/control's own edit menu
+        -- already arms (gdsGui_schematic_internal_onElementEditChosen/
+        -- onControlEditChosen's own canvas.pendingWireFromId — _findAnchor
+        -- resolves either kind of id just as readily) — that existing
+        -- per-item shortcut is completely untouched by this; both paths
+        -- into the same wire-drawing flow now exist side by side.
+        -- Reuses _controlMenuIds (see the CONTROL-MODE "SELECT CONTROL"
+        -- menu further below, its other user) purely as a scratch "menu
+        -- row -> id" map — the two flows are never open at once, and this
+        -- rebuilds it fresh every time it opens anyway. No separate
+        -- top-level local function for this — it has exactly one caller.
+        local canvas = _findSchematicCanvas()
+        if not canvas then return end
+        _controlMenuIds = {}
+        local names = {}
+        for _, e in ipairs(canvas.elements) do
+            table.insert(_controlMenuIds, e.id)
+            table.insert(names, e.label or e.id)
+        end
+        for _, c in ipairs(canvas.controls) do
+            table.insert(_controlMenuIds, c.id)
+            table.insert(names, c.label or c.id)
+        end
+        table.insert(names, "RETURN")
+        gdsGui_schematic_openMenu(canvasName, "CONNECTOR FROM:", names, "schematicConnectorFromChosen", nil)
+        return
+    end
+    -- Matched by label, not index — _openTypeMenu's own list is filtered
+    -- to one role at a time now, so a row's position in that list no
+    -- longer lines up with its position in sys.items (labels are unique
+    -- within one system, same assumption _currentSystemCatalogEntry's
+    -- whole catalog already relies on).
+    local sys = _catalogChosenSystem
+    local item = nil
+    if sys then
+        for _, candidate in ipairs(sys.items) do
+            if candidate.label == optionText then item = candidate; break end
+        end
+    end
     if not item then return end
     -- No "connector" kind left in SCHEMATIC_CATALOG — ADD WIRE on an
-    -- element's own edit menu replaced it (see
+    -- element's own edit menu, or CONNECTOR above, cover that now (see
     -- gdsGui_schematic_internal_onElementEditChosen).
     if item.kind == "element" then
         gdsGui_schematic_armElementPlacement(canvasName, item.shapeType, item.abbrev or item.label, nil, item.label,
-            item.defaultProperties, item.spritePath, item.sizeMul, item.matchControlSize, item.componentType)
+            item.defaultProperties, item.spritePath, item.gridW, item.gridH, item.componentType)
     elseif #item.presets == 1 then
         gdsGui_schematic_armControlPlacement(canvasName, item.presets[1], item.abbrev or item.label, item.callbackFunc, item.label,
-            item.spritePaths, item.overlaySpritePath, item.radiusMul, item.colorDarkenMul, item.componentType)
+            item.spritePaths, item.overlaySpritePath, item.gridSize, item.colorDarkenMul, item.componentType)
     else
         _catalogChosenControlItem = item
         local names = {}
@@ -3213,14 +3748,17 @@ end
 
 function schematicCatalogPresetChosen(canvasName, index, optionText)
     if optionText == "RETURN" then
-        if _catalogChosenSystem then _openTypeMenu(canvasName, _catalogChosenSystem) end
+        if _catalogChosenSystem and _catalogChosenControlItem then
+            _openTypeMenu(canvasName, _catalogChosenSystem, _catalogChosenControlItem.componentType or "OTHER")
+        end
+        _catalogChosenControlItem = nil
         return
     end
     local item = _catalogChosenControlItem
     if not item then return end
     local preset = item.presets[index]
     gdsGui_schematic_armControlPlacement(canvasName, preset, item.abbrev or item.label, item.callbackFunc, item.label,
-        item.spritePaths, item.overlaySpritePath, item.radiusMul, item.colorDarkenMul, item.componentType)
+        item.spritePaths, item.overlaySpritePath, item.gridSize, item.colorDarkenMul, item.componentType)
     _catalogChosenControlItem = nil
 end
 
@@ -3284,12 +3822,13 @@ function schematicControlPositionChosen(canvasName, index, optionText)
 end
 
 -- Dedicated "+" dock button (schematicAddBtn, top-right of the canvas, design
--- mode only): the sole entry point into the ADD cascade (SYSTEM > TYPE >
--- POSITIONS, see _openAddMenu), now that it's no longer one of the ACTIONS
--- menu's options. Same reentrancy guard as schematicContextButtonPressed
--- below — opening a brand new top-level menu while a cascade from either
--- entry point is already mid-flight would silently clobber it and orphan its
--- tracking locals (see gdsGui_schematic_isMenuOpen).
+-- mode only): the sole entry point into the ADD cascade ((SYSTEM >)
+-- FUNDAMENTALS > TYPE > POSITIONS, see _openAddMenu), now that it's no
+-- longer one of the ACTIONS menu's options. Same reentrancy guard as
+-- schematicContextButtonPressed below — opening a brand new top-level menu
+-- while a cascade from either entry point is already mid-flight would
+-- silently clobber it and orphan its tracking locals (see
+-- gdsGui_schematic_isMenuOpen).
 -- Activating a dock tool moves its button up to the top dock slot (ADD's)
 -- and hides the other tools until it's deactivated, so its popup — which
 -- always opens just left of the dock at the canvas's top edge (see
@@ -3340,8 +3879,9 @@ local function _schematicToolStillActive(tool)
 end
 
 -- Dedicated "+" dock button (schematicAddBtn, top-right of the canvas, design
--- mode only): the sole entry point into the ADD cascade (SYSTEM > TYPE >
--- POSITIONS, see _openAddMenu). A sticky toggle like PAINT/ANNUNCIATOR:
+-- mode only): the sole entry point into the ADD cascade ((SYSTEM >)
+-- FUNDAMENTALS > TYPE > POSITIONS, see _openAddMenu). A sticky toggle like
+-- PAINT/ANNUNCIATOR:
 -- switching it on opens the cascade pinned beside the dock; switching it
 -- off abandons whatever step of the flow is open. Same reentrancy guard as
 -- schematicContextButtonPressed below — opening a brand new top-level menu
@@ -3422,17 +3962,56 @@ function schematicContextButtonPressed()
 end
 
 function schematicDesignActionChosen(canvasName, index, optionText)
-    if optionText == "CLEAR SNAPSHOT" then
-        -- Deletes only the snapshot for whichever control-position
-        -- combination is currently showing, not every snapshot on the
-        -- system (that's RESET's job). Undo-able: pushed onto the undo
-        -- stack first, same as RESET, so "UNDO LAST ACTION" brings it back.
+    if optionText == "CLEAR THIS SNAPSHOT" then
+        -- Only ever reaches here via the sustained hold DESIGN ACTIONS'
+        -- own confirmRows gates it behind (see _openDesignActionsMenu
+        -- above) — a plain tap-release on this row is swallowed before
+        -- onSelect ever fires. Deletes only the snapshot for whichever
+        -- control-position combination is currently showing, not every
+        -- snapshot on the system (that's CLEAR ALL SNAPSHOTS' job).
+        -- Undo-able: pushed onto the undo stack first, same as CLEAR PAGE,
+        -- so "UNDO LAST ACTION" brings it back.
         gdsGui_schematic_pushUndo(canvasName)
         gdsGui_schematic_removeSnapshot(canvasName, gdsGui_schematic_computeSignature(canvasName))
+        -- Same reasoning as every snapshot-commit call site (capture,
+        -- OVERWRITE, CAPTURE AS SHOWN/ANYWAY): removing a snapshot changes
+        -- the evidence canvas.rules/attributionRules were learned from, so
+        -- the AI panel's confidence score (read off those tables once this
+        -- combination no longer has an exact snapshot of its own) must be
+        -- rebuilt here too, not left scored off a rule that may have
+        -- counted the just-deleted snapshot as one of its examples.
+        _recomputeDeducedGateStates()
+        _applySolvedColorsToCurrentCombination()
         _schematicDirty = true
         _saveCurrentSystem()
-    elseif optionText == "SNAPSHOT RESET" then
-        _openSnapshotResetConfirmMenu(canvasName)
+    elseif optionText == "CLEAR ALL SNAPSHOTS" then
+        -- Only ever reaches here via the sustained hold DESIGN ACTIONS'
+        -- own confirmRows gates it behind — same "the hold IS the
+        -- confirmation" treatment as CLEAR PAGE below, no separate
+        -- CONTINUE/CANCEL popup. Wipes every snapshot AND every learned/
+        -- locked gate/attribution rule on the system while leaving the
+        -- elements/wires/controls/annunciators themselves untouched —
+        -- "start teaching the engine over" without rebuilding the diagram.
+        -- Undo-able, same as every other destructive row here.
+        local canvas = _findSchematicCanvas()
+        if canvas then
+            gdsGui_schematic_pushUndo(canvasName)
+            canvas.snapshots = {}
+            -- Cleared outright (not left to _recomputeDeducedGateStates'
+            -- own _recomputeGateRules/_recomputeAttributionRules passes
+            -- below) — specifically to override those passes' usual
+            -- "never touch a LOCKED rule" protection — this is meant to
+            -- wipe every taught rule, confirmed or not, same as
+            -- _clearMainCanvas' own unconditional canvas.rules = {} on a
+            -- full CLEAR PAGE.
+            canvas.rules = {}
+            canvas.attributionRules = {}
+            _recomputeDeducedGateStates()
+            _applySolvedColorsToCurrentCombination()
+            _schematicDirty = true
+            _saveCurrentSystem()
+            _setSnapshotLabelText(0)
+        end
     elseif optionText == "UNDO LAST ACTION" then
         gdsGui_schematic_undo(canvasName)
         _schematicDirty = true
@@ -3443,11 +4022,11 @@ function schematicDesignActionChosen(canvasName, index, optionText)
         _openAttributionRulesListMenu(canvasName)
     elseif optionText == "SUGGEST NEXT SNAPSHOT" then
         _openSuggestNextSnapshotMenu(canvasName)
-    elseif optionText == "ELECTRICAL COLORS" then
+    elseif optionText == (_currentMedium().name or "ELECTRICAL") .. " COLORS" then
         _openElectricalColorsMenu(canvasName)
-    elseif optionText == "RESET (CLEAR PAGE)" then
-        -- RESET only ever reaches here via the sustained hold the DESIGN
-        -- ACTIONS menu's own confirmIndex gates it behind (see
+    elseif optionText == "CLEAR PAGE" then
+        -- CLEAR PAGE only ever reaches here via the sustained hold the
+        -- DESIGN ACTIONS menu's own confirmRows gates it behind (see
         -- _openDesignActionsMenu above) — a plain tap-release on this row is
         -- swallowed before onSelect ever fires. Safe to act immediately.
         -- Wipes every element/wire/control/snapshot from the live canvas and
@@ -3756,6 +4335,7 @@ local function _applyTheme(isDark)
         {name="calcLearnContent",     raw=_LEARN_CALC_RAW},
         {name="dutyLearnContent",     raw=_LEARN_DUTY_RAW},
         {name="settingsLearnContent", raw=_LEARN_SETTINGS_RAW},
+        {name="schematicLearnContent", raw=_LEARN_SCHEMATIC_RAW},
     }
     for _, pair in ipairs(_learnUpdates) do
         gdsGui_outputTxtBox_setText(pair.name, _learnSegsColored(pair.raw, isDark))
@@ -3777,7 +4357,7 @@ local function _applyFontSize(fontSize)
         "displayModeLabel", "soundsLabel", "hapticsLabel", "fontSizeLabel",
         -- learn page content
         "timerLearnContent", "windLearnContent", "calcLearnContent",
-        "dutyLearnContent", "settingsLearnContent",
+        "dutyLearnContent", "settingsLearnContent", "schematicLearnContent",
         -- page header titles (all pages) — schematic_pageTitle and the
         -- three schematic header readouts (zoom/snapshot/combination) are
         -- handled separately below: unlike every other page's title/
@@ -3943,6 +4523,7 @@ local function _applyFontSize(fontSize)
         {"calcLearnContent",     _LEARN_CALC_RAW},
         {"dutyLearnContent",     _LEARN_DUTY_RAW},
         {"settingsLearnContent", _LEARN_SETTINGS_RAW},
+        {"schematicLearnContent", _LEARN_SCHEMATIC_RAW},
     }
     for _, p in ipairs(learnPairs) do
         setCF(tx, p[1], "h", lH(p[2]))
@@ -4389,11 +4970,7 @@ function love.load()
         _w(110), _hCalcSel,
         colorYellow, textDegreeSlctd, 12, "calcPanel"
     )
-    local requiredFPM = 0
-    if selectedTime > 0 then
-        requiredFPM = math.ceil(selectedAltitude / selectedTime)
-    end
-    local requiredFPMtext = "REQ FPM:\n" .. requiredFPM
+    local requiredFPMtext = _formatRequiredFPM(selectedAltitude, selectedTime)
     gdsGui_outputTxtBox_create("requiredFPM", "MainMenu", nil,
         _x(110), _calcResCY, "CC",
         _w(80), _hCalcRes,
@@ -4519,6 +5096,14 @@ function love.load()
         learnTxtW, learnH(_LEARN_SETTINGS_RAW),
         {1, 1, 1, 1}, _learnSegsColored(_LEARN_SETTINGS_RAW, true),
         learnFontSize, "settingsLearn"
+    )
+
+    gdsGui_container_create("schematicLearn", "Learn", "SYSTEM SCHEMATICS", 32, 0)
+    gdsGui_outputTxtBox_create("schematicLearnContent", "Learn", nil,
+        learnTxtX, 10, "CT",
+        learnTxtW, learnH(_LEARN_SCHEMATIC_RAW),
+        {1, 1, 1, 1}, _learnSegsColored(_LEARN_SCHEMATIC_RAW, true),
+        learnFontSize, "schematicLearn"
     )
 
     ---------------------------------------------------------------------------
@@ -4712,25 +5297,29 @@ function love.load()
     _schematicDockSlotY[_SCHEMATIC_DOCK_TOOLS.paint]       = schCanvasYFrac + (36 + 10) / globApp.safeScreenArea.h
     _schematicDockSlotY[_SCHEMATIC_DOCK_TOOLS.annunciator] = schCanvasYFrac + 2 * (36 + 10) / globApp.safeScreenArea.h
     -- COMBINATION PREV/NEXT — design-mode-only, fixed at the left/right
-    -- middle of the screen (containerName nil, so like every other floating
+    -- edges of the screen (containerName nil, so like every other floating
     -- schematic chrome button they're positioned straight off safeScreenArea
-    -- and never move with the canvas's own pan/zoom). Each press walks the
-    -- control-position combination counter one step (see
-    -- gdsGui_schematic_stepCombination) — deactivated whenever there's
-    -- nothing to cycle (control mode, or fewer than 2 total combinations),
-    -- see the per-frame poll in love.update() below.
+    -- and never move with the canvas's own pan/zoom). Anchored bottom (LB/RB)
+    -- at the AI panel's own top edge (_aiPanelRect: cy + ch*(1-0.25), same
+    -- 0.25 panelH fraction) so the buttons sit flush atop the panel instead
+    -- of overlapping it once it's open. Each press walks the control-position
+    -- combination counter one step (see gdsGui_schematic_stepCombination) —
+    -- deactivated whenever there's nothing to cycle (control mode, or fewer
+    -- than 2 total combinations), see the per-frame poll in love.update()
+    -- below.
+    local schCombBtnYFrac = schCanvasYFrac + schCanvasHFrac * 0.75
     gdsGui_button_create("schematicCombPrevBtn", "SystemSchematic", "pushonoff",
         "Sprites/button_schematicCombPrev_pressed.png",
         "Sprites/button_schematicCombPrev_released.png",
         "Sprites/button_schematicCombPrev_deactivated.png",
-        0, 0.5, "LC", 32, 64,
+        0, schCombBtnYFrac, "LB", 32, 64,
         "schematicCombPrevPressed", globApp.BUTTON_STATES.DEACTIVATED, true, nil
     )
     gdsGui_button_create("schematicCombNextBtn", "SystemSchematic", "pushonoff",
         "Sprites/button_schematicCombNext_pressed.png",
         "Sprites/button_schematicCombNext_released.png",
         "Sprites/button_schematicCombNext_deactivated.png",
-        1, 0.5, "RC", 32, 64,
+        1, schCombBtnYFrac, "RB", 32, 64,
         "schematicCombNextPressed", globApp.BUTTON_STATES.DEACTIVATED, true, nil
     )
     -- One header row, left to right: ZOOM (shortest, fixed-ish length —
@@ -4797,9 +5386,20 @@ function love.load()
     -- VOLTAGE prompt for a "source"-role item (BATTERY, GENERATOR, ...) and
     -- ignores everything else.
     _findSchematicCanvas().onElementPlaced = "schematicSourceElementPlaced"
-    -- Appends the sensed-voltage reading (schematicElementVoltageMenuSuffix
-    -- below) to an element's edit-menu title the moment it's tapped.
-    _findSchematicCanvas().elementMenuTitleSuffix = "schematicElementVoltageMenuSuffix"
+    -- Read-only VOLTAGE/CURRENT rows (schematicElementSensedValues below)
+    -- shown above an element's own custom properties in its PROPERTIES menu
+    -- — previously VOLTAGE alone was appended to the edit-menu's own TITLE
+    -- (canvas.elementMenuTitleSuffix) instead.
+    _findSchematicCanvas().elementSensedValues = "schematicElementSensedValues"
+    -- On-canvas row-2 status text under an element's own label (see
+    -- schematic_gdsGuiLib.lua's canvas.elementStatusText hook / _drawElement)
+    -- — the element equivalent of a control's own position readout
+    -- (OPEN/CLOSED, ON/OFF, ...). Reuses the same sensed-voltage reading
+    -- schematicElementSensedValues already shows in the PROPERTIES menu, so
+    -- a source element (BATTERY, GENERATOR, ...) with a known voltage shows
+    -- e.g. "24V"; anything else (BUS, DIODE, no voltage taught yet, ...)
+    -- shows no second row at all.
+    _findSchematicCanvas().elementStatusText = "schematicElementStatusText"
     -- Starts empty: the canvas is only ever populated by an explicit NEW
     -- SYSTEM or OPEN action from the aircraft flow (see _openSystemIntoCanvas above).
     _schematicCanvasNormalLayout = { x = schCanvasXFrac, y = schCanvasYFrac, anchorPoint = "LT", wFrac = schCanvasWFrac, hFrac = schCanvasHFrac }
@@ -5014,9 +5614,7 @@ function love.update(dt)
     end
 
     if altChanged or timeChanged then
-        local requiredFPM = 0
-        if selectedTime > 0 then requiredFPM = math.ceil(selectedAltitude / selectedTime) end
-        gdsGui_outputTxtBox_setText("requiredFPM", "REQ FPM:\n" .. requiredFPM)
+        gdsGui_outputTxtBox_setText("requiredFPM", _formatRequiredFPM(selectedAltitude, selectedTime))
     end
 
     if altChanged or degreeChanged then
@@ -5546,9 +6144,12 @@ function pauseRHTopTimer()
 end
 
 function incrsMinRHTopTimer()
-    timer.t = timer.t + 60
+    -- clamped to 59:59 -- the display container is sized for "M 59:59 S"
+    -- and silently overflows/clips past that (see format_time's own 3599s cap).
+    timer.t = math.min(3599, timer.t + 60)
     saveCountdownTime()
     acknowlegeAlarm()
+    _rearmPreAlarmNavIfAboveWindow()
 end
 
 function dcrsMinRHTopTimer()
@@ -5557,9 +6158,22 @@ function dcrsMinRHTopTimer()
 end
 
 function incrsSecRHTopTimer()
-    timer.t = timer.t + 1
+    timer.t = math.min(3599, timer.t + 1)
     saveCountdownTime()
     acknowlegeAlarm()
+    _rearmPreAlarmNavIfAboveWindow()
+end
+
+-- blink.navSent is a one-shot "already auto-navigated to MainMenu for this
+-- trip through the <=3s warning window" latch (see love.update's COUNT DOWN
+-- branch). Bumping the timer back above that window with +1 min/+1 sec
+-- must re-arm it, or a countdown that re-enters the window a second time
+-- (e.g. nudged up mid-countdown) silently never gets the early warning nav
+-- again -- only the final zero-alarm, unaffected by this flag, still fires.
+function _rearmPreAlarmNavIfAboveWindow()
+    if timer.t > 3 then
+        blink.navSent = false
+    end
 end
 
 function dcrsSecRHTopTimer()
@@ -6117,7 +6731,7 @@ function captureSchematicSnapshot()
                 local entity = _findSourceEntity(canvas, onlySourceId)
                 local voltage = entity and entity.voltage
                 if not voltage then return nil end
-                return _colorForVoltage(canvas, voltage, ELECTRICAL_MEDIUM.style.powered), onlySourceId
+                return _colorForVoltage(canvas, voltage, _currentMedium().style.powered), onlySourceId
             end
 
             for _, e in ipairs(canvas.elements) do
@@ -6193,8 +6807,7 @@ function captureSchematicSnapshot()
     if #ambiguous > 0 then
         _pendingSnapshotPlan = plan
         gdsGui_schematic_openMenu("mainCanvas",
-            "AMBIGUOUS: " .. table.concat(ambiguous, "; ")
-                .. " — capture as shown if correct, or cancel to repaint first",
+            "Capture as shown if correct, or cancel to repaint first",
             {"CAPTURE AS SHOWN", "CANCEL"}, "schematicAmbiguousColorConfirmed", "schematicAmbiguousColorConfirmed", nil, 0.9)
         return
     end
@@ -6413,13 +7026,21 @@ end
 
 local function _ensureVoltageHasColor(canvasName, voltage)
     local canvas = _findSchematicCanvas()
-    if canvas and canvas.voltageColors[voltage] then
+    if not canvas then return end
+    -- canvas.voltageColors is an app-added field (not part of the library's
+    -- own canvas schema), normally set by _openSystemIntoCanvas/
+    -- _clearMainCanvas before any element could be placed at all — self-heals
+    -- to an empty table here rather than crashing on a nil index if either
+    -- of those somehow hasn't run yet for this canvas.
+    canvas.voltageColors = canvas.voltageColors or {}
+    if canvas.voltageColors[voltage] then
         _resolveAndSaveSchematic()
         return
     end
     _pendingVoltageColorPickValue = voltage
     gdsGui_schematic_openGenericColorPicker(canvasName,
-        voltage .. "V POWERED COLOR (every source at this voltage, on this system, will share it)",
+        voltage .. (_currentMedium().magnitudeUnit or "V")
+            .. " POWERED COLOR (every source at this magnitude, on this system, will share it)",
         "schematicVoltageColorChosen", "schematicVoltageColorCancelled")
 end
 
@@ -6427,6 +7048,7 @@ function schematicVoltageColorChosen(canvasName, index)
     local color = gdsGui_schematic_getColorPaletteEntry(index)
     local canvas = _findSchematicCanvas()
     if color and canvas and _pendingVoltageColorPickValue then
+        canvas.voltageColors = canvas.voltageColors or {}
         canvas.voltageColors[_pendingVoltageColorPickValue] = color
     end
     _pendingVoltageColorPickValue = nil
@@ -6443,37 +7065,73 @@ function schematicVoltageColorCancelled(canvasName)
     _resolveAndSaveSchematic()
 end
 
--- Reverse of the registration above: "24V" when elementId's CURRENTLY
--- DISPLAYED color (gdsGui_schematic_resolveColor — the exact same tiered
+-- Reverse of the registration above: "24V" (or "1500PSI", ... — see
+-- _currentMedium's own magnitudeUnit) when elementId's CURRENTLY DISPLAYED
+-- color (gdsGui_schematic_resolveColor — the exact same tiered
 -- pendingColor/snapshot/predictedColor/default lookup the live canvas
 -- itself paints with, so this can never disagree with what's actually on
 -- screen) matches one of this system's own registered voltageColors
--- entries, else nil — an unpowered element (flat gray), an untyped/non-
--- ELECTRICAL system (no voltageColors concept at all), or a multi-source
--- dashed sequence with no single flat color all read as "no one sensed
--- voltage to report," same as the hook simply returning nothing.
--- schematic_gdsGuiLib.lua's own canvas.elementMenuTitleSuffix hook (wired
--- up once in love.load()) calls this by name just before an element's
--- edit menu opens.
-function schematicElementVoltageMenuSuffix(canvasName, elementId)
+-- entries, else nil — an unpowered element (flat gray), a legacy/untyped
+-- system predating "one system type per aircraft" (no voltageColors
+-- concept at all), or a multi-source dashed sequence with no single flat
+-- color all read as "no one sensed a magnitude to report," same as the
+-- hook simply returning nothing.
+-- Formerly shown appended to the element edit menu's own title
+-- (schematic_gdsGuiLib.lua's canvas.elementMenuTitleSuffix hook); now one of
+-- the read-only rows schematicElementSensedValues below hands to the
+-- PROPERTIES menu instead (canvas.elementSensedValues), alongside CURRENT.
+function schematicElementSensedVoltage(canvasName, elementId)
     local canvas = _findSchematicCanvas()
     if not canvas or not canvas.voltageColors then return nil end
     local r, g, b, a = gdsGui_schematic_resolveColor(canvasName, "element", elementId)
     for voltage, color in pairs(canvas.voltageColors) do
         if math.abs(color[1] - r) < 0.01 and math.abs(color[2] - g) < 0.01
            and math.abs(color[3] - b) < 0.01 and math.abs((color[4] or 1) - a) < 0.01 then
-            return voltage .. "V"
+            return voltage .. (_currentMedium().magnitudeUnit or "V")
         end
     end
     return nil
 end
 
+-- Current is not modeled anywhere yet (model/solver.lua's graph is a pure
+-- powered/unpowered flood-fill — see its own header comment — with no
+-- resistance/current arithmetic at all), so this always reads N/A for now.
+-- Kept as its own named function (rather than inlining "nil" at the call
+-- site below) so a future current model has a single, already-wired-in
+-- place to plug its real per-element reading into — canvasName/elementId
+-- are already threaded through, nothing else would need to change.
+function schematicElementSensedCurrent(canvasName, elementId)
+    return nil
+end
+
+-- canvas.elementSensedValues hook (schematic_gdsGuiLib.lua's
+-- _openPropertiesMenu, wired up once in love.load()): the read-only VOLTAGE/
+-- CURRENT rows shown above an element's own custom properties. Order here
+-- is display order.
+function schematicElementSensedValues(canvasName, elementId)
+    return {
+        { label = _currentMedium().magnitudeLabel or "VOLTAGE", value = schematicElementSensedVoltage(canvasName, elementId) },
+        { label = "CURRENT", value = schematicElementSensedCurrent(canvasName, elementId) },
+    }
+end
+
+-- canvas.elementStatusText hook (schematic_gdsGuiLib.lua's _drawElement):
+-- the on-canvas row-2 status text under an element's own label, same
+-- sensed-voltage reading schematicElementSensedValues shows in the
+-- PROPERTIES menu — nil (no second row at all) for anything without a
+-- taught voltage, same as that menu's own "N/A" case resolves to nothing
+-- here instead (a canvas label has no room for a literal "N/A").
+function schematicElementStatusText(canvasName, elementId)
+    return schematicElementSensedVoltage(canvasName, elementId)
+end
+
 function schematicPerSourceSettingDetailChosen(canvasName, index, optionText)
-    if optionText == "VOLTAGE" and _pendingPerSourceTargetId then
+    if optionText == (_currentMedium().magnitudeLabel or "VOLTAGE") and _pendingPerSourceTargetId then
         local canvas = _findSchematicCanvas()
         local entity = canvas and _findSourceEntity(canvas, _pendingPerSourceTargetId)
-        gdsGui_textPrompt_open("SOURCE VOLTAGE (NUMBER)", entity and entity.voltage and tostring(entity.voltage) or "",
-            6, "schematicPerSourceVoltageConfirmed", nil, true)
+        local label = _currentMedium().magnitudeLabel or "VOLTAGE"
+        gdsGui_textPrompt_open("SOURCE " .. label .. " (NUMBER)", entity and entity.voltage and tostring(entity.voltage) or "",
+            6, "schematicPerSourceVoltageConfirmed", nil, true, "e.g. 24 or 28")
         return -- keep _pendingPerSourceTargetId set for the text-prompt's own callback
     elseif optionText == "RETURN" then
         _pendingPerSourceTargetId = nil
@@ -6510,17 +7168,23 @@ end
 
 -------------------------------------------------------------------------------
 -- SYSTEM SCHEMATIC — NEW SOURCE PLACEMENT: a freshly-placed "source"-role
--- element/control (BATTERY, GENERATOR, ...) is prompted for its nominal
--- VOLTAGE immediately, via mainCanvas.onElementPlaced (wired in love.load())
--- — required, since a source with no voltage can never get an automatic
--- powered color of its own (see _colorForPoweredNode's defaultColor
--- fallback). The element/control already exists on the canvas by the time
--- this fires (the library's placement commit runs first), so cancelling out
--- of the prompt just leaves its voltage unset rather than undoing the
+-- element/control (BATTERY, GENERATOR, HYDRAULIC PUMP, ...) is prompted for
+-- its nominal magnitude immediately, via mainCanvas.onElementPlaced (wired
+-- in love.load()) — required, since a source with none can never get an
+-- automatic powered color of its own (see _colorForPoweredNode's
+-- defaultColor fallback). The element/control already exists on the canvas
+-- by the time this fires (the library's placement commit runs first), so
+-- cancelling out of the prompt just leaves it unset rather than undoing the
 -- placement — there'd be nothing left to put it back the way it was.
+-- The prompt's own wording is pulled from the CURRENT medium's
+-- magnitudeLabel ("VOLTAGE" for ELECTRICAL, "PRESSURE" for HYDRAULIC/FUEL/
+-- BLEED AIR — see model/media/hydraulic.lua's own comment) so a freshly-
+-- placed hydraulic PUMP isn't asked for a "VOLTAGE" — still stored on the
+-- entity as .voltage internally either way; only the prompt's own text
+-- changes per medium, not the field name underneath it.
 -------------------------------------------------------------------------------
 
--- Which newly-placed source the open VOLTAGE prompt belongs to — only one
+-- Which newly-placed source the open magnitude prompt belongs to — only one
 -- placement is ever in flight at a time, same convention as
 -- _pendingPerSourceTargetId.
 local _pendingNewSourceId = nil
@@ -6528,15 +7192,17 @@ local _pendingNewSourceId = nil
 function schematicSourceElementPlaced(canvasName, kind, newId, componentType)
     if componentType ~= "source" then return end
     _pendingNewSourceId = newId
-    gdsGui_textPrompt_open("SOURCE VOLTAGE (NUMBER)", "", 6,
-        "schematicNewSourceVoltageConfirmed", "schematicNewSourceVoltageCancelled", true)
+    local label = _currentMedium().magnitudeLabel or "VOLTAGE"
+    gdsGui_textPrompt_open("SOURCE " .. label .. " (NUMBER)", "", 6,
+        "schematicNewSourceVoltageConfirmed", "schematicNewSourceVoltageCancelled", true, "e.g. 24 or 28")
 end
 
 function schematicNewSourceVoltageConfirmed(text)
     local voltage = tonumber(text)
     if not voltage then
-        gdsGui_textPrompt_open("VOLTAGE REQUIRED (NUMBER), TRY AGAIN", text or "", 6,
-            "schematicNewSourceVoltageConfirmed", "schematicNewSourceVoltageCancelled", true)
+        local label = _currentMedium().magnitudeLabel or "VOLTAGE"
+        gdsGui_textPrompt_open(label .. " REQUIRED (NUMBER), TRY AGAIN", text or "", 6,
+            "schematicNewSourceVoltageConfirmed", "schematicNewSourceVoltageCancelled", true, "e.g. 24 or 28")
         return
     end
     local canvas = _findSchematicCanvas()
@@ -6551,19 +7217,24 @@ function schematicNewSourceVoltageCancelled()
     _pendingNewSourceId = nil
 end
 
--- Both callbacks below: ELECTRICAL_MEDIUM.style is the ONE table both
--- _solveCurrentSchematic (forward prediction) and _stateForColor (backward
--- deduction, see model/learner.lua) read — overwriting one entry here keeps
--- paint/predict/deduce all using the same color from this point forward,
--- with no separate "teach it" step. Re-solving and re-deducing immediately
--- (rather than waiting for the next snapshot/combination change) means the
--- canvas reflects the new color right away, including for any gate whose
--- rule depended on evidence that's about to stop matching (see this
--- section's own comment above _openElectricalColorsMenu).
+-- Both callbacks below: the CURRENT medium's own .style is the ONE table
+-- both _solveCurrentSchematic (forward prediction) and _stateForColor
+-- (backward deduction, see model/learner.lua) read — overwriting one entry
+-- here keeps paint/predict/deduce all using the same color from this point
+-- forward, with no separate "teach it" step. Re-solving and re-deducing
+-- immediately (rather than waiting for the next snapshot/combination
+-- change) means the canvas reflects the new color right away, including
+-- for any gate whose rule depended on evidence that's about to stop
+-- matching (see this section's own comment above _openElectricalColorsMenu).
+-- Resolved via _currentMedium() rather than ELECTRICAL_MEDIUM directly —
+-- today this menu only ever opens for an ELECTRICAL system (see its own
+-- "ELECTRICAL COLORS" gate above _openElectricalColorsMenu), so the two
+-- are the same object in practice, but a future medium's own color-override
+-- menu can reuse these two callbacks unchanged.
 function schematicPoweredColorChosen(canvasName, index)
     local color = gdsGui_schematic_getColorPaletteEntry(index)
     if not color then return end
-    ELECTRICAL_MEDIUM.style.powered = color
+    _currentMedium().style.powered = color
     appSettings.electricalPoweredColor = color
     _saveAppSettings()
     _recomputeDeducedGateStates()
@@ -6573,7 +7244,7 @@ end
 function schematicUnpoweredColorChosen(canvasName, index)
     local color = gdsGui_schematic_getColorPaletteEntry(index)
     if not color then return end
-    ELECTRICAL_MEDIUM.style.unpowered = color
+    _currentMedium().style.unpowered = color
     appSettings.electricalUnpoweredColor = color
     _saveAppSettings()
     _recomputeDeducedGateStates()
@@ -6591,6 +7262,26 @@ end
 function schematicGetColorPaletteEntryTest()
     local color, name = gdsGui_schematic_getColorPaletteEntry(3) -- GREEN, per _COLOR_PALETTE's own order
     return color[1], color[2], color[3], name
+end
+
+-- model/media/registry.lua round-trip, plus _currentMedium()'s own
+-- fallback (see that function's comment): no system open yet
+-- (schematicStore.currentSystemId unset, same as every other test here)
+-- must still resolve to ELECTRICAL_MEDIUM, exactly the unconditional
+-- default this app had before the registry existed. Doesn't exercise the
+-- systemType-match branch itself -- that needs a real aircraft/system
+-- fixture in schematicStore, left for whenever a second medium is actually
+-- wired into a real system rather than faked here.
+function mediaRegistryCurrentMediumTest()
+    local fallbackIsElectrical = _currentMedium() == ELECTRICAL_MEDIUM
+
+    local registry = require("model.media.registry")
+    local fakeMedium = { name = "TEST_MEDIUM", style = { unpowered = { 0, 0, 0, 1 }, powered = { 1, 1, 1, 1 } } }
+    registry.register("TEST_MEDIUM", fakeMedium)
+    local registryRoundTrips = registry.get("TEST_MEDIUM") == fakeMedium
+    local unregisteredIsNil = registry.get("NOT_A_REAL_SYSTEM_TYPE") == nil
+
+    return fallbackIsElectrical, registryRoundTrips, unregisteredIsNil
 end
 
 -- _colorForPoweredNode tests (voltage-keyed powered colors, see that
@@ -6902,6 +7593,106 @@ function schematicTiedVoltageAttributionConfidenceTest()
     local winners = _deduceAttributionWinnersForSnapshot(canvas, graph, signature, snapshot)
 
     return isTiedVoltageColor, confidence == 1, winners.busX == nil
+end
+
+-- Verifies the GLOBAL voltage-dominance rule (model/learner.lua's
+-- findVoltageDominanceRule, rebuilt by main.lua's own
+-- _recomputeAttributionRules alongside its per-node table — see that
+-- function's own comment) actually generalizes "the single highest-
+-- voltage contributor wins"
+-- ACROSS different node ids, unlike a per-node canvas.attributionRules
+-- entry (contrast schematicAttributionRuleLearnedAndAppliedTest above,
+-- which only ever teaches ONE node id). Topology: battA(24V) and genB
+-- (28V, a source control) share busX directly (no gate — genB always
+-- backfeeds battA's own node too, ambiguous between the two whenever genB
+-- is on); a THIRD source, battC(24V), joins the same bus only through
+-- gate3. One snapshot captured with gate3 OPEN (battC not part of the
+-- ambiguity at all yet) paints busX AND battA genB's own registered
+-- color — confirming the highest-voltage heuristic, but only ever for
+-- busX/battA's node ids, never battC's (which has never been ambiguous in
+-- any capture, let alone painted).
+-- Verifies: (1) the global rule gets learned from that evidence; (2)
+-- canvas.attributionRules has NO entry at all for "battC" (never trained
+-- per-node); (3) once gate3 closes and battC becomes ambiguous for the
+-- very first time, at a combination never captured, its own color-
+-- attribution confidence is already > 0 — covered by the global rule even
+-- though nothing was ever taught about battC specifically, the exact
+-- generalization the real Aircraft 21 report asked for.
+function schematicVoltageDominanceGeneralizesAcrossNodesTest()
+    gdsGui_schematic_delete("unitTestCanvas28")
+    gdsGui_schematic_create("unitTestCanvas28", "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_addElement("unitTestCanvas28", "battA", "rect", 0, 0, 0.1, 0.1, "BATT A", nil, nil, nil, nil, "source")
+    gdsGui_schematic_addElement("unitTestCanvas28", "busX", "rect", 0.3, 0, 0.1, 0.1, "BUS X", nil, nil, nil, nil, "path")
+    gdsGui_schematic_addElement("unitTestCanvas28", "battC", "rect", 0.6, 0.3, 0.1, 0.1, "BATT C", nil, nil, nil, nil, "source")
+    gdsGui_schematic_addControl("unitTestCanvas28", "genB", 0.6, 0, {"OFF", "ON"}, 1, "GEN B", nil,
+        1, nil, nil, nil, nil, nil, "source")
+    gdsGui_schematic_addControl("unitTestCanvas28", "gate3", 0.45, 0.3, {"OFF", "ON"}, 0, "GATE 3", nil,
+        1, nil, nil, nil, nil, nil, "gate")
+    gdsGui_schematic_addWire("unitTestCanvas28", "w1", "battA", "busX", nil)
+    gdsGui_schematic_addWire("unitTestCanvas28", "w2", "genB", "busX", nil)
+    gdsGui_schematic_addWire("unitTestCanvas28", "w3", "battC", "gate3", nil)
+    gdsGui_schematic_addWire("unitTestCanvas28", "w4", "gate3", "busX", nil)
+
+    local canvas = nil
+    for _, c in ipairs(globApp.objects.schematics) do
+        if c.name == "unitTestCanvas28" then canvas = c end
+    end
+    if not canvas then return "fail: canvas not found" end
+
+    canvas.elements[1].voltage = 24 -- battA
+    canvas.elements[3].voltage = 24 -- battC
+    canvas.controls[1].voltage = 28 -- genB
+    canvas.voltageColors = { [24] = _TEST_RED, [28] = _TEST_YELLOW }
+
+    local componentTypes = _buildComponentTypeMap(canvas)
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes, _nodePositionsForGraph(canvas))
+
+    -- Capture ONE snapshot: gate3 OPEN (battC isolated, not part of the
+    -- ambiguity at all), genB ON — busX, battA AND genB's own node are all
+    -- ambiguous between {battA, genB}, painted genB's own color at every
+    -- one of them (the generator backfeeding the battery's own node too,
+    -- same convention the real captured data used) — confirms the
+    -- heuristic at 3 different nodes AT ONCE, but since they're all the
+    -- SAME underlying event, this is still only ONE dominance example
+    -- (see _recomputeAttributionRules' own "one example per snapshot, not
+    -- per node" comment). This topology's own combination space (2
+    -- controls, 4 combos total) only has TWO combinations where the
+    -- hypothesis is even testable at all — this one (gate3 open) and
+    -- battC's own target combo (gate3 closed) — so teachableTotal = 2,
+    -- and with that target excluded (see _aiColorAttributionConfidence's
+    -- own "-1" comment) there's exactly ONE other testable combination,
+    -- already confirmed: battC's confidence should come out at 100%, not
+    -- merely ">0".
+    canvas.controls[2].detentIndex = 0 -- gate3 OFF (open)
+    canvas.elements[1].pendingColor = _TEST_YELLOW -- battA: backfed by genB
+    canvas.elements[2].pendingColor = _TEST_YELLOW -- busX: backfed by genB
+    canvas.elements[3].pendingColor = { 0.75, 0.75, 0.75, 1 } -- battC: isolated by open gate3, flat unpowered gray
+    canvas.controls[1].pendingColor = _TEST_YELLOW -- genB: its own color
+    canvas.controls[2].pendingColor = { 0.75, 0.75, 0.75, 1 } -- gate3: open, flat unpowered gray
+    gdsGui_schematic_commitSnapshot("unitTestCanvas28", gdsGui_schematic_prepareSnapshot("unitTestCanvas28"))
+
+    _recomputeAttributionRules(canvas, graph)
+
+    if canvas.attributionRules["battC"] then
+        return "fail: battC should have no per-node rule at all (never ambiguous in any capture)"
+    end
+    if not canvas.voltageDominanceRule or canvas.voltageDominanceRule.status ~= "learned" then
+        return "fail: global voltage-dominance rule not learned, status=" ..
+            tostring(canvas.voltageDominanceRule and canvas.voltageDominanceRule.status)
+    end
+
+    -- Close gate3: battC joins the bus and becomes ambiguous for the very
+    -- first time, at a combination nothing was ever captured for.
+    canvas.controls[2].detentIndex = 1 -- gate3 ON (closed)
+    local sourceStates = _currentSourceStates(canvas, componentTypes)
+    local gateStates = _currentGateStates(canvas, componentTypes)
+    local nodeStates = ModelSolver.solve(graph, sourceStates, gateStates)
+    local attribution = ModelSolver.solveSourceAttribution(graph, sourceStates, gateStates)
+    local battCConfidence = _aiColorAttributionConfidence(canvas, attribution, nodeStates, "battC", gateStates, sourceStates)
+    local battCColor = _colorForPoweredNode("battC", attribution, canvas, { 0.9, 0.9, 0.9, 1 }, nodeStates)
+    local battCIsGenBColor = battCColor[1] == _TEST_YELLOW[1] and battCColor[2] == _TEST_YELLOW[2] and battCColor[3] == _TEST_YELLOW[3]
+
+    return battCConfidence == 1, battCIsGenBColor
 end
 
 -- Changing ELECTRICAL_MEDIUM.style.powered (what
@@ -7353,6 +8144,34 @@ function modelGraphDiodeDirectionIgnoresPerpendicularBendTest()
     return poweredFromGenerator, backfeedIntoGenerator
 end
 
+-- Two diodes wired DIRECTLY together, each rotated so its own cathode
+-- faces the other (d1 rotation 180 points away from d2 sitting to its
+-- right; d2 rotation 0 points away from d1 sitting to its left) -- a
+-- genuine contradiction, since neither diode's own rotation agrees on
+-- who feeds whom. The old code only ever consulted whichever end
+-- happened to be the wire's own fromElementId (here d1), confidently
+-- REVERSING the wire's drawn d1->d2 order to d2->d1 off that single,
+-- arbitrarily-picked side while silently ignoring that d2's own rotation
+-- disagrees just as much. The fix (_resolveDirectionalEdges' bothGates
+-- branch) detects the contradiction and leaves the edge unresolved,
+-- which makes buildGraph fall back to the wire's own original d1->d2
+-- draw order instead of confidently asserting the reverse.
+function modelGraphDiodeToDiodeContradictionFallsBackToDrawOrderTest()
+    local elements = { {id = "d1"}, {id = "d2"} }
+    local wires = {
+        { id = "w1", fromElementId = "d1", toElementId = "d2" },
+    }
+    local positions = {
+        d1 = { x = 0.3, y = 0.5, rotation = 180 }, -- forward points away from d2
+        d2 = { x = 0.5, y = 0.5, rotation = 0 },   -- forward points away from d1
+    }
+    local componentTypes = { d1 = "directionalGate", d2 = "directionalGate" }
+    local graph = ModelGraph.buildGraph(elements, {}, wires, componentTypes, positions)
+    local w1Edge = nil
+    for _, e in ipairs(graph.edges) do if e.id == "w1" then w1Edge = e end end
+    return w1Edge.fromId, w1Edge.toId
+end
+
 -- Integration test for the directionalGate wire-coloring fix
 -- (_solveCurrentSchematic's own wire loop, reproduced manually here since
 -- that function is hardcoded to "mainCanvas" only — same reason
@@ -7776,6 +8595,30 @@ function suggestTargetedSnapshotNilWhenScoreFnNeverScoresTest()
     return suggestion.signature
 end
 
+-- incrsMinRHTopTimer/incrsSecRHTopTimer must never push timer.t past 59:59
+-- -- the timerTopRight display container is sized for exactly that (see
+-- format_time's own 3599s test) and silently clips/overflows past it.
+function timerIncrsMin_clampsAt5959Test()
+    timer.t = 3599
+    incrsMinRHTopTimer()
+    local afterMin = timer.t
+    timer.t = 3599
+    incrsSecRHTopTimer()
+    local afterSec = timer.t
+    return afterMin, afterSec
+end
+
+-- Bumping the timer back above the <=3s warning window with +1 min must
+-- re-arm blink.navSent, so a countdown that re-enters that window a
+-- second time still gets the early warning navigation (see love.update's
+-- COUNT DOWN branch and _rearmPreAlarmNavIfAboveWindow's own comment).
+function timerIncrsMin_rearmsPreAlarmNavTest()
+    timer.t = 2
+    blink.navSent = true
+    incrsMinRHTopTimer()
+    return blink.navSent
+end
+
 -------------------------------------------------------------------------------
 -- APP-SPECIFIC UNIT TESTS
 -- Registered here (top-level, after all app functions are defined) so both
@@ -7806,6 +8649,39 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcName"]={"format_time"},
         ["funcParameters"]={-5},
         ["funcExpctOutput"]={"00:00"}}
+
+    --------------------------------------------------------------------------
+    --  _formatRequiredFPM
+    --------------------------------------------------------------------------
+    gdsGui_dev_testExecute {["id"]="formatRequiredFPM_normal",
+        ["funcName"]={"_formatRequiredFPM"},
+        ["funcParameters"]={1000, 5},
+        ["funcExpctOutput"]={"REQ FPM:\n200"}}
+
+    -- time = 0 with a nonzero altitude change is undefined, not "no rate
+    -- needed" -- must read "N/A", not a plain "0".
+    gdsGui_dev_testExecute {["id"]="formatRequiredFPM_zeroTime_nonzeroAltitude_isNA",
+        ["funcName"]={"_formatRequiredFPM"},
+        ["funcParameters"]={1000, 0},
+        ["funcExpctOutput"]={"REQ FPM:\nN/A"}}
+
+    gdsGui_dev_testExecute {["id"]="formatRequiredFPM_zeroTime_zeroAltitude_isZero",
+        ["funcName"]={"_formatRequiredFPM"},
+        ["funcParameters"]={0, 0},
+        ["funcExpctOutput"]={"REQ FPM:\n0"}}
+
+    --------------------------------------------------------------------------
+    --  timer +1 min / +1 sec (clamp + pre-alarm nav re-arm)
+    --------------------------------------------------------------------------
+    gdsGui_dev_testExecute {["id"]="timerIncrsMin_clampsAt5959",
+        ["funcName"]={"timerIncrsMin_clampsAt5959Test"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={3599, 3599}}
+
+    gdsGui_dev_testExecute {["id"]="timerIncrsMin_rearmsPreAlarmNav",
+        ["funcName"]={"timerIncrsMin_rearmsPreAlarmNavTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={false}}
 
     --------------------------------------------------------------------------
     --  calcWindComponents  (returns {xw, side, ht, label} in devMode)
@@ -8099,6 +8975,11 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcParameters"]={0},
         ["funcExpctOutput"]={"powered", "unpowered"}}
 
+    gdsGui_dev_testExecute {["id"]="modelGraph_diodeToDiode_contradictionFallsBackToDrawOrder",
+        ["funcName"]={"modelGraphDiodeToDiodeContradictionFallsBackToDrawOrderTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"d1", "d2"}}
+
     gdsGui_dev_testExecute {["id"]="schematic_diodeCathodeWire_followsIndependentlyPoweredBus",
         ["funcName"]={"schematicDiodeCathodeWireFollowsBusTest"},
         ["funcParameters"]={0},
@@ -8231,6 +9112,14 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcExpctOutput"]={true, false}}
 
     --------------------------------------------------------------------------
+    --  systemType -> medium registry (model/media/registry.lua)
+    --------------------------------------------------------------------------
+    gdsGui_dev_testExecute {["id"]="mediaRegistry_currentMediumFallbackAndRoundTrip",
+        ["funcName"]={"mediaRegistryCurrentMediumTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={true, true, true}}
+
+    --------------------------------------------------------------------------
     --  voltage-keyed powered colors + voltage tie-break
     --------------------------------------------------------------------------
     gdsGui_dev_testExecute {["id"]="colorForPoweredNode_singleSourceOwnColor",
@@ -8277,6 +9166,11 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcName"]={"schematicTiedVoltageAttributionConfidenceTest"},
         ["funcParameters"]={0},
         ["funcExpctOutput"]={true, true, true}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_voltageDominance_generalizesAcrossNodes",
+        ["funcName"]={"schematicVoltageDominanceGeneralizesAcrossNodesTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={true, true}}
 
     gdsGui_dev_testExecute {["id"]="unlockSchematicFeature_setsEntitlementFlag",
         ["funcName"]={"unlockSchematicFeatureTest"},

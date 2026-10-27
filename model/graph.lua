@@ -86,18 +86,29 @@ end
 -- to the plain "ahead if cosine > 0" sign test per wire, same as a single
 -- isolated gate always had no sibling to rank against.
 local function _resolveDirectionalEdges(wires, nodes, positions)
-    local info = {}   -- wireIndex -> {gateNode, otherNode, cosine}
+    local info = {}   -- wireIndex -> {gateNode, otherNode, cosine} or {bothGates, fromNode, toNode, fromCosine, toCosine}
     local byGate = {} -- gateNodeId -> array of wireIndex (only entries with a known cosine)
     for i, w in ipairs(wires) do
         local fromNode, toNode = nodes[w.fromElementId], nodes[w.toElementId]
         if fromNode and toNode then
             local fromIsGate, toIsGate = fromNode.role == "directionalGate", toNode.role == "directionalGate"
-            if fromIsGate or toIsGate then
+            if fromIsGate and toIsGate then
+                -- A wire connecting two diodes directly: neither end's rotation
+                -- alone decides this edge (the old behavior always deferred to
+                -- whichever end happened to be fromElementId) -- both are
+                -- consulted below so a direct diode-to-diode wire honors
+                -- whichever diode's own orientation actually agrees with it.
+                info[i] = {
+                    bothGates = true, fromNode = fromNode, toNode = toNode,
+                    fromCosine = _directionalCosine(fromNode, toNode, positions),
+                    toCosine = _directionalCosine(toNode, fromNode, positions),
+                }
+            elseif fromIsGate or toIsGate then
                 local gateNode = fromIsGate and fromNode or toNode
                 local otherNode = (gateNode == fromNode) and toNode or fromNode
                 local cosine = _directionalCosine(gateNode, otherNode, positions)
                 info[i] = { gateNode = gateNode, otherNode = otherNode, cosine = cosine }
-                if cosine and not (fromIsGate and toIsGate) then
+                if cosine then
                     byGate[gateNode.id] = byGate[gateNode.id] or {}
                     table.insert(byGate[gateNode.id], i)
                 end
@@ -107,20 +118,45 @@ local function _resolveDirectionalEdges(wires, nodes, positions)
 
     local resolved = {}
     for i, entry in pairs(info) do
-        local gateNode, otherNode, cosine = entry.gateNode, entry.otherNode, entry.cosine
-        local isAhead
-        local group = byGate[gateNode.id]
-        if group and #group == 2 and cosine then
-            local otherIndex = (group[1] == i) and group[2] or group[1]
-            local otherCosine = info[otherIndex].cosine
-            if cosine ~= otherCosine then isAhead = cosine > otherCosine end
-        elseif cosine and cosine ~= 0 then
-            isAhead = cosine > 0
-        end
-        if isAhead == true then
-            resolved[i] = { fromId = gateNode.id, toId = otherNode.id }
-        elseif isAhead == false then
-            resolved[i] = { fromId = otherNode.id, toId = gateNode.id }
+        if entry.bothGates then
+            local fromCosine, toCosine = entry.fromCosine, entry.toCosine
+            local isAhead -- true: fromNode exits into toNode, false: toNode exits into fromNode
+            -- fromNode facing toNode (fromCosine > 0) and toNode facing away from
+            -- fromNode (toCosine < 0) agree: fromNode's cathode feeds toNode's
+            -- anode. The mirror image agrees the other way. Both landing on the
+            -- SAME side (both > 0: each thinks it's exiting into the other: both
+            -- < 0: each thinks it's receiving from the other) is a genuine
+            -- contradiction -- two diodes wired directly whose rotations disagree
+            -- about which one feeds the other -- left unresolved (falls back to
+            -- the wire's own draw order) rather than silently trusting either one.
+            if fromCosine and fromCosine ~= 0 and toCosine and toCosine ~= 0 then
+                if (fromCosine > 0) ~= (toCosine > 0) then isAhead = fromCosine > 0 end
+            elseif fromCosine and fromCosine ~= 0 then
+                isAhead = fromCosine > 0
+            elseif toCosine and toCosine ~= 0 then
+                isAhead = toCosine <= 0
+            end
+            if isAhead == true then
+                resolved[i] = { fromId = entry.fromNode.id, toId = entry.toNode.id }
+            elseif isAhead == false then
+                resolved[i] = { fromId = entry.toNode.id, toId = entry.fromNode.id }
+            end
+        else
+            local gateNode, otherNode, cosine = entry.gateNode, entry.otherNode, entry.cosine
+            local isAhead
+            local group = byGate[gateNode.id]
+            if group and #group == 2 and cosine then
+                local otherIndex = (group[1] == i) and group[2] or group[1]
+                local otherCosine = info[otherIndex].cosine
+                if cosine ~= otherCosine then isAhead = cosine > otherCosine end
+            elseif cosine and cosine ~= 0 then
+                isAhead = cosine > 0
+            end
+            if isAhead == true then
+                resolved[i] = { fromId = gateNode.id, toId = otherNode.id }
+            elseif isAhead == false then
+                resolved[i] = { fromId = otherNode.id, toId = gateNode.id }
+            end
         end
     end
     return resolved

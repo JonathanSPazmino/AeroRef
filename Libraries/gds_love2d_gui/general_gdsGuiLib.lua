@@ -177,6 +177,8 @@ function gdsGui_update (dt)
 
 	gdsGui_schematic_update (dt)
 	gdsGui_schematicGallery_update (dt)
+	gdsGui_textPrompt_update (dt)
+	gdsGui_inputTxtBox_rejectFlashUpdate (dt)
 
 	gdsGui_timeControl_updateTrigger (dt)
 

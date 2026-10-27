@@ -375,11 +375,15 @@ function gdsGui_table_create (spreadSheetName, strgPage, strgspreadSheetType, da
         local vsb = self.verticalScrollBar.ref
         if vsb then
             vsb.original.x, vsb.original.y, vsb.original.width, vsb.original.height = self.verticalScrollBar.x, self.verticalScrollBar.y, self.verticalScrollBar.width, self.verticalScrollBar.height
+            -- row count can change (gdsGui_table_setData after a filter/sort) without
+            -- the linked scrollbar ever being told, leaving its step/snap sizing stale.
+            vsb.numVisValues, vsb.numTotalValues = self.numRowsPerDisplay, self.rowsCount
             if vsb.resize then vsb:resize() end
         end
         local hsb = self.horizontalScrollBar.ref
         if hsb then
             hsb.original.x, hsb.original.y, hsb.original.width, hsb.original.height = self.horizontalScrollBar.x, self.horizontalScrollBar.y, self.horizontalScrollBar.width, self.horizontalScrollBar.height
+            hsb.numVisValues, hsb.numTotalValues = self.numCollumnsPerDisplay, self.collumnsCount
             if hsb.resize then hsb:resize() end
         end
     end

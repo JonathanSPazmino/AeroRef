@@ -41,30 +41,31 @@ globApp.objects.schematics = {}
 -- PRIVATE CONSTANTS
 --------------------------------------------------------------------------------
 
-local _CONTROL_RADIUS_FRAC   = 0.045   -- control hit/draw radius, as a fraction of min(canvas.contentW, canvas.contentH)
-local _GRID_SPACING_PX       = 2.1  -- world units between grid lines; also the element/control placement snap pitch (see _snapToGrid)
+local _CONTROL_RADIUS_FRAC   = 0.045   -- shared control hit/draw radius basis, as a fraction of min(canvas.contentW, canvas.contentH) — see _controlGridRadiusScale
+-- World units between grid lines (see _snapToGrid) AND the one "gridUnit"
+-- every element/control's own footprint is now authored in: a catalog item
+-- with gridW=2 (or gridSize=2 for a control) places as exactly 2 of these
+-- squares wide on screen, at any zoom or window size, the same way
+-- _snapToGrid keeps a snapped position on-grid regardless of zoom — see
+-- _elementGridFootprintFrac/_controlGridRadiusScale below.
+local _GRID_SPACING_PX       = 2
 local _MIN_ZOOM               = 1      -- fully zoomed out: the whole canvas box fits exactly in the viewport
-local _MAX_ZOOM               = 6
+local _MAX_ZOOM               = 8
 -- Element/control labels are invisible from _MIN_ZOOM through
 -- _LABEL_FADE_START_ZOOM (zoomed out, symbols are small and crowded —
 -- labels would just be clutter), then fade in linearly as zoom climbs from
 -- there up to _MAX_ZOOM, reaching fully opaque only once fully zoomed in.
 local _LABEL_FADE_START_ZOOM   = 4
--- Design/edit mode opens pre-zoomed to 2x (see gdsGui_schematic_resetView's
--- caller in main.lua) so the design surface reachable by panning is twice
--- the area of a single viewport-full, giving more room for elements. Pixel
--- size on screen is a function of (fraction size) * canvas.contentW * zoom, so
--- _ELEMENT_DEFAULT_*_FRAC below is halved from what it'd otherwise be to
--- keep a freshly-placed element the same on-screen size it would've been at
--- zoom 1 with the un-halved fraction — "more room, same-looking elements."
-local _EDIT_MODE_INITIAL_ZOOM = 2
-local _ELEMENT_DEFAULT_W_FRAC = 0.07
-local _ELEMENT_DEFAULT_H_FRAC = 0.05
+-- Floor on an element's label print width (see _drawElement) — not scaled
+-- by zoom, since the label font itself isn't either, so this stays a fixed
+-- on-screen budget comfortably wide enough for a short name at any normal
+-- font size, regardless of how narrow the element's own gridW/gridH box is.
+local _LABEL_MIN_WIDTH_PX     = 160
 local _PINCH_MIN_DIST_PX      = 1      -- guards against a near-zero divisor right as a pinch begins
 local _WIRE_WIDTH_PX         = 2 / 3   -- half of the previous 4/3px width
 local _WIRE_CROSS_HOP_RADIUS_PX = 2.5   -- radius of the little arc hop drawn where a wire crosses an unrelated one
 local _WIRE_BUNDLE_WIDTH_MULT   = 2     -- a "twisted bundle" (see _drawWireBundleSegment) draws this many times as thick as one normal wire
-local _WIRE_BUNDLE_STRIPE_LEN_PX = 6    -- length of one wire's own diagonal color band along a bundle
+local _WIRE_BUNDLE_STRIPE_LEN_PX = 3    -- length of one wire's own diagonal color band along a bundle
 local _CONNECTOR_RELEASE_SLOP_PX = 16  -- forgiveness margin for "which element did the wire-drag land on", since exact-rectangle precision is unreliable on a touchscreen
 local _CONNECTOR_TARGET_RADIUS_PX = 9  -- drawn radius of the green "valid connection point" reticle shown at each element's center while a wire is being dragged
 local _CONNECTOR_SNAP_COLOR  = {0.25, 0.95, 0.35, 1}
@@ -99,7 +100,7 @@ local _MENU_WIDTH_FRAC       = 0.8
 local _MENU_OPACITY          = 0.85 -- all modal menu panels render 15% transparent
 local _ELEMENT_TAP_SLOP_PX   = 6   -- max press->release movement still counted as a tap, not a drag
 local _LONG_PRESS_SECONDS    = 1.3 -- how long a held (not-yet-moved) press on an element/control/wire takes to unlock move/rotate/direction mode — see gdsGui_schematic_update
-local _CONFIRM_HOLD_SECONDS  = 2   -- how long a menu's explicitly-marked confirmIndex row must be held before it fires — see _markConfirmMenu/_pollMenuHoldToConfirm
+local _CONFIRM_HOLD_SECONDS  = 2   -- how long a menu's explicitly-marked confirm row(s) must be held before firing — see _markConfirmMenu/_pollMenuHoldToConfirm
 local _CONFIRM_HOLD_MAX_DT   = 0.1 -- per-frame cap when accumulating the hold above — stops one stalled/slow frame (GC pause, app resume) from satisfying the whole hold instantly
 local _WIRE_TAP_SLOP_PX      = 10  -- max distance from a wire's drawn line still counted as tapping it
 local _SWATCH_ROW_H_PX       = 64  -- height of the single row of color squares in a swatch picker
@@ -379,26 +380,34 @@ end
 -- COMBINATION CYCLING section below). Split out of
 -- gdsGui_schematic_placementNameConfirmed so the snapshot-wipe confirm step
 -- there can defer actually running this until the user confirms.
+-- Converts a catalog item's gridW/gridH (its footprint in whole "grid
+-- units" — see _GRID_SPACING_PX) into the 0-1 content-fraction w/h
+-- gdsGui_schematic_addElement expects: multiply by the shared world-unit
+-- grid pitch, then divide out contentW/H (not a precomputed static
+-- fraction) so the result stays exactly gridW/gridH squares wide/tall
+-- regardless of the live window's current size/aspect ratio, including a
+-- later resize.
+local function _elementGridFootprintFrac(canvas, gridW, gridH)
+    return (gridW or 1) * _GRID_SPACING_PX / canvas.contentW,
+           (gridH or 1) * _GRID_SPACING_PX / canvas.contentH
+end
+
+-- Converts a control catalog item's gridSize (its diameter in whole grid
+-- units) into the radiusScale gdsGui_schematic_addControl stores
+-- per-instance: canvas.controlRadius is the one shared, size-fits-all
+-- control radius (see _CONTROL_RADIUS_FRAC), so dividing the grid-unit
+-- radius by it bakes in whatever scale this particular gridSize needs —
+-- the control equivalent of _elementGridFootprintFrac above.
+local function _controlGridRadiusScale(canvas, gridSize)
+    return (gridSize or 2) * _GRID_SPACING_PX / 2 / canvas.controlRadius
+end
+
 -- Computes wFrac/hFrac for a pending "element" placement the same way
 -- _commitNamedPlacement builds the real element below, so grid-snapping
--- (which runs before the element exists, at the initial-tap call site) uses
--- the element's true footprint instead of the shared default size.
+-- (which runs before the element exists, at the initial-tap call site)
+-- uses the element's true gridW/gridH footprint.
 local function _pendingElementSizeFrac(canvas, pending)
-    if pending.matchControlSize then
-        -- Same on-screen footprint as a GENERATOR-style control: a
-        -- control's own diameter in content units is
-        -- canvas.controlRadius * 2 * radiusScale, and the design-mode
-        -- placement flow always arms a freshly-placed control at
-        -- radiusScale = 1/_EDIT_MODE_INITIAL_ZOOM = 0.5 (see
-        -- gdsGui_schematic_armControlPlacement's call site), so that
-        -- diameter simplifies to exactly canvas.controlRadius. Dividing
-        -- by contentW/contentH (not a precomputed static fraction)
-        -- keeps this exact regardless of the live window's current
-        -- size/aspect ratio, including a later resize.
-        return canvas.controlRadius / canvas.contentW, canvas.controlRadius / canvas.contentH
-    end
-    local sizeMul = pending.sizeMul or 1
-    return _ELEMENT_DEFAULT_W_FRAC * sizeMul, _ELEMENT_DEFAULT_H_FRAC * sizeMul
+    return _elementGridFootprintFrac(canvas, pending.gridW, pending.gridH)
 end
 
 local function _commitNamedPlacement(canvas, pending, trimmed)
@@ -418,7 +427,7 @@ local function _commitNamedPlacement(canvas, pending, trimmed)
         _pushUndo(canvas)
         gdsGui_schematic_addControl(pending.canvasName, pending.newId, pending.fracX, pending.fracY,
             pending.positions, 0, trimmed, pending.callbackFunc,
-            (1 / _EDIT_MODE_INITIAL_ZOOM) * (pending.radiusMul or 1), pending.spritePaths,
+            _controlGridRadiusScale(canvas, pending.gridSize), pending.spritePaths,
             nil, pending.overlaySpritePath, nil, pending.colorDarkenMul, pending.componentType)
         canvas.snapshots = {}
         _notifyChanged(canvas)
@@ -647,6 +656,30 @@ local function _elementCenter(canvas, e)
     return ex + ew / 2, ey + eh / 2
 end
 
+-- True for a quarter-turn (90 or 270, mod 360) — the only rotations
+-- (alongside 0/180, which leave w/h as-is) a rotatable element ever sits at
+-- (see _snapRotationDegrees), and the only ones where its own axis-aligned
+-- footprint comes out with width/height swapped from its stored w/h.
+local function _isQuarterTurnRotation(rotationDeg)
+    return ((rotationDeg or 0) % 180) == 90
+end
+
+-- An element's TRUE axis-aligned world-space footprint — the box every
+-- hit-test/collision/selection site should measure against, as opposed to
+-- _elementPixelRect's own ew,eh, which stay the UNROTATED local dimensions
+-- the draw-time push/rotate transform expects (see _drawElement's
+-- drawShapeWithColor). Since rotation is always a cardinal turn, a quarter
+-- turn's real footprint is exactly its stored box with width/height
+-- swapped — no approximation needed, unlike a true arbitrary-angle OBB.
+-- Center stays the same point either way, so it's computed off the
+-- original (unswapped) box before swapping.
+local function _elementFootprintRect(canvas, e)
+    local ex, ey, ew, eh = _elementPixelRect(canvas, e)
+    local cx, cy = ex + ew / 2, ey + eh / 2
+    if _isQuarterTurnRotation(e.rotation) then ew, eh = eh, ew end
+    return cx - ew / 2, cy - eh / 2, ew, eh
+end
+
 -- Center point of any wire/connector endpoint, element or control alike — an
 -- element's box center, or a control's own position (already its center,
 -- the same point _drawControl circles around).
@@ -671,14 +704,23 @@ end
 -- box — simpler than a true circle-vs-rect test, and only ever more
 -- conservative (a control placed exactly diagonal to another, just
 -- outside true circle-to-circle contact, could still be flagged here),
--- never less safe.
+-- never less safe. bufferPx pads every comparison by one full grid unit
+-- (world-space, so it scales with zoom like everything else here — see
+-- _GRID_SPACING_PX) so two boxes can never even land flush against each
+-- other, only ever a grid unit or more apart. Second return value is the
+-- actual obstacle (an entry from canvas.elements or canvas.controls) hit,
+-- nil when there's no overlap — callers that only care about the boolean
+-- (most of them) simply ignore it; gdsGui_schematic_moved's element/control
+-- drag branches use it to flag which obstacle to highlight red (see
+-- canvas.collidingObstacleId / _drawElement/_drawControl).
 local function _footprintOverlapsAnother(canvas, cx, cy, halfX, halfY, excludeId)
+    local bufferPx = 1 * _GRID_SPACING_PX * canvas.zoom -- 1 grid unit of required gap
     for _, e in ipairs(canvas.elements) do
         if e.id ~= excludeId then
-            local ex, ey, ew, eh = _elementPixelRect(canvas, e)
+            local ex, ey, ew, eh = _elementFootprintRect(canvas, e)
             local ecx, ecy, ehalfX, ehalfY = ex + ew / 2, ey + eh / 2, ew / 2, eh / 2
-            if math.abs(cx - ecx) < halfX + ehalfX and math.abs(cy - ecy) < halfY + ehalfY then
-                return true
+            if math.abs(cx - ecx) < halfX + ehalfX + bufferPx and math.abs(cy - ecy) < halfY + ehalfY + bufferPx then
+                return true, e
             end
         end
     end
@@ -686,8 +728,8 @@ local function _footprintOverlapsAnother(canvas, cx, cy, halfX, halfY, excludeId
         if c.id ~= excludeId then
             local ccx, ccy = _toPixel(canvas, c.x, c.y)
             local crad = canvas.controlRadius * canvas.zoom * (c.radiusScale or 1)
-            if math.abs(cx - ccx) < halfX + crad and math.abs(cy - ccy) < halfY + crad then
-                return true
+            if math.abs(cx - ccx) < halfX + crad + bufferPx and math.abs(cy - ccy) < halfY + crad + bufferPx then
+                return true, c
             end
         end
     end
@@ -710,7 +752,7 @@ end
 local function _hitElement(canvas, px, py)
     for i = #canvas.elements, 1, -1 do
         local e = canvas.elements[i]
-        local ex, ey, ew, eh = _elementPixelRect(canvas, e)
+        local ex, ey, ew, eh = _elementFootprintRect(canvas, e)
         if px >= ex and px <= ex + ew and py >= ey and py <= ey + eh then
             return e
         end
@@ -762,7 +804,7 @@ local function _hitAnchorNear(canvas, px, py)
     if exact then return exact end
     local best, bestDist = nil, _CONNECTOR_RELEASE_SLOP_PX
     for _, e in ipairs(canvas.elements) do
-        local ex, ey, ew, eh = _elementPixelRect(canvas, e)
+        local ex, ey, ew, eh = _elementFootprintRect(canvas, e)
         local cx = math.max(ex, math.min(px, ex + ew))
         local cy = math.max(ey, math.min(py, ey + eh))
         local dx, dy = px - cx, py - cy
@@ -1292,14 +1334,14 @@ end
 -- x,y are 0-1 fractions of the canvas box (controls are placed on the grid too).
 -- positions is an ordered array of position names, e.g. {"OFF","ON"} or {"OFF","ON","STBY"}.
 -- radiusScale (optional, defaults to 1): multiplies canvas.controlRadius for
--- this control only — see _ELEMENT_DEFAULT_*_FRAC's comment above. Unlike an
--- element's w/h, a control's radius is normally one shared canvas-wide
--- constant (canvas.controlRadius), so this is the per-instance equivalent of
--- that halved default, passed as 1/_EDIT_MODE_INITIAL_ZOOM by the design-mode
--- placement flow so a freshly-placed control still looks the historical size
--- under the new pre-zoomed default. Omitted (nil -> 1) for every other
--- caller (loading saved data, the demo seed, unit tests), so already-placed
--- controls keep rendering exactly as they always have. spritePaths
+-- this control only. Unlike an element's w/h, a control's radius is
+-- normally one shared canvas-wide constant (canvas.controlRadius), so this
+-- is the per-instance equivalent of an element's own gridW/gridH — the
+-- design-mode placement flow passes _controlGridRadiusScale(canvas,
+-- gridSize) so a freshly-placed control is exactly gridSize grid units
+-- across (see gdsGui_schematic_armControlPlacement). Omitted (nil -> 1) for
+-- every other caller (loading saved data, the demo seed, unit tests), so
+-- already-placed controls keep rendering exactly as they always have. spritePaths
 -- (optional): array of image paths parallel to positions — the one at
 -- detentIndex+1 is drawn (letterboxed, see _drawControl) instead of the
 -- plain vector circle+indicator-line for whichever position is currently
@@ -1430,19 +1472,14 @@ end
 -- catalog item the app layer knows is electrical — ready for the user to fill
 -- in via the design-mode element edit menu's PROPERTIES option. spritePath
 -- (optional): see gdsGui_schematic_addElement — threaded through unchanged.
--- sizeMul (optional, defaults to 1): multiplies _ELEMENT_DEFAULT_W_FRAC/
--- H_FRAC for this placement only — the element equivalent of a control's own
--- per-instance radiusScale, e.g. a DIODE catalog item whose symbol reads too
--- large at the shared default element size. Ignored when matchControlSize
--- is set.
--- matchControlSize (optional, defaults to false): sizes this element to
--- exactly match a freshly-placed GENERATOR-style control's own on-screen
--- diameter instead of any sizeMul of the default — see
--- _commitNamedPlacement's own comment for the exact formula.
+-- gridW/gridH (both optional, default to 1): this element's footprint in
+-- whole "grid units" (see _GRID_SPACING_PX) — a BATTERY catalog entry with
+-- gridW=2, gridH=4 places as exactly 2 grid squares wide by 4 tall, on
+-- screen, at any zoom or window size — see _elementGridFootprintFrac.
 -- componentType (optional): see gdsGui_schematic_addElement — threaded
 -- through unchanged, onto canvas.pendingPlacement, for _commitNamedPlacement
 -- to pass on to the real addElement call once the user names the placement.
-function gdsGui_schematic_armElementPlacement(canvasName, shapeType, label, defaultColor, idPrefix, defaultPropertyKeys, spritePath, sizeMul, matchControlSize, componentType)
+function gdsGui_schematic_armElementPlacement(canvasName, shapeType, label, defaultColor, idPrefix, defaultPropertyKeys, spritePath, gridW, gridH, componentType)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     -- At most one of pendingPlacement/pendingConnectorColor/
@@ -1454,27 +1491,27 @@ function gdsGui_schematic_armElementPlacement(canvasName, shapeType, label, defa
     gdsGui_schematic_cancelPlacement(canvasName)
     canvas.pendingPlacement = { kind = "element", shapeType = shapeType, label = label,
         defaultColor = defaultColor, idPrefix = idPrefix or label, defaultPropertyKeys = defaultPropertyKeys,
-        spritePath = spritePath, sizeMul = sizeMul, matchControlSize = matchControlSize,
+        spritePath = spritePath, gridW = gridW, gridH = gridH,
         componentType = componentType }
 end
 
 -- spritePaths, overlaySpritePath (both optional): see
 -- gdsGui_schematic_addControl — threaded through unchanged.
--- radiusMul (optional, defaults to 1): multiplies the design-mode placement
--- radiusScale for this placement only — the control equivalent of an
--- element's own per-instance sizeMul, e.g. a SWITCH catalog item whose icon
--- reads too large at the shared default control size.
+-- gridSize (optional, defaults to 2): this control's diameter in whole
+-- "grid units" (see _GRID_SPACING_PX) — the control equivalent of an
+-- element's own gridW/gridH, e.g. a SWITCH catalog entry with gridSize=2
+-- places as exactly 2 grid squares across — see _controlGridRadiusScale.
 -- colorDarkenMul (optional, defaults to 1): see gdsGui_schematic_addControl
 -- — threaded through unchanged.
 -- componentType (optional): see gdsGui_schematic_addElement above —
 -- threaded through unchanged, same as the other arm-time options here.
-function gdsGui_schematic_armControlPlacement(canvasName, positions, label, callbackFunc, idPrefix, spritePaths, overlaySpritePath, radiusMul, colorDarkenMul, componentType)
+function gdsGui_schematic_armControlPlacement(canvasName, positions, label, callbackFunc, idPrefix, spritePaths, overlaySpritePath, gridSize, colorDarkenMul, componentType)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     gdsGui_schematic_cancelPlacement(canvasName)
     canvas.pendingPlacement = { kind = "control", positions = positions, label = label,
         callbackFunc = callbackFunc, idPrefix = idPrefix or label, spritePaths = spritePaths,
-        overlaySpritePath = overlaySpritePath, radiusMul = radiusMul, colorDarkenMul = colorDarkenMul,
+        overlaySpritePath = overlaySpritePath, gridSize = gridSize, colorDarkenMul = colorDarkenMul,
         componentType = componentType }
 end
 
@@ -1624,34 +1661,65 @@ end
 --------------------------------------------------------------------------------
 
 -- Called only when the caller explicitly passes a confirmIndex (a
--- destructive action — DELETE, RESET, OVERWRITE, CONTINUE). Tags the row at
--- confirmIndex (1-based, into menu.options) as requiring a sustained
+-- destructive action — DELETE, RESET, OVERWRITE, CONTINUE). confirmIndex is
+-- either a plain number (1-based into menu.options — the original, still-
+-- supported single-row shape, always drawn in red)
+-- or an array of {index, color} entries for 2+ independently-colored
+-- confirm rows in the SAME menu (e.g. DESIGN ACTIONS' own CLEAR THIS
+-- SNAPSHOT/yellow and CLEAR ALL SNAPSHOTS/red) — color is {r,g,b,a},
+-- optional per entry (falls back to the same red default). Builds
+-- menu.confirmRows = {[index] = color}, consulted everywhere a row used to
+-- be compared against a single menu.confirmIndex (_handleMenuRelease,
+-- _pollMenuHoldToConfirm, _drawMenuBox/_drawMenuTextRow).
+--
+-- Tags every row named in confirmRows as requiring a sustained
 -- _CONFIRM_HOLD_SECONDS press instead of a plain tap, guarding against an
 -- accidental tap triggering something destructive, and folds a hint about
 -- that into the title so the user isn't left holding a row with no idea why
--- it isn't responding — see _pollMenuHoldToConfirm for where the hold is
--- actually timed. The destructive row lives directly in its menu's own
--- option list alongside every ordinary (plain-tap) row — e.g. the element
--- edit menu's own DELETE — rather than behind a separate "are you sure"
--- popup: one hold IS the confirmation, so there's nothing left to pop up a
--- second menu for. Deliberately passed explicitly by every call site rather
--- than inferred from option text/shape — a future row that happens to be
--- named "DELETE" or sit in a 2-option menu must not be silently gated
--- behind a hold it never asked for.
+-- it isn't responding (naming the one row by text when there's only one,
+-- same as before; a plain generic hint once there's more than one, since
+-- each row's own color already distinguishes it on screen) — see
+-- _pollMenuHoldToConfirm for where the hold is actually timed. Every
+-- destructive row lives directly in its menu's own option list alongside
+-- ordinary (plain-tap) rows — e.g. the element edit menu's own DELETE —
+-- rather than behind a separate "are you sure" popup: one hold IS the
+-- confirmation, so there's nothing left to pop up a second menu for.
+-- Deliberately passed explicitly by every call site rather than inferred
+-- from option text/shape — a future row that happens to be named "DELETE"
+-- or sit in a 2-option menu must not be silently gated behind a hold it
+-- never asked for.
 local function _markConfirmMenu(menu, confirmIndex)
     if not confirmIndex then return end
-    menu.confirmIndex = confirmIndex
+    -- Red — the historical single-confirm-row color, still the default
+    -- when a caller passes a plain confirmIndex number, or omits a color
+    -- for one entry of a per-row table. Local to here (its only use), not
+    -- file scope, to stay under this file's 200-local ceiling.
+    local defaultColor = {0.75, 0.15, 0.15, 1}
+    local rows = {}
+    if type(confirmIndex) == "table" then
+        for _, entry in ipairs(confirmIndex) do
+            rows[entry.index] = entry.color or defaultColor
+        end
+    else
+        rows[confirmIndex] = defaultColor
+    end
+    menu.confirmRows = rows
     if menu.title then
-        menu.title = menu.title .. " (PRESS & HOLD \"" .. menu.options[confirmIndex] ..
-            "\" " .. _CONFIRM_HOLD_SECONDS .. "S TO CONFIRM)"
+        local names = {}
+        for idx in pairs(rows) do table.insert(names, menu.options[idx]) end
+        if #names == 1 then
+            menu.title = menu.title .. " (PRESS & HOLD \"" .. names[1] .. "\" " .. _CONFIRM_HOLD_SECONDS .. "S TO CONFIRM)"
+        else
+            menu.title = menu.title .. " (PRESS & HOLD TO CONFIRM)"
+        end
     end
 end
 
 -- onSelectFunc(canvasName, index, optionText) and onCancelFunc(canvasName) are
 -- global function names (strings), resolved via _G[...] like every other
--- string-named callback in this library. confirmIndex (optional, 1-based
--- into options) marks that row a destructive hold-to-confirm gate instead of
--- a plain tap — see _markConfirmMenu. widthFrac (optional) overrides the
+-- string-named callback in this library. confirmIndex (optional) marks one
+-- or more rows a destructive hold-to-confirm gate instead of a plain tap —
+-- see _markConfirmMenu for its two accepted shapes. widthFrac (optional) overrides the
 -- menu box's width as a fraction of the canvas width (default
 -- _MENU_WIDTH_FRAC).
 function gdsGui_schematic_openMenu(canvasName, title, options, onSelectFunc, onCancelFunc, confirmIndex, widthFrac)
@@ -1808,9 +1876,9 @@ local function _handleMenuPress(owner, touchId, px, py)
     owner.menu._pressedHit     = _menuRowAt(owner, owner.menu, px, py)
     owner.menu._pressedTouchId = touchId
     -- Fresh press, fresh hold timer — see _pollMenuHoldToConfirm, which is
-    -- what actually fires a confirmIndex row once this reaches
+    -- what actually fires a confirm row once this reaches
     -- _CONFIRM_HOLD_SECONDS; harmless to reset here even for a non-confirm
-    -- menu, since nothing ever reads it without menu.confirmIndex set.
+    -- menu, since nothing ever reads it without menu.confirmRows set.
     owner.menu._holdElapsed    = 0
 end
 
@@ -1830,10 +1898,10 @@ local function _handleMenuRelease(owner, touchId, px, py)
         local cb = menu.onCancel
         owner.menu = nil
         if cb and _G[cb] then _G[cb](owner.name) end
-    elseif pressedHit == menu.confirmIndex then
-        -- A confirm menu's action row (see _markConfirmMenu) only ever
-        -- fires via a sustained hold, timed by _pollMenuHoldToConfirm — a
-        -- plain tap-release here, however deliberate it looked, is just an
+    elseif menu.confirmRows and menu.confirmRows[pressedHit] then
+        -- A confirm row (see _markConfirmMenu) only ever fires via a
+        -- sustained hold, timed by _pollMenuHoldToConfirm — a plain
+        -- tap-release here, however deliberate it looked, is just an
         -- abandoned attempt. The menu stays open so the user can try again.
         return
     elseif type(pressedHit) == "number" then
@@ -1846,43 +1914,72 @@ end
 
 -- Polled every frame (from gdsGui_schematic_update/gdsGui_schematicGallery_update)
 -- against any owner currently showing a menu: if that menu is a confirm menu
--- (menu.confirmIndex set — see _markConfirmMenu) and its action row is
--- currently being held down, accumulates the hold and fires onSelect the
--- instant it crosses _CONFIRM_HOLD_SECONDS — the same action a completed
--- tap-release would fire on any ordinary menu row, just gated behind a
--- deliberate hold instead of an easy-to-land-by-accident tap. Firing on
--- elapsed time rather than waiting for release is deliberate: a destructive
--- confirm should commit the moment the hold requirement is actually met, not
--- one more gesture after it.
+-- (menu.confirmRows set — see _markConfirmMenu) and whichever row is
+-- currently pressed is one of its confirm rows, accumulates the hold and
+-- fires onSelect the instant it crosses _CONFIRM_HOLD_SECONDS — the same
+-- action a completed tap-release would fire on any ordinary menu row, just
+-- gated behind a deliberate hold instead of an easy-to-land-by-accident
+-- tap. Firing on elapsed time rather than waiting for release is
+-- deliberate: a destructive confirm should commit the moment the hold
+-- requirement is actually met, not one more gesture after it.
 local function _pollMenuHoldToConfirm(owner, dt)
     local menu = owner.menu
-    if not menu or not menu.confirmIndex then return end
-    if menu._pressedTouchId == nil or menu._pressedHit ~= menu.confirmIndex then
+    if not menu or not menu.confirmRows then return end
+    local pressedIndex = menu._pressedHit
+    if menu._pressedTouchId == nil or not menu.confirmRows[pressedIndex] then
         menu._holdElapsed = 0
         return
     end
     menu._holdElapsed = (menu._holdElapsed or 0) + math.min(dt, _CONFIRM_HOLD_MAX_DT)
     if menu._holdElapsed < _CONFIRM_HOLD_SECONDS then return end
-    local opt = menu.options[menu.confirmIndex]
+    local opt = menu.options[pressedIndex]
     local cb = menu.onSelect
     owner.menu = nil
-    if cb and _G[cb] then _G[cb](owner.name, menu.confirmIndex, opt) end
+    if cb and _G[cb] then _G[cb](owner.name, pressedIndex, opt) end
 end
 
--- One text menu row, highlighted red when it's the destructive "DELETE"
--- option (wherever it appears: the design-mode element/wire/control/
--- annunciator edit menus, a gallery's aircraft/system manage-action menu).
--- holdFrac (optional, 0-1): while this row is the confirm-gated action AND is
--- currently being held down (see _pollMenuHoldToConfirm), draws a
--- left-to-right loading-bar overlay across it so the user can see how much
--- longer the hold needs to last instead of just waiting blind — reaching
--- the row's full width exactly when the hold is about to fire.
-local function _drawMenuTextRow(mx, mw, rowY, opt, holdFrac)
-    if opt == "DELETE" then
-        love.graphics.setColor(0.75, 0.15, 0.15, 1)
+-- One text menu row, filled with confirmColor whenever it's a confirm-gated
+-- action (menu.confirmRows[idx] — see _markConfirmMenu) — EVERY row
+-- requiring a sustained hold to fire, whatever its label actually says
+-- ("DELETE", "DELETE PROPERTY", "CLEAR PAGE", "CONTINUE", "OVERWRITE", ...),
+-- not just rows whose text happens to literally read "DELETE". Previously
+-- keyed off an exact opt == "DELETE" text match, so every other
+-- confirm-gated row (RESET, SNAPSHOT RESET's CONTINUE, a snapshot-conflict
+-- OVERWRITE, ...) looked like an ordinary plain-tap row even though it
+-- already required the same hold to actually fire — inconsistent styling
+-- for identical behavior. holdFrac (optional, 0-1): while this row is a
+-- confirm-gated action AND is currently being held down (see
+-- _pollMenuHoldToConfirm), draws a left-to-right loading-bar overlay across
+-- it so the user can see how much longer the hold needs to last instead of
+-- just waiting blind — reaching the row's full width exactly when the hold
+-- is about to fire.
+local function _drawMenuTextRow(mx, mw, rowY, opt, confirmColor, holdFrac)
+    if confirmColor then
+        love.graphics.setColor(confirmColor[1], confirmColor[2], confirmColor[3], confirmColor[4] or 1)
         love.graphics.rectangle("fill", mx + 4, rowY + 2, mw - 8, _MENU_ROW_H - 4)
         love.graphics.setColor(1, 1, 1, 1)
         love.graphics.rectangle("line", mx + 4, rowY + 2, mw - 8, _MENU_ROW_H - 4)
+        -- Black for a light confirm color (yellow and up), white otherwise
+        -- — keeps the row's own label readable regardless of which color
+        -- it was given (the historical red default always resolved to
+        -- white text; yellow needs the opposite). Plain luminance
+        -- threshold, not a true perceptual formula — this only ever has
+        -- to pick between two colors wildly far apart in brightness,
+        -- never a close call. Nested here (its only caller) to stay under
+        -- this file's 200-local ceiling.
+        local luminance = 0.299 * confirmColor[1] + 0.587 * confirmColor[2] + 0.114 * confirmColor[3]
+        if luminance > 0.6 then love.graphics.setColor(0, 0, 0, 1) else love.graphics.setColor(1, 1, 1, 1) end
+    elseif opt == "RETURN" then
+        -- Every RETURN row, on every schematic menu (this function is the
+        -- one shared draw path _drawMenuBox/gdsGui_schematicGallery_
+        -- drawMenuOverlay both call) — a footer matching _drawMenuBox's
+        -- own title-bar treatment exactly (full-bleed fill, no inset
+        -- margin, no outline), not another row styled like the
+        -- confirmColor ones above. Still an ordinary single-tap row —
+        -- only its background changes, no hold-to-confirm behavior.
+        love.graphics.setColor(0.25, 0.25, 0.25, _MENU_OPACITY)
+        love.graphics.rectangle("fill", mx, rowY, mw, _MENU_ROW_H)
+        love.graphics.setColor(1, 1, 1, 1)
     else
         love.graphics.setColor(1, 1, 1, 0.15)
         love.graphics.rectangle("line", mx + 4, rowY + 2, mw - 8, _MENU_ROW_H - 4)
@@ -1890,7 +1987,7 @@ local function _drawMenuTextRow(mx, mw, rowY, opt, holdFrac)
     end
     love.graphics.printf(opt, mx, rowY + 8, mw, "center")
     if holdFrac and holdFrac > 0 then
-        love.graphics.setColor(1, 1, 1, 0.45)
+        love.graphics.setColor(0.2, 0.5, 1, 0.5)
         love.graphics.rectangle("fill", mx + 4, rowY + 2, (mw - 8) * math.min(1, holdFrac), _MENU_ROW_H - 4)
         love.graphics.setColor(1, 1, 1, 1)
         love.graphics.rectangle("line", mx + 4, rowY + 2, mw - 8, _MENU_ROW_H - 4)
@@ -1918,13 +2015,13 @@ local function _drawMenuBox(owner, menu)
         rowY = rowY + titleH
     end
 
-    -- Which row (by combined options index — same indexing menu.confirmIndex
-    -- itself uses, swatches included) is the confirm action currently being
+    -- Which row (by combined options index — same indexing menu.confirmRows
+    -- itself uses, swatches included) is a confirm action currently being
     -- held down, and how far through _CONFIRM_HOLD_SECONDS that hold is —
     -- see _drawMenuTextRow's own comment for why.
     local holdIndex, holdFrac
-    if menu.confirmIndex and menu._pressedTouchId ~= nil and menu._pressedHit == menu.confirmIndex then
-        holdIndex = menu.confirmIndex
+    if menu.confirmRows and menu._pressedTouchId ~= nil and menu.confirmRows[menu._pressedHit] then
+        holdIndex = menu._pressedHit
         holdFrac = (menu._holdElapsed or 0) / _CONFIRM_HOLD_SECONDS
     end
 
@@ -1941,12 +2038,13 @@ local function _drawMenuBox(owner, menu)
         end
         rowY = rowY + _SWATCH_ROW_H_PX
         for j, opt in ipairs(menu.extraOptions) do
-            _drawMenuTextRow(mx, mw, rowY, opt, (n + j == holdIndex) and holdFrac or nil)
+            local idx = n + j
+            _drawMenuTextRow(mx, mw, rowY, opt, menu.confirmRows and menu.confirmRows[idx], (idx == holdIndex) and holdFrac or nil)
             rowY = rowY + _MENU_ROW_H
         end
     else
         for i, opt in ipairs(menu.options) do
-            _drawMenuTextRow(mx, mw, rowY, opt, (i == holdIndex) and holdFrac or nil)
+            _drawMenuTextRow(mx, mw, rowY, opt, menu.confirmRows and menu.confirmRows[i], (i == holdIndex) and holdFrac or nil)
             rowY = rowY + _MENU_ROW_H
         end
     end
@@ -2689,12 +2787,12 @@ function gdsGui_schematic_openElementEditMenu(canvasName, elementId)
     local title = el.label or elementId
     -- canvas.elementMenuTitleSuffix (optional, by-name like every other
     -- string-registered hook): called as fn(canvasName, elementId) just
-    -- before this menu opens, for a line to APPEND to its title — e.g.
-    -- the inference model's own sensed voltage reading (main.lua's
-    -- schematicElementVoltageMenuSuffix). The library never interprets
-    -- what comes back; nil/"" means nothing extra to show, same as the
-    -- hook simply not being registered at all (an untyped/non-ELECTRICAL
-    -- system, say).
+    -- before this menu opens, for a line to APPEND to its title. The
+    -- library never interprets what comes back; nil/"" means nothing extra
+    -- to show, same as the hook simply not being registered at all. Not
+    -- currently wired up by main.lua — the app used this for its sensed-
+    -- voltage reading until that moved to the PROPERTIES menu instead (see
+    -- canvas.elementSensedValues, _openPropertiesMenu below).
     if canvas.elementMenuTitleSuffix then
         local fn = _G[canvas.elementMenuTitleSuffix]
         local suffix = fn and fn(canvasName, elementId)
@@ -2967,6 +3065,19 @@ end
 -- is ever in flight at a time, same as _pendingNamedPlacement above.
 local _pendingPropertyEntry = nil
 
+-- canvas.elementSensedValues (optional, by-name like canvas.onChange and
+-- every other string-registered hook): called as fn(canvasName, elementId)
+-- just before the PROPERTIES menu opens, returning an array of
+-- {label=string, value=string|nil} READ-ONLY sensed readings (e.g. VOLTAGE,
+-- eventually CURRENT once current is modeled — see main.lua's
+-- schematicElementSensedValues) to show above the element's own
+-- user-editable custom properties. A nil/empty value displays "N/A" —
+-- distinct from a custom property's "(not set)", since these rows were
+-- never meant to be typed into in the first place. They're prepended to
+-- `options` ahead of el.properties, so gdsGui_schematic_internal_
+-- onPropertyRowChosen below has to offset its index into el.properties by
+-- however many of these rows there are (canvas._propertySensedRowCount) —
+-- tapping one of these rows itself is a no-op (nothing to edit).
 function _openPropertiesMenu(canvasName, elementId)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
@@ -2976,6 +3087,36 @@ function _openPropertiesMenu(canvasName, elementId)
     canvas._propertyEditTargetId = elementId
     canvas.selectedElementId = elementId
     local options = {}
+    local sensedCount = 0
+    local sensedLabels = {}
+    if canvas.elementSensedValues then
+        local fn = _G[canvas.elementSensedValues]
+        local sensed = fn and fn(canvasName, elementId)
+        for _, s in ipairs(sensed or {}) do
+            table.insert(options, s.label .. ": " .. ((s.value == nil or s.value == "") and "N/A" or s.value))
+            sensedLabels[s.label:upper()] = true
+            sensedCount = sensedCount + 1
+        end
+    end
+    canvas._propertySensedRowCount = sensedCount
+    -- A custom property sharing a reserved sensed-value label (e.g. a
+    -- "VOLTAGE" property hand-added before this feature existed) would
+    -- otherwise show a second, user-editable "VOLTAGE: (not set)" row right
+    -- next to the real read-only one above — stale/confusing, so it's
+    -- stripped on sight rather than merely hidden (gdsGui_schematic_
+    -- propertyKeyConfirmed blocks creating a new one the same way going
+    -- forward). Not pushed onto the undo stack — this is a one-time data
+    -- migration, not a user edit the user would ever want to "undo" back in.
+    if next(sensedLabels) ~= nil and el.properties then
+        local removedAny = false
+        for i = #el.properties, 1, -1 do
+            if sensedLabels[el.properties[i].key:upper()] then
+                table.remove(el.properties, i)
+                removedAny = true
+            end
+        end
+        if removedAny then _notifyChanged(canvas) end
+    end
     for _, p in ipairs(el.properties or {}) do
         table.insert(options, p.key .. ": " .. ((p.value == "" or p.value == nil) and "(not set)" or p.value))
     end
@@ -3003,16 +3144,33 @@ function gdsGui_schematic_internal_onPropertyRowChosen(canvasName, index, option
         return
     elseif optionText == "ADD PROPERTY" then
         _pendingPropertyEntry = { canvasName = canvasName, elementId = elementId }
-        gdsGui_textPrompt_open("NEW PROPERTY NAME (e.g. VOLTAGE)", "", 20,
+        -- VOLTAGE is no longer a free-form example here — it's a reserved,
+        -- auto-populated sensed-value row above these (see
+        -- canvas.elementSensedValues) — PART NUMBER avoids suggesting the
+        -- user re-type something already shown read-only.
+        gdsGui_textPrompt_open("NEW PROPERTY NAME (e.g. PART NUMBER)", "", 20,
             "gdsGui_schematic_propertyKeyConfirmed", "gdsGui_schematic_propertyEntryCancelled")
         return
     end
+    -- Rows above the user's own custom properties are the read-only sensed
+    -- values _openPropertiesMenu prepended (VOLTAGE, CURRENT, ...) — see its
+    -- own comment. Tapping one is a no-op; el.properties' own indices start
+    -- right after them.
+    local sensedCount = canvas._propertySensedRowCount or 0
+    if index <= sensedCount then return end
     local el = _findElement(canvas, elementId)
-    local prop = el and el.properties and el.properties[index]
+    local prop = el and el.properties and el.properties[index - sensedCount]
     if not prop then return end
     canvas._propertyActionKey = prop.key
+    -- DELETE PROPERTY (index 2) is this menu's own confirmIndex row, same
+    -- treatment as every sibling DELETE action (element/control/wire/
+    -- annunciator edit menus) — previously the one DELETE-shaped row in the
+    -- whole editor that fired on a plain tap with no hold-to-confirm gate
+    -- at all, an inconsistency rather than a deliberate lower-stakes case
+    -- (contrast CLEAR SNAPSHOT in _openDesignActionsMenu, which stays
+    -- plain-tap on purpose — see that call site's own comment).
     gdsGui_schematic_openMenu(canvasName, prop.key, {"EDIT VALUE", "DELETE PROPERTY", "RETURN"},
-        "gdsGui_schematic_internal_onPropertyActionChosen", "gdsGui_schematic_internal_onPropertyActionCancelled")
+        "gdsGui_schematic_internal_onPropertyActionChosen", "gdsGui_schematic_internal_onPropertyActionCancelled", 2)
 end
 
 function gdsGui_schematic_internal_onPropertyActionChosen(canvasName, index, optionText)
@@ -3056,6 +3214,21 @@ function gdsGui_schematic_propertyKeyConfirmed(text)
         gdsGui_textPrompt_open("NAME REQUIRED, TRY AGAIN", "", 20,
             "gdsGui_schematic_propertyKeyConfirmed", "gdsGui_schematic_propertyEntryCancelled")
         return
+    end
+    -- VOLTAGE/CURRENT (or whatever canvas.elementSensedValues currently
+    -- reports for this element — see _openPropertiesMenu) are reserved,
+    -- read-only sensed rows; a same-named custom property would just create
+    -- a second, confusing, user-editable row right next to the real one.
+    local canvas = _findCanvas(pending.canvasName)
+    if canvas and canvas.elementSensedValues and _G[canvas.elementSensedValues] then
+        local sensed = _G[canvas.elementSensedValues](pending.canvasName, pending.elementId) or {}
+        for _, s in ipairs(sensed) do
+            if s.label:upper() == trimmed then
+                gdsGui_textPrompt_open("\"" .. trimmed .. "\" IS RESERVED, TRY AGAIN", "", 20,
+                    "gdsGui_schematic_propertyKeyConfirmed", "gdsGui_schematic_propertyEntryCancelled")
+                return
+            end
+        end
     end
     pending.key = trimmed
     gdsGui_textPrompt_open("VALUE FOR " .. trimmed, "", 20,
@@ -3684,11 +3857,16 @@ local function _drawColorSequenceStriped(boundsX, boundsY, boundsW, boundsH, col
 end
 
 -- Draws a spritePath image (an element's own, or a control's spritePaths
--- entry for its current detent — see gdsGui_schematic_addControl) letterboxed
--- into the given box (tinted by r,g,b,a — the normal resolved color, so
+-- entry for its current detent — see gdsGui_schematic_addControl) filling
+-- the given box exactly (tinted by r,g,b,a — the normal resolved color, so
 -- snapshot/pending color overrides still read on a sprite the same as they
--- do on a plain rect/circle). Scales to fit, not to fill, so a non-square
--- source image (or box) never gets stretched out of proportion. rotationDeg
+-- do on a plain rect/circle). Scales X and Y independently to fill, not to
+-- fit, so the drawn sprite always matches the box's own edges (the same box
+-- the selection square/collision check use — see _drawElement) exactly,
+-- never shrunk/letterboxed to preserve the source image's own aspect ratio.
+-- A control's box is always square (see _drawControl's drawHalf), so this
+-- is a no-op there either way; it only matters for an element whose own
+-- gridW/gridH box isn't the same aspect as its source image. rotationDeg
 -- (optional, 0/90/180/270, see _snapRotationDegrees) spins it around the
 -- box's own center — same cardinal-orientation convention as
 -- _drawDiodeSymbol, just generalized to any image instead of hand-drawn
@@ -3696,17 +3874,16 @@ end
 local function _drawElementSprite(path, ex, ey, ew, eh, r, g, b, a, rotationDeg)
     local image = _loadElementSprite(path)
     local iw, ih = image:getDimensions()
-    local scale = math.min(ew / iw, eh / ih)
-    local drawW, drawH = iw * scale, ih * scale
+    local scaleX, scaleY = ew / iw, eh / ih
     love.graphics.setColor(r, g, b, a)
     if rotationDeg and rotationDeg ~= 0 then
         love.graphics.push()
         love.graphics.translate(ex + ew / 2, ey + eh / 2)
         love.graphics.rotate(math.rad(rotationDeg))
-        love.graphics.draw(image, -drawW / 2, -drawH / 2, 0, scale, scale)
+        love.graphics.draw(image, -ew / 2, -eh / 2, 0, scaleX, scaleY)
         love.graphics.pop()
     else
-        love.graphics.draw(image, ex + (ew - drawW) / 2, ey + (eh - drawH) / 2, 0, scale, scale)
+        love.graphics.draw(image, ex, ey, 0, scaleX, scaleY)
     end
 end
 
@@ -3731,16 +3908,18 @@ end
 local _CANVAS_BG_OPACITY = 0.35  -- shared by the main backdrop and the corner images below
 
 -- These background/corner watermarks (the airplane/schematic-canvas artwork
--- set via gdsGui_schematic_setBackground*Image below) are a near-white tint
--- meant to barely show against a DARK canvas — on the light canvas backdrop
--- that same tint goes invisible outright, so in WHITE MODE
--- (globApp.themeIsDark == false) they're tinted dark gray instead of white.
+-- set via gdsGui_schematic_setBackground*Image below) are tinted per theme
+-- rather than drawn at the art's own color, so they read as a faint
+-- watermark against either canvas backdrop instead of going invisible (a
+-- light tint vanishes on a light canvas) or clashing too brightly (plain
+-- white on a dark canvas). Dark mode: flat mid-gray (80,80,80). WHITE MODE
+-- (globApp.themeIsDark == false): darker gray so it stays faint against the
+-- light backdrop too.
+local _BG_DARK_MODE_TINT  = {80 / 255, 80 / 255, 80 / 255}
 local _BG_LIGHT_MODE_TINT = {0.25, 0.25, 0.25}
-local function _drawTintedImage(image, px, py, scale, r, g, b, a)
-    if globApp.themeIsDark == false then
-        r, g, b = _BG_LIGHT_MODE_TINT[1], _BG_LIGHT_MODE_TINT[2], _BG_LIGHT_MODE_TINT[3]
-    end
-    love.graphics.setColor(r, g, b, a)
+local function _drawTintedImage(image, px, py, scale, a)
+    local tint = (globApp.themeIsDark == false) and _BG_LIGHT_MODE_TINT or _BG_DARK_MODE_TINT
+    love.graphics.setColor(tint[1], tint[2], tint[3], a)
     love.graphics.draw(image, px, py, 0, scale, scale)
 end
 
@@ -3754,7 +3933,7 @@ local function _drawCanvasBackground(canvas)
     local px = canvas.x + canvas.panX
     local py = canvas.y + canvas.panY + worldY * canvas.zoom
     local scale = worldScale * canvas.zoom
-    _drawTintedImage(image, px, py, scale, 1, 1, 1, _CANVAS_BG_OPACITY)
+    _drawTintedImage(image, px, py, scale, _CANVAS_BG_OPACITY)
 end
 
 -- Draws canvas.cornerBackgroundImagePath / cornerRightBackgroundImagePath /
@@ -3780,7 +3959,7 @@ local function _drawCornerImage(canvas, path, alignRight, alignTop, sizeMul)
     local px = canvas.x + canvas.panX + worldX * canvas.zoom
     local py = canvas.y + canvas.panY + worldY * canvas.zoom
     local scale = worldScale * canvas.zoom
-    _drawTintedImage(image, px, py, scale, 1, 1, 1, _CANVAS_BG_OPACITY)
+    _drawTintedImage(image, px, py, scale, _CANVAS_BG_OPACITY)
 end
 
 local function _drawCanvasCornerBackground(canvas)
@@ -3870,17 +4049,7 @@ local function _labelAlphaForZoom(zoom)
     return math.max(0, math.min(1, (zoom - _LABEL_FADE_START_ZOOM) / (_MAX_ZOOM - _LABEL_FADE_START_ZOOM)))
 end
 
--- One common selection-ring radius for every element's ring (so selecting a
--- DIODE vs. a BUS doesn't flash two different ring sizes), pinned to the
--- same size a GENERATOR control's own selection ring uses — i.e. a control
--- placed with no radiusMul override, whose stored radiusScale is always
--- exactly 1/_EDIT_MODE_INITIAL_ZOOM (baked in at placement-commit time; see
--- _commitNamedPlacement) — rather than derived from any element's own size.
-local function _commonElementSelectionRadius(canvas)
-    return canvas.controlRadius * canvas.zoom * (1 / _EDIT_MODE_INITIAL_ZOOM) + 4
-end
-
-local function _drawElement(canvas, e, commonSelRad, signature)
+local function _drawElement(canvas, e, signature)
     local ex, ey, ew, eh = _elementPixelRect(canvas, e)
     -- Drawn exactly as resolved (no extra darken), so an element shows the
     -- same palette color — default gray included — as a wire or control.
@@ -3929,6 +4098,25 @@ local function _drawElement(canvas, e, commonSelRad, signature)
         drawShapeWithColor(r, g, b, a)
     end
 
+    -- From here on, ex,ey,ew,eh give way to the element's own TRUE
+    -- (rotation-aware) footprint — everything below is either the
+    -- selection outline/overlays (which must match what
+    -- _footprintOverlapsAnother/_hitElement actually collide against, see
+    -- _elementFootprintRect) or the label (world-space text, not inside
+    -- the shape's own push/rotate block above, so "below the box" means
+    -- below the box as it actually sits rotated).
+    local fex, fey, few, feh = _elementFootprintRect(canvas, e)
+    -- Flagged by gdsGui_schematic_moved's "element"/"control" dragKind
+    -- branches as the specific obstacle a relocation drag is currently
+    -- pushing into (via _footprintOverlapsAnother's 2nd return value) —
+    -- red for exactly as long as that stays true, cleared the instant the
+    -- drag clears it or the gesture ends. Independent of (and drawn before,
+    -- so selection's own yellow/magenta wins if both were ever true at
+    -- once) the normal selection outline below.
+    if canvas.collidingObstacleId == e.id then
+        love.graphics.setColor(1, 0, 0, 1)
+        love.graphics.rectangle("line", fex, fey, few, feh)
+    end
     if canvas.selectedElementId == e.id then
         -- Magenta once the 2-second hold has unlocked drag/rotate for it
         -- (see gdsGui_schematic_update's long-press timer) — yellow is
@@ -3942,16 +4130,16 @@ local function _drawElement(canvas, e, commonSelRad, signature)
         else
             love.graphics.setColor(1, 1, 0, 1)
         end
-        -- Same circular selection ring as a control's own (see
-        -- _drawControl's matching "circle", cx, cy, rad + 4" line) instead
-        -- of a rectangle hugging the box — one consistent "this is
-        -- selected" shape for every anchor kind, element or control alike.
-        -- Radius is shared across every element on this canvas (see
-        -- _commonElementSelectionRadius above) rather than each element's
-        -- own half-diagonal, so the ring doesn't visibly change size as
-        -- selection moves between a small DIODE and a large BUS.
-        local selCx, selCy = ex + ew / 2, ey + eh / 2
-        love.graphics.circle("line", selCx, selCy, commonSelRad)
+        -- Hugs the element's own true pixel footprint (fex,fey,few,feh) with
+        -- no padding — the exact same box _footprintOverlapsAnother checks
+        -- placement/drag collisions against (see _elementFootprintRect), so
+        -- the visible selection square IS the collision boundary — rotated
+        -- right along with the element for a non-square (gridW ~= gridH)
+        -- one, not a separate shared size that only approximated it.
+        -- Square, same as a control's own selection box (see _drawControl's
+        -- matching "rectangle" line) — one consistent "this is selected"
+        -- shape for every anchor kind.
+        love.graphics.rectangle("line", fex, fey, few, feh)
         if canvas.selectionMoveModeActive then
             -- Mutually exclusive, not both at once: every further tap on
             -- the active target toggles between them (see
@@ -3959,15 +4147,14 @@ local function _drawElement(canvas, e, commonSelRad, signature)
             -- than opening the edit menu. Every element is rotatable now,
             -- same as every control.
             if canvas.rotateModeActive then
-                -- commonSelRad - 1: same offset the old per-element formula
-                -- used between its own ringBase and selRad (diag+3 vs.
-                -- diag+4), kept here so the rotate arc still nests just
-                -- outside the (now shared-size) selection ring above
-                -- instead of landing inside it for a smaller element.
-                local ringBase = commonSelRad - 1
-                _drawRotateModeOverlay(ex + ew / 2, ey + eh / 2, ringBase, canvas.zoom)
+                -- Half-diagonal, not half-width/height — the smallest
+                -- circle that still fully encloses the (now exact, not
+                -- shared-size) selection box above, so the rotate arc nests
+                -- just outside its corners rather than cutting through them.
+                local ringBase = math.sqrt((few / 2) ^ 2 + (feh / 2) ^ 2)
+                _drawRotateModeOverlay(fex + few / 2, fey + feh / 2, ringBase, canvas.zoom)
             else
-                _drawMoveModeOverlay(ex + ew / 2, ey + eh / 2, ew / 2 + 3, eh / 2 + 3, canvas.zoom)
+                _drawMoveModeOverlay(fex + few / 2, fey + feh / 2, few / 2, feh / 2, canvas.zoom)
             end
         end
     end
@@ -3983,18 +4170,36 @@ local function _drawElement(canvas, e, commonSelRad, signature)
         -- actually tracks that setting — falling back to the ambient font
         -- so the GUI library still draws something without it.
         love.graphics.setFont(globApp.appFont or love.graphics.getFont())
-        if e.shapeType == "diode" or e.spritePath then
-            -- A diode has no filled body to back the label against (just
-            -- thin lines), and at a 90/270 rotation those lines run right
-            -- through the box's vertical center — so unlike every other
-            -- shape, its label sits below the box instead of across it. A
-            -- sprite is the same problem from the opposite direction: it
-            -- DOES fill most of the box with actual art, which centered
-            -- text would just overlap.
-            love.graphics.printf(e.label, ex, ey + eh + 2, ew, "center")
-        else
-            love.graphics.printf(e.label, ex, ey + eh / 2 - 6, ew, "center")
-        end
+        -- canvas.elementStatusText (optional, by-name like canvas.onChange/
+        -- canvas.elementSensedValues): called as fn(canvasName, elementId),
+        -- returning an optional status string (e.g. a source element's
+        -- sensed voltage) for this element's own row 2 — the element
+        -- equivalent of a control's current position (see _drawControl's
+        -- posName). Stays nil, and the label stays one row, for any element
+        -- the app layer hasn't wired a status reading for. Kept as an
+        -- app-resolved hook (not a field this domain-agnostic library reads
+        -- directly off `e`) for the same reason componentType/onChange are
+        -- callback-by-name — see this file's own header comment.
+        local statusText = canvas.elementStatusText and _G[canvas.elementStatusText]
+            and _G[canvas.elementStatusText](canvas.name, e.id)
+        local labelText = statusText and ((e.label or "") .. "\n" .. statusText) or e.label
+        -- Always below the box, never centered across it — same position/
+        -- style as a control's own label (see _drawControl), one consistent
+        -- look for every anchor kind. A diode/sprite had no other choice
+        -- already (diode has no filled body to back text against; a sprite
+        -- fills the box with actual art), now shared by every shape.
+        --
+        -- Print width is NOT just ew: an element's own box can now be far
+        -- narrower than its name needs (a 2-grid-unit-wide BATTERY, say —
+        -- see armElementPlacement's gridW/gridH), and the label font is a
+        -- fixed on-screen size that doesn't shrink with it (not scaled by
+        -- canvas.zoom like ew is) — so a plain `ew` width would wrap even a
+        -- short name onto a second line it was never meant to have. Floored
+        -- at _LABEL_MIN_WIDTH_PX (comfortably wider than a short label needs
+        -- at any normal font size) and still centered on the box's own
+        -- center, so a wide element (a BUS) is unaffected either way.
+        local labelW = math.max(few, _LABEL_MIN_WIDTH_PX)
+        love.graphics.printf(labelText, fex + few / 2 - labelW / 2, fey + feh + 2, labelW, "center")
     end
 end
 
@@ -4750,6 +4955,22 @@ end
 local function _drawControl(canvas, c, signature)
     local cx, cy = _toPixel(canvas, c.x, c.y)
     local rad = canvas.controlRadius * canvas.zoom * (c.radiusScale or 1)
+    -- Half-extent of the square SELECTION outline/label layout only — a
+    -- few px of cosmetic breathing room around the icon. The icon itself
+    -- (sprite, vector fallback, striped-sequence bounds, overlay sprite)
+    -- draws at the bare hit-test radius (rad), the same one
+    -- _footprintOverlapsAnother/_hitControl use, so a control's drawn
+    -- footprint never exceeds the box that actually keeps it from
+    -- overlapping its neighbors (see gdsGui's own "selection box IS the
+    -- collision box" rule) — the +4 ring just frames it, never grows it.
+    local drawHalf = rad + 4
+    -- Same obstacle-highlight flag _drawElement checks — see its own
+    -- comment and gdsGui_schematic_moved's "element"/"control" dragKind
+    -- branches.
+    if canvas.collidingObstacleId == c.id then
+        love.graphics.setColor(1, 0, 0, 1)
+        love.graphics.rectangle("line", cx - drawHalf, cy - drawHalf, drawHalf * 2, drawHalf * 2)
+    end
     if canvas.selectedControlId == c.id then
         -- Same yellow/magenta selection emphasis as an element's outline —
         -- see its comment (including the half-opacity magenta).
@@ -4758,14 +4979,18 @@ local function _drawControl(canvas, c, signature)
         else
             love.graphics.setColor(1, 1, 0, 1)
         end
-        love.graphics.circle("line", cx, cy, rad + 4)
+        -- Square, not round — controls are sized in square grid units (see
+        -- gdsGui_schematic_armControlPlacement's gridSize), so a square
+        -- selection box reads as "this many grid squares" the same way an
+        -- element's own rectangular footprint does.
+        love.graphics.rectangle("line", cx - drawHalf, cy - drawHalf, drawHalf * 2, drawHalf * 2)
         if canvas.selectionMoveModeActive then
             -- Mutually exclusive, not both at once — see the matching
             -- comment in _drawElement.
             if canvas.rotateModeActive then
-                _drawRotateModeOverlay(cx, cy, rad + 4, canvas.zoom)
+                _drawRotateModeOverlay(cx, cy, drawHalf, canvas.zoom)
             else
-                _drawMoveModeOverlay(cx, cy, rad + 4, rad + 4, canvas.zoom)
+                _drawMoveModeOverlay(cx, cy, drawHalf, drawHalf, canvas.zoom)
             end
         end
     end
@@ -4823,6 +5048,8 @@ local function _drawControl(canvas, c, signature)
             spinDeg + (c.rotation or 0))
     end
     local posName = (c.positions and c.positions[c.detentIndex + 1]) or tostring(c.detentIndex)
+    -- Row 1: the label (name). Row 2: the control's current status (ON/OFF,
+    -- OPEN/CLOSED, STBY, ...).
     local text = (c.label or "") .. "\n" .. posName
     local tc = globApp.themeTextColor or {1, 1, 1, 1}
     love.graphics.setColor(tc[1], tc[2], tc[3], _labelAlphaForZoom(canvas.zoom))
@@ -4830,7 +5057,7 @@ local function _drawControl(canvas, c, signature)
     -- same reason this can't rely on whatever font outputTxtBox's draw pass
     -- last left active.
     love.graphics.setFont(globApp.appFont or love.graphics.getFont())
-    love.graphics.printf(text, cx - rad * 2, cy + rad + 2, rad * 4, "center")
+    love.graphics.printf(text, cx - drawHalf * 2, cy + drawHalf + 2, drawHalf * 4, "center")
 end
 
 -- Draws one target reticle at an anchor's (element or control) center,
@@ -4861,6 +5088,42 @@ local function _drawConnectorTargets(canvas, snapTarget)
 end
 
 function gdsGui_schematic_draw(pageName)
+    -- Highlights whichever element/control the AI info panel's current
+    -- REASON line is blaming for this combination's own confidence
+    -- shortfall — canvas.aiCulpritId, a plain transient field the
+    -- main.lua adapter sets each frame the AI panel is open and clears
+    -- the instant it isn't (same "just a shared field on canvas, no
+    -- public setter" convention canvas.collidingObstacleId already
+    -- uses). Drawn as its own final overlay pass (see its one call site,
+    -- after every element/control/wire/annunciator) rather than inline
+    -- inside _drawElement/_drawControl like the obstacle/selection
+    -- highlights are — so the ring is never partially hidden by some
+    -- OTHER entity drawn on top of it later in the same frame. Nested
+    -- here (not a file-scope local like every other _draw* helper) to
+    -- stay under this file's 200-local ceiling.
+    local function drawAiCulpritHighlight(canvas)
+        local id = canvas.aiCulpritId
+        if not id then return end
+        local anchor = _findAnchor(canvas, id)
+        if not anchor then return end
+
+        local cx, cy, radius
+        if anchor.w then
+            local fex, fey, few, feh = _elementFootprintRect(canvas, anchor)
+            cx, cy = fex + few / 2, fey + feh / 2
+            radius = math.sqrt((few / 2) ^ 2 + (feh / 2) ^ 2) + 6
+        else
+            cx, cy = _toPixel(canvas, anchor.x, anchor.y)
+            radius = canvas.controlRadius * canvas.zoom * (anchor.radiusScale or 1) + 8
+        end
+
+        love.graphics.setColor(1, 0.84, 0, 1) -- gold
+        love.graphics.setLineWidth(2)
+        love.graphics.circle("line", cx, cy, radius)
+        love.graphics.setLineWidth(1)
+        love.graphics.setColor(1, 1, 1, 1)
+    end
+
     for _, canvas in ipairs(globApp.objects.schematics) do
         if canvas.page == pageName then
             love.graphics.setScissor(canvas.x, canvas.y, canvas.w, canvas.h)
@@ -4895,10 +5158,10 @@ function gdsGui_schematic_draw(pageName)
                 end
                 _drawWireBundleSegment(bundle.x1, bundle.y1, bundle.x2, bundle.y2, colors, canvas.zoom)
             end
-            local commonSelRad = _commonElementSelectionRadius(canvas)
-            for _, e in ipairs(canvas.elements) do _drawElement(canvas, e, commonSelRad, signature) end
+            for _, e in ipairs(canvas.elements) do _drawElement(canvas, e, signature) end
             for _, c in ipairs(canvas.controls) do _drawControl(canvas, c, signature) end
             _drawAnnunciators(canvas)
+            drawAiCulpritHighlight(canvas)
 
             if canvas.wireTool.fromId then
                 local fromE = _findAnchor(canvas, canvas.wireTool.fromId)
@@ -5142,9 +5405,10 @@ function gdsGui_schematic_pressed(touchId, x, y)
         -- first one is already doing, so a second one lands as a pinch.
         canvas.touches[touchId] = { x = x, y = y }
         if _touchCount(canvas.touches) >= 2 then
-            canvas.focusTouchId    = nil
-            canvas.dragKind        = nil
-            canvas.wireTool.fromId = nil
+            canvas.focusTouchId        = nil
+            canvas.dragKind            = nil
+            canvas.wireTool.fromId     = nil
+            canvas.collidingObstacleId = nil
             _startPinch(canvas)
             goto continue
         end
@@ -5196,7 +5460,7 @@ function gdsGui_schematic_pressed(touchId, x, y)
                 candCx, candCy, candHalfX, candHalfY = px + pw / 2, py + ph / 2, pw / 2, ph / 2
             else
                 candCx, candCy = _toPixel(canvas, fracX, fracY)
-                candHalfX = canvas.controlRadius * canvas.zoom * (canvas.pendingPlacement.radiusMul or 1)
+                candHalfX = canvas.controlRadius * canvas.zoom * _controlGridRadiusScale(canvas, canvas.pendingPlacement.gridSize)
                 candHalfY = candHalfX
             end
             if _footprintOverlapsAnother(canvas, candCx, candCy, candHalfX, candHalfY, nil) then
@@ -5216,20 +5480,20 @@ function gdsGui_schematic_pressed(touchId, x, y)
                 spritePath = canvas.pendingPlacement.spritePath,
                 spritePaths = canvas.pendingPlacement.spritePaths,
                 overlaySpritePath = canvas.pendingPlacement.overlaySpritePath,
-                sizeMul = canvas.pendingPlacement.sizeMul,
-                matchControlSize = canvas.pendingPlacement.matchControlSize,
+                gridW = canvas.pendingPlacement.gridW,
+                gridH = canvas.pendingPlacement.gridH,
                 -- Was missing entirely -- _commitNamedPlacement reads all
                 -- three of these off `pending` (componentType for
-                -- addElement/addControl's own trailing param, radiusMul/
+                -- addElement/addControl's own trailing param, gridSize/
                 -- colorDarkenMul for a control's radiusScale/dim factor),
                 -- but nothing ever copied them from canvas.pendingPlacement
                 -- into this struct, so every catalog-placed element/control
                 -- silently got componentType=nil (opting it out of the
                 -- inference model's graph entirely) and every control was
                 -- placed at a flat radiusScale/colorDarkenMul regardless of
-                -- its catalog entry's own radiusMul/colorDarkenMul.
+                -- its catalog entry's own gridSize/colorDarkenMul.
                 componentType = canvas.pendingPlacement.componentType,
-                radiusMul = canvas.pendingPlacement.radiusMul,
+                gridSize = canvas.pendingPlacement.gridSize,
                 colorDarkenMul = canvas.pendingPlacement.colorDarkenMul,
             }
             _openPlacementNamePrompt("NAME THIS " .. canvas.pendingPlacement.kind:upper(),
@@ -5635,7 +5899,15 @@ function gdsGui_schematic_moved(touchId, x, y)
                 -- edge instead of passing through it.
                 local px, py = _toPixel(canvas, candX, candY)
                 local pw, ph = elem.w * canvas.contentW * canvas.zoom, elem.h * canvas.contentH * canvas.zoom
-                if not _footprintOverlapsAnother(canvas, px + pw / 2, py + ph / 2, pw / 2, ph / 2, elem.id) then
+                if _isQuarterTurnRotation(elem.rotation) then pw, ph = ph, pw end
+                local blocked, obstacle = _footprintOverlapsAnother(canvas, px + pw / 2, py + ph / 2, pw / 2, ph / 2, elem.id)
+                -- Flags the obstacle actually in the way so _drawElement/
+                -- _drawControl can highlight it red for as long as the drag
+                -- keeps pushing into it — cleared the instant it's clear
+                -- again (nil obstacle) or the gesture ends (gdsGui_schematic_
+                -- released's own cleanup).
+                canvas.collidingObstacleId = obstacle and obstacle.id or nil
+                if not blocked then
                     elem.x, elem.y = candX, candY
                 end
             end
@@ -5654,7 +5926,17 @@ function gdsGui_schematic_moved(touchId, x, y)
                 local cx, cy = _elementCenter(canvas, elem)
                 local rawAngle = math.atan2(y - cy, x - cx) - canvas.rotateGrabAngleOffset
                 local axis = elem.componentType == "directionalGate" and directionalGateWireAxis(canvas, elem)
-                elem.rotation = axis and snapRotationDegreesToAxis(rawAngle, axis) or _snapRotationDegrees(rawAngle)
+                local candRotation = axis and snapRotationDegreesToAxis(rawAngle, axis) or _snapRotationDegrees(rawAngle)
+                -- Rotating a non-square element (gridW ~= gridH) can swap its
+                -- own footprint into/out of overlapping a neighbor it never
+                -- touched before — same "just don't apply it" guard the
+                -- move-drag above uses (see _footprintOverlapsAnother), so a
+                -- quarter-turn that would collide simply doesn't take.
+                local pw, ph = elem.w * canvas.contentW * canvas.zoom, elem.h * canvas.contentH * canvas.zoom
+                if _isQuarterTurnRotation(candRotation) then pw, ph = ph, pw end
+                if not _footprintOverlapsAnother(canvas, cx, cy, pw / 2, ph / 2, elem.id) then
+                    elem.rotation = candRotation
+                end
             end
             if not canvas.dragMoved and
                (math.abs(x - canvas.dragStartX) > _ELEMENT_TAP_SLOP_PX or
@@ -5692,7 +5974,10 @@ function gdsGui_schematic_moved(touchId, x, y)
                 -- element drag above — see _footprintOverlapsAnother.
                 local px, py = _toPixel(canvas, candX, candY)
                 local rad = canvas.controlRadius * canvas.zoom * (ctrl.radiusScale or 1)
-                if not _footprintOverlapsAnother(canvas, px, py, rad, rad, ctrl.id) then
+                local blocked, obstacle = _footprintOverlapsAnother(canvas, px, py, rad, rad, ctrl.id)
+                -- Same obstacle-highlight flag as the element drag above.
+                canvas.collidingObstacleId = obstacle and obstacle.id or nil
+                if not blocked then
                     ctrl.x, ctrl.y = candX, candY
                 end
             end
@@ -5861,6 +6146,7 @@ function gdsGui_schematic_released(touchId, x, y)
                 canvas.focusTouchId = nil
                 canvas.dragKind = nil
                 canvas.wireTool.fromId = nil
+                canvas.collidingObstacleId = nil
                 canvas._pendingDragUndoSnapshot = nil
             end
             _handleMenuRelease(canvas, touchId, x, y)
@@ -5996,9 +6282,13 @@ function gdsGui_schematic_released(touchId, x, y)
                 canvas.dragKind == "controlRotate") then
                 _notifyChanged(canvas)
             end
-            canvas.focusTouchId    = nil
-            canvas.dragKind        = nil
-            canvas.wireTool.fromId = nil
+            canvas.focusTouchId       = nil
+            canvas.dragKind           = nil
+            canvas.wireTool.fromId    = nil
+            -- Gesture's over either way (applied or blocked) — nothing left
+            -- to flag red (see gdsGui_schematic_moved's "element"/"control"
+            -- dragKind branches).
+            canvas.collidingObstacleId = nil
             -- A plain tap never crossed the slop threshold, so this was
             -- never committed to the undo stack (see gdsGui_schematic_moved)
             -- — nothing left to discard but the pending capture itself.
