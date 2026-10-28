@@ -441,7 +441,8 @@ local function _commitNamedPlacement(canvas, pending, trimmed)
         local wFrac, hFrac = _pendingElementSizeFrac(canvas, pending)
         gdsGui_schematic_addElement(pending.canvasName, pending.newId, pending.shapeType,
             pending.fracX, pending.fracY, wFrac, hFrac,
-            trimmed, pending.defaultColor, properties, nil, pending.spritePath, pending.componentType)
+            trimmed, pending.defaultColor, properties, nil, pending.spritePath, pending.componentType,
+            _deepCopy(pending.terminals))
         canvas.snapshots = {}
         _notifyChanged(canvas)
     else
@@ -449,7 +450,8 @@ local function _commitNamedPlacement(canvas, pending, trimmed)
         gdsGui_schematic_addControl(pending.canvasName, pending.newId, pending.fracX, pending.fracY,
             pending.positions, 0, trimmed, pending.callbackFunc,
             _controlGridRadiusScale(canvas, pending.gridSize), pending.spritePaths,
-            nil, pending.overlaySpritePath, nil, pending.colorDarkenMul, pending.componentType)
+            nil, pending.overlaySpritePath, nil, pending.colorDarkenMul, pending.componentType,
+            _deepCopy(pending.terminals))
         canvas.snapshots = {}
         _notifyChanged(canvas)
     end
@@ -757,15 +759,22 @@ local function _footprintOverlapsAnother(canvas, cx, cy, halfX, halfY, excludeId
     return false
 end
 
+-- Wire-terminal helpers for a control with its own `terminals` list (see
+-- gdsGui_schematic_addControl), e.g. a DPST switch's 4 lugs — one table of
+-- functions, defined just below _hitControl (and _terminals.segments after
+-- _clampedOrthogonalSegments), to stay under this file's 200-local ceiling.
+local _terminals = {}
+
 -- Pivot point for the "spin to set direction" drag on an already-selected
--- wire — the midpoint between its two anchors' centers, mirroring how an
--- element's own center is the pivot for its rotate drag (see
--- gdsGui_schematic_pressed/_moved's "rotate"/"wireDirection" dragKinds).
+-- wire — the midpoint between its two ends (anchor centers, or the
+-- terminals it's attached to), mirroring how an element's own center is
+-- the pivot for its rotate drag (see gdsGui_schematic_pressed/_moved's
+-- "rotate"/"wireDirection" dragKinds).
 local function _wireMidpoint(canvas, wire)
     local fromA, toA = _findAnchor(canvas, wire.fromElementId), _findAnchor(canvas, wire.toElementId)
     if not fromA or not toA then return nil end
-    local x1, y1 = _anchorCenter(canvas, fromA)
-    local x2, y2 = _anchorCenter(canvas, toA)
+    local x1, y1 = _terminals.wireEnd(canvas, fromA, wire.fromTerminal)
+    local x2, y2 = _terminals.wireEnd(canvas, toA, wire.toTerminal)
     return (x1 + x2) / 2, (y1 + y2) / 2
 end
 
@@ -781,22 +790,78 @@ local function _hitElement(canvas, px, py)
     return nil
 end
 
+-- A control with terminals hit-tests its whole square icon box, not just
+-- the inscribed circle — its terminals sit out in the box's corners (a
+-- DPST's lugs), exactly where a wire is meant to be started/dropped.
 local function _hitControl(canvas, px, py)
     for i = #canvas.controls, 1, -1 do
         local c = canvas.controls[i]
         local rad = canvas.controlRadius * canvas.zoom * (c.radiusScale or 1)
         local cx, cy = _toPixel(canvas, c.x, c.y)
         local dx, dy = px - cx, py - cy
-        if (dx * dx + dy * dy) <= (rad * rad) then
+        if c.terminals then
+            if math.abs(dx) <= rad and math.abs(dy) <= rad then return c end
+        elseif (dx * dx + dy * dy) <= (rad * rad) then
             return c
         end
     end
     return nil
 end
 
--- Either kind of wire/connector endpoint, exact hit only.
-local function _hitAnchor(canvas, px, py)
-    return _hitElement(canvas, px, py) or _hitControl(canvas, px, py)
+-- Pixel position of terminal `index` on `anchor` (offset from its center
+-- as a fraction of its icon box — a control's square, an element's own
+-- unrotated w/h box — spun with its own rotation the same way its sprite
+-- is), plus the screen axis ("h" or "v") a wire leaves that terminal along
+-- — the terminal's own exitX/exitY, rotated. nil when the anchor has no
+-- such terminal.
+function _terminals.point(canvas, anchor, index)
+    local t = anchor.terminals and anchor.terminals[index]
+    if not t then return nil end
+    local cx, cy, boxW, boxH
+    if anchor.w then
+        local _, _, ew, eh = _elementPixelRect(canvas, anchor)
+        cx, cy = _elementCenter(canvas, anchor)
+        boxW, boxH = ew, eh
+    else
+        cx, cy = _toPixel(canvas, anchor.x, anchor.y)
+        boxW = canvas.controlRadius * canvas.zoom * (anchor.radiusScale or 1) * 2
+        boxH = boxW
+    end
+    local rot = math.rad(anchor.rotation or 0)
+    local cosR, sinR = math.cos(rot), math.sin(rot)
+    local ox, oy = t.x * boxW, t.y * boxH
+    local ex, ey = t.exitX or 0, t.exitY or 0
+    local rex, rey = ex * cosR - ey * sinR, ex * sinR + ey * cosR
+    return cx + ox * cosR - oy * sinR, cy + ox * sinR + oy * cosR,
+        (math.abs(rex) > math.abs(rey)) and "h" or "v"
+end
+
+-- Index of anchor's terminal nearest the pixel point — how a wire picks
+-- which terminal it attaches to: whichever one the user drags/drops it
+-- closest to. nil for an anchor without terminals.
+function _terminals.nearest(canvas, anchor, px, py)
+    if not anchor.terminals then return nil end
+    local best, bestDistSq
+    for i in ipairs(anchor.terminals) do
+        local tx, ty = _terminals.point(canvas, anchor, i)
+        local distSq = (tx - px) * (tx - px) + (ty - py) * (ty - py)
+        if not bestDistSq or distSq < bestDistSq then best, bestDistSq = i, distSq end
+    end
+    return best
+end
+
+-- Where one end of a wire meets its anchor: x, y, the anchor to clamp the
+-- wire to (see _anchorEdgePoint), and the exit axis. A terminal end is the
+-- terminal's own point with nothing to clamp to (the wire meets the lug
+-- itself, not the icon's edge); any other end is the anchor's center,
+-- clamped as usual, with no exit axis of its own.
+function _terminals.wireEnd(canvas, anchor, terminalIndex)
+    if terminalIndex and anchor.terminals and anchor.terminals[terminalIndex] then
+        local x, y, axis = _terminals.point(canvas, anchor, terminalIndex)
+        return x, y, nil, axis
+    end
+    local x, y = _anchorCenter(canvas, anchor)
+    return x, y, anchor, nil
 end
 
 local function _distPointToSegment(px, py, x1, y1, x2, y2)
@@ -815,13 +880,14 @@ end
 -- (it needs that function's per-wire lane-offset output to tell co-located
 -- wires apart — see the comment there for why).
 
--- Like _hitAnchor, but tolerant of a near-miss: if the point isn't exactly
+-- Which anchor (element or control) a point lands on, tolerant of a
+-- near-miss: if the point isn't exactly
 -- inside any element's box or control's radius, falls back to the nearest
 -- one within _CONNECTOR_RELEASE_SLOP_PX pixels. Used only for "which anchor
 -- did a wire-drag land on" — a release a few pixels off (easy to do,
 -- especially with a finger) should still connect rather than silently fail.
 local function _hitAnchorNear(canvas, px, py)
-    local exact = _hitAnchor(canvas, px, py)
+    local exact = _hitElement(canvas, px, py) or _hitControl(canvas, px, py)
     if exact then return exact end
     local best, bestDist = nil, _CONNECTOR_RELEASE_SLOP_PX
     for _, e in ipairs(canvas.elements) do
@@ -850,11 +916,16 @@ end
 -- now, or nil if none (including: too far from anything, or the only match
 -- is the wire's own starting anchor). Single source of truth shared by the
 -- live snap-preview (drawing) and the actual connect-on-release logic, so
--- what the user sees while dragging is exactly what they'll get.
+-- what the user sees while dragging is exactly what they'll get. Second
+-- return value: for a target with terminals, the one nearest the loose end
+-- (see _terminals.nearest), nil otherwise.
 local function _connectorSnapTarget(canvas)
     if not canvas.wireTool.fromId then return nil end
-    local target = _hitAnchorNear(canvas, canvas.wireTool.curX, canvas.wireTool.curY)
-    if target and target.id ~= canvas.wireTool.fromId then return target end
+    local x, y = canvas.wireTool.curX, canvas.wireTool.curY
+    local target = _hitAnchorNear(canvas, x, y)
+    if target and target.id ~= canvas.wireTool.fromId then
+        return target, _terminals.nearest(canvas, target, x, y)
+    end
     return nil
 end
 
@@ -1271,14 +1342,17 @@ end
 -- (e.g. "source" | "path" | "gate" | "directionalGate" | "sink"; see
 -- model/graph.lua). nil means untagged/excluded from solving, so every
 -- element placed before this feature existed keeps working unchanged.
-function gdsGui_schematic_addElement(canvasName, id, shapeType, x, y, w, h, label, defaultColor, properties, rotation, spritePath, componentType)
+-- terminals (optional): wire attachment points, same shape and behavior
+-- as gdsGui_schematic_addControl's own — x/y are fractions of the
+-- element's own (unrotated) w/h box here, since its sprite fills that box.
+function gdsGui_schematic_addElement(canvasName, id, shapeType, x, y, w, h, label, defaultColor, properties, rotation, spritePath, componentType, terminals)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     table.insert(canvas.elements, {
         id = id, shapeType = shapeType, x = x, y = y, w = w, h = h,
         label = label, defaultColor = defaultColor or _DEFAULT_COLOR, pendingColor = nil,
         properties = properties or {}, rotation = rotation or 0, spritePath = spritePath,
-        componentType = componentType, predictedColor = nil,
+        componentType = componentType, predictedColor = nil, terminals = terminals,
     })
     _resyncPlacementCounter(canvas, id)
 end
@@ -1333,11 +1407,30 @@ end
 -- directionOverride (optional, 0/90/180/270) forces the h-first-vs-v-first
 -- choice in the orthogonal routing below — see _wireForceAxis — the same
 -- "nil means automatic" convention as an element's own rotation parameter.
-function gdsGui_schematic_addWire(canvasName, id, fromElementId, toElementId, defaultColor, directionOverride)
+-- fromTerminal/toTerminal (optional): which of that end's control's own
+-- terminals (see gdsGui_schematic_addControl) the wire attaches to, by
+-- index. Ignored for an end without terminals. Left nil for an end that
+-- does have them (a wire saved before that control had terminals), it's
+-- settled here once, to the terminal nearest the wire's other end, so
+-- drawing and the app's own connectivity model always agree on it.
+function gdsGui_schematic_addWire(canvasName, id, fromElementId, toElementId, defaultColor, directionOverride, fromTerminal, toTerminal)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
+    local fromA, toA = _findAnchor(canvas, fromElementId), _findAnchor(canvas, toElementId)
+    if fromA and toA then
+        if not fromTerminal and fromA.terminals then
+            local ox, oy = _terminals.wireEnd(canvas, toA, toTerminal)
+            fromTerminal = _terminals.nearest(canvas, fromA, ox, oy)
+        end
+        if not toTerminal and toA.terminals then
+            local ox, oy = _terminals.wireEnd(canvas, fromA, fromTerminal)
+            toTerminal = _terminals.nearest(canvas, toA, ox, oy)
+        end
+    end
     table.insert(canvas.wires, {
         id = id, fromElementId = fromElementId, toElementId = toElementId,
+        fromTerminal = fromA and fromA.terminals and fromTerminal or nil,
+        toTerminal = toA and toA.terminals and toTerminal or nil,
         defaultColor = defaultColor or _DEFAULT_COLOR, pendingColor = nil,
         directionOverride = directionOverride, predictedColor = nil,
     })
@@ -1394,7 +1487,18 @@ end
 -- above — the same opaque app-assigned graph-role string, for a control
 -- that's an interactive source or gate (e.g. a generator switch or a
 -- breaker) rather than a passive element.
-function gdsGui_schematic_addControl(canvasName, id, x, y, positions, initialDetentIndex, label, callbackFunc, radiusScale, spritePaths, rotation, overlaySpritePath, defaultColor, colorDarkenMul, componentType)
+-- terminals (optional): array of wire attachment points on the icon,
+-- {x, y, exitX, exitY, ...} — x/y the terminal's offset from the control's
+-- center as a fraction of its icon box (-0.5..0.5, before rotation),
+-- exitX/exitY the unit direction a wire leaves it in. A wire to a control
+-- with terminals attaches to one of them (whichever it's dropped nearest —
+-- see _terminals.nearest) instead of the control's edge, and remembers
+-- which (the wire's fromTerminal/toTerminal). An optional `pole` number
+-- groups terminals that are one conductor (a DPST's two poles): a color
+-- sequence on the control then paints each pole's part of the icon in its
+-- own color (see _terminals.drawPoleColors). Any other keys are stored
+-- untouched for the app layer.
+function gdsGui_schematic_addControl(canvasName, id, x, y, positions, initialDetentIndex, label, callbackFunc, radiusScale, spritePaths, rotation, overlaySpritePath, defaultColor, colorDarkenMul, componentType, terminals)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     local numDetents = math.max(2, #positions)
@@ -1405,7 +1509,7 @@ function gdsGui_schematic_addControl(canvasName, id, x, y, positions, initialDet
         spritePaths = spritePaths, rotation = rotation or 0, overlaySpritePath = overlaySpritePath,
         defaultColor = defaultColor or _DEFAULT_COLOR, pendingColor = nil,
         colorDarkenMul = colorDarkenMul or 1,
-        componentType = componentType, predictedColor = nil,
+        componentType = componentType, predictedColor = nil, terminals = terminals,
     })
     _resyncPlacementCounter(canvas, id)
 end
@@ -1500,7 +1604,8 @@ end
 -- componentType (optional): see gdsGui_schematic_addElement — threaded
 -- through unchanged, onto canvas.pendingPlacement, for _commitNamedPlacement
 -- to pass on to the real addElement call once the user names the placement.
-function gdsGui_schematic_armElementPlacement(canvasName, shapeType, label, defaultColor, idPrefix, defaultPropertyKeys, spritePath, gridW, gridH, componentType)
+-- terminals (optional): see gdsGui_schematic_addElement.
+function gdsGui_schematic_armElementPlacement(canvasName, shapeType, label, defaultColor, idPrefix, defaultPropertyKeys, spritePath, gridW, gridH, componentType, terminals)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     -- At most one of pendingPlacement/pendingConnectorColor/
@@ -1513,7 +1618,7 @@ function gdsGui_schematic_armElementPlacement(canvasName, shapeType, label, defa
     canvas.pendingPlacement = { kind = "element", shapeType = shapeType, label = label,
         defaultColor = defaultColor, idPrefix = idPrefix or label, defaultPropertyKeys = defaultPropertyKeys,
         spritePath = spritePath, gridW = gridW, gridH = gridH,
-        componentType = componentType }
+        componentType = componentType, terminals = terminals }
 end
 
 -- spritePaths, overlaySpritePath (both optional): see
@@ -1526,14 +1631,16 @@ end
 -- — threaded through unchanged.
 -- componentType (optional): see gdsGui_schematic_addElement above —
 -- threaded through unchanged, same as the other arm-time options here.
-function gdsGui_schematic_armControlPlacement(canvasName, positions, label, callbackFunc, idPrefix, spritePaths, overlaySpritePath, gridSize, colorDarkenMul, componentType)
+-- terminals (optional): see gdsGui_schematic_addControl — deep-copied per
+-- placement so no two controls share one table.
+function gdsGui_schematic_armControlPlacement(canvasName, positions, label, callbackFunc, idPrefix, spritePaths, overlaySpritePath, gridSize, colorDarkenMul, componentType, terminals)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     gdsGui_schematic_cancelPlacement(canvasName)
     canvas.pendingPlacement = { kind = "control", positions = positions, label = label,
         callbackFunc = callbackFunc, idPrefix = idPrefix or label, spritePaths = spritePaths,
         overlaySpritePath = overlaySpritePath, gridSize = gridSize, colorDarkenMul = colorDarkenMul,
-        componentType = componentType }
+        componentType = componentType, terminals = terminals }
 end
 
 -- Arms a one-shot "draw the next wire/pipe/etc." gesture: tap one element,
@@ -3877,6 +3984,67 @@ local function _drawColorSequenceStriped(boundsX, boundsY, boundsW, boundsH, col
     if prevScX then love.graphics.setScissor(prevScX, prevScY, prevScW, prevScH) else love.graphics.setScissor() end
 end
 
+-- A color sequence on a control whose terminals carry a `pole` number
+-- (see gdsGui_schematic_addControl): colors[i] is the i-th pole's own
+-- color, in the order poles first appear in c.terminals, so each pole's
+-- part of the icon is painted in its own color rather than the generic
+-- alternating stripes, which land wherever they happen to fall and can
+-- show a live pole gray. The icon is split at the midpoint between
+-- neighbouring poles' terminal centers, across whichever screen axis the
+-- poles are spread along (it follows the control's rotation). Each slice
+-- is clipped with intersectScissor so the canvas's own clip still holds.
+-- false (nothing drawn) when c has no poles or the sequence isn't exactly
+-- one color per pole, so the caller falls back to the stripes.
+function _terminals.drawPoleColors(canvas, c, colors, drawFn, cx, cy, rad)
+    if not c.terminals then return false end
+    local order, sums = {}, {}
+    for i, t in ipairs(c.terminals) do
+        if t.pole then
+            local sum = sums[t.pole]
+            if not sum then
+                sum = { x = 0, y = 0, n = 0 }
+                sums[t.pole] = sum
+                table.insert(order, t.pole)
+            end
+            local px, py = _terminals.point(canvas, c, i)
+            sum.x, sum.y, sum.n = sum.x + px, sum.y + py, sum.n + 1
+        end
+    end
+    if #order < 2 or #order ~= #colors then return false end
+    local centers = {}
+    local minX, maxX, minY, maxY = math.huge, -math.huge, math.huge, -math.huge
+    for i, pole in ipairs(order) do
+        local sum = sums[pole]
+        local center = { x = sum.x / sum.n, y = sum.y / sum.n, color = colors[i] }
+        centers[i] = center
+        minX, maxX = math.min(minX, center.x), math.max(maxX, center.x)
+        minY, maxY = math.min(minY, center.y), math.max(maxY, center.y)
+    end
+    local alongX = (maxX - minX) >= (maxY - minY)
+    table.sort(centers, function(a, b) if alongX then return a.x < b.x end return a.y < b.y end)
+    local prevScX, prevScY, prevScW, prevScH = love.graphics.getScissor()
+    local lo = alongX and (cx - rad) or (cy - rad)
+    for i, center in ipairs(centers) do
+        local hi
+        if i < #centers then
+            hi = alongX and (center.x + centers[i + 1].x) / 2 or (center.y + centers[i + 1].y) / 2
+        else
+            hi = alongX and (cx + rad) or (cy + rad)
+        end
+        if prevScX then love.graphics.setScissor(prevScX, prevScY, prevScW, prevScH) else love.graphics.setScissor() end
+        if alongX then
+            love.graphics.intersectScissor(lo, cy - rad, math.max(0, hi - lo + 1), rad * 2)
+        else
+            love.graphics.intersectScissor(cx - rad, lo, rad * 2, math.max(0, hi - lo + 1))
+        end
+        local col = center.color
+        drawFn(col[1], col[2], col[3], col[4] or 1)
+        lo = hi
+    end
+    if prevScX then love.graphics.setScissor(prevScX, prevScY, prevScW, prevScH) else love.graphics.setScissor() end
+    return true
+end
+
 -- Draws a spritePath image (an element's own, or a control's spritePaths
 -- entry for its current detent — see gdsGui_schematic_addControl) filling
 -- the given box exactly (tinted by r,g,b,a — the normal resolved color, so
@@ -4444,6 +4612,62 @@ local function _clampedOrthogonalSegments(canvas, fromAnchor, x1, y1, toAnchor, 
     end
 end
 
+-- _clampedOrthogonalSegments, for ends from _terminals.wireEnd: a terminal
+-- end (fromAxis/toAxis set) always leaves along its own exit axis, so a
+-- wire never runs sideways out of a DPST's top lug straight across its
+-- neighbouring lug. With no terminal end, or the two ends already level on
+-- one axis, it's exactly _clampedOrthogonalSegments.
+function _terminals.segments(canvas, x1, y1, fromA, fromAxis, x2, y2, toA, toAxis, forceAxis)
+    if (not fromAxis and not toAxis) or x1 == x2 or y1 == y2 then
+        return _clampedOrthogonalSegments(canvas, fromA, x1, y1, toA, x2, y2, forceAxis)
+    end
+    if fromAxis and fromAxis == toAxis then
+        -- Both ends are terminals leaving on the same axis: out of one, a
+        -- single jog midway, into the other.
+        if fromAxis == "v" then
+            local midY = (y1 + y2) / 2
+            return { { x1, y1, x1, midY }, { x1, midY, x2, midY }, { x2, midY, x2, y2 } }
+        end
+        local midX = (x1 + x2) / 2
+        return { { x1, y1, midX, y1 }, { midX, y1, midX, y2 }, { midX, y2, x2, y2 } }
+    end
+    -- One terminal end, one plain anchor whose own body already spans the
+    -- terminal's line (e.g. a bus sitting right above a top lug): a single
+    -- straight run off that anchor's edge, not a stub sideways out of it.
+    local plainA = (not fromAxis and fromA) or (not toAxis and toA)
+    if plainA and (fromAxis or toAxis) then
+        local axis = fromAxis or toAxis
+        local ax, ay = (plainA == fromA) and x1 or x2, (plainA == fromA) and y1 or y2
+        local tx, ty = (plainA == fromA) and x2 or x1, (plainA == fromA) and y2 or y1
+        local seg
+        if axis == "v" and math.abs(tx - ax) < _anchorHalfExtent(canvas, plainA, "x") then
+            local _, ey = _anchorEdgePoint(canvas, plainA, ax, ay, "y", (ty > ay) and 1 or -1)
+            seg = { tx, ey, tx, ty }
+        elseif axis == "h" and math.abs(ty - ay) < _anchorHalfExtent(canvas, plainA, "y") then
+            local ex = _anchorEdgePoint(canvas, plainA, ax, ay, "x", (tx > ax) and 1 or -1)
+            seg = { ex, ty, tx, ty }
+        end
+        if seg then
+            if plainA == fromA then return { seg } end
+            return { { seg[3], seg[4], seg[1], seg[2] } }
+        end
+    end
+    -- One bend: the first leg along the from-terminal's own exit axis (or,
+    -- for a plain from-anchor, whichever axis lets the last leg arrive
+    -- along the to-terminal's), the second straight into the far end.
+    local firstAxis = fromAxis or ((toAxis == "v") and "h" or "v")
+    local sx, sy = (x2 > x1) and 1 or -1, (y2 > y1) and 1 or -1
+    local fx, fy, tx, ty = x1, y1, x2, y2
+    if firstAxis == "v" then
+        if fromA then fx, fy = _anchorEdgePoint(canvas, fromA, x1, y1, "y", sy) end
+        if toA then tx, ty = _anchorEdgePoint(canvas, toA, x2, y2, "x", -sx) end
+        return { { fx, fy, fx, ty }, { fx, ty, tx, ty } }
+    end
+    if fromA then fx, fy = _anchorEdgePoint(canvas, fromA, x1, y1, "x", sx) end
+    if toA then tx, ty = _anchorEdgePoint(canvas, toA, x2, y2, "y", -sy) end
+    return { { fx, fy, tx, fy }, { tx, fy, tx, ty } }
+end
+
 -- Do two perpendicular (one horizontal, one vertical) segments cross at a
 -- point strictly inside both — i.e. a true mid-path crossing, not merely
 -- touching at one of their own endpoints (a shared anchor or bend corner)?
@@ -4650,8 +4874,7 @@ end
 -- to each anchor's own edge, with no hop/bundle treatment — used by the
 -- live wire-drag preview and the (unrelated-to-other-wires) selection
 -- highlight pass, neither of which need the cross-wire analysis below.
-local function _drawClampedOrthogonalLine(canvas, fromAnchor, x1, y1, toAnchor, x2, y2)
-    local segments = _clampedOrthogonalSegments(canvas, fromAnchor, x1, y1, toAnchor, x2, y2)
+local function _drawClampedOrthogonalLine(canvas, segments)
     local halfW = love.graphics.getLineWidth() / 2
     local prevEndX, prevEndY, prevVertical
     for idx, seg in ipairs(segments) do
@@ -4734,9 +4957,11 @@ local function _wirePlansChanged(canvas)
     for i, c in ipairs(canvas.controls) do
         local sc = ctrls[i]
         if not sc then sc = {}; ctrls[i] = sc end
-        if sc.id ~= c.id or sc.x ~= c.x or sc.y ~= c.y then
+        -- rotation: a terminal-bearing control's wires attach at points
+        -- that spin with it (see _terminals.point).
+        if sc.id ~= c.id or sc.x ~= c.x or sc.y ~= c.y or sc.rotation ~= c.rotation then
             changed = true
-            sc.id, sc.x, sc.y = c.id, c.x, c.y
+            sc.id, sc.x, sc.y, sc.rotation = c.id, c.x, c.y, c.rotation
         end
     end
     for i = #canvas.controls + 1, #ctrls do ctrls[i] = nil end
@@ -4747,10 +4972,12 @@ local function _wirePlansChanged(canvas)
         local sw = wires[i]
         if not sw then sw = {}; wires[i] = sw end
         if sw.id ~= w.id or sw.fromElementId ~= w.fromElementId or sw.toElementId ~= w.toElementId
-           or sw.directionOverride ~= w.directionOverride then
+           or sw.directionOverride ~= w.directionOverride
+           or sw.fromTerminal ~= w.fromTerminal or sw.toTerminal ~= w.toTerminal then
             changed = true
             sw.id, sw.fromElementId, sw.toElementId, sw.directionOverride =
                 w.id, w.fromElementId, w.toElementId, w.directionOverride
+            sw.fromTerminal, sw.toTerminal = w.fromTerminal, w.toTerminal
         end
     end
     for i = #canvas.wires + 1, #wires do wires[i] = nil end
@@ -4769,6 +4996,14 @@ local function _wireForceAxis(w)
     if d == 90 or d == 270 then return "v" end
     if d == 0 or d == 180 then return "h" end
     return nil
+end
+
+-- A finished wire's own routed segments between its two (already looked
+-- up) anchors, attaching at its fromTerminal/toTerminal where it has them.
+function _terminals.wireSegments(canvas, w, fromE, toE)
+    local x1, y1, fromA, fromAxis = _terminals.wireEnd(canvas, fromE, w.fromTerminal)
+    local x2, y2, toA, toAxis = _terminals.wireEnd(canvas, toE, w.toTerminal)
+    return _terminals.segments(canvas, x1, y1, fromA, fromAxis, x2, y2, toA, toAxis, _wireForceAxis(w))
 end
 
 
@@ -4820,9 +5055,7 @@ local function _computeWirePlans(canvas)
         for _, w in ipairs(canvas.wires) do
             local fromE, toE = _findAnchor(canvas, w.fromElementId), _findAnchor(canvas, w.toElementId)
             if fromE and toE then
-                local x1, y1 = _anchorCenter(canvas, fromE)
-                local x2, y2 = _anchorCenter(canvas, toE)
-                local segments = _clampedOrthogonalSegments(canvas, fromE, x1, y1, toE, x2, y2, _wireForceAxis(w))
+                local segments = _terminals.wireSegments(canvas, w, fromE, toE)
                 plans[w.id] = { segments = segments, hopDistances = {}, bundledRanges = {} }
             end
         end
@@ -4842,9 +5075,7 @@ local function _computeWirePlans(canvas)
     for order, w in ipairs(canvas.wires) do
         local fromE, toE = _findAnchor(canvas, w.fromElementId), _findAnchor(canvas, w.toElementId)
         if fromE and toE then
-            local x1, y1 = _anchorCenter(canvas, fromE)
-            local x2, y2 = _anchorCenter(canvas, toE)
-            local segments = _clampedOrthogonalSegments(canvas, fromE, x1, y1, toE, x2, y2, _wireForceAxis(w))
+            local segments = _terminals.wireSegments(canvas, w, fromE, toE)
             plans[w.id] = { segments = segments, hopDistances = {}, bundledRanges = {} }
             for segIdx, seg in ipairs(segments) do
                 local horiz = (seg[2] == seg[4])
@@ -4958,8 +5189,8 @@ local function _hitWire(canvas, px, py)
         else
             local fromA, toA = _findAnchor(canvas, w.fromElementId), _findAnchor(canvas, w.toElementId)
             if fromA and toA then
-                local x1, y1 = _anchorCenter(canvas, fromA)
-                local x2, y2 = _anchorCenter(canvas, toA)
+                local x1, y1 = _terminals.wireEnd(canvas, fromA, w.fromTerminal)
+                local x2, y2 = _terminals.wireEnd(canvas, toA, w.toTerminal)
                 if _distPointToSegment(px, py, x1, y1, x2, y2) <= _WIRE_TAP_SLOP_PX then return w end
             end
         end
@@ -5102,7 +5333,9 @@ local function _drawControl(canvas, c, signature)
     local sequence = gdsGui_schematic_resolveColorSequence(canvas.name, "control", c.id, signature)
     if sequence then
         r, g, b, a = sequence[1][1], sequence[1][2], sequence[1][3], sequence[1][4]
-        _drawColorSequenceStriped(cx - rad, cy - rad, rad * 2, rad * 2, sequence, drawBodyWithColor)
+        if not _terminals.drawPoleColors(canvas, c, sequence, drawBodyWithColor, cx, cy, rad) then
+            _drawColorSequenceStriped(cx - rad, cy - rad, rad * 2, rad * 2, sequence, drawBodyWithColor)
+        end
     else
         r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "control", c.id, signature)
         drawBodyWithColor(r, g, b, a)
@@ -5139,8 +5372,26 @@ end
 
 -- Draws one target reticle at an anchor's (element or control) center,
 -- filled solid if it's the current snap target, a faint outline otherwise.
-local function _drawOneConnectorTarget(canvas, anchor, snapTarget)
+-- An anchor with terminals gets one (smaller) reticle per terminal instead,
+-- only the snapped-to terminal (snapTerminal) filled.
+local function _drawOneConnectorTarget(canvas, anchor, snapTarget, snapTerminal)
     if anchor.id == canvas.wireTool.fromId then return end
+    if anchor.terminals then
+        local rad = _CONNECTOR_TARGET_RADIUS_PX * canvas.zoom * 0.6
+        for i in ipairs(anchor.terminals) do
+            local tx, ty = _terminals.point(canvas, anchor, i)
+            if snapTarget and snapTarget.id == anchor.id and snapTerminal == i then
+                love.graphics.setColor(_CONNECTOR_SNAP_COLOR[1], _CONNECTOR_SNAP_COLOR[2], _CONNECTOR_SNAP_COLOR[3], 1)
+                love.graphics.circle("fill", tx, ty, rad)
+                love.graphics.setColor(1, 1, 1, 1)
+                love.graphics.circle("line", tx, ty, rad)
+            else
+                love.graphics.setColor(_CONNECTOR_SNAP_COLOR[1], _CONNECTOR_SNAP_COLOR[2], _CONNECTOR_SNAP_COLOR[3], 0.55)
+                love.graphics.circle("line", tx, ty, rad)
+            end
+        end
+        return
+    end
     local cx, cy = _anchorCenter(canvas, anchor)
     local rad = _CONNECTOR_TARGET_RADIUS_PX * canvas.zoom
     if snapTarget and snapTarget.id == anchor.id then
@@ -5159,9 +5410,9 @@ end
 -- (gone the instant it isn't). The one currently in snap range is filled
 -- solid to show the clamp that's about to happen if released now; the rest
 -- are faint outlines.
-local function _drawConnectorTargets(canvas, snapTarget)
-    for _, e in ipairs(canvas.elements) do _drawOneConnectorTarget(canvas, e, snapTarget) end
-    for _, c in ipairs(canvas.controls) do _drawOneConnectorTarget(canvas, c, snapTarget) end
+local function _drawConnectorTargets(canvas, snapTarget, snapTerminal)
+    for _, e in ipairs(canvas.elements) do _drawOneConnectorTarget(canvas, e, snapTarget, snapTerminal) end
+    for _, c in ipairs(canvas.controls) do _drawOneConnectorTarget(canvas, c, snapTarget, snapTerminal) end
 end
 
 function gdsGui_schematic_draw(pageName)
@@ -5302,22 +5553,30 @@ function gdsGui_schematic_draw(pageName)
             if canvas.wireTool.fromId then
                 local fromE = _findAnchor(canvas, canvas.wireTool.fromId)
                 if fromE and canvas.wireTool.curX then
-                    local snapTarget = _connectorSnapTarget(canvas)
-                    _drawConnectorTargets(canvas, snapTarget)
-                    local fx, fy = _anchorCenter(canvas, fromE)
-                    -- Clamped to the snap target's center (if any) rather than
-                    -- the raw cursor/finger position, so the line visibly locks
-                    -- on once in range instead of just trailing the touch point.
+                    local snapTarget, snapTerminal = _connectorSnapTarget(canvas)
+                    _drawConnectorTargets(canvas, snapTarget, snapTerminal)
+                    -- Clamped to the snap target's center/terminal (if any)
+                    -- rather than the raw cursor/finger position, so the line
+                    -- visibly locks on once in range instead of just trailing
+                    -- the touch point.
                     local tx, ty = canvas.wireTool.curX, canvas.wireTool.curY
+                    local toA, toAxis
                     if snapTarget then
-                        tx, ty = _anchorCenter(canvas, snapTarget)
+                        tx, ty, toA, toAxis = _terminals.wireEnd(canvas, snapTarget, snapTerminal)
                     end
+                    -- A from-terminal not yet picked (ADD WIRE started off
+                    -- the control) follows whichever is nearest the loose end
+                    -- — the same pick the release makes.
+                    local fromTerminal = canvas.wireTool.fromTerminal or _terminals.nearest(canvas, fromE, tx, ty)
+                    local fx, fy, fromA, fromAxis = _terminals.wireEnd(canvas, fromE, fromTerminal)
                     love.graphics.setColor(1, 1, 1, 0.6)
                     love.graphics.setLineWidth(2 * canvas.zoom)
-                    -- fromE's end always clamps to its own edge; the loose
-                    -- cursor/finger end only clamps once it's snapped onto a
-                    -- real target (snapTarget), same as the finished wire.
-                    _drawClampedOrthogonalLine(canvas, fromE, fx, fy, snapTarget, tx, ty)
+                    -- fromE's end always clamps to its own edge (or meets its
+                    -- terminal); the loose cursor/finger end only clamps once
+                    -- it's snapped onto a real target, same as the finished
+                    -- wire.
+                    _drawClampedOrthogonalLine(canvas,
+                        _terminals.segments(canvas, fx, fy, fromA, fromAxis, tx, ty, toA, toAxis))
                     love.graphics.setLineWidth(1)
                 end
             end
@@ -5631,6 +5890,7 @@ function gdsGui_schematic_pressed(touchId, x, y)
                 componentType = canvas.pendingPlacement.componentType,
                 gridSize = canvas.pendingPlacement.gridSize,
                 colorDarkenMul = canvas.pendingPlacement.colorDarkenMul,
+                terminals = canvas.pendingPlacement.terminals,
             }
             _openPlacementNamePrompt("NAME THIS " .. canvas.pendingPlacement.kind:upper(),
                 _suggestedPlacementName(canvas, canvas.pendingPlacement.label))
@@ -5728,11 +5988,18 @@ function gdsGui_schematic_pressed(touchId, x, y)
             -- there's nothing to connect from, so just drop it.
             local fromId = canvas.pendingWireFromId
             canvas.pendingWireFromId = nil
-            if _findAnchor(canvas, fromId) then
+            local fromAnchor = _findAnchor(canvas, fromId)
+            if fromAnchor then
                 canvas.focusTouchId    = touchId
                 canvas.wireTool.fromId = fromId
                 canvas.wireTool.curX   = x
                 canvas.wireTool.curY   = y
+                -- Starting the drag on the control itself picks its terminal
+                -- right here; starting anywhere else leaves it to follow
+                -- the loose end (see the wire-drag preview in
+                -- gdsGui_schematic_draw, and the release).
+                canvas.wireTool.fromTerminal = (_hitControl(canvas, x, y) == fromAnchor)
+                    and _terminals.nearest(canvas, fromAnchor, x, y) or nil
             end
             goto continue
         end
@@ -5745,6 +6012,7 @@ function gdsGui_schematic_pressed(touchId, x, y)
             if anchor then
                 canvas.focusTouchId    = touchId
                 canvas.wireTool.fromId = anchor.id
+                canvas.wireTool.fromTerminal = _terminals.nearest(canvas, anchor, x, y)
                 canvas.wireTool.curX   = x
                 canvas.wireTool.curY   = y
                 if canvas.pendingConnectorColor then
@@ -5904,7 +6172,7 @@ end
 
 function gdsGui_schematic_moved(touchId, x, y)
     local activePageName = _getActivePageName()
-    -- For a "directionalGate" element (DIODE, DPST SWITCH) being rotated
+    -- For a "directionalGate" element (DIODE) being rotated
     -- below: which cardinal AXIS ("h" or "v") its own connected wires
     -- predominantly run along, by summing each connected neighbor's own
     -- |dx|/|dy| offset from the element's center across every wire
@@ -6180,7 +6448,7 @@ function gdsGui_schematic_internal_onWireCreateConfirmed(canvasName, index, opti
         if not canvas then return end
         local baseId = pending.fromId .. "_to_" .. pending.toId
         gdsGui_schematic_addWire(canvasName, _uniqueWireId(canvas, baseId),
-            pending.fromId, pending.toId, pending.color)
+            pending.fromId, pending.toId, pending.color, nil, pending.fromTerminal, pending.toTerminal)
         canvas.snapshots = {}
         _notifyChanged(canvas)
     end
@@ -6230,30 +6498,44 @@ end
 
 function gdsGui_schematic_released(touchId, x, y)
     local activePageName = _getActivePageName()
-    -- True if anchorId is a simple 2-terminal device -- a gate-role
+    -- Non-nil if anchorId is a simple 2-terminal device -- a gate-role
     -- control with exactly 2 positions (OFF/ON, CLOSED/OPEN, ..., the
-    -- "two-way switch" case) OR a directionalGate-role element (DIODE,
-    -- DPST SWITCH -- the same 2-lead "anode in, cathode out" component
+    -- "two-way switch" case) OR a directionalGate-role element (DIODE
+    -- -- the same 2-lead "anode in, cathode out" component
     -- model/graph.lua's own _resolveDirectionalEdges assumes throughout)
     -- -- and it ALREADY has 2 wires touching it, the physical maximum
     -- either kind of 2-terminal device can ever actually have wired to
     -- it. A 3-position switch (numDetents ~= 2), any other control role
     -- (e.g. GENERATOR, "source" -- a real output terminal can
     -- legitimately feed more than one bus), or any other element role
-    -- isn't limited here at all. Nested (not a top-level local, which
+    -- isn't limited here at all. A control with its own terminals list
+    -- (a DPST's 4 lugs -- see gdsGui_schematic_addControl) is capped at
+    -- one wire per terminal instead: that exact terminal already taken
+    -- is what blocks. Returns the notice to show, or nil when not at the
+    -- limit. Nested (not a top-level local, which
     -- this file's handlers otherwise all are) purely to stay under this
     -- file's 200-local ceiling -- it has exactly one caller, below.
-    local function twoTerminalAnchorAtWireLimit(canvas, anchorId)
+    local function twoTerminalAnchorAtWireLimit(canvas, anchorId, terminalIndex)
         local ctrl = _findControl(canvas, anchorId)
         local elem = not ctrl and _findElement(canvas, anchorId)
+        if (ctrl and ctrl.terminals) or (elem and elem.terminals) then
+            for _, w in ipairs(canvas.wires) do
+                if (w.fromElementId == anchorId and w.fromTerminal == terminalIndex)
+                   or (w.toElementId == anchorId and w.toTerminal == terminalIndex) then
+                    return "THAT TERMINAL ALREADY HAS A WIRE."
+                end
+            end
+            return nil
+        end
         local isTwoTerminal = (ctrl and ctrl.componentType == "gate" and ctrl.numDetents == 2)
             or (elem and elem.componentType == "directionalGate")
-        if not isTwoTerminal then return false end
+        if not isTwoTerminal then return nil end
         local count = 0
         for _, w in ipairs(canvas.wires) do
             if w.fromElementId == anchorId or w.toElementId == anchorId then count = count + 1 end
         end
-        return count >= 2
+        if count >= 2 then return "A 2-POSITION SWITCH OR DIODE CAN HAVE AT MOST 2 WIRES." end
+        return nil
     end
 
     for _, canvas in ipairs(globApp.objects.schematics) do
@@ -6303,12 +6585,22 @@ function gdsGui_schematic_released(touchId, x, y)
                 end
                 canvas._paintTarget = nil
             elseif canvas.wireTool.fromId then
-                local toElem = _connectorSnapTarget(canvas)
+                local toElem, toTerminal = _connectorSnapTarget(canvas)
+                local fromElem = toElem and _findAnchor(canvas, canvas.wireTool.fromId)
+                local fromTerminal = canvas.wireTool.fromTerminal
+                if fromElem and not fromTerminal then
+                    -- Not picked at press (see gdsGui_schematic_pressed's
+                    -- pendingWireFromId branch): the terminal nearest where
+                    -- the wire actually lands, same as the drag preview.
+                    local ox, oy = _terminals.wireEnd(canvas, toElem, toTerminal)
+                    fromTerminal = _terminals.nearest(canvas, fromElem, ox, oy)
+                end
+                canvas.wireTool.fromTerminal = nil
+                local limitNotice = toElem and (twoTerminalAnchorAtWireLimit(canvas, canvas.wireTool.fromId, fromTerminal)
+                    or twoTerminalAnchorAtWireLimit(canvas, toElem.id, toTerminal))
                 if toElem then
-                    if twoTerminalAnchorAtWireLimit(canvas, canvas.wireTool.fromId)
-                       or twoTerminalAnchorAtWireLimit(canvas, toElem.id) then
-                        gdsGui_schematic_openMenu(canvas.name,
-                            "A 2-POSITION SWITCH OR DIODE CAN HAVE AT MOST 2 WIRES.", {"OK"},
+                    if limitNotice then
+                        gdsGui_schematic_openMenu(canvas.name, limitNotice, {"OK"},
                             "gdsGui_schematic_internal_onTwoTerminalWireLimitDismissed", nil)
                     else
                         -- wireTool.color: an explicit per-gesture override (set
@@ -6326,6 +6618,7 @@ function gdsGui_schematic_released(touchId, x, y)
                             _pendingWireCreation = {
                                 canvasName = canvas.name, fromId = canvas.wireTool.fromId,
                                 toId = toElem.id, color = pendingColor,
+                                fromTerminal = fromTerminal, toTerminal = toTerminal,
                             }
                             gdsGui_schematic_openMenu(canvas.name,
                                 "ADDING A NEW CONNECTOR WILL DELETE ALL " .. snapshotCount .. " SNAPSHOT(S). CONTINUE?",
@@ -6335,7 +6628,7 @@ function gdsGui_schematic_released(touchId, x, y)
                         else
                             local baseId = canvas.wireTool.fromId .. "_to_" .. toElem.id
                             gdsGui_schematic_addWire(canvas.name, _uniqueWireId(canvas, baseId),
-                                canvas.wireTool.fromId, toElem.id, pendingColor)
+                                canvas.wireTool.fromId, toElem.id, pendingColor, nil, fromTerminal, toTerminal)
                             canvas.snapshots = {}
                             _notifyChanged(canvas)
                         end

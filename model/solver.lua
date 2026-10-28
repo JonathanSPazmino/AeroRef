@@ -57,7 +57,10 @@ local function solve(graph, sourceStates, gateStates)
         -- that as "powered" is a separate, display-layer decision (see
         -- main.lua's isOpenGate override) -- this is purely about
         -- reachability.
-        local blocksOnward = node.role == "gate" and gateStates[currentId] ~= "closed"
+        -- A "gatePole" (one pole of a multi-pole switch -- see graph.lua's
+        -- _poleNodeId) follows its owning control's own position.
+        local blocksOnward = (node.role == "gate" and gateStates[currentId] ~= "closed")
+            or (node.role == "gatePole" and gateStates[node.gateOf] ~= "closed")
         if not blocksOnward then
             for _, neighborId in ipairs(adjacency[currentId] or {}) do
                 local neighborNode = graph.nodes[neighborId]
@@ -88,8 +91,14 @@ local function solve(graph, sourceStates, gateStates)
     end
 
     local states = {}
-    for id in pairs(graph.nodes) do
-        states[id] = powered[id] and POWERED or UNPOWERED
+    for id, node in pairs(graph.nodes) do
+        local isPowered = powered[id]
+        -- A multi-pole gate's own (edgeless) node reads powered when any of
+        -- its poles does -- see graph.lua's _poleNodeId.
+        for _, poleId in ipairs(node.poles or {}) do
+            if powered[poleId] then isPowered = true end
+        end
+        states[id] = isPowered and POWERED or UNPOWERED
     end
     return states
 end
@@ -216,7 +225,11 @@ local function solveSourceAttribution(graph, sourceStates, gateStates)
         if isOn then
             local states = solve(graph, { [sourceId] = true }, gateStates)
             for nodeId, state in pairs(states) do
-                if state == POWERED then
+                -- A multi-pole gate's own node (see graph.lua's _poleNodeId)
+                -- is skipped: its "powered" is just "some pole is", so its
+                -- sources would be the union of electrically separate
+                -- circuits. Each pole node is attributed on its own instead.
+                if state == POWERED and not graph.nodes[nodeId].poles then
                     attribution[nodeId] = attribution[nodeId] or {}
                     attribution[nodeId][sourceId] = true
                 end

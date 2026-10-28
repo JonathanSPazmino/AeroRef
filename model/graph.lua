@@ -17,6 +17,9 @@
 --                         conduct ONE way -- see _resolveDirectionalEdges
 --                         below for how that way is decided
 --   "sink"             -- load/consumer: terminal, no special behavior
+--   "gatePole"         -- never app-supplied: one pole of a multi-pole
+--                         "gate" control (DPST SWITCH), created by
+--                         buildGraph itself -- see _poleNodeId below
 -- A node with no componentType tag (nil) is excluded from the graph
 -- entirely, so schematics saved before this feature existed, or elements
 -- the user hasn't tagged yet, simply don't participate in solving.
@@ -162,6 +165,29 @@ local function _resolveDirectionalEdges(wires, nodes, positions)
     return resolved
 end
 
+-- A "gate" control whose terminals (see schematic_gdsGuiLib.lua's
+-- addControl) carry a `pole` number is really several electrically
+-- separate switches ganged under one lever (a DPST SWITCH: two poles, each
+-- joining its own pair of opposing terminals, never one pole to the
+-- other). Each pole becomes its own "gatePole" node, gateOf = the control's
+-- id, so a wire on one pole can never reach a wire on the other through
+-- the switch; solver.lua opens/closes every pole off that one control's
+-- own gateStates entry. The control's own node stays in the graph (no
+-- edges, poles = its pole ids) so everything keyed by control id -- gate
+-- states, rules, display -- is unchanged; solve() reports it powered when
+-- any of its poles is.
+local function _poleNodeId(controlId, pole)
+    return controlId .. "#" .. tostring(pole)
+end
+
+-- The graph node id a wire's end actually attaches to: the pole node for a
+-- terminal on a multi-pole gate control, else the anchor's own id.
+local function _wireEndNodeId(anchorId, terminalIndex, polesByControl)
+    local poles = polesByControl[anchorId]
+    local pole = poles and poles[terminalIndex or 1]
+    return pole and _poleNodeId(anchorId, pole) or anchorId
+end
+
 -- positions (optional): {id -> {x, y, rotation}} for every node, in any
 -- consistent unit (the main.lua adapter passes fraction-of-canvas
 -- centers) -- see _resolveDirectionalEdges above, the only consumer. Omit
@@ -170,19 +196,66 @@ end
 local function buildGraph(elements, controls, wires, componentTypes, positions)
     componentTypes = componentTypes or {}
     local nodes = {}
+    -- A directionalGate's own terminals can say outright which lead is
+    -- which: flow = "in" (anode) or "out" (cathode). nodeId -> {terminalIndex -> flow}
+    local flowsByNode = {}
     for _, e in ipairs(elements or {}) do
         local role = componentTypes[e.id]
-        if role then nodes[e.id] = { id = e.id, role = role } end
+        if role then
+            nodes[e.id] = { id = e.id, role = role }
+            if role == "directionalGate" and e.terminals then
+                local flows = {}
+                for i, t in ipairs(e.terminals) do flows[i] = t.flow end
+                flowsByNode[e.id] = flows
+            end
+        end
     end
+    local polesByControl = {} -- controlId -> {terminalIndex -> pole}
     for _, c in ipairs(controls or {}) do
         local role = componentTypes[c.id]
-        if role then nodes[c.id] = { id = c.id, role = role } end
+        if role then
+            nodes[c.id] = { id = c.id, role = role }
+            if role == "gate" and c.terminals then
+                local byTerminal, poleIds = {}, {}
+                for i, t in ipairs(c.terminals) do
+                    if t.pole then
+                        byTerminal[i] = t.pole
+                        local poleId = _poleNodeId(c.id, t.pole)
+                        if not nodes[poleId] then
+                            nodes[poleId] = { id = poleId, role = "gatePole", gateOf = c.id }
+                            table.insert(poleIds, poleId)
+                            if positions and positions[c.id] then positions[poleId] = positions[c.id] end
+                        end
+                    end
+                end
+                if #poleIds > 0 then
+                    polesByControl[c.id] = byTerminal
+                    nodes[c.id].poles = poleIds
+                end
+            end
+        end
     end
 
     -- An edge only matters to the solver once both endpoints are tagged
     -- graph nodes; a wire touching an untyped element just isn't part of
     -- the graph yet.
-    wires = wires or {}
+    -- Every wire re-expressed against the node ids its ends really attach
+    -- to (see _wireEndNodeId), so everything below -- and wireEnds, for the
+    -- main.lua adapter's per-wire coloring -- sees a pole, not the bare
+    -- multi-pole control.
+    local wireEnds = {}
+    local graphWires = {}
+    for i, w in ipairs(wires or {}) do
+        local fromId = _wireEndNodeId(w.fromElementId, w.fromTerminal, polesByControl)
+        local toId = _wireEndNodeId(w.toElementId, w.toTerminal, polesByControl)
+        wireEnds[w.id] = { fromId = fromId, toId = toId }
+        graphWires[i] = {
+            id = w.id, fromElementId = fromId, toElementId = toId,
+            fromFlow = w.fromTerminal and flowsByNode[w.fromElementId] and flowsByNode[w.fromElementId][w.fromTerminal],
+            toFlow = w.toTerminal and flowsByNode[w.toElementId] and flowsByNode[w.toElementId][w.toTerminal],
+        }
+    end
+    wires = graphWires
     local resolvedDirections = _resolveDirectionalEdges(wires, nodes, positions)
     local edges = {}
     for i, w in ipairs(wires) do
@@ -192,11 +265,29 @@ local function buildGraph(elements, controls, wires, componentTypes, positions)
             local r = resolvedDirections[i]
             local fromId = (r and r.fromId) or w.fromElementId
             local toId   = (r and r.toId) or w.toElementId
+            -- A wire on a directionalGate's own anode/cathode terminal is
+            -- exact, so it wins over the geometric guess above: current
+            -- leaves through "out", enters through "in".
+            if w.fromFlow == "out" or w.toFlow == "in" then
+                fromId, toId = w.fromElementId, w.toElementId
+            elseif w.fromFlow == "in" or w.toFlow == "out" then
+                fromId, toId = w.toElementId, w.fromElementId
+            end
             table.insert(edges, { id = w.id, fromId = fromId, toId = toId, directional = directional })
         end
     end
 
-    return { nodes = nodes, edges = edges }
+    return { nodes = nodes, edges = edges, wireEnds = wireEnds }
+end
+
+-- The node ids wire w's two ends attach to in graph (a multi-pole gate's
+-- pole node rather than the control itself -- see _poleNodeId), in w's own
+-- drawn from/to order. Falls back to w's anchor ids for a wire buildGraph
+-- never saw.
+local function wireEndIds(graph, w)
+    local ends = graph.wireEnds and graph.wireEnds[w.id]
+    if ends then return ends.fromId, ends.toId end
+    return w.fromElementId, w.toElementId
 end
 
 -- True if some source node can still reach nodeId without using the edge
@@ -233,4 +324,4 @@ local function hasAltPath(graph, nodeId, excludeGateId)
     return false
 end
 
-return { buildGraph = buildGraph, hasAltPath = hasAltPath }
+return { buildGraph = buildGraph, hasAltPath = hasAltPath, wireEndIds = wireEndIds }

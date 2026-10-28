@@ -404,17 +404,52 @@ local SCHEMATIC_CATALOG = {
         { label = "BUS", abbrev = "BUS",       kind = "element", shapeType = "rect",
           defaultProperties = {"VOLTAGE", "CURRENT"}, spritePath = "Sprites/element_bus.png",
           gridW = 4, gridH = 2, componentType = "path" },
-        { label = "DIODE", abbrev = "DIOD",     kind = "element", shapeType = "diode", spritePath = "Sprites/element_diode.png",
-          gridW = 2, gridH = 2, componentType = "directionalGate" },
+        -- Anode (flow "in") on the left, cathode (flow "out") on the right,
+        -- matching rotation 0 conducting +x (model/graph.lua's
+        -- _CARDINAL_FORWARD). A wire on either terminal is the exact
+        -- conducting direction, not a geometric guess — see buildGraph.
+        { label = "DIODE", abbrev = "DIOD",     kind = "element", shapeType = "diode",
+          spritePath = "Sprites/element_diodeTerminals.png",
+          gridW = 2, gridH = 2, componentType = "directionalGate",
+          terminals = {
+              { x = -0.43,  y = 0.03,  exitX = -1, exitY = 0, flow = "in" },
+              { x =  0.422, y = 0.027, exitX =  1, exitY = 0, flow = "out" },
+          } },
         { label = "SWITCH", abbrev = "SWCH",    kind = "control", presets = { {"OPEN", "CLOSED"}, {"OPEN", "CLOSED", "STBY"} },
           spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate" },
         -- Double pole, single throw: two mechanically-ganged switch poles
-        -- (the dashed link drawn between them in the artwork) each feeding
-        -- its own diode before reaching its own "ending" terminal — a fixed
-        -- static symbol (kind = "element", like DIODE/BATTERY/BUS above),
-        -- not an interactive on/off control.
-        { label = "DPST SWITCH", abbrev = "DPST", kind = "element", shapeType = "rect",
-          spritePath = "Sprites/element_dpstDiode.png", gridW = 3, gridH = 4, componentType = "directionalGate" },
+        -- (the crossbar linking them in the artwork) that open/close
+        -- together — an interactive OPEN/CLOSED gate like SWITCH above, just
+        -- its own icon pair (inline, not a file-scope local like
+        -- _SWITCH_SPRITE_PATHS: main.lua sits at Lua's 200-local ceiling)
+        -- and 4 wire terminals at the artwork's own terminal circles
+        -- (offsets are fractions of the icon box from its center, before
+        -- rotation; exitX/exitY is the way a wire leaves that terminal).
+        -- Terminal order: top-left, top-right, bottom-left, bottom-right.
+        -- Each pole joins its own top terminal
+        -- to the bottom one beneath it and never touches the other pole —
+        -- see model/graph.lua's "gatePole" role.
+        { label = "DPST SWITCH", abbrev = "DPST", kind = "control", presets = { {"OPEN", "CLOSED"} },
+          spritePaths = {"Sprites/control_dpstOpen.png", "Sprites/control_dpstClosed.png"},
+          gridSize = 3, componentType = "gate",
+          terminals = {
+              { x = -0.415, y = -0.42, exitX = 0, exitY = -1, pole = 1 },
+              { x =  0.153, y = -0.42, exitX = 0, exitY = -1, pole = 2 },
+              { x = -0.415, y =  0.42, exitX = 0, exitY =  1, pole = 1 },
+              { x =  0.153, y =  0.42, exitX = 0, exitY =  1, pole = 2 },
+          } },
+        -- Bus tie: joins two buses (one per bus bar in the artwork) when
+        -- CLOSED. A single path, so one ordinary "gate" node — no `pole`
+        -- split like DPST SWITCH above — but with a terminal at the middle
+        -- of each bus bar so wires meet the bars themselves, leaving
+        -- sideways (left bar, then right bar).
+        { label = "BUS TIE", abbrev = "BTIE", kind = "control", presets = { {"OPEN", "CLOSED"} },
+          spritePaths = {"Sprites/control_busTieOpen.png", "Sprites/control_busTieClosed.png"},
+          gridSize = 3, componentType = "gate",
+          terminals = {
+              { x = -0.48,  y = -0.017, exitX = -1, exitY = 0 },
+              { x =  0.479, y = -0.017, exitX =  1, exitY = 0 },
+          } },
     }},
     { system = "HYDRAULIC", items = {
         -- ACCUMULATOR/PUMP mirror BATTERY/GENERATOR's own split exactly: a
@@ -1168,7 +1203,7 @@ end
 
 -- {id -> {x, y, rotation}} for every element AND control on canvas, fed to
 -- ModelGraph.buildGraph as its optional 5th param so it can resolve a
--- "directionalGate" (DIODE, DPST SWITCH) edge's real conducting direction
+-- "directionalGate" (DIODE) edge's real conducting direction
 -- geometrically — from the diode's own rotation and which side of it a
 -- neighbor physically sits on — instead of from whichever element the wire
 -- happened to be DRAWN from first (model/graph.lua's own prior, admittedly
@@ -1511,9 +1546,36 @@ local function _solveCurrentSchematic()
             -- powered node, via _colorForPoweredNode below.
             local isOpenGate = componentTypes[c.id] == "gate" and not _isActivePosition(c)
             local isOffSource = componentTypes[c.id] == "source" and not sourceStates[c.id]
-            result.controls[c.id] = (state == ModelSolver.POWERED and not isOpenGate and not isOffSource)
-                and _colorForPoweredNode(c.id, attribution, canvas, medium.style.powered, nodeStates)
-                or medium.style.unpowered
+            local poleIds = graph.nodes[c.id] and graph.nodes[c.id].poles
+            if poleIds and state == ModelSolver.POWERED and not isOpenGate then
+                -- A multi-pole switch (DPST) carries separate circuits, so
+                -- its body shows each pole's own color side by side (one
+                -- solid color when they agree) — never one color for the
+                -- switch as a whole, which would mean both circuits share
+                -- one source. A pole with nothing live on it shows gray.
+                local colors = {}
+                for _, poleId in ipairs(poleIds) do
+                    local poleColor = (nodeStates[poleId] == ModelSolver.POWERED)
+                        and _colorForPoweredNode(poleId, attribution, canvas, medium.style.powered, nodeStates)
+                        or medium.style.unpowered
+                    if type(poleColor[1]) == "table" then
+                        for _, color in ipairs(poleColor) do table.insert(colors, color) end
+                    else
+                        table.insert(colors, poleColor)
+                    end
+                end
+                local allSame = true
+                for i = 2, #colors do
+                    for k = 1, 4 do
+                        if (colors[1][k] or 1) ~= (colors[i][k] or 1) then allSame = false end
+                    end
+                end
+                result.controls[c.id] = allSame and colors[1] or colors
+            else
+                result.controls[c.id] = (state == ModelSolver.POWERED and not isOpenGate and not isOffSource)
+                    and _colorForPoweredNode(c.id, attribution, canvas, medium.style.powered, nodeStates)
+                    or medium.style.unpowered
+            end
         end
     end
     -- A wire's predicted color is a conservative "both ends powered"
@@ -1537,7 +1599,7 @@ local function _solveCurrentSchematic()
     -- approximation, just picking whichever end it's actually accurate
     -- for.
     --
-    -- A wire touching a "directionalGate" node (DIODE, DPST SWITCH) is a
+    -- A wire touching a "directionalGate" node (DIODE) is a
     -- DIFFERENT case from the open-gate one above, not an extension of
     -- it: the gate's own graph node is a single powered/unpowered value
     -- that can't represent its two real-world leads being at DIFFERENT
@@ -1557,24 +1619,31 @@ local function _solveCurrentSchematic()
     -- gate) -- this is just trusting that neighbor's own already-correct
     -- answer instead of re-deriving it through the lossy single-node
     -- diode value.
+    --
+    -- Node states/attribution are read off each end's own graph node
+    -- (ModelGraph.wireEndIds) — for a multi-pole gate (DPST SWITCH) that's
+    -- the one pole the wire's terminal belongs to, not the switch as a
+    -- whole — while role/gate-position checks stay keyed by the anchor id.
     for _, w in ipairs(canvas.wires) do
+        local fromNodeId, toNodeId = ModelGraph.wireEndIds(graph, w)
         local fromIsDirectionalGate = componentTypes[w.fromElementId] == "directionalGate"
         local toIsDirectionalGate = componentTypes[w.toElementId] == "directionalGate"
         if fromIsDirectionalGate or toIsDirectionalGate then
             local otherId = fromIsDirectionalGate and w.toElementId or w.fromElementId
-            local otherState = nodeStates[otherId]
+            local otherNodeId = fromIsDirectionalGate and toNodeId or fromNodeId
+            local otherState = nodeStates[otherNodeId]
             if otherState and not oscillatingIds[otherId] then
                 result.wires[w.id] = (otherState == ModelSolver.POWERED)
-                    and _colorForPoweredNode(otherId, attribution, canvas, medium.style.powered, nodeStates)
+                    and _colorForPoweredNode(otherNodeId, attribution, canvas, medium.style.powered, nodeStates)
                     or medium.style.unpowered
             end
         else
-            local fromState, toState = nodeStates[w.fromElementId], nodeStates[w.toElementId]
+            local fromState, toState = nodeStates[fromNodeId], nodeStates[toNodeId]
             if fromState and toState and not oscillatingIds[w.fromElementId] and not oscillatingIds[w.toElementId] then
                 if fromState == ModelSolver.POWERED and toState == ModelSolver.POWERED then
                     local fromIsOpenGate = componentTypes[w.fromElementId] == "gate" and finalGateStates[w.fromElementId] ~= "closed"
                     local toIsOpenGate = componentTypes[w.toElementId] == "gate" and finalGateStates[w.toElementId] ~= "closed"
-                    local anchorId = (fromIsOpenGate and not toIsOpenGate) and w.toElementId or w.fromElementId
+                    local anchorId = (fromIsOpenGate and not toIsOpenGate) and toNodeId or fromNodeId
                     result.wires[w.id] = _colorForPoweredNode(anchorId, attribution, canvas, medium.style.powered, nodeStates)
                 else
                     result.wires[w.id] = medium.style.unpowered
@@ -1892,8 +1961,10 @@ function _teachableCombosTotal(canvas, graph, maxCombos)
         local teachable = false
         for nodeId, contributingIds in pairs(attribution) do
             if _isGenuinelyColorAmbiguous(canvas, contributingIds) then
-                local role = graph.nodes[nodeId].role
-                local isOpenGate = role == "gate" and gateStates[nodeId] ~= "closed"
+                local node = graph.nodes[nodeId]
+                local role = node.role
+                local isOpenGate = (role == "gate" and gateStates[nodeId] ~= "closed")
+                    or (role == "gatePole" and gateStates[node.gateOf] ~= "closed")
                 local isOffSource = role == "source" and not sourceStates[nodeId]
                 if not isOpenGate and not isOffSource then
                     teachable = true
@@ -2624,18 +2695,19 @@ local function _computeAiPanelStats()
             -- _solveCurrentSchematic's own live wire loop uses — never
             -- both-ends-powered, which would simply never fire for a
             -- correctly-blocking diode's cathode-side wire at all.
+            local fromNodeId, toNodeId = ModelGraph.wireEndIds(graph, w)
             local fromIsDirectionalGate = componentTypes[w.fromElementId] == "directionalGate"
             local toIsDirectionalGate = componentTypes[w.toElementId] == "directionalGate"
             local powered, anchorId
             if fromIsDirectionalGate or toIsDirectionalGate then
-                anchorId = fromIsDirectionalGate and w.toElementId or w.fromElementId
+                anchorId = fromIsDirectionalGate and toNodeId or fromNodeId
                 powered = nodeStatesForSig[anchorId] == ModelSolver.POWERED
             else
-                local fromState, toState = nodeStatesForSig[w.fromElementId], nodeStatesForSig[w.toElementId]
+                local fromState, toState = nodeStatesForSig[fromNodeId], nodeStatesForSig[toNodeId]
                 powered = fromState == ModelSolver.POWERED and toState == ModelSolver.POWERED
                 local fromIsOpenGate = componentTypes[w.fromElementId] == "gate" and gateStatesForSig[w.fromElementId] ~= "closed"
                 local toIsOpenGate = componentTypes[w.toElementId] == "gate" and gateStatesForSig[w.toElementId] ~= "closed"
-                anchorId = (fromIsOpenGate and not toIsOpenGate) and w.toElementId or w.fromElementId
+                anchorId = (fromIsOpenGate and not toIsOpenGate) and toNodeId or fromNodeId
             end
             if powered then
                 local expected, sourceId = expectedColorAndSource(anchorId)
@@ -2952,7 +3024,7 @@ local function _openSystemIntoCanvas(systemId, mode)
     for _, e in ipairs(sys.elements or {}) do
         gdsGui_schematic_addElement("mainCanvas", e.id, e.shapeType, e.x, e.y, e.w, e.h, e.label,
             _deepCopyTable(e.defaultColor), _deepCopyTable(e.properties), e.rotation or 0, e.spritePath,
-            e.componentType)
+            e.componentType, _deepCopyTable(e.terminals))
         -- voltage (per-source display setting — see
         -- _openPerSourceSettingsMenu) isn't among addElement's own
         -- parameters, so it doesn't round-trip through it like
@@ -2970,7 +3042,7 @@ local function _openSystemIntoCanvas(systemId, mode)
     for _, c in ipairs(sys.controls or {}) do
         gdsGui_schematic_addControl("mainCanvas", c.id, c.x, c.y, _deepCopyTable(c.positions), c.detentIndex,
             c.label, c.callbackFunc, c.radiusScale, c.spritePaths, c.rotation, c.overlaySpritePath,
-            _deepCopyTable(c.defaultColor), c.colorDarkenMul, c.componentType)
+            _deepCopyTable(c.defaultColor), c.colorDarkenMul, c.componentType, _deepCopyTable(c.terminals))
         if canvas then
             local ctrl = canvas.controls[#canvas.controls]
             ctrl.voltage = c.voltage
@@ -2978,7 +3050,7 @@ local function _openSystemIntoCanvas(systemId, mode)
     end
     for _, w in ipairs(sys.wires or {}) do
         gdsGui_schematic_addWire("mainCanvas", w.id, w.fromElementId, w.toElementId, _deepCopyTable(w.defaultColor),
-            w.directionOverride)
+            w.directionOverride, w.fromTerminal, w.toTerminal)
     end
     for _, a in ipairs(sys.annunciators or {}) do
         gdsGui_schematic_addAnnunciator("mainCanvas", a.id, a.label, _deepCopyTable(a.color), a.active)
@@ -3390,11 +3462,12 @@ local function _openSystemSelectMenu(canvasName)
 end
 
 -- 1st level of the ADD cascade now: one button per model/graph.lua node
--- role that at least one of sys's own catalog items actually declares
--- ("directionalGate" shown as FLOW — see the Learn page's own "ONE-WAY
--- GATE" explanation of the same concept under friendlier words), in the
--- order a user naturally thinks about a flow network: what starts it,
--- what carries it, what blocks it, which way it's allowed, where it ends.
+-- role that at least one of sys's own catalog items actually declares, in
+-- the order a user naturally thinks about a flow network: what starts it,
+-- what carries it, what blocks it, where it ends. A "directionalGate"
+-- (DIODE, CHECK VALVE) has no button of its own: it's a one-way gate (see
+-- the Learn page's own "ONE-WAY GATE" explanation), listed under GATE
+-- alongside the switches/valves — see _openTypeMenu.
 -- A role with zero matching items for THIS system (ELECTRICAL/BLEED AIR
 -- have no "sink"-tagged item yet) just isn't offered — nothing to drill
 -- into. OTHER covers any catalog item with no role at all (PRESSURIZATION's
@@ -3412,11 +3485,12 @@ end
 -- (_openAddMenu, schematicCatalogSystemChosen) call it just as well
 -- through a global lookup.
 function _openFundamentalsMenu(canvasName, sys)
-    local roleOrder  = { "directionalGate", "source", "path", "gate", "sink" }
-    local roleLabels = { directionalGate = "FLOW", source = "SOURCE", path = "PATH", gate = "GATE", sink = "SINK" }
+    local roleOrder  = { "source", "path", "gate", "sink" }
+    local roleLabels = { source = "SOURCE", path = "PATH", gate = "GATE", sink = "SINK" }
     local present, hasOther = {}, false
     for _, item in ipairs(sys.items) do
-        if item.componentType then present[item.componentType] = true else hasOther = true end
+        local role = (item.componentType == "directionalGate") and "gate" or item.componentType
+        if role then present[role] = true else hasOther = true end
     end
     -- SINK always shows regardless of present["sink"] -- unlike the other
     -- four roles, every system gets this button up front even before any
@@ -3447,7 +3521,9 @@ end
 local function _openTypeMenu(canvasName, sys, role)
     local names = {}
     for _, item in ipairs(sys.items) do
+        -- GATE also lists one-way gates (see _openFundamentalsMenu).
         local matches = (role == "OTHER" and not item.componentType) or item.componentType == role
+            or (role == "gate" and item.componentType == "directionalGate")
         if matches then table.insert(names, item.label) end
     end
     if role == "path" then
@@ -3511,7 +3587,7 @@ function schematicCatalogSystemChosen(canvasName, index, optionText)
     _openFundamentalsMenu(canvasName, sys)
 end
 
--- FUNDAMENTALS button tapped: FLOW/SOURCE/PATH/GATE/SINK drill into that
+-- FUNDAMENTALS button tapped: SOURCE/PATH/GATE/SINK drill into that
 -- role's own item list (_openTypeMenu); OTHER drills into the untagged
 -- one; ANNUNCIATOR jumps straight to the name prompt instead (catalog-
 -- wide, not nested under any role — see _openFundamentalsMenu above).
@@ -3526,7 +3602,7 @@ function schematicFundamentalChosen(canvasName, index, optionText)
         _openTypeMenu(canvasName, sys, "OTHER")
         return
     end
-    local roleByLabel = { FLOW = "directionalGate", SOURCE = "source", PATH = "path", GATE = "gate", SINK = "sink" }
+    local roleByLabel = { SOURCE = "source", PATH = "path", GATE = "gate", SINK = "sink" }
     local role = roleByLabel[optionText]
     if not role then return end
     _openTypeMenu(canvasName, sys, role)
@@ -3587,10 +3663,10 @@ function schematicCatalogItemChosen(canvasName, index, optionText)
     -- gdsGui_schematic_internal_onElementEditChosen).
     if item.kind == "element" then
         gdsGui_schematic_armElementPlacement(canvasName, item.shapeType, item.abbrev or item.label, nil, item.label,
-            item.defaultProperties, item.spritePath, item.gridW, item.gridH, item.componentType)
+            item.defaultProperties, item.spritePath, item.gridW, item.gridH, item.componentType, item.terminals)
     elseif #item.presets == 1 then
         gdsGui_schematic_armControlPlacement(canvasName, item.presets[1], item.abbrev or item.label, item.callbackFunc, item.label,
-            item.spritePaths, item.overlaySpritePath, item.gridSize, item.colorDarkenMul, item.componentType)
+            item.spritePaths, item.overlaySpritePath, item.gridSize, item.colorDarkenMul, item.componentType, item.terminals)
     else
         _catalogChosenControlItem = item
         local names = {}
@@ -3614,7 +3690,7 @@ function schematicCatalogPresetChosen(canvasName, index, optionText)
     if not item then return end
     local preset = item.presets[index]
     gdsGui_schematic_armControlPlacement(canvasName, preset, item.abbrev or item.label, item.callbackFunc, item.label,
-        item.spritePaths, item.overlaySpritePath, item.gridSize, item.colorDarkenMul, item.componentType)
+        item.spritePaths, item.overlaySpritePath, item.gridSize, item.colorDarkenMul, item.componentType, item.terminals)
     _catalogChosenControlItem = nil
 end
 
@@ -6628,18 +6704,19 @@ function captureSchematicSnapshot()
                 -- uses — never both-ends-powered, which would simply
                 -- never fire for a correctly-blocking diode's cathode-side
                 -- wire at all.
+                local fromNodeId, toNodeId = ModelGraph.wireEndIds(graph, w)
                 local fromIsDirectionalGate = componentTypes[w.fromElementId] == "directionalGate"
                 local toIsDirectionalGate = componentTypes[w.toElementId] == "directionalGate"
                 local powered, anchorId
                 if fromIsDirectionalGate or toIsDirectionalGate then
-                    anchorId = fromIsDirectionalGate and w.toElementId or w.fromElementId
+                    anchorId = fromIsDirectionalGate and toNodeId or fromNodeId
                     powered = nodeStates[anchorId] == ModelSolver.POWERED
                 else
-                    local fromState, toState = nodeStates[w.fromElementId], nodeStates[w.toElementId]
+                    local fromState, toState = nodeStates[fromNodeId], nodeStates[toNodeId]
                     powered = fromState == ModelSolver.POWERED and toState == ModelSolver.POWERED
                     local fromIsOpenGate = componentTypes[w.fromElementId] == "gate" and gateStates[w.fromElementId] ~= "closed"
                     local toIsOpenGate = componentTypes[w.toElementId] == "gate" and gateStates[w.toElementId] ~= "closed"
-                    anchorId = (fromIsOpenGate and not toIsOpenGate) and w.toElementId or w.fromElementId
+                    anchorId = (fromIsOpenGate and not toIsOpenGate) and toNodeId or fromNodeId
                 end
                 if powered then
                     local expected, sourceId = expectedColorAndSource(attribution[anchorId])
@@ -7947,6 +8024,48 @@ function modelGraphHasAltPathTest()
     return ModelGraph.hasAltPath(graph, "bus2", "w3")
 end
 
+-- A DPST (two poles: terminals 1+3 are pole 1, 2+4 pole 2 -- see the
+-- catalog's own DPST SWITCH entry) with s1 on pole 1's top terminal and
+-- busA on pole 1's bottom, busB/busC on pole 2's top/bottom. CLOSED must
+-- power busA through pole 1 only -- never busB/busC across to the other
+-- pole -- with the switch's own node reading powered; OPEN must leave busA
+-- unpowered too.
+function modelSolverDpstPolesIsolatedTest()
+    local elements = { {id = "s1"}, {id = "busA"}, {id = "busB"}, {id = "busC"} }
+    local controls = { {id = "dpst", terminals = { {pole = 1}, {pole = 2}, {pole = 1}, {pole = 2} }} }
+    local wires = {
+        { id = "w1", fromElementId = "s1", toElementId = "dpst", toTerminal = 1 },
+        { id = "w2", fromElementId = "dpst", fromTerminal = 3, toElementId = "busA" },
+        { id = "w3", fromElementId = "busB", toElementId = "dpst", toTerminal = 2 },
+        { id = "w4", fromElementId = "dpst", fromTerminal = 4, toElementId = "busC" },
+    }
+    local componentTypes = { s1 = "source", busA = "path", busB = "path", busC = "path", dpst = "gate" }
+    local graph = ModelGraph.buildGraph(elements, controls, wires, componentTypes)
+    local closed = ModelSolver.solve(graph, { s1 = true }, { dpst = "closed" })
+    local open = ModelSolver.solve(graph, { s1 = true }, { dpst = "open" })
+    return closed.busA, closed.busB, closed.busC, closed.dpst, open.busA
+end
+
+-- A diode whose wires sit on its own anode ("in") / cathode ("out")
+-- terminals, both deliberately drawn the wrong way round (d1 -> s1 onto
+-- the anode, sink1 -> d1 onto the cathode) and with no positions at all:
+-- the terminals alone must decide it, so s1 powers sink1 through d1 —
+-- and reversed (s1 on the cathode), d1 must block it.
+function modelGraphDiodeDirectionFromTerminalsTest()
+    local elements = { {id = "s1"}, {id = "sink1"},
+        {id = "d1", terminals = { {flow = "in"}, {flow = "out"} }} }
+    local componentTypes = { s1 = "source", sink1 = "sink", d1 = "directionalGate" }
+    local forward = ModelGraph.buildGraph(elements, {}, {
+        { id = "w1", fromElementId = "d1", fromTerminal = 1, toElementId = "s1" },
+        { id = "w2", fromElementId = "sink1", toElementId = "d1", toTerminal = 2 },
+    }, componentTypes)
+    local reversed = ModelGraph.buildGraph(elements, {}, {
+        { id = "w1", fromElementId = "s1", toElementId = "d1", toTerminal = 2 },
+        { id = "w2", fromElementId = "d1", fromTerminal = 1, toElementId = "sink1" },
+    }, componentTypes)
+    return ModelSolver.solve(forward, { s1 = true }, {}).sink1, ModelSolver.solve(reversed, { s1 = true }, {}).sink1
+end
+
 -- s1 (on) feeds bus1 directly; s2 (off, e.g. an off generator) also sits on
 -- bus1, with sink2 wired only through s2. s2's own terminal must read
 -- powered (the real wire from bus1 carries voltage right up to it, same as
@@ -8841,6 +8960,16 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcName"]={"modelGraphHasAltPathTest"},
         ["funcParameters"]={0},
         ["funcExpctOutput"]={true}}
+
+    gdsGui_dev_testExecute {["id"]="modelGraph_diodeDirection_fromTerminals",
+        ["funcName"]={"modelGraphDiodeDirectionFromTerminalsTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"powered", "unpowered"}}
+
+    gdsGui_dev_testExecute {["id"]="modelSolver_dpst_polesIsolated",
+        ["funcName"]={"modelSolverDpstPolesIsolatedTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"powered", "unpowered", "unpowered", "powered", "unpowered"}}
 
     gdsGui_dev_testExecute {["id"]="modelSolver_offSource_reachedButBlocksPast",
         ["funcName"]={"modelSolverOffSourceReachedButBlocksPastTest"},
