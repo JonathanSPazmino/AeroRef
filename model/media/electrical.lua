@@ -17,8 +17,6 @@ local Registry = require("model.media.registry")
 
 local ELECTRICAL = {
     name = "ELECTRICAL",
-    states = { "unpowered", "powered" },
-    default = "unpowered",
     style = {
         unpowered = { 0.55, 0.55, 0.55, 1 },
         powered   = { 1, 1, 0, 1 },

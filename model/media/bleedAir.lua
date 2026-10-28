@@ -11,8 +11,6 @@ local Registry = require("model.media.registry")
 
 local BLEED_AIR = {
     name = "BLEED AIR",
-    states = { "unpowered", "powered" },
-    default = "unpowered",
     style = {
         unpowered = { 0.55, 0.55, 0.55, 1 },
         powered   = { 0.35, 0.70, 0.90, 1 }, -- flowing bleed air, pneumatic-schematic light blue

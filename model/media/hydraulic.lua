@@ -22,8 +22,6 @@ local Registry = require("model.media.registry")
 
 local HYDRAULIC = {
     name = "HYDRAULIC",
-    states = { "unpowered", "powered" },
-    default = "unpowered",
     style = {
         unpowered = { 0.55, 0.55, 0.55, 1 },
         powered   = { 0.85, 0.35, 0.1, 1 }, -- pressurized line, common hydraulic-schematic red/orange

@@ -228,5 +228,5 @@ end
 
 return {
     solve = solve, solveWithRules = solveWithRules, solveSourceAttribution = solveSourceAttribution,
-    POWERED = POWERED, UNPOWERED = UNPOWERED,
+    POWERED = POWERED,
 }

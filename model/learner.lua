@@ -349,5 +349,5 @@ return {
     inferGate = inferGate, deduceAllGates = deduceAllGates, findSimplestRule = findSimplestRule,
     findAttributionRule = findAttributionRule, findVoltageDominanceRule = findVoltageDominanceRule,
     buildConditionKey = buildConditionKey,
-    OPEN = OPEN, CLOSED = CLOSED, UNKNOWN = UNKNOWN,
+    UNKNOWN = UNKNOWN,
 }

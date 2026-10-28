@@ -65,7 +65,7 @@ local _PINCH_MIN_DIST_PX      = 1      -- guards against a near-zero divisor rig
 local _WIRE_WIDTH_PX         = 2 / 3   -- half of the previous 4/3px width
 local _WIRE_CROSS_HOP_RADIUS_PX = 2.5   -- radius of the little arc hop drawn where a wire crosses an unrelated one
 local _WIRE_BUNDLE_WIDTH_MULT   = 2     -- a "twisted bundle" (see _drawWireBundleSegment) draws this many times as thick as one normal wire
-local _WIRE_BUNDLE_STRIPE_LEN_PX = 3    -- length of one wire's own diagonal color band along a bundle
+local _WIRE_BUNDLE_STRIPE_LEN_PX = _GRID_SPACING_PX    -- length of one wire's own diagonal color band along a bundle -- exactly 1 grid unit (see _GRID_SPACING_PX)
 local _CONNECTOR_RELEASE_SLOP_PX = 16  -- forgiveness margin for "which element did the wire-drag land on", since exact-rectangle precision is unreliable on a touchscreen
 local _CONNECTOR_TARGET_RADIUS_PX = 9  -- drawn radius of the green "valid connection point" reticle shown at each element's center while a wire is being dragged
 local _CONNECTOR_SNAP_COLOR  = {0.25, 0.95, 0.35, 1}
@@ -284,12 +284,33 @@ local _openAnnunciatorRenamePrompt
 local _UNDO_STACK_MAX = 20
 
 local function _snapshotState(canvas)
+    -- Shallow, not deep — canvas.snapshots is one full color map PER
+    -- CAPTURED COMBINATION (gdsGui_schematic_commitSnapshot), so a deep
+    -- copy of it scales with elements x captured snapshots, paid on every
+    -- undo-tracked edit (every drag, rename, delete...) — for a user
+    -- who's captured a few hundred combinations (exactly what the AI
+    -- panel's own workflow encourages), that's a real, unbounded cost on
+    -- every subsequent drag. Safe because an individual captured
+    -- snapshot (canvas.snapshots[sig]) is only ever replaced wholesale or
+    -- deleted outright — commitSnapshot assigns canvas.snapshots[sig] =
+    -- {a brand-new table}, deletion sets canvas.snapshots[sig] = nil —
+    -- never mutated in place field by field once created (no call site
+    -- anywhere writes into an existing snap.elements/controls/wires
+    -- bucket directly). A later replace/delete on the LIVE
+    -- canvas.snapshots can't retroactively change what THIS copy's own
+    -- entries already point to, so reusing the same inner per-signature
+    -- tables here is exactly as correct as a full recursive copy, at a
+    -- fraction of the cost. Built as a plain local loop (not a separate
+    -- top-level _shallowCopy helper) since it has exactly one caller.
+    local snapshotsCopy = {}
+    for k, v in pairs(canvas.snapshots) do snapshotsCopy[k] = v end
+
     return {
         elements     = _deepCopy(canvas.elements),
         wires        = _deepCopy(canvas.wires),
         controls     = _deepCopy(canvas.controls),
         annunciators = _deepCopy(canvas.annunciators),
-        snapshots    = _deepCopy(canvas.snapshots),
+        snapshots    = snapshotsCopy,
     }
 end
 
@@ -4752,6 +4773,62 @@ end
 
 
 local function _computeWirePlans(canvas)
+    -- Mid-gesture fast path: recomputes ONLY each wire's own segments
+    -- (cheap, O(wires) -- one _clampedOrthogonalSegments call per wire,
+    -- independent of every other wire) so a wire keeps visually tracking
+    -- the element/control it's attached to, or the view itself, in real
+    -- time -- and skips the expensive O(wires^2 * segments^2) crossing-
+    -- hop/bundle sweep below entirely for the duration, rather than
+    -- reusing its last result. hopDistances/bundledRanges are left EMPTY
+    -- here, not stale — bundles (the 2nd return value) are stored as
+    -- ABSOLUTE pixel coordinates computed against whatever segment
+    -- geometry was live at the time of that last sweep, so reusing them
+    -- while segments themselves keep moving every frame (a drag/pan/pinch
+    -- changes exactly that geometry) visibly detaches the bundled/hop
+    -- rendering from the rest of the diagram — it was tried, and looked
+    -- exactly like that: solid colored shapes left floating at their old
+    -- screen position while everything else panned underneath them, only
+    -- snapping to the new position on release. Drawing every wire as a
+    -- plain solo line instead (no hop arcs, no bundled bands) for the
+    -- gesture's duration has no such risk, since every pixel drawn still
+    -- comes from THIS frame's own live segment. Purely a cosmetic
+    -- simplification, same as the old pre-bundling look, that resolves
+    -- itself the instant the gesture ends and the full sweep below runs
+    -- again for real. Without this, a diagram with many wires gets
+    -- progressively laggier and less responsive to edit the more wires it
+    -- has, since every single frame of every drag/pan/pinch was paying
+    -- that full O(n^2) sweep whether or not anything about the CROSSINGS
+    -- themselves had actually changed. The cache/signature
+    -- (canvas._wirePlansCache/_wpSig) is deliberately left untouched
+    -- here, so the very first frame after the gesture ends falls through
+    -- to the normal path below, sees "changed" (true positions now differ
+    -- from the signature last recorded before the gesture began), and
+    -- recomputes for real exactly once to catch up. Active gesture: an
+    -- element/control/rotate/wireDirection drag or pan that has actually
+    -- started moving (canvas.focusTouchId set AND canvas.dragMoved true —
+    -- see gdsGui_schematic_pressed/_moved/_released), or a pinch-zoom
+    -- (canvas.pinch.active). Deliberately NOT just "focusTouchId ~= nil":
+    -- that's already set the instant a finger touches down, including a
+    -- plain tap-and-hold that never moves (dragKind "pendingLongPress", or
+    -- a "pan"/"element"/etc. press held perfectly still) — nothing about
+    -- the geometry has changed yet in that case, so dropping to the plain-
+    -- line fast path there only hid the hop arcs/bundle bands for the
+    -- entire hold (reappearing on release) with no performance benefit,
+    -- since the expensive sweep below hadn't actually run again.
+    if canvas._wirePlansCache and ((canvas.focusTouchId ~= nil and canvas.dragMoved) or (canvas.pinch and canvas.pinch.active)) then
+        local plans = {}
+        for _, w in ipairs(canvas.wires) do
+            local fromE, toE = _findAnchor(canvas, w.fromElementId), _findAnchor(canvas, w.toElementId)
+            if fromE and toE then
+                local x1, y1 = _anchorCenter(canvas, fromE)
+                local x2, y2 = _anchorCenter(canvas, toE)
+                local segments = _clampedOrthogonalSegments(canvas, fromE, x1, y1, toE, x2, y2, _wireForceAxis(w))
+                plans[w.id] = { segments = segments, hopDistances = {}, bundledRanges = {} }
+            end
+        end
+        return plans, {}
+    end
+
     local changed = _wirePlansChanged(canvas)
     if canvas._wirePlansCache and not changed then
         return canvas._wirePlansCache, canvas._wireBundlesCache
@@ -5124,9 +5201,32 @@ function gdsGui_schematic_draw(pageName)
         love.graphics.setColor(1, 1, 1, 1)
     end
 
+    -- Viewport culling: skip issuing draw calls entirely for anything whose
+    -- own bounding box doesn't even overlap the canvas's visible on-screen
+    -- rect (canvas.x/y/w/h — the same rect love.graphics.setScissor already
+    -- clips to below, GPU-side). Scissor only discards already-issued
+    -- fragments at the GPU; it does nothing for the CPU-side cost of
+    -- actually BUILDING each draw call (table reads, color resolution,
+    -- love.graphics state changes) in the first place — that cost was
+    -- previously paid for every element/control/wire in the WHOLE diagram,
+    -- every frame, regardless of how much of it was actually panned into
+    -- view. Padded by cullPad so nothing merely near the edge (a label
+    -- that overflows its own box, a selection/highlight ring's extra
+    -- radius) pops in/out right at the boundary. vx/vy/vw/vh are set fresh
+    -- per canvas below (each schematic page's own canvas has its own
+    -- rect); rectVisible reads them as upvalues, so one closure serves
+    -- every canvas in the loop.
+    local cullPad = 48
+    local vx, vy, vw, vh
+    local function rectVisible(x, y, w, h)
+        return x < vx + vw and x + w > vx and y < vy + vh and y + h > vy
+    end
+
     for _, canvas in ipairs(globApp.objects.schematics) do
         if canvas.page == pageName then
             love.graphics.setScissor(canvas.x, canvas.y, canvas.w, canvas.h)
+            vx, vy = canvas.x - cullPad, canvas.y - cullPad
+            vw, vh = canvas.w + cullPad * 2, canvas.h + cullPad * 2
 
             -- globApp.themeCanvasBgColor (set by the app layer's dark/light
             -- mode toggle, if it sets one at all) — see _drawGrid's own
@@ -5145,21 +5245,57 @@ function gdsGui_schematic_draw(pageName)
             -- per drawn entity for a value that cannot change mid-frame).
             local signature = gdsGui_schematic_computeSignature(canvas.name)
             local wirePlans, wireBundles = _computeWirePlans(canvas)
-            for _, w in ipairs(canvas.wires) do _drawWire(canvas, w, wirePlans[w.id], signature) end
+            for _, w in ipairs(canvas.wires) do
+                -- Culled by the bounding box of its own ACTUAL path (every
+                -- segment's endpoints), not just a straight line between its
+                -- two anchors — a jogged/bent wire can swing well outside
+                -- that straight-line box while still having a real anchor
+                -- off-screen on each end. No plan (a dangling wire mid-undo,
+                -- same case _hitWire's own fallback handles) always draws —
+                -- nothing to measure, so nothing safe to cull.
+                local plan = wirePlans[w.id]
+                local visible = true
+                if plan and plan.segments and #plan.segments > 0 then
+                    local minX, minY, maxX, maxY
+                    for _, seg in ipairs(plan.segments) do
+                        local loX, hiX = math.min(seg[1], seg[3]), math.max(seg[1], seg[3])
+                        local loY, hiY = math.min(seg[2], seg[4]), math.max(seg[2], seg[4])
+                        minX = minX and math.min(minX, loX) or loX
+                        maxX = maxX and math.max(maxX, hiX) or hiX
+                        minY = minY and math.min(minY, loY) or loY
+                        maxY = maxY and math.max(maxY, hiY) or hiY
+                    end
+                    visible = rectVisible(minX, minY, maxX - minX, maxY - minY)
+                end
+                if visible then _drawWire(canvas, w, plan, signature) end
+            end
             -- Each bundle zone (see _computeWirePlans) draws as ONE thick
             -- line with its member wires' own colors, resolved fresh here
             -- (not cached in the plan) same as every other entity's color —
-            -- see _drawWireBundleSegment.
+            -- see _drawWireBundleSegment. Culled by its own two endpoints
+            -- directly (already absolute pixel coordinates, unlike a wire's
+            -- segments — no need to scan anything to get its bounding box).
             for _, bundle in ipairs(wireBundles) do
-                local colors = {}
-                for _, wireId in ipairs(bundle.wireIds) do
-                    local r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "wire", wireId, signature)
-                    table.insert(colors, { r, g, b, a })
+                local loX, hiX = math.min(bundle.x1, bundle.x2), math.max(bundle.x1, bundle.x2)
+                local loY, hiY = math.min(bundle.y1, bundle.y2), math.max(bundle.y1, bundle.y2)
+                if rectVisible(loX, loY, hiX - loX, hiY - loY) then
+                    local colors = {}
+                    for _, wireId in ipairs(bundle.wireIds) do
+                        local r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "wire", wireId, signature)
+                        table.insert(colors, { r, g, b, a })
+                    end
+                    _drawWireBundleSegment(bundle.x1, bundle.y1, bundle.x2, bundle.y2, colors, canvas.zoom)
                 end
-                _drawWireBundleSegment(bundle.x1, bundle.y1, bundle.x2, bundle.y2, colors, canvas.zoom)
             end
-            for _, e in ipairs(canvas.elements) do _drawElement(canvas, e, signature) end
-            for _, c in ipairs(canvas.controls) do _drawControl(canvas, c, signature) end
+            for _, e in ipairs(canvas.elements) do
+                local ex, ey, ew, eh = _elementFootprintRect(canvas, e)
+                if rectVisible(ex, ey, ew, eh) then _drawElement(canvas, e, signature) end
+            end
+            for _, c in ipairs(canvas.controls) do
+                local ccx, ccy = _toPixel(canvas, c.x, c.y)
+                local crad = canvas.controlRadius * canvas.zoom * (c.radiusScale or 1)
+                if rectVisible(ccx - crad, ccy - crad, crad * 2, crad * 2) then _drawControl(canvas, c, signature) end
+            end
             _drawAnnunciators(canvas)
             drawAiCulpritHighlight(canvas)
 

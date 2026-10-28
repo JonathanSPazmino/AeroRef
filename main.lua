@@ -25,7 +25,7 @@ require("model.media.hydraulic")
 require("model.media.fuel")
 require("model.media.bleedAir")
 
-APP_VERSION = "1.0.26"
+APP_VERSION = "1.0.30"
 
 -- Shape version of schematicProjects.lua's data, independent of APP_VERSION
 -- (an app update can ship with no data-shape change at all, or vice versa).
@@ -1839,6 +1839,83 @@ local function _lockGateRule(canvas, gateId)
     if rule and rule.status == "learned" then rule.status = "locked" end
 end
 
+-- Every combination in the ENTIRE combination space (captured or not)
+-- where the global voltage-dominance hypothesis is even testable at all —
+-- at least one node is genuinely ambiguous (_isGenuinelyColorAmbiguous)
+-- AND not forced to a flat, unattributed display (an open gate's or off
+-- source's own body always shows plain gray regardless of attribution —
+-- see _aiColorAttributionConfidence's own short-circuits — so painting
+-- one of those never actually asserts a color there is anything to learn
+-- from). Brute-force enumerated, one model/solver.lua solve per
+-- combination — fine for the small control counts this was written
+-- against, but a REAL diagram's combination space is the product of every
+-- control's own detent count, so it grows exponentially with how many
+-- controls exist: a few hundred thousand combinations (a perfectly normal
+-- count for a large diagram, nothing exotic) made this take upwards of
+-- 30 SECONDS, synchronously, on the very thread the UI itself runs on.
+-- maxCombos bails out (returns nil — same "absence means not known yet"
+-- convention as everywhere else in this model layer, and every caller
+-- already has an `or 1`/nil-safe fallback for exactly this) rather than
+-- ever walking a space that large. Previously called unconditionally from
+-- _recomputeAttributionRules (so EVERY edit — a control flipped, a wire
+-- added — paid this cost even with the AI panel closed and nobody
+-- looking at the number at all); now only ever called lazily from
+-- _computeAiPanelStats, which is itself throttled to at most twice a
+-- second AND only runs while that panel is actually open — so a normal
+-- edit never pays this at all any more, and the one case that still can
+-- (the panel open, mid-edit) is capped to a bounded, no-longer-exponential
+-- worst case instead of an unbounded one.
+-- Global, not local — this file is already at Lua's 200-top-level-local
+-- ceiling (see _LEARN_SCHEMATIC_RAW's own comment on the same
+-- constraint), and this function's one caller works just as well through
+-- a global lookup.
+function _teachableCombosTotal(canvas, graph, maxCombos)
+    maxCombos = maxCombos or 5000
+    local sortedIds, numDetentsById = {}, {}
+    local spaceSize = 1
+    for _, c in ipairs(canvas.controls) do
+        table.insert(sortedIds, c.id)
+        numDetentsById[c.id] = c.numDetents
+        spaceSize = spaceSize * math.max(1, c.numDetents)
+    end
+    if spaceSize > maxCombos then return nil end
+
+    local componentTypes = {}
+    for id, node in pairs(graph.nodes) do componentTypes[id] = node.role end
+
+    local detents = {}
+    for _, id in ipairs(sortedIds) do detents[id] = 0 end
+    local total = 0
+    while true do
+        local gateStates, sourceStates = _gateAndSourceStatesForDetents(canvas, componentTypes, detents)
+        local attribution = ModelSolver.solveSourceAttribution(graph, sourceStates, gateStates)
+        local teachable = false
+        for nodeId, contributingIds in pairs(attribution) do
+            if _isGenuinelyColorAmbiguous(canvas, contributingIds) then
+                local role = graph.nodes[nodeId].role
+                local isOpenGate = role == "gate" and gateStates[nodeId] ~= "closed"
+                local isOffSource = role == "source" and not sourceStates[nodeId]
+                if not isOpenGate and not isOffSource then
+                    teachable = true
+                    break
+                end
+            end
+        end
+        if teachable then total = total + 1 end
+
+        local i = #sortedIds
+        while i >= 1 do
+            local id = sortedIds[i]
+            detents[id] = detents[id] + 1
+            if detents[id] < numDetentsById[id] then break end
+            detents[id] = 0
+            i = i - 1
+        end
+        if i == 0 then break end
+    end
+    return total
+end
+
 -- canvas.attributionRules[nodeId] = a model/learner.lua attribution rule
 -- (see findAttributionRule), or {status="noRule"} — same "always an
 -- explicit entry for every node that's ever shown up ambiguous, never
@@ -1852,12 +1929,13 @@ end
 -- above — the GLOBAL counterpart (model/learner.lua's
 -- findVoltageDominanceRule): not keyed by node id at all, since it's
 -- testing one single system-wide hypothesis ("the highest-voltage
--- contributor always wins") rather than learning a per-node mapping.
--- Folded into this same function (rather than its own top-level local)
--- purely to stay under this file's 200-local ceiling; it draws from the
--- exact same per-snapshot `winners` this function already computes, just
--- pooling every node's evidence together instead of splitting it out by
--- id, paired with whether that winner was the single highest-voltage
+-- contributor always wins") rather than learning a per-node mapping. Its
+-- own .teachableTotal field is NOT set here — see _teachableCombosTotal's
+-- own comment for why that's left to _computeAiPanelStats instead. The
+-- rest draws from the exact same per-snapshot `winners` this function
+-- already computes, just pooling every node's evidence together instead
+-- of splitting it out by id, paired with whether that winner was the
+-- single highest-voltage
 -- contributor's own pick (nil when that pick isn't well-defined — some
 -- contributor has no registered voltage, or the top voltage is tied
 -- across 2+ of them, same conditions _isGenuinelyColorAmbiguous's own
@@ -1931,66 +2009,10 @@ local function _recomputeAttributionRules(canvas, graph)
         end
     end
 
-    -- teachableTotal: every combination in the ENTIRE combination space
-    -- (captured or not) where the global hypothesis is even testable at
-    -- all — at least one node is genuinely ambiguous
-    -- (_isGenuinelyColorAmbiguous) AND not forced to a flat, unattributed
-    -- display (an open gate's or off source's own body always shows plain
-    -- gray regardless of attribution — see _aiColorAttributionConfidence's
-    -- own short-circuits — so painting one of those never actually
-    -- asserts a color there is anything to learn from). Brute-force
-    -- enumerated — the app's own COMBINATION: X/Y counter already assumes
-    -- this whole space is small enough for a human to step through one at
-    -- a time, so it's small enough to walk here too — only on a recompute
-    -- (snapshot capture/system load), never per frame. Lets
-    -- _aiColorAttributionConfidence turn exampleCount into a fraction of
-    -- every OTHER combination that could have confirmed or refuted this
-    -- exact hypothesis, rather than against an arbitrary fixed constant —
-    -- see its own comment.
-    local function teachableCombosTotal()
-        local sortedIds, numDetentsById = {}, {}
-        for _, c in ipairs(canvas.controls) do
-            table.insert(sortedIds, c.id)
-            numDetentsById[c.id] = c.numDetents
-        end
-        local componentTypes = {}
-        for id, node in pairs(graph.nodes) do componentTypes[id] = node.role end
-
-        local detents = {}
-        for _, id in ipairs(sortedIds) do detents[id] = 0 end
-        local total = 0
-        while true do
-            local gateStates, sourceStates = _gateAndSourceStatesForDetents(canvas, componentTypes, detents)
-            local attribution = ModelSolver.solveSourceAttribution(graph, sourceStates, gateStates)
-            local teachable = false
-            for nodeId, contributingIds in pairs(attribution) do
-                if _isGenuinelyColorAmbiguous(canvas, contributingIds) then
-                    local role = graph.nodes[nodeId].role
-                    local isOpenGate = role == "gate" and gateStates[nodeId] ~= "closed"
-                    local isOffSource = role == "source" and not sourceStates[nodeId]
-                    if not isOpenGate and not isOffSource then
-                        teachable = true
-                        break
-                    end
-                end
-            end
-            if teachable then total = total + 1 end
-
-            local i = #sortedIds
-            while i >= 1 do
-                local id = sortedIds[i]
-                detents[id] = detents[id] + 1
-                if detents[id] < numDetentsById[id] then break end
-                detents[id] = 0
-                i = i - 1
-            end
-            if i == 0 then break end
-        end
-        return total
-    end
-
     canvas.voltageDominanceRule = ModelLearner.findVoltageDominanceRule(dominanceExamples)
-    canvas.voltageDominanceRule.teachableTotal = teachableCombosTotal()
+    -- teachableTotal is deliberately NOT set here — see _teachableCombosTotal's
+    -- own comment for why computing it is left to whoever actually needs
+    -- it (the AI panel), not paid unconditionally on every edit.
     -- Which captured combinations actually backed a "learned" verdict, by
     -- signature (converted to a combination NUMBER only at display time —
     -- _combinationIndexForDetents isn't in scope yet this early in the
@@ -2170,8 +2192,8 @@ end
 
 -------------------------------------------------------------------------------
 -- SYSTEM SCHEMATIC — AI INFO PANEL: a read-only overlay (schematicAiBtn,
--- just below ANNUNCIATOR) surfacing three things about the inference
--- engine's current state for whichever system is open:
+-- just below ANNUNCIATOR) surfacing what the inference engine currently
+-- thinks about whichever system is open:
 --   COMBINATION         -- which control-position combination is showing
 --                          now (same counter as schematicCombLabel).
 --   PREDICTION CONFIDENCE -- how much to trust the colors currently
@@ -2192,12 +2214,20 @@ end
 --                          wrong, low-confidence color purely from the
 --                          second factor — see _aiColorAttributionConfidence's
 --                          own comment for a concrete case.
---   SNAPSHOT IMPORTANCE -- of every snapshot captured on this system, what
---                          fraction actually taught the engine anything
---                          (contributed a non-"unknown" deduced state for
---                          at least one gate — see
---                          _deducedGateStatesBySignature) rather than
---                          being dead weight the learner can't use.
+--   REASON/FIX          -- only shown alongside a confidence shortfall
+--                          (below 100%): REASON names the single worst
+--                          factor and why (reasonTextWithEvidence below);
+--                          FIX, only for the exact-snapshot-contradiction
+--                          case, says exactly what repaint would resolve
+--                          it. Deliberately NOT a suggested combination to
+--                          go capture next — that used to be a GLOBAL,
+--                          combination-space brute-force scan
+--                          (scanTeachableSpace) run the instant this panel
+--                          opened, which froze the app outright on a
+--                          system with many controls (its own combination
+--                          space grows exponentially with how many exist)
+--                          — removed rather than merely capped, see git
+--                          history for the capped version this replaced.
 -------------------------------------------------------------------------------
 
 -- A "learned" (not yet locked) rule's own confidence scales with how many
@@ -2343,49 +2373,33 @@ local function _capturedSignaturesSet(canvas)
 end
 
 -- {combinationIndex, combinationTotal, confidencePercent,
--- primaryReasonText, primaryReasonNodeId, suggestedCombinationIndex,
--- fixInstructionText, teachCombos, snapshotImportancePercent} for
+-- primaryReasonText, primaryReasonNodeId, fixInstructionText} for
 -- whichever system mainCanvas currently has open — confidencePercent is
 -- nil (rather than a misleading number) when there's genuinely nothing to
--- measure (an untyped/non-ELECTRICAL system); snapshotImportancePercent
--- is nil when nothing anywhere in the space is teachable at all (so
--- there's no maximum to be a fraction of). nil entirely if there's no
+-- measure (an untyped/non-ELECTRICAL system). nil entirely if there's no
 -- canvas at all.
 -- primaryReasonNodeId is the element/control id primaryReasonText is
 -- actually about (always set alongside it) — drawSchematicAiPanel copies
 -- it onto canvas.aiCulpritId each frame so gdsGui_schematic_draw's own
 -- drawAiCulpritHighlight can ring it in gold; nothing else reads it.
 -- primaryReasonText is set alongside any confidencePercent < 100.
--- fixInstructionText is the ONE case primaryReasonText can be set WITHOUT
--- suggestedCombinationIndex alongside it: structuralColorMismatches below
--- catches a captured snapshot's own paint flatly contradicting a
--- provable single-source expectation — not a data gap a new combination
--- could fix, but an outright mistake in THIS exact snapshot, so
--- fixInstructionText instead just says to repaint and re-capture it
--- (OVERWRITE).
--- Otherwise, suggestedCombinationIndex is set only for a gate-rule data
--- gap (or any oscillating factor) worth navigating to: for a learnable
--- gate rule, model/suggest.lua's suggestTargetedSnapshot targets one that
--- would deduce a gate state not already seen in training (falls back to
--- its plain suggestNextSnapshot if no such candidate exists); for an
--- oscillating gate, any untested neighbor is as good as any other (a
--- stability problem, not a data-gap one), so the plain heuristic is used
--- directly. An ambiguous-attribution worst case gets neither: THIS
--- combination already exercises the ambiguity, so there's no missing
--- COMBINATION to navigate to — only a missing disagreeing EXAMPLE, which
--- teachCombos (below) surfaces instead, system-wide rather than scoped to
--- just this one factor.
--- teachCombos is a persistent, GLOBAL checklist — always populated
--- (possibly empty) whenever there's a graph at all, independent of
--- confidencePercent: every combination NUMBER anywhere in the whole space
--- that's teachable for at least one node (scanTeachableSpace below),
--- each tagged with whether its own snapshot has already been captured —
--- EXCEPT combinationIndex itself (this combination), excluded below: it's
--- a checklist of combos to go CAPTURE, and you're already looking at this
--- one, captured or not.
--- snapshotImportancePercent ranks THIS combination's own value as a
--- capture target against the single most valuable combination anywhere
--- in the space (see scanTeachableSpace's own comment on "recurrence").
+-- fixInstructionText is the ONE case primaryReasonText can be set for:
+-- structuralColorMismatches below catches a captured snapshot's own paint
+-- flatly contradicting a provable single-source expectation — not a data
+-- gap, but an outright mistake in THIS exact snapshot, so
+-- fixInstructionText just says to repaint and re-capture it (OVERWRITE).
+-- Every OTHER confidence shortfall only ever gets a plain REASON, no
+-- suggested combination to go capture next — that used to exist
+-- (suggestedCombinationIndex, via model/suggest.lua's
+-- suggestTargetedSnapshot/suggestNextSnapshot) alongside a GLOBAL
+-- teaching checklist (teachCombos/snapshotImportancePercent, via a
+-- full combination-space brute-force scan) but both were removed: the
+-- scan ran the INSTANT this panel opened, and its cost grows
+-- exponentially with how many controls exist — on a system with many
+-- controls that froze the app outright rather than merely stuttering.
+-- See git history for the capped-but-still-present version this
+-- replaced, if that navigation/checklist feature is ever wanted back
+-- (properly bounded this time, not just removed).
 local function _computeAiPanelStats()
     local canvas = _findSchematicCanvas()
     if not canvas then return nil end
@@ -2398,6 +2412,18 @@ local function _computeAiPanelStats()
     local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes, _nodePositionsForGraph(canvas))
     local sourceStates = _currentSourceStates(canvas, componentTypes)
     local gateStates = _currentGateStates(canvas, componentTypes)
+
+    -- Lazy: _recomputeAttributionRules (every edit) deliberately leaves
+    -- this unset — see _teachableCombosTotal's own comment. This function
+    -- is already throttled to at most twice a second AND only runs while
+    -- this panel is actually open (drawSchematicAiPanel's own cache), so
+    -- it's the one place this brute-force, capped-but-still-real cost is
+    -- actually affordable to pay. Only computed once per fresh
+    -- voltageDominanceRule table (nil check, not a time check — the table
+    -- itself gets rebuilt from scratch on the next real edit regardless).
+    if canvas.voltageDominanceRule and canvas.voltageDominanceRule.teachableTotal == nil then
+        canvas.voltageDominanceRule.teachableTotal = _teachableCombosTotal(canvas, graph)
+    end
 
     -- Every captured combination (by combination NUMBER, see
     -- _combinationIndexForDetents) that was actually usable as a training
@@ -2460,9 +2486,9 @@ local function _computeAiPanelStats()
     -- Plain-English reason one rule isn't fully trusted yet — deliberately
     -- short (at most 2 short sentences: the shortfall, then an optional
     -- dominance-credit sentence) rather than enumerating every backing
-    -- combination by number; that detail is still there to find via TRY
-    -- NEXT/TEACH, this line's only job is a quick, readable "why". Shared
-    -- by both the gate-position and color-attribution confidence factors,
+    -- combination by number; this line's only job is a quick, readable
+    -- "why". Shared by both the gate-position and color-attribution
+    -- confidence factors,
     -- since both use the same model/learner.lua {status, reason,
     -- exampleCount} shape (see findSimplestRule/findAttributionRule's own
     -- comments). The caller only reaches here once it already knows
@@ -2713,169 +2739,8 @@ local function _computeAiPanelStats()
                     or reasonTextWithEvidence(worst, labelsById)
                 stats.primaryReasonText = label .. ": " .. why
                 stats.primaryReasonNodeId = worst.id
-
-                -- currentSignature is marked as if already captured so
-                -- neither remedy below ever points at the very combination
-                -- this panel is currently unsure about — capturing THAT
-                -- one trivially hits 100% by the exact-snapshot short-
-                -- circuit above without teaching anything, which would
-                -- make either remedy a circular/useless claim.
-                local excludedSignatures = _capturedSignaturesSet(canvas)
-                excludedSignatures[currentSignature] = true
-
-                -- An ambiguous-attribution worst case has no navigation
-                -- target at all — THIS combination already exercises the
-                -- ambiguity (that's exactly why it's the worst factor
-                -- right now), and what's missing is a disagreeing
-                -- EXAMPLE, not a missing combination (see TEACH's own
-                -- comment below, scanTeachableSpace, for where/how that
-                -- gets surfaced instead). A gate-rule data gap (or an
-                -- oscillating gate) IS a genuinely missing combination
-                -- though, so only that case gets a navigation suggestion.
-                if not (worst.kind == "attribution" and not worst.isOscillating) then
-                    -- Gate-rule data gap (or an oscillating gate — see
-                    -- below): a genuinely missing COMBINATION, so a
-                    -- navigation suggestion actually helps here, unlike
-                    -- the attribution case above. For an oscillating gate,
-                    -- any nearby untested combination is as good as any
-                    -- other (it's a stability problem, not a data-gap
-                    -- one), so this keeps the plain one-flip heuristic.
-                    -- For a learnable gate rule (insufficient_examples/
-                    -- no_variation/no_consistent_explanation), targets a
-                    -- combination that would deduce a state for worst.id
-                    -- NOT already seen in training — see suggestTargetedSnapshot
-                    -- and _gateAndSourceStatesForDetents above.
-                    local suggestion
-                    if worst.kind == "gateRule" and not worst.isOscillating then
-                        local seenStates = {}
-                        for signature in pairs(canvas.snapshots) do
-                            local deduced = _deducedGateStatesBySignature[signature]
-                            local s = deduced and deduced[worst.id]
-                            if s and s ~= ModelLearner.UNKNOWN then seenStates[s] = true end
-                        end
-                        local function scoreFn(candidateDetents)
-                            local candGateStates, candSourceStates =
-                                _gateAndSourceStatesForDetents(canvas, componentTypes, candidateDetents)
-                            local candNodeStates = ModelSolver.solve(graph, candSourceStates, candGateStates)
-                            local deduced = ModelLearner.inferGate(worst.id, candNodeStates, graph)
-                            if deduced == ModelLearner.UNKNOWN then return nil end
-                            return (not seenStates[deduced]) and 2 or 1
-                        end
-                        suggestion = ModelSuggest.suggestTargetedSnapshot(_controlsForSuggest(canvas), excludedSignatures, scoreFn)
-                    end
-                    suggestion = suggestion or ModelSuggest.suggestNextSnapshot(_controlsForSuggest(canvas), excludedSignatures)
-                    if suggestion then
-                        stats.suggestedCombinationIndex = _combinationIndexForDetents(canvas, suggestion.detents)
-                    end
-                end
             end
         end
-    end
-
-    -- Persistent, GLOBAL teaching checklist — unlike the REASON/TRY NEXT
-    -- pair above (which only ever speak to whichever single factor is
-    -- worst for THIS combination), this scans the ENTIRE combination
-    -- space for every combo NUMBER that's teachable for AT LEAST ONE node
-    -- — same per-combo ambiguous-and-not-forced-flat test
-    -- teachableCombosTotal (above _recomputeAttributionRules) uses for
-    -- "any node at all" — paired with whether that combo's own snapshot
-    -- has already been captured, so the panel can show a standing
-    -- checklist (every one checked off eventually) rather than a list
-    -- that shrinks and loses its own history as captures happen.
-    --
-    -- SNAPSHOT IMPORTANCE reuses the same per-node scan to rank combos by
-    -- how many OTHER combos they'd help teach: a combo's "recurrence" is
-    -- the number of (node, other combo) pairs it shares a teach-set with
-    -- (every node where BOTH combos are genuinely ambiguous means
-    -- capturing either one teaches something relevant to the other). The
-    -- combo with the highest recurrence anywhere in the space is the
-    -- single most valuable one to capture (100%); every other combo's
-    -- importance — including whichever one is currently showing — is
-    -- just its own recurrence as a fraction of that maximum.
-    local function scanTeachableSpace()
-        local sortedIds, numDetentsById = {}, {}
-        for _, c in ipairs(canvas.controls) do
-            table.insert(sortedIds, c.id)
-            numDetentsById[c.id] = c.numDetents
-        end
-        local capturedSignatures = _capturedSignaturesSet(canvas)
-        local candDetents = {}
-        for _, id in ipairs(sortedIds) do candDetents[id] = 0 end
-
-        local capturedByIndex, indicesByNode = {}, {}
-        while true do
-            local candGateStates, candSourceStates = _gateAndSourceStatesForDetents(canvas, componentTypes, candDetents)
-            local candAttribution = ModelSolver.solveSourceAttribution(graph, candSourceStates, candGateStates)
-            local idx = _combinationIndexForDetents(canvas, candDetents)
-            local teachableHere = false
-            for nodeId, contributingIds in pairs(candAttribution) do
-                if _isGenuinelyColorAmbiguous(canvas, contributingIds) then
-                    local role = graph.nodes[nodeId].role
-                    local isOpenGate = role == "gate" and candGateStates[nodeId] ~= "closed"
-                    local isOffSource = role == "source" and not candSourceStates[nodeId]
-                    if not isOpenGate and not isOffSource then
-                        teachableHere = true
-                        indicesByNode[nodeId] = indicesByNode[nodeId] or {}
-                        table.insert(indicesByNode[nodeId], idx)
-                    end
-                end
-            end
-            if teachableHere then
-                local candControlStates = {}
-                for _, id in ipairs(sortedIds) do
-                    table.insert(candControlStates, { id = id, detentIndex = candDetents[id] })
-                end
-                local candSignature = gdsGui_schematic_buildSignature(candControlStates)
-                capturedByIndex[idx] = capturedSignatures[candSignature] or false
-            end
-
-            local i = #sortedIds
-            while i >= 1 do
-                local id = sortedIds[i]
-                candDetents[id] = candDetents[id] + 1
-                if candDetents[id] < numDetentsById[id] then break end
-                candDetents[id] = 0
-                i = i - 1
-            end
-            if i == 0 then break end
-        end
-
-        local teachableIndices = {}
-        for idx in pairs(capturedByIndex) do table.insert(teachableIndices, idx) end
-        table.sort(teachableIndices)
-
-        local recurrenceByIndex = {}
-        for _, indices in pairs(indicesByNode) do
-            local n = #indices
-            if n > 1 then
-                for _, idx in ipairs(indices) do
-                    recurrenceByIndex[idx] = (recurrenceByIndex[idx] or 0) + (n - 1)
-                end
-            end
-        end
-
-        return teachableIndices, capturedByIndex, recurrenceByIndex
-    end
-
-    local teachableIndices, capturedByIndex, recurrenceByIndex = scanTeachableSpace()
-
-    -- The combo currently showing is excluded from its own checklist — the
-    -- whole point of TEACH is "combos to go CAPTURE", and you're already
-    -- looking at this one, captured or not; listing it as something to go
-    -- navigate to would be pointing at yourself.
-    stats.teachCombos = {}
-    for _, idx in ipairs(teachableIndices) do
-        if idx ~= stats.combinationIndex then
-            table.insert(stats.teachCombos, { index = idx, captured = capturedByIndex[idx] })
-        end
-    end
-
-    local maxRecurrence = 0
-    for _, r in pairs(recurrenceByIndex) do
-        if r > maxRecurrence then maxRecurrence = r end
-    end
-    if maxRecurrence > 0 then
-        stats.snapshotImportancePercent = math.floor((recurrenceByIndex[stats.combinationIndex] or 0) / maxRecurrence * 100 + 0.5)
     end
 
     return stats
@@ -2900,6 +2765,22 @@ local _aiPanelFont  = nil
 -- drag-forwarding callback gdsGui_schematic_setInputBlockRect calls.
 local _aiPanelScrollY = 0
 local _AI_PANEL_WHEEL_PX_PER_NOTCH = 24
+-- _computeAiPanelStats' own result, time-throttled rather than recomputed
+-- every single draw frame the panel is open (see drawSchematicAiPanel) —
+-- it rebuilds the whole graph and every confidence factor from scratch,
+-- plus (lazily, once per fresh voltageDominanceRule table)
+-- _teachableCombosTotal's own capped-but-still-real brute-force walk, so
+-- paying that 60 times a second just from having this panel open,
+-- independent of whether anything was even being edited, is still worth
+-- avoiding even with the worse exponential scan (scanTeachableSpace) that
+-- used to live here removed entirely — see this section's own header
+-- comment. {stats, time} in one table
+-- (mutated in place) rather than two separate locals. Global, not local
+-- like its sibling AI-panel state above — this file is already at Lua's
+-- 200-top-level-local ceiling (see _LEARN_SCHEMATIC_RAW's own comment on
+-- the same constraint), and this table's one reader (drawSchematicAiPanel)
+-- works just as well through a global.
+_aiPanelStatsCache = { stats = nil, time = 0 }
 
 function schematicAiBtnPressed(newState)
     _aiPanelOpen = (newState == globApp.BUTTON_STATES.PRESSED)
@@ -2974,7 +2855,16 @@ function drawSchematicAiPanel()
     local px, py, pw, ph = _aiPanelRect()
     if not px then clearCulprit(); return end
 
-    local stats = _computeAiPanelStats()
+    -- Throttled to at most twice a second — see _aiPanelStatsCache's own
+    -- comment. now - cache.time is already well past the threshold on the
+    -- very first call (cache.time starts at 0), so this needs no separate
+    -- first-call case.
+    local now = love.timer.getTime()
+    if now - _aiPanelStatsCache.time > 0.5 then
+        _aiPanelStatsCache.stats = _computeAiPanelStats()
+        _aiPanelStatsCache.time = now
+    end
+    local stats = _aiPanelStatsCache.stats
     if not stats then clearCulprit(); return end
     if culpritCanvas then culpritCanvas.aiCulpritId = stats.primaryReasonNodeId end
 
@@ -2986,39 +2876,19 @@ function drawSchematicAiPanel()
     if not _aiPanelFont then _aiPanelFont = love.graphics.newFont(13) end
     love.graphics.setFont(_aiPanelFont)
 
-    -- Each entry is either a plain string, or {text=, checkmark=true} for
-    -- one row of the vertical TEACH checklist below — checkmark draws a
-    -- green check mark at the row's right edge, for whichever combo
-    -- numbers already have a captured snapshot.
     local lines = {
         string.format("COMBINATION: %d / %d", stats.combinationIndex, stats.combinationTotal),
         "PREDICTION CONFIDENCE: " .. (stats.confidencePercent and (stats.confidencePercent .. "%") or "N/A"),
     }
-    -- REASON/TRY NEXT only ever appear alongside a confidence shortfall —
-    -- see _computeAiPanelStats' own comment on why these fields are only
-    -- ever set together with confidencePercent < 100. TEACH (below) is
-    -- the one exception: a persistent, GLOBAL checklist shown regardless
-    -- of confidencePercent, replacing the old WHY line entirely.
+    -- REASON/FIX only ever appear alongside a confidence shortfall — see
+    -- _computeAiPanelStats' own comment on why these fields are only ever
+    -- set together with confidencePercent < 100.
     if stats.primaryReasonText then
         table.insert(lines, "REASON: " .. stats.primaryReasonText)
-    end
-    if stats.suggestedCombinationIndex then
-        table.insert(lines, string.format("TRY NEXT: COMBINATION %d/%d", stats.suggestedCombinationIndex, stats.combinationTotal))
     end
     if stats.fixInstructionText then
         table.insert(lines, "FIX: " .. stats.fixInstructionText)
     end
-    if stats.teachCombos then
-        if #stats.teachCombos == 0 then
-            table.insert(lines, "TEACH: N/A")
-        else
-            table.insert(lines, "TEACH:")
-            for _, combo in ipairs(stats.teachCombos) do
-                table.insert(lines, { text = tostring(combo.index), checkmark = combo.captured })
-            end
-        end
-    end
-    table.insert(lines, "SNAPSHOT IMPORTANCE: " .. (stats.snapshotImportancePercent and (stats.snapshotImportancePercent .. "%") or "N/A"))
 
     local pad, wrapW, lineGap = 10, pw - 20, 4
     local lineH = _aiPanelFont:getHeight() + lineGap
@@ -3029,8 +2899,7 @@ function drawSchematicAiPanel()
     -- left over from a longer REASON line that just got shorter) never
     -- leaves a blank gap hanging at the bottom instead of snapping back.
     local lineCounts, totalH = {}, 0
-    for i, line in ipairs(lines) do
-        local text = type(line) == "table" and line.text or line
+    for i, text in ipairs(lines) do
         local _, wrapped = _aiPanelFont:getWrap(text, wrapW)
         lineCounts[i] = math.max(1, #wrapped)
         totalH = totalH + lineCounts[i] * lineH
@@ -3041,22 +2910,9 @@ function drawSchematicAiPanel()
 
     love.graphics.setScissor(px, py, pw, ph)
     local y = py + pad - _aiPanelScrollY
-    for i, line in ipairs(lines) do
-        local text = type(line) == "table" and line.text or line
+    for i, text in ipairs(lines) do
         love.graphics.setColor(1, 1, 0, 1)
         love.graphics.printf(text, px + pad, y, wrapW, "left")
-        if type(line) == "table" and line.checkmark then
-            -- Drawn as two short line segments (not a text glyph — the
-            -- panel's default font has no guaranteed check-mark glyph) a
-            -- few characters to the right of the combo number itself,
-            -- vertically centered on its own line.
-            local cx = px + pad + _aiPanelFont:getWidth(text) + 14
-            local cy = y + _aiPanelFont:getHeight() / 2
-            love.graphics.setColor(0, 1, 0, 1)
-            love.graphics.setLineWidth(2)
-            love.graphics.line(cx - 6, cy, cx - 2, cy + 4, cx + 6, cy - 5)
-            love.graphics.setLineWidth(1)
-        end
         y = y + lineCounts[i] * lineH
     end
     love.graphics.setScissor()
@@ -5518,14 +5374,17 @@ function love.load()
     local showTC = (appSettings.tcAcceptedVersion ~= APP_VERSION)
     local lastSchematicPage = (not showTC) and appSettings.schematicUnlocked and appSettings.schematicLastPage
 
-    local resumeSystem = lastSchematicPage == "SystemSchematic" and _findSystem(schematicStore.currentSystemId)
-    local resumeAircraft = lastSchematicPage == "SchematicManageGallery" and _findCurrentAircraft()
+    -- A cold boot never reopens straight into a specific system's canvas
+    -- (lastSchematicPage == "SystemSchematic") -- it lands on that system's
+    -- OWN aircraft's systems gallery instead, same as if lastSchematicPage
+    -- had been "SchematicManageGallery" to begin with. The user picks which
+    -- system to reopen from there; currentSystemId itself is left untouched
+    -- (still whatever system was last open, for every other "resume this
+    -- system" path that isn't a cold boot, e.g. navBackToSchematicHome).
+    local resumeAircraft = (lastSchematicPage == "SystemSchematic" or lastSchematicPage == "SchematicManageGallery")
+        and _findCurrentAircraft()
 
-    if resumeSystem then
-        _openSystemIntoCanvas(resumeSystem.id, appSettings.schematicEditMode and "design" or "control")
-        _navSyncAll("SystemSchematic")
-        gdsGui_page_switch("LoadingSchematic", 7, 3, false)
-    elseif resumeAircraft then
+    if resumeAircraft then
         gdsGui_schematicGallery_setItems("manageGallery", _systemGalleryItems(resumeAircraft))
         gdsGui_outputTxtBox_setText("schematicManage_pageTitle", _aircraftSystemsTitle(resumeAircraft))
         _navSyncAll("SchematicManageGallery")
@@ -7595,6 +7454,29 @@ function schematicTiedVoltageAttributionConfidenceTest()
     return isTiedVoltageColor, confidence == 1, winners.busX == nil
 end
 
+-- _teachableCombosTotal's own cap (maxCombos): a combination space at or
+-- under it still gets the real brute-force count; a space over it bails
+-- out to nil (model/graph.lua's own "absence means not known yet"
+-- convention) instead of ever walking it — the exact behavior that keeps
+-- a real diagram's control flip/wire-add path from freezing for however
+-- long its own combination space takes to brute-force. Hand-built empty
+-- graphs (no nodes at all) for both — nothing can ever be "ambiguous" with
+-- no nodes, so the small case's own real count is always 0; this is
+-- testing the CAP's own pass/fail boundary, not the ambiguity logic
+-- itself (already covered by schematicVoltageDominanceGeneralizesAcrossNodesTest
+-- and its own siblings above).
+function teachableCombosTotalCapTest()
+    local graph = { nodes = {}, edges = {} }
+    local smallCanvas = { controls = { { id = "c1", numDetents = 4 } }, elements = {}, wires = {} }
+    local underCap = _teachableCombosTotal(smallCanvas, graph, 10) -- space size 4, cap 10
+
+    local bigCanvas = { controls = { { id = "c1", numDetents = 100 }, { id = "c2", numDetents = 100 } },
+        elements = {}, wires = {} }
+    local overCap = _teachableCombosTotal(bigCanvas, graph, 5000) -- space size 10000, cap 5000
+
+    return underCap == 0, overCap == nil
+end
+
 -- Verifies the GLOBAL voltage-dominance rule (model/learner.lua's
 -- findVoltageDominanceRule, rebuilt by main.lua's own
 -- _recomputeAttributionRules alongside its per-node table — see that
@@ -9166,6 +9048,11 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcName"]={"schematicTiedVoltageAttributionConfidenceTest"},
         ["funcParameters"]={0},
         ["funcExpctOutput"]={true, true, true}}
+
+    gdsGui_dev_testExecute {["id"]="teachableCombosTotal_cap",
+        ["funcName"]={"teachableCombosTotalCapTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={true, true}}
 
     gdsGui_dev_testExecute {["id"]="schematic_voltageDominance_generalizesAcrossNodes",
         ["funcName"]={"schematicVoltageDominanceGeneralizesAcrossNodesTest"},

@@ -9,8 +9,6 @@ local Registry = require("model.media.registry")
 
 local FUEL = {
     name = "FUEL",
-    states = { "unpowered", "powered" },
-    default = "unpowered",
     style = {
         unpowered = { 0.55, 0.55, 0.55, 1 },
         powered   = { 0.80, 0.60, 0.15, 1 }, -- flowing fuel, amber
