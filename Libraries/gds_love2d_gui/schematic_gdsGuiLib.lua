@@ -1493,11 +1493,8 @@ end
 -- exitX/exitY the unit direction a wire leaves it in. A wire to a control
 -- with terminals attaches to one of them (whichever it's dropped nearest —
 -- see _terminals.nearest) instead of the control's edge, and remembers
--- which (the wire's fromTerminal/toTerminal). An optional `pole` number
--- groups terminals that are one conductor (a DPST's two poles): a color
--- sequence on the control then paints each pole's part of the icon in its
--- own color (see _terminals.drawPoleColors). Any other keys are stored
--- untouched for the app layer.
+-- which (the wire's fromTerminal/toTerminal). Any other keys (e.g. the
+-- app's own pole number) are stored untouched for the app layer.
 function gdsGui_schematic_addControl(canvasName, id, x, y, positions, initialDetentIndex, label, callbackFunc, radiusScale, spritePaths, rotation, overlaySpritePath, defaultColor, colorDarkenMul, componentType, terminals)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
@@ -3984,67 +3981,6 @@ local function _drawColorSequenceStriped(boundsX, boundsY, boundsW, boundsH, col
     if prevScX then love.graphics.setScissor(prevScX, prevScY, prevScW, prevScH) else love.graphics.setScissor() end
 end
 
--- A color sequence on a control whose terminals carry a `pole` number
--- (see gdsGui_schematic_addControl): colors[i] is the i-th pole's own
--- color, in the order poles first appear in c.terminals, so each pole's
--- part of the icon is painted in its own color rather than the generic
--- alternating stripes, which land wherever they happen to fall and can
--- show a live pole gray. The icon is split at the midpoint between
--- neighbouring poles' terminal centers, across whichever screen axis the
--- poles are spread along (it follows the control's rotation). Each slice
--- is clipped with intersectScissor so the canvas's own clip still holds.
--- false (nothing drawn) when c has no poles or the sequence isn't exactly
--- one color per pole, so the caller falls back to the stripes.
-function _terminals.drawPoleColors(canvas, c, colors, drawFn, cx, cy, rad)
-    if not c.terminals then return false end
-    local order, sums = {}, {}
-    for i, t in ipairs(c.terminals) do
-        if t.pole then
-            local sum = sums[t.pole]
-            if not sum then
-                sum = { x = 0, y = 0, n = 0 }
-                sums[t.pole] = sum
-                table.insert(order, t.pole)
-            end
-            local px, py = _terminals.point(canvas, c, i)
-            sum.x, sum.y, sum.n = sum.x + px, sum.y + py, sum.n + 1
-        end
-    end
-    if #order < 2 or #order ~= #colors then return false end
-    local centers = {}
-    local minX, maxX, minY, maxY = math.huge, -math.huge, math.huge, -math.huge
-    for i, pole in ipairs(order) do
-        local sum = sums[pole]
-        local center = { x = sum.x / sum.n, y = sum.y / sum.n, color = colors[i] }
-        centers[i] = center
-        minX, maxX = math.min(minX, center.x), math.max(maxX, center.x)
-        minY, maxY = math.min(minY, center.y), math.max(maxY, center.y)
-    end
-    local alongX = (maxX - minX) >= (maxY - minY)
-    table.sort(centers, function(a, b) if alongX then return a.x < b.x end return a.y < b.y end)
-    local prevScX, prevScY, prevScW, prevScH = love.graphics.getScissor()
-    local lo = alongX and (cx - rad) or (cy - rad)
-    for i, center in ipairs(centers) do
-        local hi
-        if i < #centers then
-            hi = alongX and (center.x + centers[i + 1].x) / 2 or (center.y + centers[i + 1].y) / 2
-        else
-            hi = alongX and (cx + rad) or (cy + rad)
-        end
-        if prevScX then love.graphics.setScissor(prevScX, prevScY, prevScW, prevScH) else love.graphics.setScissor() end
-        if alongX then
-            love.graphics.intersectScissor(lo, cy - rad, math.max(0, hi - lo + 1), rad * 2)
-        else
-            love.graphics.intersectScissor(cx - rad, lo, rad * 2, math.max(0, hi - lo + 1))
-        end
-        local col = center.color
-        drawFn(col[1], col[2], col[3], col[4] or 1)
-        lo = hi
-    end
-    if prevScX then love.graphics.setScissor(prevScX, prevScY, prevScW, prevScH) else love.graphics.setScissor() end
-    return true
-end
-
 -- Draws a spritePath image (an element's own, or a control's spritePaths
 -- entry for its current detent — see gdsGui_schematic_addControl) filling
 -- the given box exactly (tinted by r,g,b,a — the normal resolved color, so
@@ -5333,9 +5269,7 @@ local function _drawControl(canvas, c, signature)
     local sequence = gdsGui_schematic_resolveColorSequence(canvas.name, "control", c.id, signature)
     if sequence then
         r, g, b, a = sequence[1][1], sequence[1][2], sequence[1][3], sequence[1][4]
-        if not _terminals.drawPoleColors(canvas, c, sequence, drawBodyWithColor, cx, cy, rad) then
-            _drawColorSequenceStriped(cx - rad, cy - rad, rad * 2, rad * 2, sequence, drawBodyWithColor)
-        end
+        _drawColorSequenceStriped(cx - rad, cy - rad, rad * 2, rad * 2, sequence, drawBodyWithColor)
     else
         r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "control", c.id, signature)
         drawBodyWithColor(r, g, b, a)

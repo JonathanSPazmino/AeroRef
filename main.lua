@@ -1546,36 +1546,13 @@ local function _solveCurrentSchematic()
             -- powered node, via _colorForPoweredNode below.
             local isOpenGate = componentTypes[c.id] == "gate" and not _isActivePosition(c)
             local isOffSource = componentTypes[c.id] == "source" and not sourceStates[c.id]
-            local poleIds = graph.nodes[c.id] and graph.nodes[c.id].poles
-            if poleIds and state == ModelSolver.POWERED and not isOpenGate then
-                -- A multi-pole switch (DPST) carries separate circuits, so
-                -- its body shows each pole's own color side by side (one
-                -- solid color when they agree) — never one color for the
-                -- switch as a whole, which would mean both circuits share
-                -- one source. A pole with nothing live on it shows gray.
-                local colors = {}
-                for _, poleId in ipairs(poleIds) do
-                    local poleColor = (nodeStates[poleId] == ModelSolver.POWERED)
-                        and _colorForPoweredNode(poleId, attribution, canvas, medium.style.powered, nodeStates)
-                        or medium.style.unpowered
-                    if type(poleColor[1]) == "table" then
-                        for _, color in ipairs(poleColor) do table.insert(colors, color) end
-                    else
-                        table.insert(colors, poleColor)
-                    end
-                end
-                local allSame = true
-                for i = 2, #colors do
-                    for k = 1, 4 do
-                        if (colors[1][k] or 1) ~= (colors[i][k] or 1) then allSame = false end
-                    end
-                end
-                result.controls[c.id] = allSame and colors[1] or colors
-            else
-                result.controls[c.id] = (state == ModelSolver.POWERED and not isOpenGate and not isOffSource)
-                    and _colorForPoweredNode(c.id, attribution, canvas, medium.style.powered, nodeStates)
-                    or medium.style.unpowered
-            end
+            -- A multi-pole switch (DPST) carries separate circuits, so no
+            -- one color could describe its body — it always reads gray,
+            -- powered or not; its wires show each pole's own color.
+            local isMultiPole = graph.nodes[c.id] and graph.nodes[c.id].poles
+            result.controls[c.id] = (state == ModelSolver.POWERED and not isOpenGate and not isOffSource and not isMultiPole)
+                and _colorForPoweredNode(c.id, attribution, canvas, medium.style.powered, nodeStates)
+                or medium.style.unpowered
         end
     end
     -- A wire's predicted color is a conservative "both ends powered"
