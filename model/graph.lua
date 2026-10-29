@@ -199,6 +199,20 @@ local function buildGraph(elements, controls, wires, componentTypes, positions)
     -- A directionalGate's own terminals can say outright which lead is
     -- which: flow = "in" (anode) or "out" (cathode). nodeId -> {terminalIndex -> flow}
     local flowsByNode = {}
+    -- A terminal marked `signal` (a relay's command input -- see
+    -- model/relay.lua) carries a control signal, not power: a wire on one is
+    -- left out of the graph entirely. anchorId -> {terminalIndex -> true}
+    local signalTerminals = {}
+    local function noteSignalTerminals(anchor)
+        for i, t in ipairs(anchor.terminals or {}) do
+            if t.signal then
+                signalTerminals[anchor.id] = signalTerminals[anchor.id] or {}
+                signalTerminals[anchor.id][i] = true
+            end
+        end
+    end
+    for _, e in ipairs(elements or {}) do noteSignalTerminals(e) end
+    for _, c in ipairs(controls or {}) do noteSignalTerminals(c) end
     for _, e in ipairs(elements or {}) do
         local role = componentTypes[e.id]
         if role then
@@ -245,7 +259,18 @@ local function buildGraph(elements, controls, wires, componentTypes, positions)
     -- multi-pole control.
     local wireEnds = {}
     local graphWires = {}
-    for i, w in ipairs(wires or {}) do
+    local signalWires = {} -- wireId -> true, see signalTerminals above
+    local powerWires = {}
+    for _, w in ipairs(wires or {}) do
+        local fromSignal = w.fromTerminal and signalTerminals[w.fromElementId] and signalTerminals[w.fromElementId][w.fromTerminal]
+        local toSignal = w.toTerminal and signalTerminals[w.toElementId] and signalTerminals[w.toElementId][w.toTerminal]
+        if fromSignal or toSignal then
+            signalWires[w.id] = true
+        else
+            table.insert(powerWires, w)
+        end
+    end
+    for i, w in ipairs(powerWires) do
         local fromId = _wireEndNodeId(w.fromElementId, w.fromTerminal, polesByControl)
         local toId = _wireEndNodeId(w.toElementId, w.toTerminal, polesByControl)
         wireEnds[w.id] = { fromId = fromId, toId = toId }
@@ -277,7 +302,7 @@ local function buildGraph(elements, controls, wires, componentTypes, positions)
         end
     end
 
-    return { nodes = nodes, edges = edges, wireEnds = wireEnds }
+    return { nodes = nodes, edges = edges, wireEnds = wireEnds, signalWires = signalWires }
 end
 
 -- The node ids wire w's two ends attach to in graph (a multi-pole gate's

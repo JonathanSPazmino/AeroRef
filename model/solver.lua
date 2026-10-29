@@ -239,7 +239,48 @@ local function solveSourceAttribution(graph, sourceStates, gateStates)
     return attribution
 end
 
+-- True if nodeId pushes power INTO the wire behind edge (one of its own
+-- edges). Being reached isn't enough: solve() marks an open gate, an open
+-- gate pole and an off source powered when power arrives at them, but none
+-- of them passes it on, so they feed none of their wires — power on a wire
+-- touching one comes from that wire's other end, if anywhere. A
+-- directionalGate (diode) is only ever reached from its entry side (see
+-- solve's one-way adjacency), so it feeds exactly its exit-side wires
+-- whenever it's powered.
+local function _feedsWire(graph, nodeId, edge, nodeStates, gateStates, sourceStates)
+    local node = graph.nodes[nodeId]
+    if not node or nodeStates[nodeId] ~= POWERED then return false end
+    if node.role == "gate" then return gateStates[nodeId] == "closed" end
+    if node.role == "gatePole" then return gateStates[node.gateOf] == "closed" end
+    if node.role == "source" then return sourceStates[nodeId] and true or false end
+    if node.role == "directionalGate" then return edge.directional and edge.fromId == nodeId end
+    return true
+end
+
+-- Whether the wire with id wireId carries power, and from which end: the
+-- graph node id feeding it (its color comes from that node's attribution),
+-- false for a dead wire, or nil when there's nothing to predict (the wire
+-- isn't a power edge in graph, or an end has no solved state). When both
+-- ends feed it, a non-diode end is preferred — a diode's own node reflects
+-- only its entry side, while the node across the wire is the wire's own
+-- conductor.
+local function wireFeed(graph, wireId, nodeStates, gateStates, sourceStates)
+    gateStates, sourceStates = gateStates or {}, sourceStates or {}
+    local edge
+    for _, e in ipairs(graph.edges) do
+        if e.id == wireId then edge = e; break end
+    end
+    if not edge or nodeStates[edge.fromId] == nil or nodeStates[edge.toId] == nil then return nil end
+    local ends = { edge.fromId, edge.toId }
+    if graph.nodes[edge.fromId].role == "directionalGate" then ends = { edge.toId, edge.fromId } end
+    for _, nodeId in ipairs(ends) do
+        if _feedsWire(graph, nodeId, edge, nodeStates, gateStates, sourceStates) then return nodeId end
+    end
+    return false
+end
+
 return {
     solve = solve, solveWithRules = solveWithRules, solveSourceAttribution = solveSourceAttribution,
+    wireFeed = wireFeed,
     POWERED = POWERED,
 }

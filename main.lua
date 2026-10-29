@@ -412,8 +412,8 @@ local SCHEMATIC_CATALOG = {
           spritePath = "Sprites/element_diodeTerminals.png",
           gridW = 2, gridH = 2, componentType = "directionalGate",
           terminals = {
-              { x = -0.43,  y = 0.03,  exitX = -1, exitY = 0, flow = "in" },
-              { x =  0.422, y = 0.027, exitX =  1, exitY = 0, flow = "out" },
+              { x = -0.416, y = 0.03,  exitX = -1, exitY = 0, flow = "in" },
+              { x =  0.419, y = 0.009, exitX =  1, exitY = 0, flow = "out" },
           } },
         { label = "SWITCH", abbrev = "SWCH",    kind = "control", presets = { {"OPEN", "CLOSED"}, {"OPEN", "CLOSED", "STBY"} },
           spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate" },
@@ -438,17 +438,20 @@ local SCHEMATIC_CATALOG = {
               { x = -0.415, y =  0.42, exitX = 0, exitY =  1, pole = 1 },
               { x =  0.153, y =  0.42, exitX = 0, exitY =  1, pole = 2 },
           } },
-        -- Bus tie: joins two buses (one per bus bar in the artwork) when
-        -- CLOSED. A single path, so one ordinary "gate" node — no `pole`
-        -- split like DPST SWITCH above — but with a terminal at the middle
-        -- of each bus bar so wires meet the bars themselves, leaving
-        -- sideways (left bar, then right bar).
-        { label = "BUS TIE", abbrev = "BTIE", kind = "control", presets = { {"OPEN", "CLOSED"} },
-          spritePaths = {"Sprites/control_busTieOpen.png", "Sprites/control_busTieClosed.png"},
-          gridSize = 3, componentType = "gate",
+        -- Bus tie: a relay joining two buses (one per bus bar in the
+        -- artwork) — nobody sets it directly. Its position comes from logic
+        -- learned from snapshots (see _relays): what each bus terminal
+        -- senses and the position of its command switch, auto-placed above
+        -- it and wired to the `signal` terminal at the blade's pivot (see
+        -- schematicSourceElementPlaced). The artwork shows open/closed per
+        -- that learned position (_relays.updateSprites). Terminals: left
+        -- bar, right bar, then the pivot.
+        { label = "BUS TIE", abbrev = "BTIE", kind = "element", shapeType = "rect",
+          spritePath = "Sprites/control_busTieOpen.png", gridW = 3, gridH = 3, componentType = "gate",
           terminals = {
               { x = -0.48,  y = -0.017, exitX = -1, exitY = 0 },
               { x =  0.479, y = -0.017, exitX =  1, exitY = 0 },
+              { x =  0.008, y = -0.18,  exitX =  0, exitY = -1, signal = true },
           } },
     }},
     { system = "HYDRAULIC", items = {
@@ -580,13 +583,32 @@ local _controlMenuIds           = {}
 local _controlMenuSelectedId    = nil
 local _pendingSnapshotPlan      = nil
 
--- Phase 5 (inference-schematic-assistance plan) UI state: which gate the
--- open GATE RULES detail menu's LOCK action targets, and the detents the
+-- Phase 5 (inference-schematic-assistance plan) UI state: the detents the
 -- open SUGGEST NEXT SNAPSHOT menu's APPLY action would jump to — see
--- _openGateRulesListMenu/_openSuggestNextSnapshotMenu below and their
--- *Chosen callbacks further down the file.
-local _pendingGateRuleGateId    = nil
+-- _openSuggestNextSnapshotMenu below and its *Chosen callback further down
+-- the file. (The GATE RULES detail menu's pending gate lives in _relays.)
 local _pendingSuggestedDetents  = nil
+-- RELAY GATES (a BUS TIE contactor): a "gate" whose position nobody sets
+-- directly, decided instead by logic learned from painted snapshots — see
+-- model/relay.lua. One table rather than separate locals: main.lua sits at
+-- Lua's 200-local ceiling, so this also carries the GATE RULES detail
+-- menu's pending gate id (pendingRuleGateId).
+local _relays = {
+    model = require("model.relay"),
+    spritePaths = { open = "Sprites/control_busTieOpen.png", closed = "Sprites/control_busTieClosed.png" },
+    -- {signature -> {relayId -> "open"|"closed"}}: each relay's position as
+    -- its own snapshot paints it. Derived, never persisted — rebuilt with
+    -- the gate rules by _recomputeDeducedGateStates.
+    deducedBySignature = {},
+    -- {relayId -> logic table the user set}, rebuilt the same way.
+    rules = {},
+    pendingRuleGateId = nil,
+    -- The open SET LOGIC grid: {relayId, rows} (see _relays.openLogicGrid).
+    editing = nil,
+    -- Set whenever a relay may have gained unset combinations; polled in
+    -- love.update to open the mandatory SET LOGIC grid.
+    checkLogic = false,
+}
 -- Which ambiguous node the open ATTRIBUTION RULES detail menu's LOCK
 -- action targets — see _openAttributionRulesListMenu below.
 local _pendingAttributionRuleNodeId = nil
@@ -1298,6 +1320,324 @@ local function _gateAndSourceStatesForDetents(canvas, componentTypes, detents)
     return gateStates, sourceStates
 end
 
+-- Index of anchor's `signal` terminal (a relay's command input — see
+-- model/graph.lua's signalTerminals), or nil.
+function _relays.signalTerminal(anchor)
+    for i, t in ipairs(anchor.terminals or {}) do
+        if t.signal then return i end
+    end
+    return nil
+end
+
+-- {id -> true} for every relay on canvas: a "gate" with a signal terminal.
+function _relays.idSet(canvas)
+    local ids = {}
+    for _, e in ipairs(canvas.elements) do
+        if e.componentType == "gate" and _relays.signalTerminal(e) then ids[e.id] = true end
+    end
+    for _, c in ipairs(canvas.controls) do
+        if c.componentType == "gate" and _relays.signalTerminal(c) then ids[c.id] = true end
+    end
+    return ids
+end
+
+-- Every relay on canvas in model/relay.lua's shape: {id, terminalNodeIds =
+-- {A, B}, command}. A/B are the graph nodes wired to its first two power
+-- terminals (nil when unwired); command is the position label of the
+-- control wired to its signal terminal, at detentById's position when given
+-- (a past snapshot's combination), else its live one.
+function _relays.list(canvas, graph, detentById)
+    local relays = {}
+    local anchors = {}
+    for _, e in ipairs(canvas.elements) do table.insert(anchors, e) end
+    for _, c in ipairs(canvas.controls) do table.insert(anchors, c) end
+    for _, anchor in ipairs(anchors) do
+        local signalIndex = anchor.componentType == "gate" and _relays.signalTerminal(anchor)
+        if signalIndex then
+            local relay = { id = anchor.id, terminalNodeIds = {}, command = _relays.model.NO_COMMAND,
+                gear = _relays.model.NO_GEAR }
+            local gearControl = _relays.gearControl(canvas)
+            if gearControl then
+                local detent = (detentById and detentById[gearControl.id]) or gearControl.detentIndex
+                relay.gear = gearControl.positions[detent + 1] or relay.gear
+            end
+            local powerTerminals = {}
+            for i in ipairs(anchor.terminals) do
+                if i ~= signalIndex then table.insert(powerTerminals, i) end
+            end
+            for _, w in ipairs(canvas.wires) do
+                local fromNodeId, toNodeId = ModelGraph.wireEndIds(graph, w)
+                local terminal, otherAnchorId, otherNodeId
+                if w.fromElementId == anchor.id then
+                    terminal, otherAnchorId, otherNodeId = w.fromTerminal, w.toElementId, toNodeId
+                elseif w.toElementId == anchor.id then
+                    terminal, otherAnchorId, otherNodeId = w.toTerminal, w.fromElementId, fromNodeId
+                end
+                if terminal == signalIndex then
+                    for _, c in ipairs(canvas.controls) do
+                        if c.id == otherAnchorId then
+                            local detent = (detentById and detentById[c.id]) or c.detentIndex
+                            relay.command = c.positions[detent + 1] or relay.command
+                        end
+                    end
+                elseif terminal == powerTerminals[1] then
+                    relay.terminalNodeIds[1] = otherNodeId
+                elseif terminal == powerTerminals[2] then
+                    relay.terminalNodeIds[2] = otherNodeId
+                end
+            end
+            table.insert(relays, relay)
+        end
+    end
+    return relays
+end
+
+-- {sourceId -> voltage} for every source on canvas (nil voltage: unassigned).
+function _relays.sourceVoltages(canvas)
+    local voltages = {}
+    for _, e in ipairs(canvas.elements) do
+        if e.componentType == "source" then voltages[e.id] = e.voltage end
+    end
+    for _, c in ipairs(canvas.controls) do
+        if c.componentType == "source" then voltages[c.id] = c.voltage end
+    end
+    return voltages
+end
+
+-- "powered"/"unpowered" for a painted relay body color — powered being the
+-- medium's own powered color or any registered voltage color — else nil.
+function _relays.bodyState(canvas, color)
+    if not color then return nil end
+    local function same(a, b)
+        return a[1] == b[1] and a[2] == b[2] and a[3] == b[3] and (a[4] or 1) == (b[4] or 1)
+    end
+    local style = _currentMedium().style
+    if same(color, style.unpowered) then return "unpowered" end
+    if same(color, style.powered) then return "powered" end
+    for _, voltageColor in pairs(canvas.voltageColors or {}) do
+        if same(color, voltageColor) then return "powered" end
+    end
+    return nil
+end
+
+-- Each relay's position as painted in one snapshot-shaped color bucket set
+-- (a captured snapshot, or a capture plan about to become one): body showing
+-- power -> closed, gray -> open. Used to check a capture's paint against
+-- itself, never for learning (see _relays.recompute's sense check for that).
+function _relays.statesFromPaint(canvas, elementColors, controlColors)
+    local states = {}
+    for id in pairs(_relays.idSet(canvas)) do
+        local bodyState = _relays.bodyState(canvas, (elementColors or {})[id] or (controlColors or {})[id])
+        if bodyState then states[id] = (bodyState == "powered") and "closed" or "open" end
+    end
+    return states
+end
+
+-- gateStates with every relay's position added: knownStates (e.g. what this
+-- combination's own snapshot paints) where given, the learned rules
+-- (_relays.rules) for the rest. Returns gateStates itself when there are no
+-- relays at all.
+function _relays.addStates(canvas, graph, gateStates, sourceStates, knownStates, detentById)
+    local relays = _relays.list(canvas, graph, detentById)
+    if #relays == 0 then return gateStates end
+    return (_relays.model.resolve(graph, sourceStates, gateStates, relays, _relays.rules,
+        _relays.sourceVoltages(canvas), knownStates))
+end
+
+-- Each relay's command wire and command switch belong to it: no power runs
+-- through them, so there's no color to teach (noPaint), the switch gets no
+-- other wires (noAddWire), and they only go away with the relay itself
+-- (noDelete — see _relays.removeOrphanSwitches).
+-- The switch also records its relay (relayOf). Re-derived here every time,
+-- so it follows reloads.
+function _relays.markLinkedParts(canvas)
+    for _, w in ipairs(canvas.wires) do w.noPaint, w.noDelete = nil, nil end
+    for _, c in ipairs(canvas.controls) do c.noPaint, c.noDelete, c.noAddWire = nil, nil, nil end
+    for _, e in ipairs(canvas.elements) do
+        local signalIndex = e.componentType == "gate" and _relays.signalTerminal(e)
+        if signalIndex then
+            for _, w in ipairs(canvas.wires) do
+                if (w.fromElementId == e.id and w.fromTerminal == signalIndex)
+                   or (w.toElementId == e.id and w.toTerminal == signalIndex) then
+                    w.noPaint, w.noDelete = true, true
+                end
+            end
+            local control = _relays.commandControl(canvas, e)
+            if control then
+                control.noPaint, control.noDelete, control.noAddWire, control.relayOf = true, true, true, e.id
+            end
+        end
+    end
+    _relays.syncGearControl(canvas) -- re-flags (or adds/removes) the hidden GEAR control
+end
+
+-- Deleting a relay already takes its command wire with it (the library
+-- removes every wire on a deleted element); this removes its command switch
+-- too. Returns true if anything was removed.
+function _relays.removeOrphanSwitches(canvas)
+    local relayIds = _relays.idSet(canvas)
+    local orphans = {}
+    for _, c in ipairs(canvas.controls) do
+        if c.relayOf and not relayIds[c.relayOf] then table.insert(orphans, c.id) end
+    end
+    for _, id in ipairs(orphans) do gdsGui_schematic_removeControl(canvas.name, id) end
+    _relays.syncGearControl(canvas)
+    return #orphans > 0
+end
+
+-- GEAR: the aircraft's global gear position — DOWN = on the ground, UP =
+-- airborne — set by the GEAR buttons (schematicGearBtnPressed) and kept in
+-- appSettings.gearDown. A system with a bus tie carries it as a hidden
+-- control, GEAR, so it's part of every snapshot's combination (and PREV/
+-- NEXT step through it) like any switch, and bus tie logic can depend on
+-- it. _relays.syncGearControl adds/removes that control as bus ties come
+-- and go; _relays.applyGlobalGear copies the global position onto it.
+_relays.GEAR_ID = "GEAR"
+_relays.GEAR_POSITIONS = { "DOWN", "UP" }
+
+function _relays.gearControl(canvas)
+    for _, c in ipairs(canvas.controls) do
+        if c.id == _relays.GEAR_ID then return c end
+    end
+    return nil
+end
+
+function _relays.gearText(gear)
+    if gear == "DOWN" then return "ON GROUND" end
+    if gear == "UP" then return "AIRBORNE" end
+    return "ANY GEAR"
+end
+
+function _relays.applyGlobalGear(canvas)
+    local gear = _relays.gearControl(canvas)
+    if gear then gear.detentIndex = appSettings.gearDown and 0 or 1 end
+end
+
+-- Hidden GEAR control present exactly when the canvas has a bus tie.
+function _relays.syncGearControl(canvas)
+    local hasRelay = next(_relays.idSet(canvas)) ~= nil
+    local gear = _relays.gearControl(canvas)
+    if hasRelay and not gear then
+        gdsGui_schematic_addControl(canvas.name, _relays.GEAR_ID, 0, 0, _relays.GEAR_POSITIONS,
+            appSettings.gearDown and 0 or 1, "GEAR")
+        gear = _relays.gearControl(canvas)
+    elseif gear and not hasRelay then
+        gdsGui_schematic_removeControl(canvas.name, _relays.GEAR_ID)
+        return
+    end
+    if gear then gear.hidden, gear.noPaint, gear.noDelete, gear.noAddWire = true, true, true, true end
+end
+
+-- Both GEAR buttons (design dock and control mode) show the global position.
+function _relays.refreshGearButtons(designing)
+    local state = appSettings.gearDown and "pushed" or "released"
+    gdsGui_button_setState("schematicGearBtn", state)
+    gdsGui_button_setState("schematicGearCtlBtn", state)
+    if designing ~= nil then
+        gdsGui_button_setHidden("schematicGearBtn", not designing)
+        gdsGui_button_setHidden("schematicGearCtlBtn", designing)
+    end
+end
+
+-- The control wired to relay's signal terminal (its command switch), or nil.
+function _relays.commandControl(canvas, relay)
+    local signalIndex = _relays.signalTerminal(relay)
+    for _, w in ipairs(canvas.wires) do
+        local otherId
+        if w.fromElementId == relay.id and w.fromTerminal == signalIndex then otherId = w.toElementId end
+        if w.toElementId == relay.id and w.toTerminal == signalIndex then otherId = w.fromElementId end
+        if otherId then
+            for _, c in ipairs(canvas.controls) do if c.id == otherId then return c end end
+        end
+    end
+    return nil
+end
+
+-- Every input combination relay's logic must cover: each gear position
+-- (on the ground / airborne) x each command switch position x each voltage
+-- a terminal can sense ("0" plus every distinct source voltage on canvas)
+-- for both terminals. Returns an array of {key, gear, command, a, b}, in
+-- display order.
+function _relays.requiredCombinations(canvas, relay)
+    local control = _relays.commandControl(canvas, relay)
+    local commands = control and control.positions or { _relays.model.NO_COMMAND }
+    local gearControl = _relays.gearControl(canvas)
+    local gears = gearControl and gearControl.positions or { _relays.model.NO_GEAR }
+    local seen, numbers = {}, {}
+    for _, v in pairs(_relays.sourceVoltages(canvas)) do
+        if not seen[v] then seen[v] = true; table.insert(numbers, v) end
+    end
+    table.sort(numbers)
+    local volts = { "0" }
+    for _, v in ipairs(numbers) do table.insert(volts, tostring(v)) end
+    local combos = {}
+    for _, gear in ipairs(gears) do
+        for _, command in ipairs(commands) do
+            for _, a in ipairs(volts) do
+                for _, b in ipairs(volts) do
+                    table.insert(combos, { key = _relays.model.buildKey(gear, command, a, b),
+                        gear = gear, command = command, a = a, b = b })
+                end
+            end
+        end
+    end
+    return combos
+end
+
+-- The first relay element whose user-set logic (e.relayLogic, {key ->
+-- "open"|"closed"}) doesn't cover every required combination — e.g. just
+-- placed, or a source with a new voltage was added since — or nil.
+function _relays.relayMissingLogic(canvas)
+    for _, e in ipairs(canvas.elements) do
+        if e.componentType == "gate" and _relays.signalTerminal(e) then
+            for _, combo in ipairs(_relays.requiredCombinations(canvas, e)) do
+                if not (e.relayLogic and e.relayLogic[combo.key]) then return e end
+            end
+        end
+    end
+    return nil
+end
+
+-- Opens the SET LOGIC grid for relay: one row per required combination,
+-- pre-filled from whatever it already has. Mirror-image rows (terminals
+-- swapped) are kept in agreement as the user picks — see
+-- schematicRelayLogicChanged — so the logic can never contradict itself.
+-- Mandatory (SAVE only) when opened because logic is missing; fromGateRules
+-- (editing from DESIGN ACTIONS > GATE RULES) adds CANCEL, and either button
+-- returns to the GATE RULES list.
+function _relays.openLogicGrid(canvas, relay, fromGateRules)
+    local function volts(v) return v .. "V" end
+    local rows, rowByKey = {}, {}
+    for _, combo in ipairs(_relays.requiredCombinations(canvas, relay)) do
+        -- A bus tie set up before gear existed has keys without it
+        -- ("command|a|b"): its answer pre-fills both gear positions.
+        local existing = relay.relayLogic and (relay.relayLogic[combo.key]
+            or relay.relayLogic[combo.command .. "|" .. combo.a .. "|" .. combo.b])
+        local row = { key = combo.key, label = _relays.gearText(combo.gear) .. "\nSW " .. combo.command
+                .. "\n" .. volts(combo.a) .. " | " .. volts(combo.b),
+            choice = (existing == "open" and 1) or (existing == "closed" and 2) or nil }
+        table.insert(rows, row)
+        rowByKey[combo.key] = row
+    end
+    for _, row in ipairs(rows) do row.mirror = rowByKey[_relays.model.mirrorKey(row.key)] end
+    _relays.editing = { relayId = relay.id, rows = rows, fromGateRules = fromGateRules }
+    gdsGui_schematic_openChoiceGrid(canvas.name,
+        (relay.label or relay.id) .. (fromGateRules and ": BUS TIE LOGIC\nTap OPEN or CLOSED to change a row"
+            or ": SET BUS TIE LOGIC\nPick OPEN or CLOSED for every row"),
+        "GEAR / SW / T1 | T2", rows, { "OPEN", "CLOSED" }, "schematicRelayLogicChanged", "schematicRelayLogicSaved",
+        fromGateRules and "schematicRelayLogicCancelled" or nil)
+end
+
+-- Draws each relay element open or closed per gateStates.
+function _relays.updateSprites(canvas, gateStates)
+    for _, e in ipairs(canvas.elements) do
+        if e.componentType == "gate" and _relays.signalTerminal(e) then
+            local path = (gateStates[e.id] == "closed") and _relays.spritePaths.closed or _relays.spritePaths.open
+            gdsGui_schematic_setElementSprite(canvas.name, e.id, path)
+        end
+    end
+end
+
 -- Builds the graph from the live mainCanvas, solves it, and maps the
 -- result through the electrical medium's style table into a
 -- snapshot-bucket-shaped {elements={id=color}, wires={id=color},
@@ -1469,6 +1809,10 @@ local function _solveCurrentSchematic()
     local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes, _nodePositionsForGraph(canvas))
     local sourceStates = _currentSourceStates(canvas, componentTypes)
     local gateStates = _currentGateStates(canvas, componentTypes)
+    -- Relays (BUS TIE) join gateStates as already decided: as this
+    -- combination's own snapshot paints them, else per their learned logic.
+    local signature = gdsGui_schematic_computeSignature(canvas.name)
+    gateStates = _relays.addStates(canvas, graph, gateStates, sourceStates, _relays.deducedBySignature[signature])
 
     -- A "gate"-role node the user operates directly (gateStates already
     -- has an entry for it, via _currentGateStates) is ALWAYS passed to
@@ -1520,11 +1864,14 @@ local function _solveCurrentSchematic()
     -- entirely — resolveColor falls through to that entity's own flat
     -- defaultColor tier rather than painting an arbitrary guess for a gate
     -- Phase 4 couldn't actually resolve.
+    _relays.updateSprites(canvas, finalGateStates)
     local result = { elements = {}, wires = {}, controls = {} }
     for _, e in ipairs(canvas.elements) do
         local state = nodeStates[e.id]
         if state and not oscillatingIds[e.id] then
-            result.elements[e.id] = state == ModelSolver.POWERED
+            -- An open relay's body reads gray, same as an open switch below.
+            local isOpenGate = componentTypes[e.id] == "gate" and finalGateStates[e.id] ~= "closed"
+            result.elements[e.id] = (state == ModelSolver.POWERED and not isOpenGate)
                 and _colorForPoweredNode(e.id, attribution, canvas, medium.style.powered, nodeStates)
                 or medium.style.unpowered
         end
@@ -1555,76 +1902,21 @@ local function _solveCurrentSchematic()
                 or medium.style.unpowered
         end
     end
-    -- A wire's predicted color is a conservative "both ends powered"
-    -- approximation, not a true per-edge flow trace (solve() only reports
-    -- per-node reachability, not which edge actually carried the power to
-    -- a node reachable several ways) — it's enough to show power stopping
-    -- exactly at an open gate or an unreached branch, which is all Phase 1
-    -- needs to prove. Colored off the FROM end's own attribution (what's
-    -- leaving that end), same approximation in spirit — not a true
-    -- per-edge trace either, just "which color this wire would carry if
-    -- it's actually conducting right now" — EXCEPT when the FROM end is
-    -- itself an OPEN gate and the TO end isn't: an open gate is exactly
-    -- the "single node whose two real-world terminals are fed by
-    -- different sources" case _isGenuinelyColorAmbiguous's own comment
-    -- flags (e.g. a generator feeding the gate's near side while the far
-    -- side is independently backfed from a bus on the other side of the
-    -- very contact that's open) — the gate's OWN attributed color can be
-    -- the WRONG side's source entirely for THIS specific wire, whereas the
-    -- non-gate end's attribution is never affected by whether this one
-    -- edge conducts. Anchoring off that end instead is still the same
-    -- approximation, just picking whichever end it's actually accurate
-    -- for.
-    --
-    -- A wire touching a "directionalGate" node (DIODE) is a
-    -- DIFFERENT case from the open-gate one above, not an extension of
-    -- it: the gate's own graph node is a single powered/unpowered value
-    -- that can't represent its two real-world leads being at DIFFERENT
-    -- states at once -- exactly the normal case for a reverse-biased
-    -- diode (cathode lead hot off a live bus, anode lead cold because the
-    -- diode is correctly blocking that bus from backfeeding through it).
-    -- Requiring BOTH ends powered off that single shared value, same as
-    -- every ordinary wire, would leave the cathode-side wire gray even
-    -- though the bus it's directly, un-gatedly wired to is live. So
-    -- instead: this wire's hotness and color are taken ENTIRELY from its
-    -- own non-gate endpoint's own state/attribution (never the gate
-    -- node's) -- correct for either leg, since solve()'s own forward-only
-    -- traversal (model/solver.lua) already guarantees an entry/anode-side
-    -- neighbor only reads powered when something is actually feeding IN,
-    -- and an exit/cathode-side neighbor only reads powered when something
-    -- is actually live on it (independently or fed forward through the
-    -- gate) -- this is just trusting that neighbor's own already-correct
-    -- answer instead of re-deriving it through the lossy single-node
-    -- diode value.
-    --
-    -- Node states/attribution are read off each end's own graph node
-    -- (ModelGraph.wireEndIds) — for a multi-pole gate (DPST SWITCH) that's
-    -- the one pole the wire's terminal belongs to, not the switch as a
-    -- whole — while role/gate-position checks stay keyed by the anchor id.
+    -- A wire is live only when one of its ends actually feeds power into
+    -- it (ModelSolver.wireFeed), and takes that end's color. Being reached
+    -- isn't enough: an open switch/pole or an off source is marked powered
+    -- when power arrives at it but passes none on, and a diode feeds only
+    -- its exit side — so a wire past an open contact, or on a diode's
+    -- blocked side, reads dead unless its other end is live on its own.
+    -- A relay's command wire (graph.signalWires) isn't a power edge, so it
+    -- gets no predicted color and keeps its own default.
     for _, w in ipairs(canvas.wires) do
-        local fromNodeId, toNodeId = ModelGraph.wireEndIds(graph, w)
-        local fromIsDirectionalGate = componentTypes[w.fromElementId] == "directionalGate"
-        local toIsDirectionalGate = componentTypes[w.toElementId] == "directionalGate"
-        if fromIsDirectionalGate or toIsDirectionalGate then
-            local otherId = fromIsDirectionalGate and w.toElementId or w.fromElementId
-            local otherNodeId = fromIsDirectionalGate and toNodeId or fromNodeId
-            local otherState = nodeStates[otherNodeId]
-            if otherState and not oscillatingIds[otherId] then
-                result.wires[w.id] = (otherState == ModelSolver.POWERED)
-                    and _colorForPoweredNode(otherNodeId, attribution, canvas, medium.style.powered, nodeStates)
-                    or medium.style.unpowered
-            end
-        else
-            local fromState, toState = nodeStates[fromNodeId], nodeStates[toNodeId]
-            if fromState and toState and not oscillatingIds[w.fromElementId] and not oscillatingIds[w.toElementId] then
-                if fromState == ModelSolver.POWERED and toState == ModelSolver.POWERED then
-                    local fromIsOpenGate = componentTypes[w.fromElementId] == "gate" and finalGateStates[w.fromElementId] ~= "closed"
-                    local toIsOpenGate = componentTypes[w.toElementId] == "gate" and finalGateStates[w.toElementId] ~= "closed"
-                    local anchorId = (fromIsOpenGate and not toIsOpenGate) and toNodeId or fromNodeId
-                    result.wires[w.id] = _colorForPoweredNode(anchorId, attribution, canvas, medium.style.powered, nodeStates)
-                else
-                    result.wires[w.id] = medium.style.unpowered
-                end
+        if not oscillatingIds[w.fromElementId] and not oscillatingIds[w.toElementId] then
+            local feedId = ModelSolver.wireFeed(graph, w.id, nodeStates, finalGateStates, sourceStates)
+            if feedId then
+                result.wires[w.id] = _colorForPoweredNode(feedId, attribution, canvas, medium.style.powered, nodeStates)
+            elseif feedId == false then
+                result.wires[w.id] = medium.style.unpowered
             end
         end
     end
@@ -1663,6 +1955,9 @@ local _recomputeDeducedGateStates
 -- defined never matters for callers), but the identifiers inside its own
 -- body still resolve lexically at parse time, same as any other function.
 function schematicCanvasChanged()
+    -- A deleted bus tie takes its command switch with it.
+    local canvas = _findSchematicCanvas()
+    if canvas then _relays.removeOrphanSwitches(canvas) end
     -- A design-mode edit (wire drawn, element/control added, componentType
     -- changed via a re-placement, etc.) can change what the graph itself
     -- looks like, not just a control's position — the per-frame poll in
@@ -1682,6 +1977,7 @@ function schematicCanvasChanged()
     -- deletion also wipes canvas.snapshots outright, see e.g.
     -- gdsGui_schematic_internal_onElementEditChosen's DELETE branch).
     _recomputeDeducedGateStates()
+    _relays.checkLogic = true -- a new switch position or relay may need logic set
     _requestSchematicSave()
 end
 
@@ -1769,6 +2065,44 @@ local function _pastGateAndSourceStates(canvas, graph, signature)
     return gateStates, sourceStates
 end
 
+-- _pastGateAndSourceStates plus every relay's position for that snapshot:
+-- as its own paint shows it, else per the learned relay logic.
+function _relays.pastStates(canvas, graph, signature)
+    local gateStates, sourceStates = _pastGateAndSourceStates(canvas, graph, signature)
+    gateStates = _relays.addStates(canvas, graph, gateStates, sourceStates,
+        _relays.deducedBySignature[signature], gdsGui_schematic_parseSignature(signature))
+    return gateStates, sourceStates
+end
+
+-- Rebuilds _relays.rules (each relay's logic as the user set it — see
+-- _relays.openLogicGrid) and _relays.deducedBySignature: a relay's position
+-- in each captured snapshot, from how its body is painted there
+-- (model/relay.lua's deduce). That only ever decides the snapshot's own
+-- combination; every other combination is predicted from the set logic.
+-- While one relay is sensed, the others sit at their own painted positions.
+function _relays.recompute(canvas, graph)
+    _relays.deducedBySignature, _relays.rules = {}, {}
+    _relays.markLinkedParts(canvas)
+    for _, e in ipairs(canvas.elements) do
+        if e.relayLogic and e.componentType == "gate" and _relays.signalTerminal(e) then _relays.rules[e.id] = e.relayLogic end
+    end
+    if #_relays.list(canvas, graph) == 0 then return end
+    local voltages = _relays.sourceVoltages(canvas)
+    for signature, snapshot in pairs(canvas.snapshots) do
+        local gateStates, sourceStates = _pastGateAndSourceStates(canvas, graph, signature)
+        for id, state in pairs(_relays.statesFromPaint(canvas, snapshot.elements, snapshot.controls)) do
+            gateStates[id] = state
+        end
+        local deduced = {}
+        for _, relay in ipairs(_relays.list(canvas, graph, gdsGui_schematic_parseSignature(signature))) do
+            local senseA, senseB = _relays.model.senseInputs(graph, sourceStates, gateStates, relay, voltages)
+            local painted = (snapshot.elements and snapshot.elements[relay.id]) or (snapshot.controls and snapshot.controls[relay.id])
+            deduced[relay.id] = _relays.model.deduce(_relays.bodyState(canvas, painted), senseA, senseB)
+        end
+        _relays.deducedBySignature[signature] = deduced
+    end
+end
+
 -- For one already-captured snapshot, re-solves source attribution under
 -- THAT snapshot's own combination (_pastGateAndSourceStates above), then
 -- for every node GENUINELY ambiguous there (_isGenuinelyColorAmbiguous —
@@ -1786,7 +2120,7 @@ end
 -- for gate rules.
 -- Returns {nodeId -> sourceId} for this one snapshot.
 local function _deduceAttributionWinnersForSnapshot(canvas, graph, signature, snapshot)
-    local gateStates, sourceStates = _pastGateAndSourceStates(canvas, graph, signature)
+    local gateStates, sourceStates = _relays.pastStates(canvas, graph, signature)
     local attribution = ModelSolver.solveSourceAttribution(graph, sourceStates, gateStates)
 
     local winners = {}
@@ -1860,8 +2194,11 @@ local function _recomputeGateRules(canvas, graph)
         end
     end
 
+    -- A relay's logic is learned separately (_relays.recompute).
+    local relayIds = _relays.idSet(canvas)
+    for id in pairs(relayIds) do canvas.rules[id] = nil end
     for id, node in pairs(graph.nodes) do
-        if node.role == "gate" then
+        if node.role == "gate" and not relayIds[id] then
             local existing = canvas.rules[id]
             if not (existing and existing.status == "locked") then
                 local candidateIds = {}
@@ -1934,6 +2271,7 @@ function _teachableCombosTotal(canvas, graph, maxCombos)
     local total = 0
     while true do
         local gateStates, sourceStates = _gateAndSourceStatesForDetents(canvas, componentTypes, detents)
+        gateStates = _relays.addStates(canvas, graph, gateStates, sourceStates, nil, detents)
         local attribution = ModelSolver.solveSourceAttribution(graph, sourceStates, gateStates)
         local teachable = false
         for nodeId, contributingIds in pairs(attribution) do
@@ -2021,7 +2359,7 @@ local function _recomputeAttributionRules(canvas, graph)
         local winners = _deduceAttributionWinnersForSnapshot(canvas, graph, signature, snapshot)
         if next(winners) ~= nil then
             local nodeStates = _snapshotToNodeStates(snapshot, graph)
-            local gateStates, sourceStates = _pastGateAndSourceStates(canvas, graph, signature)
+            local gateStates, sourceStates = _relays.pastStates(canvas, graph, signature)
             local attribution = ModelSolver.solveSourceAttribution(graph, sourceStates, gateStates)
 
             -- One dominance example per SNAPSHOT, not per (node, snapshot)
@@ -2225,6 +2563,7 @@ end
 
 function _recomputeDeducedGateStates()
     _deducedGateStatesBySignature = {}
+    _relays.deducedBySignature, _relays.rules = {}, {}
     local canvas = _findSchematicCanvas()
     if not canvas then return end
     local componentTypes = _buildComponentTypeMap(canvas)
@@ -2234,8 +2573,11 @@ function _recomputeDeducedGateStates()
         local nodeStates = _snapshotToNodeStates(snapshot, graph)
         _deducedGateStatesBySignature[signature] = ModelLearner.deduceAllGates(graph, nodeStates)
     end
+    _relays.recompute(canvas, graph) -- before the attribution rules, which read relay positions
     _recomputeGateRules(canvas, graph)
     _recomputeAttributionRules(canvas, graph) -- also rebuilds canvas.voltageDominanceRule, see its own comment
+    -- Relay logic may have just changed what this combination predicts.
+    _applySolvedColorsToCurrentCombination()
 end
 
 -------------------------------------------------------------------------------
@@ -2460,6 +2802,8 @@ local function _computeAiPanelStats()
     local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes, _nodePositionsForGraph(canvas))
     local sourceStates = _currentSourceStates(canvas, componentTypes)
     local gateStates = _currentGateStates(canvas, componentTypes)
+    gateStates = _relays.addStates(canvas, graph, gateStates, sourceStates,
+        _relays.deducedBySignature[gdsGui_schematic_computeSignature(canvas.name)])
 
     -- Lazy: _recomputeAttributionRules (every edit) deliberately leaves
     -- this unset — see _teachableCombosTotal's own comment. This function
@@ -2607,7 +2951,7 @@ local function _computeAiPanelStats()
     -- also color that way. Nested here (not a top-level local) purely to
     -- stay under this file's 200-local ceiling.
     local function structuralColorMismatches(signature, snapshot)
-        local gateStatesForSig, sourceStatesForSig = _pastGateAndSourceStates(canvas, graph, signature)
+        local gateStatesForSig, sourceStatesForSig = _relays.pastStates(canvas, graph, signature)
         local nodeStatesForSig = ModelSolver.solve(graph, sourceStatesForSig, gateStatesForSig)
         local attributionForSig = ModelSolver.solveSourceAttribution(graph, sourceStatesForSig, gateStatesForSig)
         local labelsById = _labelsByIdForCanvas(canvas)
@@ -2638,7 +2982,9 @@ local function _computeAiPanelStats()
 
         local mismatches = {}
         for _, e in ipairs(canvas.elements) do
-            if nodeStatesForSig[e.id] == ModelSolver.POWERED then
+            -- An open relay's body reads gray (see _solveCurrentSchematic).
+            local isOpenGate = componentTypes[e.id] == "gate" and gateStatesForSig[e.id] ~= "closed"
+            if nodeStatesForSig[e.id] == ModelSolver.POWERED and not isOpenGate then
                 local expected, sourceId = expectedColorAndSource(e.id)
                 local painted = snapshot.elements and snapshot.elements[e.id]
                 if expected and painted and not colorsEqual(expected, painted) then
@@ -2666,26 +3012,9 @@ local function _computeAiPanelStats()
             end
         end
         for _, w in ipairs(canvas.wires) do
-            -- A directionalGate-touching wire is checked off its own
-            -- non-gate endpoint alone, same "the gate's single shared node
-            -- can't represent its two leads independently" reasoning
-            -- _solveCurrentSchematic's own live wire loop uses — never
-            -- both-ends-powered, which would simply never fire for a
-            -- correctly-blocking diode's cathode-side wire at all.
-            local fromNodeId, toNodeId = ModelGraph.wireEndIds(graph, w)
-            local fromIsDirectionalGate = componentTypes[w.fromElementId] == "directionalGate"
-            local toIsDirectionalGate = componentTypes[w.toElementId] == "directionalGate"
-            local powered, anchorId
-            if fromIsDirectionalGate or toIsDirectionalGate then
-                anchorId = fromIsDirectionalGate and toNodeId or fromNodeId
-                powered = nodeStatesForSig[anchorId] == ModelSolver.POWERED
-            else
-                local fromState, toState = nodeStatesForSig[fromNodeId], nodeStatesForSig[toNodeId]
-                powered = fromState == ModelSolver.POWERED and toState == ModelSolver.POWERED
-                local fromIsOpenGate = componentTypes[w.fromElementId] == "gate" and gateStatesForSig[w.fromElementId] ~= "closed"
-                local toIsOpenGate = componentTypes[w.toElementId] == "gate" and gateStatesForSig[w.toElementId] ~= "closed"
-                anchorId = (fromIsOpenGate and not toIsOpenGate) and toNodeId or fromNodeId
-            end
+            -- Same feeding-end rule as _solveCurrentSchematic's live wire loop.
+            local anchorId = ModelSolver.wireFeed(graph, w.id, nodeStatesForSig, gateStatesForSig, sourceStatesForSig)
+            local powered = anchorId and true or false
             if powered then
                 local expected, sourceId = expectedColorAndSource(anchorId)
                 local painted = snapshot.wires and snapshot.wires[w.id]
@@ -2830,6 +3159,17 @@ local _AI_PANEL_WHEEL_PX_PER_NOTCH = 24
 -- the same constraint), and this table's one reader (drawSchematicAiPanel)
 -- works just as well through a global.
 _aiPanelStatsCache = { stats = nil, time = 0 }
+
+-- Either GEAR button: flips the aircraft's global gear position (pressed =
+-- DOWN, on the ground) and moves this system's hidden GEAR control to match;
+-- love.update's combination poll then re-solves the canvas.
+function schematicGearBtnPressed(newState)
+    appSettings.gearDown = (newState == globApp.BUTTON_STATES.PRESSED)
+    _saveAppSettings()
+    _relays.refreshGearButtons()
+    local canvas = _findSchematicCanvas()
+    if canvas then _relays.applyGlobalGear(canvas) end
+end
 
 function schematicAiBtnPressed(newState)
     _aiPanelOpen = (newState == globApp.BUTTON_STATES.PRESSED)
@@ -3014,6 +3354,7 @@ local function _openSystemIntoCanvas(systemId, mode)
         if canvas then
             local el = canvas.elements[#canvas.elements]
             el.voltage = e.voltage
+            el.relayLogic = _deepCopyTable(e.relayLogic)
         end
     end
     for _, c in ipairs(sys.controls or {}) do
@@ -3023,6 +3364,7 @@ local function _openSystemIntoCanvas(systemId, mode)
         if canvas then
             local ctrl = canvas.controls[#canvas.controls]
             ctrl.voltage = c.voltage
+            ctrl.relayOf = c.relayOf
         end
     end
     for _, w in ipairs(sys.wires or {}) do
@@ -3043,10 +3385,16 @@ local function _openSystemIntoCanvas(systemId, mode)
         -- global (see _ensureVoltageHasColor's own comment).
         canvas.voltageColors = _deepCopyTable(sys.voltageColors or {})
     end
+    if canvas then
+        _relays.syncGearControl(canvas)
+        _relays.applyGlobalGear(canvas)
+    end
     _applySolvedColorsToCurrentCombination()
     _recomputeDeducedGateStates()
+    _relays.checkLogic = true
 
     schematicStore.currentSystemId = systemId
+    schematicRefreshGlow()
     local designing = (mode == "design")
     -- Every initial open (design or control) lands at a fixed 1.4x zoom,
     -- vertically centered (see gdsGui_schematic_resetView) rather than the
@@ -3067,6 +3415,7 @@ local function _openSystemIntoCanvas(systemId, mode)
     gdsGui_button_setHidden("schematicAnnunciatorBtn", not designing)
     gdsGui_button_setState("schematicAiBtn", designing and "released" or "deactivated")
     gdsGui_button_setHidden("schematicAiBtn", not designing)
+    _relays.refreshGearButtons(designing)
     _aiPanelOpen = false -- a freshly (re)loaded system starts with the AI panel closed
     gdsGui_button_setState("schematicFullScreenToggle", designing and "deactivated" or "released")
     -- setFontSizeToFit (not a plain setText) since sys.name's length varies
@@ -3229,7 +3578,7 @@ local function _openGateRulesListMenu(canvasName)
     local options = {}
     for _, id in ipairs(gateIds) do
         local rule = canvas.rules and canvas.rules[id]
-        local status = (rule and rule.status) or "noRule"
+        local status = (_relays.rules[id] and "set") or (rule and rule.status) or "noRule"
         table.insert(options, (labelsById[id] or id) .. " (" .. status .. ")")
     end
     table.insert(options, "RETURN")
@@ -3249,7 +3598,7 @@ local function _openGateRuleDetailMenu(canvasName, gateId)
     if rule and rule.status == "learned" then table.insert(options, "LOCK THIS RULE") end
     table.insert(options, "RETURN")
 
-    _pendingGateRuleGateId = gateId
+    _relays.pendingRuleGateId = gateId
     gdsGui_schematic_openMenu(canvasName, text, options, "schematicGateRuleDetailChosen", "schematicGateRuleDetailCancelled", nil, 0.8)
 end
 
@@ -3615,8 +3964,10 @@ function schematicCatalogItemChosen(canvasName, index, optionText)
             table.insert(names, e.label or e.id)
         end
         for _, c in ipairs(canvas.controls) do
-            table.insert(_controlMenuIds, c.id)
-            table.insert(names, c.label or c.id)
+            if not c.noAddWire then
+                table.insert(_controlMenuIds, c.id)
+                table.insert(names, c.label or c.id)
+            end
         end
         table.insert(names, "RETURN")
         gdsGui_schematic_openMenu(canvasName, "CONNECTOR FROM:", names, "schematicConnectorFromChosen", nil)
@@ -3688,8 +4039,10 @@ local function _openSelectControlMenu(canvasName)
     _controlMenuIds = {}
     local names = {}
     for _, c in ipairs(canvas.controls) do
-        table.insert(_controlMenuIds, c.id)
-        table.insert(names, c.label or c.id)
+        if not c.hidden then -- e.g. GEAR: set by its own buttons
+            table.insert(_controlMenuIds, c.id)
+            table.insert(names, c.label or c.id)
+        end
     end
     table.insert(names, "RETURN")
     gdsGui_schematic_openMenu(canvasName, "SELECT CONTROL", names, "schematicControlChosen", nil)
@@ -4495,6 +4848,7 @@ function love.load()
     -- straight back into that exact page (and system/mode, for the canvas)
     -- instead of always landing on MainMenu first.
     if appSettings.schematicLastPage == nil then appSettings.schematicLastPage = false end
+    if appSettings.gearDown == nil then appSettings.gearDown = true end -- global gear: on the ground
     -- A user-chosen override for the ELECTRICAL medium's powered/unpowered
     -- display colors (see schematicPoweredColorChosen/
     -- schematicUnpoweredColorChosen below) — nil means "use
@@ -5185,7 +5539,26 @@ function love.load()
         0.97, schCanvasYFrac + 2 * (36 + 10) / globApp.safeScreenArea.h, "RT", 36, 36,
         "schematicAnnunciatorBtnPressed", globApp.BUTTON_STATES.RELEASED, true, nil
     )
-    -- AI: docked directly below ANNUNCIATOR, same floating-chrome
+    -- GEAR: docked directly below ANNUNCIATOR. The aircraft's global gear
+    -- position (DOWN = on the ground, UP = airborne — see _relays.GEAR_ID);
+    -- a sticky toggle, pressed = DOWN. Design mode only; control mode has
+    -- its own copy, schematicGearCtlBtn, below FULL SCREEN.
+    gdsGui_button_create("schematicGearBtn", "SystemSchematic", "toggle",
+        "Sprites/button_schematicGear_pressed.png",
+        "Sprites/button_schematicGear_released.png",
+        "Sprites/button_schematicGear_deactivated.png",
+        0.97, schCanvasYFrac + 3 * (36 + 10) / globApp.safeScreenArea.h, "RT", 36, 36,
+        "schematicGearBtnPressed", globApp.BUTTON_STATES.RELEASED, true, nil
+    )
+    gdsGui_button_create("schematicGearCtlBtn", "SystemSchematic", "toggle",
+        "Sprites/button_schematicGear_pressed.png",
+        "Sprites/button_schematicGear_released.png",
+        "Sprites/button_schematicGear_deactivated.png",
+        0.875, schCanvasYFrac, "CT", 36, 36,
+        "schematicGearBtnPressed", globApp.BUTTON_STATES.RELEASED, true, nil
+    )
+    _relays.refreshGearButtons()
+    -- AI: docked directly below GEAR, same floating-chrome
     -- convention and sticky "toggle" type (stays open across any number of
     -- taps, same as PAINT/ANNUNCIATOR). Deliberately NOT one of
     -- _SCHEMATIC_DOCK_TOOLS' mutually-exclusive set, unlike those three —
@@ -5198,7 +5571,7 @@ function love.load()
         "Sprites/button_schematicAi_pressed.png",
         "Sprites/button_schematicAi_released.png",
         "Sprites/button_schematicAi_deactivated.png",
-        0.97, schCanvasYFrac + 3 * (36 + 10) / globApp.safeScreenArea.h, "RT", 36, 36,
+        0.97, schCanvasYFrac + 4 * (36 + 10) / globApp.safeScreenArea.h, "RT", 36, 36,
         "schematicAiBtnPressed", globApp.BUTTON_STATES.RELEASED, true, nil
     )
     _schematicDockX = 0.97
@@ -5617,6 +5990,21 @@ function love.update(dt)
     end
 
     local schematicCanvas = _findSchematicCanvas()
+    -- A bus tie's logic is mandatory: once nothing else is on screen, open
+    -- its SET LOGIC grid if any combination is still unset.
+    if _relays.checkLogic and schematicCanvas and not gdsGui_schematic_isMenuOpen("mainCanvas")
+       and not gdsGui_textPrompt_isOpen() then
+        _relays.checkLogic = false
+        local relay = _relays.relayMissingLogic(schematicCanvas)
+        if relay then _relays.openLogicGrid(schematicCanvas, relay) end
+    end
+    -- PREV/NEXT step the hidden GEAR control too; the global gear follows it.
+    local gearControl = schematicCanvas and _relays.gearControl(schematicCanvas)
+    if gearControl and (gearControl.detentIndex == 0) ~= appSettings.gearDown then
+        appSettings.gearDown = (gearControl.detentIndex == 0)
+        _saveAppSettings()
+        _relays.refreshGearButtons()
+    end
     if schematicCanvas and not gdsGui_schematic_isMenuOpen("mainCanvas") then
         if _schematicCombControlsChanged(schematicCanvas) then
             _schematicCombIndex = gdsGui_schematic_getCombinationIndex("mainCanvas")
@@ -6499,6 +6887,7 @@ function schematicModeToggled(newState)
     gdsGui_button_setHidden("schematicAnnunciatorBtn", not designing)
     gdsGui_button_setState("schematicAiBtn", designing and "released" or "deactivated")
     gdsGui_button_setHidden("schematicAiBtn", not designing)
+    _relays.refreshGearButtons(designing)
     if not designing then _aiPanelOpen = false end
     gdsGui_button_setState("schematicFullScreenToggle", designing and "deactivated" or "released")
     _saveAppSettings()
@@ -6594,6 +6983,10 @@ function captureSchematicSnapshot()
             local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes, _nodePositionsForGraph(canvas))
             local sourceStates = _currentSourceStates(canvas, componentTypes)
             local gateStates = _currentGateStates(canvas, componentTypes)
+            -- Relays as this capture paints them, so painting one into the
+            -- other position (teaching it) isn't flagged as a mismatch.
+            gateStates = _relays.addStates(canvas, graph, gateStates, sourceStates,
+                _relays.statesFromPaint(canvas, plan.elements, plan.controls))
 
             local nodeStates
             if canvas.rules and next(canvas.rules) ~= nil then
@@ -6647,7 +7040,9 @@ function captureSchematicSnapshot()
             end
 
             for _, e in ipairs(canvas.elements) do
-                if nodeStates[e.id] == ModelSolver.POWERED then
+                -- An open relay's body reads gray (see _solveCurrentSchematic).
+                local isOpenGate = componentTypes[e.id] == "gate" and gateStates[e.id] ~= "closed"
+                if nodeStates[e.id] == ModelSolver.POWERED and not isOpenGate then
                     local expected, sourceId = expectedColorAndSource(attribution[e.id])
                     local painted = plan.elements[e.id]
                     if expected and painted and not colorsEqual(expected, painted) then
@@ -6674,27 +7069,9 @@ function captureSchematicSnapshot()
                 end
             end
             for _, w in ipairs(canvas.wires) do
-                -- A directionalGate-touching wire is checked off its own
-                -- non-gate endpoint alone, same "the gate's single shared
-                -- node can't represent its two leads independently"
-                -- reasoning _solveCurrentSchematic's own live wire loop
-                -- uses — never both-ends-powered, which would simply
-                -- never fire for a correctly-blocking diode's cathode-side
-                -- wire at all.
-                local fromNodeId, toNodeId = ModelGraph.wireEndIds(graph, w)
-                local fromIsDirectionalGate = componentTypes[w.fromElementId] == "directionalGate"
-                local toIsDirectionalGate = componentTypes[w.toElementId] == "directionalGate"
-                local powered, anchorId
-                if fromIsDirectionalGate or toIsDirectionalGate then
-                    anchorId = fromIsDirectionalGate and toNodeId or fromNodeId
-                    powered = nodeStates[anchorId] == ModelSolver.POWERED
-                else
-                    local fromState, toState = nodeStates[fromNodeId], nodeStates[toNodeId]
-                    powered = fromState == ModelSolver.POWERED and toState == ModelSolver.POWERED
-                    local fromIsOpenGate = componentTypes[w.fromElementId] == "gate" and gateStates[w.fromElementId] ~= "closed"
-                    local toIsOpenGate = componentTypes[w.toElementId] == "gate" and gateStates[w.toElementId] ~= "closed"
-                    anchorId = (fromIsOpenGate and not toIsOpenGate) and toNodeId or fromNodeId
-                end
+                -- Same feeding-end rule as _solveCurrentSchematic's live wire loop.
+                local anchorId = ModelSolver.wireFeed(graph, w.id, nodeStates, gateStates, sourceStates)
+                local powered = anchorId and true or false
                 if powered then
                     local expected, sourceId = expectedColorAndSource(attribution[anchorId])
                     local painted = plan.wires[w.id]
@@ -6804,7 +7181,13 @@ function schematicGateRulesListChosen(canvasName, index, optionText)
     local canvas = _findSchematicCanvas()
     if not canvas then return end
     local gateId = _sortedGateIds(canvas)[index]
-    if gateId then _openGateRuleDetailMenu(canvasName, gateId) end
+    -- A bus tie's logic opens straight into its editable, scrollable grid.
+    local relay = gateId and _relays.idSet(canvas)[gateId] and _findSourceEntity(canvas, gateId)
+    if relay then
+        _relays.openLogicGrid(canvas, relay, true)
+    elseif gateId then
+        _openGateRuleDetailMenu(canvasName, gateId)
+    end
 end
 
 -- LOCK THIS RULE / RETURN from one gate's detail view — both reopen the
@@ -6813,16 +7196,16 @@ end
 -- re-opening the menu from scratch each time.
 function schematicGateRuleDetailChosen(canvasName, index, optionText)
     local canvas = _findSchematicCanvas()
-    if optionText == "LOCK THIS RULE" and canvas and _pendingGateRuleGateId then
-        _lockGateRule(canvas, _pendingGateRuleGateId)
+    if optionText == "LOCK THIS RULE" and canvas and _relays.pendingRuleGateId then
+        _lockGateRule(canvas, _relays.pendingRuleGateId)
         _requestSchematicSave()
     end
-    _pendingGateRuleGateId = nil
+    _relays.pendingRuleGateId = nil
     if canvas then _openGateRulesListMenu(canvasName) end
 end
 
 function schematicGateRuleDetailCancelled()
-    _pendingGateRuleGateId = nil
+    _relays.pendingRuleGateId = nil
 end
 
 -- ATTRIBUTION RULES list row tapped — index maps back to
@@ -7071,6 +7454,7 @@ function schematicPerSourceVoltageConfirmed(text)
     if not entity or not canvas then return end
     local voltage = tonumber(text)
     entity.voltage = voltage -- nil (cleared) if text wasn't a valid number, same as an empty field
+    _relays.checkLogic = true -- a new voltage adds bus tie combinations to set
     if voltage then
         _ensureVoltageHasColor(canvas.name, voltage)
     else
@@ -7102,7 +7486,53 @@ end
 -- _pendingPerSourceTargetId.
 local _pendingNewSourceId = nil
 
+-- SET BUS TIE LOGIC grid (see _relays.openLogicGrid): a pick on one row is
+-- copied to its mirror-image row, so the two can never disagree.
+function schematicRelayLogicChanged(canvasName, rowIndex, choiceIndex)
+    local row = _relays.editing and _relays.editing.rows[rowIndex]
+    if row and row.mirror then row.mirror.choice = choiceIndex end
+end
+
+function schematicRelayLogicSaved(canvasName)
+    local editing = _relays.editing
+    _relays.editing = nil
+    local canvas = _findSchematicCanvas()
+    local relay = canvas and editing and _findSourceEntity(canvas, editing.relayId)
+    if not relay then return end
+    relay.relayLogic = {}
+    for _, row in ipairs(editing.rows) do
+        relay.relayLogic[row.key] = (row.choice == 2) and "closed" or "open"
+    end
+    schematicCanvasChanged()
+    if editing.fromGateRules then _openGateRulesListMenu(canvasName) end
+end
+
+function schematicRelayLogicCancelled(canvasName)
+    _relays.editing = nil
+    _openGateRulesListMenu(canvasName)
+end
+
 function schematicSourceElementPlaced(canvasName, kind, newId, componentType)
+    -- A freshly-placed relay (BUS TIE) gets its command switch: placed above
+    -- it and wired from the switch's own terminal to the relay's signal
+    -- terminal — only this once, at creation; afterwards it's an ordinary
+    -- wire the user can delete or redraw.
+    local canvas = _findSchematicCanvas()
+    local relay = canvas and componentType == "gate" and _findSourceEntity(canvas, newId)
+    local signalIndex = relay and _relays.signalTerminal(relay)
+    if signalIndex then
+        local switchId = gdsGui_schematic_addLinkedControl(canvasName, newId, signalIndex, 4, "SWITCH", (relay.label or newId) .. " SW",
+            { "OPEN", "CLOSED" }, { "Sprites/control_tieSwitchOpen.png", "Sprites/control_tieSwitchClosed.png" }, 2, nil,
+            { { x = 0.014, y = 0.426, exitX = 0, exitY = 1 } }, 1)
+        local switch = switchId and _findSourceEntity(canvas, switchId)
+        if switch then switch.relayOf = newId end
+        _relays.syncGearControl(canvas)
+        -- The placement's own change notice fired before the switch existed;
+        -- this one also flags the new relay's logic as missing, so the SET
+        -- LOGIC grid opens next (see _relays.checkLogic).
+        schematicCanvasChanged()
+        return
+    end
     if componentType ~= "source" then return end
     _pendingNewSourceId = newId
     local label = _currentMedium().magnitudeLabel or "VOLTAGE"
@@ -7124,6 +7554,7 @@ function schematicNewSourceVoltageConfirmed(text)
     if not entity or not canvas then return end
     entity.voltage = voltage
     _ensureVoltageHasColor(canvas.name, voltage)
+    _relays.checkLogic = true -- a new voltage adds bus tie combinations to set
 end
 
 function schematicNewSourceVoltageCancelled()
@@ -7144,6 +7575,14 @@ end
 -- "ELECTRICAL COLORS" gate above _openElectricalColorsMenu), so the two
 -- are the same object in practice, but a future medium's own color-override
 -- menu can reuse these two callbacks unchanged.
+-- Powered parts of an ELECTRICAL schematic glow (gdsGui_schematic_setGlow):
+-- every color except this medium's unpowered gray. Other media stay flat.
+-- Re-run whenever the system or its unpowered color changes.
+function schematicRefreshGlow()
+    local medium = _currentMedium()
+    gdsGui_schematic_setGlow("mainCanvas", medium == ELECTRICAL_MEDIUM, { medium.style.unpowered })
+end
+
 function schematicPoweredColorChosen(canvasName, index)
     local color = gdsGui_schematic_getColorPaletteEntry(index)
     if not color then return end
@@ -7160,6 +7599,7 @@ function schematicUnpoweredColorChosen(canvasName, index)
     _currentMedium().style.unpowered = color
     appSettings.electricalUnpoweredColor = color
     _saveAppSettings()
+    schematicRefreshGlow()
     _recomputeDeducedGateStates()
     _applySolvedColorsToCurrentCombination()
 end
@@ -8524,6 +8964,53 @@ function schematicLockGateRuleTest()
     return lockedResult, noRuleResult
 end
 
+-- GEN1 - BUS1 - [TIE] - BUS2 - GEN2, with a command switch on the tie's
+-- signal terminal. Shared by the two relay tests below.
+function _relays.testGraph()
+    local elements = { { id = "bus1" }, { id = "bus2" }, { id = "tie", terminals = { {}, {}, { signal = true } } } }
+    local controls = { { id = "gen1" }, { id = "gen2" }, { id = "sw" } }
+    local wires = {
+        { id = "w1", fromElementId = "gen1", toElementId = "bus1" },
+        { id = "w2", fromElementId = "gen2", toElementId = "bus2" },
+        { id = "w3", fromElementId = "bus1", toElementId = "tie", toTerminal = 1 },
+        { id = "w4", fromElementId = "tie", toElementId = "bus2", fromTerminal = 2 },
+        { id = "w5", fromElementId = "tie", toElementId = "sw", fromTerminal = 3 },
+    }
+    local types = { bus1 = "path", bus2 = "path", tie = "gate", gen1 = "source", gen2 = "source" }
+    return ModelGraph.buildGraph(elements, controls, wires, types)
+end
+
+-- The command wire carries no power: GEN1 must not reach the switch's side
+-- through it, and it's reported in signalWires.
+function schematicRelaySignalWireCarriesNoPowerTest()
+    local graph = _relays.testGraph()
+    return graph.signalWires.w5 == true, #graph.edges
+end
+
+-- Logic set as "both buses live -> open" and "one side live -> closed"
+-- (switch CLOSED): the mirror-image one-side case is covered too, nothing
+-- live keeps the default open, and switch OPEN was never set so stays open.
+function schematicRelayAppliesSetLogicTest()
+    local Relay = _relays.model
+    local graph = _relays.testGraph()
+    local volts = { gen1 = 28, gen2 = 28 }
+    local relay = { id = "tie", terminalNodeIds = { "bus1", "bus2" }, gear = "DOWN", command = "CLOSED" }
+    local function keyFor(sourceStates)
+        local a, b = Relay.senseInputs(graph, sourceStates, {}, relay, volts)
+        return Relay.buildKey("DOWN", "CLOSED", a, b)
+    end
+    local rules = { tie = {
+        [keyFor({ gen1 = true, gen2 = true })] = "open",
+        [keyFor({ gen1 = true })] = "closed",
+    } }
+    local onlyGen2 = Relay.resolve(graph, { gen2 = true }, {}, { relay }, rules, volts).tie
+    local both = Relay.resolve(graph, { gen1 = true, gen2 = true }, {}, { relay }, rules, volts).tie
+    local none = Relay.resolve(graph, {}, {}, { relay }, rules, volts).tie
+    relay.command = "OPEN"
+    local switchOpen = Relay.resolve(graph, { gen1 = true }, {}, { relay }, rules, volts).tie
+    return keyFor({ gen1 = true }), onlyGen2, both, none, switchOpen
+end
+
 function suggestNextSnapshotNoCapturesYetTest()
     local controls = { {id="a", numDetents=2}, {id="b", numDetents=2} }
     local suggestion = ModelSuggest.suggestNextSnapshot(controls, {})
@@ -9055,6 +9542,16 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcName"]={"schematicFormatRuleTextUsesCanvasLabelsTest"},
         ["funcParameters"]={0},
         ["funcExpctOutput"]={"RELAY 1 is closed when BUS A is powered"}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_relay_signalWireCarriesNoPower",
+        ["funcName"]={"schematicRelaySignalWireCarriesNoPowerTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={true, 4}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_relay_appliesSetLogic",
+        ["funcName"]={"schematicRelayAppliesSetLogicTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"DOWN|CLOSED|28|0", "closed", "open", "open", "open"}}
 
     gdsGui_dev_testExecute {["id"]="schematic_lockGateRule_locksLearnedLeavesNoRuleAlone",
         ["funcName"]={"schematicLockGateRuleTest"},

@@ -748,7 +748,7 @@ local function _footprintOverlapsAnother(canvas, cx, cy, halfX, halfY, excludeId
         end
     end
     for _, c in ipairs(canvas.controls) do
-        if c.id ~= excludeId then
+        if c.id ~= excludeId and not c.hidden then
             local ccx, ccy = _toPixel(canvas, c.x, c.y)
             local crad = canvas.controlRadius * canvas.zoom * (c.radiusScale or 1)
             if math.abs(cx - ccx) < halfX + crad + bufferPx and math.abs(cy - ccy) < halfY + crad + bufferPx then
@@ -764,6 +764,10 @@ end
 -- functions, defined just below _hitControl (and _terminals.segments after
 -- _clampedOrthogonalSegments), to stay under this file's 200-local ceiling.
 local _terminals = {}
+-- The CHOICE GRID modal form's helpers (see gdsGui_schematic_openChoiceGrid).
+local _choiceGrid = {}
+-- The powered-glow helpers (see gdsGui_schematic_setGlow).
+local _glow = {}
 
 -- Pivot point for the "spin to set direction" drag on an already-selected
 -- wire — the midpoint between its two ends (anchor centers, or the
@@ -799,7 +803,9 @@ local function _hitControl(canvas, px, py)
         local rad = canvas.controlRadius * canvas.zoom * (c.radiusScale or 1)
         local cx, cy = _toPixel(canvas, c.x, c.y)
         local dx, dy = px - cx, py - cy
-        if c.terminals then
+        if c.hidden then
+            -- not on the canvas at all (see addControl's hidden note)
+        elseif c.terminals then
             if math.abs(dx) <= rad and math.abs(dy) <= rad then return c end
         elseif (dx * dx + dy * dy) <= (rad * rad) then
             return c
@@ -905,7 +911,7 @@ local function _hitAnchorNear(canvas, px, py)
         local cx, cy = _toPixel(canvas, c.x, c.y)
         local dx, dy = px - cx, py - cy
         local dist = math.max(0, math.sqrt(dx * dx + dy * dy) - rad)
-        if dist < bestDist then
+        if dist < bestDist and not c.hidden then
             best, bestDist = c, dist
         end
     end
@@ -1495,6 +1501,10 @@ end
 -- see _terminals.nearest) instead of the control's edge, and remembers
 -- which (the wire's fromTerminal/toTerminal). Any other keys (e.g. the
 -- app's own pole number) are stored untouched for the app layer.
+-- An app may set `hidden = true` on a control afterwards: it's then never
+-- drawn, tapped, overlap-checked or wired, but still counts toward the
+-- combination signature like any other control (e.g. an app-wide state such
+-- as the aircraft's gear position that snapshots must depend on).
 function gdsGui_schematic_addControl(canvasName, id, x, y, positions, initialDetentIndex, label, callbackFunc, radiusScale, spritePaths, rotation, overlaySpritePath, defaultColor, colorDarkenMul, componentType, terminals)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
@@ -1583,6 +1593,54 @@ function gdsGui_schematic_setControlPosition(canvasName, controlId, positionInde
         control.detentIndex = positionIndex
         _fireControlCallback(control)
     end
+end
+
+-- Places a new control distanceGridUnits grid units from anchorId's center,
+-- out along terminal terminalIndex's own exit direction (rotated with the
+-- anchor), and wires that terminal to it — e.g. the pilot switch commanding
+-- a relay. terminals (optional) are the new control's own (see addControl);
+-- the wire lands on its terminal linkTerminal. idPrefix/label follow the
+-- catalog placement conventions: the id is minted from the canvas's
+-- placement counter, and label gets a numeric suffix if already taken.
+-- Does not push undo or notify — the caller is expected to be inside a
+-- placement that already did. Returns the new control's id, or nil if the
+-- anchor or terminal doesn't exist.
+function gdsGui_schematic_addLinkedControl(canvasName, anchorId, terminalIndex, distanceGridUnits, idPrefix, label, positions, spritePaths, gridSize, componentType, terminals, linkTerminal)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return nil end
+    local anchor = _findAnchor(canvas, anchorId)
+    local t = anchor and anchor.terminals and anchor.terminals[terminalIndex]
+    if not t then return nil end
+
+    local cx, cy = anchor.x, anchor.y
+    if anchor.w then cx, cy = anchor.x + anchor.w / 2, anchor.y + anchor.h / 2 end
+    local rot = math.rad(anchor.rotation or 0)
+    local ex, ey = t.exitX or 0, t.exitY or 0
+    local dx, dy = ex * math.cos(rot) - ey * math.sin(rot), ex * math.sin(rot) + ey * math.cos(rot)
+    local fracX = cx + dx * distanceGridUnits * _GRID_SPACING_PX / canvas.contentW
+    local fracY = cy + dy * distanceGridUnits * _GRID_SPACING_PX / canvas.contentH
+    fracX, fracY = _snapToGrid(canvas, fracX, fracY)
+
+    canvas._placementCounter = canvas._placementCounter + 1
+    local id = idPrefix .. "_" .. canvas._placementCounter
+    local uniqueLabel, n = label, 2
+    while _labelInUse(canvas, uniqueLabel) do
+        uniqueLabel = label .. " " .. n
+        n = n + 1
+    end
+    gdsGui_schematic_addControl(canvasName, id, fracX, fracY, positions, 0, uniqueLabel, nil,
+        _controlGridRadiusScale(canvas, gridSize), spritePaths, nil, nil, nil, nil, componentType, terminals)
+    gdsGui_schematic_addWire(canvasName, _uniqueWireId(canvas, anchorId .. "_to_" .. id), anchorId, id,
+        nil, nil, terminalIndex, linkTerminal)
+    return id
+end
+
+-- Swaps the image an element draws (see addElement's spritePath) — for app
+-- state the artwork itself shows, e.g. a relay drawn open or closed.
+function gdsGui_schematic_setElementSprite(canvasName, elementId, spritePath)
+    local canvas = _findCanvas(canvasName)
+    local el = canvas and _findElement(canvas, elementId)
+    if el then el.spritePath = spritePath end
 end
 
 --------------------------------------------------------------------------------
@@ -1893,14 +1951,13 @@ end
 -- itself, see its module header) — and the same wrap width (mw, no extra
 -- padding) that printf wraps against, so the measured height always matches
 -- what's actually drawn.
-local _TITLE_VPAD = 16 -- 8px top inset (matches rowY + 8 below) + 8px bottom
-
 local function _titleHeight(mw, title)
     if not title then return 0 end
+    local titleVPad = 16 -- 8px top inset (matches rowY + 8 below) + 8px bottom
     local font = love.graphics.getFont()
     local _, lines = font:getWrap(title, mw)
     local numLines = math.max(1, #lines)
-    return math.max(_MENU_ROW_H, numLines * font:getHeight() + _TITLE_VPAD)
+    return math.max(_MENU_ROW_H, numLines * font:getHeight() + titleVPad)
 end
 
 -- Generalized over any owner with .x/.y/.w/.h (schematic canvas or gallery)
@@ -2122,6 +2179,7 @@ end
 
 -- Shared modal-menu box drawing for any owner with a .menu.
 local function _drawMenuBox(owner, menu)
+    if menu.choiceGrid then return _choiceGrid.draw(owner, menu) end
     love.graphics.setColor(0, 0, 0, 0.6)
     love.graphics.rectangle("fill", owner.x, owner.y, owner.w, owner.h)
 
@@ -2173,6 +2231,218 @@ local function _drawMenuBox(owner, menu)
             rowY = rowY + _MENU_ROW_H
         end
     end
+    love.graphics.setColor(1, 1, 1, 1)
+end
+
+--------------------------------------------------------------------------------
+-- PUBLIC API — CHOICE GRID: a modal, scrollable form where every row must get
+-- one of a fixed set of choices (e.g. OPEN/CLOSED) before SAVE unlocks. It
+-- lives in canvas.menu (menu.choiceGrid set) so it gets the same modal
+-- treatment as any other menu — isMenuOpen, input priority, drawing.
+-- Tapping outside never closes it: SAVE is the only way out, unless
+-- onCancelFunc is given, which adds a CANCEL button beside SAVE (fired as
+-- fn(canvasName) after the grid closes, nothing saved).
+-- rows: array of {label = string, choice = nil | index into choices}, kept
+-- by reference — the app's onChange callback, fn(canvasName, rowIndex,
+-- choiceIndex), fires after a tap sets row.choice and may edit other rows
+-- (e.g. keep linked rows in agreement). onSave: fn(canvasName), fired once
+-- every row has a choice and SAVE is tapped; the grid closes first.
+-- header (optional): column caption drawn above the rows.
+--------------------------------------------------------------------------------
+
+_choiceGrid.ROW_H, _choiceGrid.FOOTER_H = 46, 44
+
+function gdsGui_schematic_openChoiceGrid(canvasName, title, header, rows, choices, onChangeFunc, onSaveFunc, onCancelFunc)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return end
+    canvas.annunciatorPanelOpen = false
+    canvas.menu = { choiceGrid = true, title = title, header = header, rows = rows, choices = choices,
+        onChange = onChangeFunc, onSave = onSaveFunc, onCancel = onCancelFunc, scroll = 0 }
+end
+
+-- Footer button rects: SAVE, and CANCEL to its left when the grid has one.
+function _choiceGrid.footerButtons(g, menu)
+    local y, h = g.footerY + 4, _choiceGrid.FOOTER_H - 8
+    if not menu.onCancel then return { save = { x = g.x + 4, y = y, w = g.w - 8, h = h } } end
+    local half = (g.w - 12) / 2
+    return { cancel = { x = g.x + 4, y = y, w = half, h = h }, save = { x = g.x + 8 + half, y = y, w = half, h = h } }
+end
+
+function _choiceGrid.remaining(menu)
+    local n = 0
+    for _, row in ipairs(menu.rows) do if not row.choice then n = n + 1 end end
+    return n
+end
+
+-- Box, rows viewport and footer geometry, plus the scroll limit.
+function _choiceGrid.geometry(owner, menu)
+    local w = owner.w * 0.94
+    local titleH = _titleHeight(w, menu.title)
+    local headerH = menu.header and _MENU_ROW_H or 0
+    -- Rows grow to fit the tallest multi-line label.
+    local maxLines = 1
+    for _, row in ipairs(menu.rows) do
+        local _, breaks = row.label:gsub("\n", "")
+        maxLines = math.max(maxLines, breaks + 1)
+    end
+    local rowH = math.max(_choiceGrid.ROW_H, maxLines * love.graphics.getFont():getHeight() + 14)
+    local contentH = #menu.rows * rowH
+    local maxBodyH = owner.h * 0.92 - titleH - headerH - _choiceGrid.FOOTER_H
+    local bodyH = math.max(rowH, math.min(contentH, maxBodyH))
+    local h = titleH + headerH + bodyH + _choiceGrid.FOOTER_H
+    local x = owner.x + (owner.w - w) / 2
+    local y = owner.y + math.max(0, (owner.h - h) / 2)
+    return { x = x, y = y, w = w, h = h, titleH = titleH, headerH = headerH, rowH = rowH,
+        bodyY = y + titleH + headerH, bodyH = bodyH, footerY = y + h - _choiceGrid.FOOTER_H,
+        maxScroll = math.max(0, contentH - bodyH) }
+end
+
+-- The choice cells' x/width within a row: right-hand half of the box, split evenly.
+function _choiceGrid.cellRect(g, menu, choiceIndex)
+    local areaX = g.x + g.w * 0.5
+    local cellW = (g.w * 0.5 - 6) / #menu.choices
+    return areaX + (choiceIndex - 1) * cellW, cellW
+end
+
+-- {kind = "cell", row, choice} | {kind = "save"} | nil for what (px, py) is on.
+function _choiceGrid.hit(owner, menu, px, py)
+    local g = _choiceGrid.geometry(owner, menu)
+    if px < g.x or px > g.x + g.w then return nil end
+    if py >= g.footerY and py <= g.footerY + _choiceGrid.FOOTER_H then
+        local cancel = _choiceGrid.footerButtons(g, menu).cancel
+        if cancel and px < cancel.x + cancel.w then return { kind = "cancel" } end
+        return { kind = "save" }
+    end
+    if py < g.bodyY or py >= g.bodyY + g.bodyH then return nil end
+    local rowIndex = math.floor((py - g.bodyY + menu.scroll) / g.rowH) + 1
+    if not menu.rows[rowIndex] then return nil end
+    for c = 1, #menu.choices do
+        local cx, cw = _choiceGrid.cellRect(g, menu, c)
+        if px >= cx and px < cx + cw then return { kind = "cell", row = rowIndex, choice = c } end
+    end
+    return nil
+end
+
+function _choiceGrid.press(owner, touchId, px, py)
+    local menu = owner.menu
+    if menu._pressedTouchId ~= nil and menu._pressedTouchId ~= touchId then return end
+    menu._pressedTouchId, menu._pressY, menu._pressScroll, menu._dragging = touchId, py, menu.scroll, false
+end
+
+function _choiceGrid.move(owner, touchId, px, py)
+    local menu = owner.menu
+    if menu._pressedTouchId ~= touchId then return end
+    local dy = py - menu._pressY
+    if math.abs(dy) > _ELEMENT_TAP_SLOP_PX then menu._dragging = true end
+    if menu._dragging then
+        local g = _choiceGrid.geometry(owner, menu)
+        menu.scroll = math.max(0, math.min(g.maxScroll, menu._pressScroll - dy))
+    end
+end
+
+function _choiceGrid.release(owner, touchId, px, py)
+    local menu = owner.menu
+    if menu._pressedTouchId ~= touchId then return end
+    menu._pressedTouchId = nil
+    if menu._dragging then return end
+    local hit = _choiceGrid.hit(owner, menu, px, py)
+    if not hit then return end
+    if hit.kind == "cell" then
+        menu.rows[hit.row].choice = hit.choice
+        if menu.onChange and _G[menu.onChange] then _G[menu.onChange](owner.name, hit.row, hit.choice) end
+    elseif hit.kind == "save" and _choiceGrid.remaining(menu) == 0 then
+        local cb = menu.onSave
+        owner.menu = nil
+        if cb and _G[cb] then _G[cb](owner.name) end
+    elseif hit.kind == "cancel" then
+        local cb = menu.onCancel
+        owner.menu = nil
+        if cb and _G[cb] then _G[cb](owner.name) end
+    end
+end
+
+function _choiceGrid.wheel(owner, dy)
+    local menu = owner.menu
+    local g = _choiceGrid.geometry(owner, menu)
+    menu.scroll = math.max(0, math.min(g.maxScroll, menu.scroll - dy * g.rowH))
+end
+
+function _choiceGrid.draw(owner, menu)
+    love.graphics.setColor(0, 0, 0, 0.6)
+    love.graphics.rectangle("fill", owner.x, owner.y, owner.w, owner.h)
+    local g = _choiceGrid.geometry(owner, menu)
+    love.graphics.setColor(0.15, 0.15, 0.18, _MENU_OPACITY)
+    love.graphics.rectangle("fill", g.x, g.y, g.w, g.h)
+
+    love.graphics.setColor(0.25, 0.25, 0.25, _MENU_OPACITY)
+    love.graphics.rectangle("fill", g.x, g.y, g.w, g.titleH)
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.printf(menu.title or "", g.x, g.y + 8, g.w, "center")
+    if menu.header then
+        love.graphics.setColor(1, 1, 1, 0.7)
+        love.graphics.printf(menu.header, g.x + 8, g.y + g.titleH + 8, g.w - 16, "left")
+    end
+
+    local prevScX, prevScY, prevScW, prevScH = love.graphics.getScissor()
+    love.graphics.intersectScissor(g.x, g.bodyY, g.w, g.bodyH)
+    for i, row in ipairs(menu.rows) do
+        local rowY = g.bodyY + (i - 1) * g.rowH - menu.scroll
+        if rowY + g.rowH >= g.bodyY and rowY <= g.bodyY + g.bodyH then
+            -- An unanswered row is flagged so the user can find what's left.
+            if not row.choice then
+                love.graphics.setColor(0.6, 0.15, 0.15, 0.35)
+                love.graphics.rectangle("fill", g.x + 2, rowY + 1, g.w - 4, g.rowH - 2)
+            end
+            -- Labels and choices are printed unwrapped (a label may carry
+            -- its own "\n"), vertically centered in the row.
+            local font = love.graphics.getFont()
+            local _, lineCount = row.label:gsub("\n", "")
+            local textY = rowY + (g.rowH - (lineCount + 1) * font:getHeight()) / 2
+            love.graphics.setColor(1, 1, 1, 1)
+            love.graphics.print(row.label, g.x + 8, textY)
+            for c, choiceLabel in ipairs(menu.choices) do
+                local cx, cw = _choiceGrid.cellRect(g, menu, c)
+                if row.choice == c then
+                    love.graphics.setColor(1, 1, 0, 1)
+                    love.graphics.rectangle("fill", cx + 2, rowY + 4, cw - 4, g.rowH - 8)
+                    love.graphics.setColor(0, 0, 0, 1)
+                else
+                    love.graphics.setColor(1, 1, 1, 0.4)
+                    love.graphics.rectangle("line", cx + 2, rowY + 4, cw - 4, g.rowH - 8)
+                    love.graphics.setColor(1, 1, 1, 1)
+                end
+                -- Shrunk to fit a narrow cell rather than spilling past it.
+                local textW = font:getWidth(choiceLabel)
+                local fit = math.min(1, (cw - 8) / textW)
+                love.graphics.print(choiceLabel, cx + (cw - textW * fit) / 2,
+                    rowY + (g.rowH - font:getHeight() * fit) / 2, 0, fit, fit)
+            end
+        end
+    end
+    if prevScX then love.graphics.setScissor(prevScX, prevScY, prevScW, prevScH) else love.graphics.setScissor() end
+
+    -- Scroll position indicator, only when there's more than fits.
+    if g.maxScroll > 0 then
+        local barH = g.bodyH * g.bodyH / (g.bodyH + g.maxScroll)
+        local barY = g.bodyY + (g.bodyH - barH) * (menu.scroll / g.maxScroll)
+        love.graphics.setColor(1, 1, 1, 0.5)
+        love.graphics.rectangle("fill", g.x + g.w - 4, barY, 3, barH)
+    end
+
+    local remaining = _choiceGrid.remaining(menu)
+    local buttons = _choiceGrid.footerButtons(g, menu)
+    local font = love.graphics.getFont()
+    local function button(rect, label, fill, textAlpha)
+        love.graphics.setColor(fill)
+        love.graphics.rectangle("fill", rect.x, rect.y, rect.w, rect.h)
+        love.graphics.setColor(1, 1, 1, textAlpha)
+        love.graphics.printf(label, rect.x, rect.y + (rect.h - font:getHeight()) / 2, rect.w, "center")
+    end
+    if buttons.cancel then button(buttons.cancel, "CANCEL", { 0.35, 0.35, 0.35, 1 }, 1) end
+    local saveLabel = remaining == 0 and "SAVE" or (buttons.cancel and (remaining .. " LEFT") or ("SET ALL ROWS (" .. remaining .. " LEFT)"))
+    button(buttons.save, saveLabel, remaining == 0 and { 0.15, 0.55, 0.2, 1 } or { 0.3, 0.3, 0.3, 1 }, remaining == 0 and 1 or 0.6)
+    love.graphics.setColor(1, 1, 0, 1)
+    love.graphics.rectangle("line", g.x, g.y, g.w, g.h)
     love.graphics.setColor(1, 1, 1, 1)
 end
 
@@ -3064,6 +3334,13 @@ function gdsGui_schematic_openWireEditMenu(canvasName, wireId)
     local w = _findWire(canvas, wireId)
     if not w then return end
     canvas._wireEditTargetId = wireId
+    -- noDelete: an app-set flag for an item that only goes away along with
+    -- whatever owns it (e.g. a relay's command wire and switch).
+    if w.noDelete then
+        gdsGui_schematic_openMenu(canvasName, "WIRE: " .. wireId .. "\nCan't be deleted on its own — delete the item it belongs to.",
+            {"OK"}, "gdsGui_schematic_internal_onWireEditCancelled", "gdsGui_schematic_internal_onWireEditCancelled")
+        return
+    end
     gdsGui_schematic_openMenu(canvasName, "WIRE: " .. wireId, {"DELETE"},
         "gdsGui_schematic_internal_onWireEditChosen", "gdsGui_schematic_internal_onWireEditCancelled", 1)
 end
@@ -3118,11 +3395,15 @@ function gdsGui_schematic_openControlEditMenu(canvasName, controlId)
     local ctrl = _findControl(canvas, controlId)
     if not ctrl then return end
     canvas._controlEditTargetId = controlId
-    local options = {"ADD WIRE"}
+    -- noAddWire: an app-set flag for a control whose wiring the app owns
+    -- (e.g. a relay's command switch) — no ADD WIRE row.
+    local options = ctrl.noAddWire and {} or {"ADD WIRE"}
     for _, p in ipairs(ctrl.positions) do table.insert(options, p) end
-    table.insert(options, "DELETE")
+    -- No DELETE for a noDelete control (see openWireEditMenu).
+    if not ctrl.noDelete then table.insert(options, "DELETE") end
     gdsGui_schematic_openMenu(canvasName, ctrl.label or controlId, options,
-        "gdsGui_schematic_internal_onControlEditChosen", "gdsGui_schematic_internal_onControlEditCancelled", #options)
+        "gdsGui_schematic_internal_onControlEditChosen", "gdsGui_schematic_internal_onControlEditCancelled",
+        (not ctrl.noDelete) and #options or nil)
 end
 
 function gdsGui_schematic_internal_onControlEditChosen(canvasName, index, optionText)
@@ -3131,7 +3412,9 @@ function gdsGui_schematic_internal_onControlEditChosen(canvasName, index, option
     local controlId = canvas._controlEditTargetId
     local ctrl = _findControl(canvas, controlId)
     local nPositions = ctrl and #ctrl.positions or 0
-    if index == 1 then
+    -- Rows: [ADD WIRE unless noAddWire], one per position, [DELETE unless noDelete].
+    local offset = (ctrl and ctrl.noAddWire) and 0 or 1
+    if offset == 1 and index == 1 then
         -- ADD WIRE tapped: arm a one-shot wire-drag whose fixed start is
         -- this control, same "stay armed, no need to land on an anchor
         -- next press" convention as an element's own ADD WIRE (see
@@ -3141,7 +3424,7 @@ function gdsGui_schematic_internal_onControlEditChosen(canvasName, index, option
         gdsGui_schematic_cancelPlacement(canvasName)
         canvas.pendingWireFromId = controlId
         return
-    elseif index == nPositions + 2 then
+    elseif index == nPositions + offset + 1 then
         -- DELETE only ever reaches here via the sustained hold this menu's
         -- own confirmIndex gates it behind (see openControlEditMenu above) —
         -- a plain tap-release on this row is swallowed by _handleMenuRelease
@@ -3162,9 +3445,9 @@ function gdsGui_schematic_internal_onControlEditChosen(canvasName, index, option
     -- deliberately NOT undoable (same as any other instrument interaction).
     -- This design-mode edit-menu path is a genuine edit though, same as
     -- every sibling mutation here (rename, delete, move). A position's
-    -- 0-based index is index - 2 (ADD WIRE occupies index 1).
+    -- 0-based index is index - offset - 1 (ADD WIRE, when shown, is row 1).
     _pushUndo(canvas)
-    gdsGui_schematic_setControlPosition(canvasName, controlId, index - 2)
+    gdsGui_schematic_setControlPosition(canvasName, controlId, index - offset - 1)
     _notifyChanged(canvas)
 end
 
@@ -4178,7 +4461,10 @@ local function _drawElement(canvas, e, signature)
     local ex, ey, ew, eh = _elementPixelRect(canvas, e)
     -- Drawn exactly as resolved (no extra darken), so an element shows the
     -- same palette color — default gray included — as a wire or control.
-    local function drawShapeWithColor(r, g, b, a)
+    -- isHalo: drawing a powered-glow copy (see _glow.halo) — the shapes'
+    -- white outlines are left out so the halo stays the element's own color.
+    local function drawShapeWithColor(r, g, b, a, isHalo)
+        local outline = isHalo and 0 or 1
         love.graphics.setColor(r, g, b, a)
         if e.spritePath then
             _drawElementSprite(e.spritePath, ex, ey, ew, eh, r, g, b, a, e.rotation)
@@ -4193,7 +4479,7 @@ local function _drawElement(canvas, e, signature)
             love.graphics.translate(ex + ew / 2, ey + eh / 2)
             love.graphics.rotate(math.rad(e.rotation or 0))
             love.graphics.ellipse("fill", 0, 0, ew / 2, eh / 2)
-            love.graphics.setColor(1, 1, 1, 1)
+            love.graphics.setColor(1, 1, 1, outline)
             love.graphics.ellipse("line", 0, 0, ew / 2, eh / 2)
             love.graphics.pop()
         elseif e.shapeType == "diode" then
@@ -4205,7 +4491,7 @@ local function _drawElement(canvas, e, signature)
             love.graphics.translate(ex + ew / 2, ey + eh / 2)
             love.graphics.rotate(math.rad(e.rotation or 0))
             love.graphics.rectangle("fill", -ew / 2, -eh / 2, ew, eh)
-            love.graphics.setColor(1, 1, 1, 1)
+            love.graphics.setColor(1, 1, 1, outline)
             love.graphics.rectangle("line", -ew / 2, -eh / 2, ew, eh)
             love.graphics.pop()
         end
@@ -4220,6 +4506,7 @@ local function _drawElement(canvas, e, signature)
         _drawColorSequenceStriped(ex, ey, ew, eh, sequence, drawShapeWithColor)
     else
         local r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "element", e.id, signature)
+        if _glow.applies(canvas, r, g, b) then _glow.halo(canvas.zoom, r, g, b, drawShapeWithColor) end
         drawShapeWithColor(r, g, b, a)
     end
 
@@ -5134,6 +5421,182 @@ local function _hitWire(canvas, px, py)
     return nil
 end
 
+--------------------------------------------------------------------------------
+-- POWERED GLOW: while enabled (gdsGui_schematic_setGlow), every element,
+-- control and wire whose display color isn't plain (gray-ish, the library's
+-- default gray, or one of the app's plain colors such as its unpowered gray)
+-- gets a soft, slowly pulsing halo in its own color, so live parts read as
+-- energized at a glance. A striped color sequence (no single answer) never
+-- glows. How: each glowing item's shape is also drawn into an offscreen
+-- canvas at half resolution (_glow.capture), which is blurred with a
+-- separable Gaussian shader and added over the schematic once per frame
+-- (_glow.finish) — a real blur, so overlapping wires and corners stay
+-- smooth instead of stacking into blocks.
+--------------------------------------------------------------------------------
+
+_glow.SCALE = 0.5        -- offscreen glow resolution, relative to the screen
+_glow.PASSES = 2         -- blur iterations (each one horizontal + vertical)
+_glow.SPREAD = 1.0       -- blur tap distance, in offscreen pixels
+_glow.INTENSITY = 0.75   -- composite strength before the pulse
+_glow.WIRE_WIDTH = 1.8   -- a wire's glow source, as a multiple of its width
+
+-- plainColors: array of {r,g,b[,a]} that never glow. enabled false/nil turns
+-- the effect off.
+function gdsGui_schematic_setGlow(canvasName, enabled, plainColors)
+    local canvas = _findCanvas(canvasName)
+    if canvas then canvas.glow = enabled and { plain = plainColors or {} } or nil end
+end
+
+function _glow.applies(canvas, r, g, b)
+    if not canvas.glow or not canvas.glow.active then return false end
+    -- Grays (and white) never glow, whatever their exact shade.
+    if math.max(r, g, b) - math.min(r, g, b) < 0.12 then return false end
+    for _, c in ipairs(canvas.glow.plain) do
+        if math.abs(c[1] - r) < 0.02 and math.abs(c[2] - g) < 0.02 and math.abs(c[3] - b) < 0.02 then return false end
+    end
+    return true
+end
+
+-- 0.75..1, a slow breathing pulse shared by everything glowing.
+function _glow.pulse()
+    return 0.875 + 0.125 * math.sin(love.timer.getTime() * 2.5)
+end
+
+-- Lazily builds the blur shader and the two offscreen canvases (rebuilt if
+-- the window size changed). False if shaders aren't available — the glow is
+-- then simply skipped.
+function _glow.ensureResources()
+    if _glow.failed then return false end
+    if not _glow.shader then
+        local ok, shader = pcall(love.graphics.newShader, [[
+            uniform vec2 direction;
+            vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
+                vec4 sum = Texel(tex, tc) * 0.2270270270;
+                sum += Texel(tex, tc + direction * 1.3846153846) * 0.3162162162;
+                sum += Texel(tex, tc - direction * 1.3846153846) * 0.3162162162;
+                sum += Texel(tex, tc + direction * 3.2307692308) * 0.0702702703;
+                sum += Texel(tex, tc - direction * 3.2307692308) * 0.0702702703;
+                return sum * color;
+            }
+        ]])
+        if not ok then _glow.failed = true; return false end
+        _glow.shader = shader
+    end
+    local w = math.max(1, math.ceil(love.graphics.getWidth() * _glow.SCALE))
+    local h = math.max(1, math.ceil(love.graphics.getHeight() * _glow.SCALE))
+    if not _glow.canvasA or _glow.canvasA:getWidth() ~= w or _glow.canvasA:getHeight() ~= h then
+        _glow.canvasA = love.graphics.newCanvas(w, h)
+        _glow.canvasB = love.graphics.newCanvas(w, h)
+    end
+    return true
+end
+
+-- Explicit save/restore of the state the glow passes change (render
+-- target, scissor, shader, blend mode, color, line width) — relied on
+-- instead of push("all"), which didn't reliably restore the render target.
+function _glow.saveState()
+    local st = { canvas = love.graphics.getCanvas(), shader = love.graphics.getShader(),
+        lineWidth = love.graphics.getLineWidth() }
+    st.scX, st.scY, st.scW, st.scH = love.graphics.getScissor()
+    st.blend, st.alphaMode = love.graphics.getBlendMode()
+    st.r, st.g, st.b, st.a = love.graphics.getColor()
+    return st
+end
+
+function _glow.restoreState(st)
+    love.graphics.setCanvas(st.canvas)
+    if st.scX then love.graphics.setScissor(st.scX, st.scY, st.scW, st.scH) else love.graphics.setScissor() end
+    love.graphics.setShader(st.shader)
+    love.graphics.setBlendMode(st.blend, st.alphaMode)
+    love.graphics.setColor(st.r, st.g, st.b, st.a)
+    love.graphics.setLineWidth(st.lineWidth)
+end
+
+-- Start of a schematic canvas's frame: clears the offscreen glow buffer.
+function _glow.begin(canvas)
+    if not canvas.glow then return end
+    canvas.glow.active = _glow.ensureResources()
+    if not canvas.glow.active then return end
+    local st = _glow.saveState()
+    love.graphics.setCanvas(_glow.canvasA)
+    -- clear() honors the scissor: with the canvas's screen-space scissor
+    -- still set, part of this half-size buffer was never cleared, and the
+    -- blur kept smearing last frame's glow across it.
+    love.graphics.setScissor()
+    love.graphics.clear(0, 0, 0, 0)
+    _glow.restoreState(st)
+end
+
+-- Draws drawFn() (an item's bare shape, already in its own glow color) into
+-- the offscreen glow buffer instead of the screen.
+function _glow.capture(drawFn)
+    local st = _glow.saveState()
+    love.graphics.setCanvas(_glow.canvasA)
+    love.graphics.setScissor()
+    love.graphics.setBlendMode("alpha")
+    love.graphics.push()
+    love.graphics.origin()
+    love.graphics.scale(_glow.SCALE)
+    drawFn()
+    love.graphics.pop()
+    _glow.restoreState(st)
+end
+
+-- End of the canvas's frame: blurs the buffer and adds it over the canvas
+-- (clipped to the canvas's own rect).
+function _glow.finish(canvas)
+    if not canvas.glow or not canvas.glow.active then return end
+    canvas.glow.active = false
+    local w, h = _glow.canvasA:getDimensions()
+    local st = _glow.saveState()
+    love.graphics.push()
+    love.graphics.origin()
+    love.graphics.setScissor()
+    love.graphics.setShader(_glow.shader)
+    love.graphics.setBlendMode("alpha", "premultiplied")
+    love.graphics.setColor(1, 1, 1, 1)
+    for _ = 1, _glow.PASSES do
+        love.graphics.setCanvas(_glow.canvasB)
+        love.graphics.clear(0, 0, 0, 0)
+        _glow.shader:send("direction", { _glow.SPREAD / w, 0 })
+        love.graphics.draw(_glow.canvasA)
+        love.graphics.setCanvas(_glow.canvasA)
+        love.graphics.clear(0, 0, 0, 0)
+        _glow.shader:send("direction", { 0, _glow.SPREAD / h })
+        love.graphics.draw(_glow.canvasB)
+    end
+    love.graphics.setShader()
+    love.graphics.setCanvas(st.canvas)
+    love.graphics.setScissor(canvas.x, canvas.y, canvas.w, canvas.h)
+    love.graphics.setBlendMode("add", "premultiplied")
+    local k = math.min(1, _glow.INTENSITY * _glow.pulse())
+    love.graphics.setColor(k, k, k, k)
+    love.graphics.draw(_glow.canvasA, 0, 0, 0, 1 / _glow.SCALE, 1 / _glow.SCALE)
+    -- A second, lighter layer for the bright core when INTENSITY > 1.
+    local extra = _glow.INTENSITY * _glow.pulse() - 1
+    if extra > 0 then
+        love.graphics.setColor(extra, extra, extra, extra)
+        love.graphics.draw(_glow.canvasA, 0, 0, 0, 1 / _glow.SCALE, 1 / _glow.SCALE)
+    end
+    love.graphics.pop()
+    _glow.restoreState(st)
+end
+
+-- Glow source for a wire: its own path, a little wider than the wire.
+function _glow.wire(plan, zoom, wireWidth, r, g, b)
+    _glow.capture(function()
+        love.graphics.setColor(r, g, b, 1)
+        love.graphics.setLineWidth(wireWidth * _glow.WIRE_WIDTH)
+        _drawWirePlanSegments(plan, zoom)
+    end)
+end
+
+-- Glow source for an element/control: drawFn(r, g, b, a, isHalo) draws its
+-- bare shape (isHalo leaves out outlines that aren't its own color).
+function _glow.halo(zoom, r, g, b, drawFn)
+    _glow.capture(function() drawFn(r, g, b, 1, true) end)
+end
+
 local function _drawWire(canvas, w, plan, signature)
     if not plan then return end
     local wireWidth = _WIRE_WIDTH_PX * canvas.zoom
@@ -5189,6 +5652,7 @@ local function _drawWire(canvas, w, plan, signature)
             end, bw < bh)
     else
         local r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "wire", w.id, signature)
+        if _glow.applies(canvas, r, g, b) then _glow.wire(plan, canvas.zoom, wireWidth, r, g, b) end
         love.graphics.setColor(r, g, b, a)
         love.graphics.setLineWidth(wireWidth)
         _drawWirePlanSegments(plan, canvas.zoom)
@@ -5272,6 +5736,7 @@ local function _drawControl(canvas, c, signature)
         _drawColorSequenceStriped(cx - rad, cy - rad, rad * 2, rad * 2, sequence, drawBodyWithColor)
     else
         r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "control", c.id, signature)
+        if _glow.applies(canvas, r, g, b) then _glow.halo(canvas.zoom, r, g, b, drawBodyWithColor) end
         drawBodyWithColor(r, g, b, a)
     end
     -- overlaySpritePath below reuses this same (darkened) representative
@@ -5346,7 +5811,9 @@ end
 -- are faint outlines.
 local function _drawConnectorTargets(canvas, snapTarget, snapTerminal)
     for _, e in ipairs(canvas.elements) do _drawOneConnectorTarget(canvas, e, snapTarget, snapTerminal) end
-    for _, c in ipairs(canvas.controls) do _drawOneConnectorTarget(canvas, c, snapTarget, snapTerminal) end
+    for _, c in ipairs(canvas.controls) do
+        if not c.hidden then _drawOneConnectorTarget(canvas, c, snapTarget, snapTerminal) end
+    end
 end
 
 function gdsGui_schematic_draw(pageName)
@@ -5430,6 +5897,7 @@ function gdsGui_schematic_draw(pageName)
             -- per drawn entity for a value that cannot change mid-frame).
             local signature = gdsGui_schematic_computeSignature(canvas.name)
             local wirePlans, wireBundles = _computeWirePlans(canvas)
+            _glow.begin(canvas)
             for _, w in ipairs(canvas.wires) do
                 -- Culled by the bounding box of its own ACTUAL path (every
                 -- segment's endpoints), not just a straight line between its
@@ -5479,8 +5947,9 @@ function gdsGui_schematic_draw(pageName)
             for _, c in ipairs(canvas.controls) do
                 local ccx, ccy = _toPixel(canvas, c.x, c.y)
                 local crad = canvas.controlRadius * canvas.zoom * (c.radiusScale or 1)
-                if rectVisible(ccx - crad, ccy - crad, crad * 2, crad * 2) then _drawControl(canvas, c, signature) end
+                if not c.hidden and rectVisible(ccx - crad, ccy - crad, crad * 2, crad * 2) then _drawControl(canvas, c, signature) end
             end
+            _glow.finish(canvas)
             _drawAnnunciators(canvas)
             drawAiCulpritHighlight(canvas)
 
@@ -5594,7 +6063,6 @@ end
 -- zoom in, matching Figma/Maps/etc.) is the only way to zoom without one.
 -- Same "hold the point under the cursor fixed" anchoring as _updatePinch,
 -- just computed in one step instead of across a continuous gesture.
-local _WHEEL_ZOOM_SENSITIVITY = 0.12  -- zoom multiplier per unit of wheel delta
 
 function gdsGui_schematic_wheelZoom(x, y, dy)
     if dy == 0 then return end
@@ -5613,6 +6081,10 @@ function gdsGui_schematic_wheelZoom(x, y, dy)
                 return
             end
         end
+        if canvas.page == activePageName and canvas.menu and canvas.menu.choiceGrid then
+            _choiceGrid.wheel(canvas, dy)
+            return
+        end
         if canvas.page == activePageName and not canvas.menu
            and x >= canvas.x and x <= canvas.x + canvas.w
            and y >= canvas.y and y <= canvas.y + canvas.h then
@@ -5621,7 +6093,8 @@ function gdsGui_schematic_wheelZoom(x, y, dy)
             -- zoom (see _calculateGeometry).
             local anchorFracX = ((x - canvas.x - canvas.panX) / canvas.zoom) / canvas.contentW
             local anchorFracY = ((y - canvas.y - canvas.panY) / canvas.zoom) / canvas.contentH
-            local newZoom = canvas.zoom * ((1 + _WHEEL_ZOOM_SENSITIVITY) ^ dy)
+            local wheelZoomSensitivity = 0.12 -- zoom multiplier per unit of wheel delta
+            local newZoom = canvas.zoom * ((1 + wheelZoomSensitivity) ^ dy)
             newZoom = math.max(_MIN_ZOOM, math.min(_MAX_ZOOM, newZoom))
             canvas.zoom = newZoom
             _calculateGeometry(canvas)
@@ -5683,7 +6156,11 @@ function gdsGui_schematic_pressed(touchId, x, y)
         -- records what it landed on — gdsGui_schematic_released below is
         -- what actually fires onSelect/onCancel.
         if canvas.menu then
-            _handleMenuPress(canvas, touchId, x, y)
+            if canvas.menu.choiceGrid then
+                _choiceGrid.press(canvas, touchId, x, y)
+            else
+                _handleMenuPress(canvas, touchId, x, y)
+            end
             goto continue
         end
 
@@ -5888,6 +6365,9 @@ function gdsGui_schematic_pressed(touchId, x, y)
             -- stay paintable as normal — only the source node itself is
             -- excluded.
             if target and target.componentType == "source" then target = nil end
+            -- noPaint: an app-set flag for any item whose color the app
+            -- doesn't want taught (e.g. a relay's command wire and switch).
+            if target and target.noPaint then target = nil end
             if target then
                 canvas.focusTouchId = touchId
                 canvas.dragKind     = "paint"
@@ -6169,7 +6649,10 @@ function gdsGui_schematic_moved(touchId, x, y)
         -- gdsGui_schematic_pressed/_draw already gate on this; this and
         -- _released below didn't.
         if canvas.page ~= activePageName then goto continue end
-        if canvas.menu then goto continue end
+        if canvas.menu then
+            if canvas.menu.choiceGrid then _choiceGrid.move(canvas, touchId, x, y) end
+            goto continue
+        end
         if canvas.annunciatorPanelOpen then
             _handleAnnunciatorPanelMove(canvas, touchId, x, y)
             goto continue
@@ -6501,7 +6984,11 @@ function gdsGui_schematic_released(touchId, x, y)
                 canvas.collidingObstacleId = nil
                 canvas._pendingDragUndoSnapshot = nil
             end
-            _handleMenuRelease(canvas, touchId, x, y)
+            if canvas.menu.choiceGrid then
+                _choiceGrid.release(canvas, touchId, x, y)
+            else
+                _handleMenuRelease(canvas, touchId, x, y)
+            end
             goto continue
         end
         if canvas.annunciatorPanelOpen then
