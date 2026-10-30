@@ -25,7 +25,7 @@ require("model.media.hydraulic")
 require("model.media.fuel")
 require("model.media.bleedAir")
 
-APP_VERSION = "1.0.30"
+APP_VERSION = "1.0.32"
 
 -- Shape version of schematicProjects.lua's data, independent of APP_VERSION
 -- (an app update can ship with no data-shape change at all, or vice versa).
@@ -398,11 +398,23 @@ local SCHEMATIC_CATALOG = {
         { label = "GENERATOR", abbrev = "GENR", kind = "control", presets = { {"OFF", "ON"} },
           spritePaths = _GENERATOR_SPRITE_PATHS, overlaySpritePath = _GENERATOR_OVERLAY_SPRITE_PATH,
           gridSize = 2, componentType = "source" },
+        -- No defaultProperties (placement grid asks for NAME/TYPE/VOLTAGE/
+        -- POWERED COLOR only) — VOLTAGE already comes from the placement
+        -- grid's own source TYPE/VOLTAGE row (componentType == "source";
+        -- see schematicElementPlacementExtraRows) and CURRENT is sensed-
+        -- only (schematicElementSensedCurrent, never modeled) — either as
+        -- a manual property would just sit there duplicating/disagreeing
+        -- with it, same reasoning BUS below has for its own VOLTAGE/CURRENT.
         { label = "BATTERY", abbrev = "BATT",   kind = "element", shapeType = "rect",
-          defaultProperties = {"VOLTAGE", "CURRENT"}, spritePath = "Sprites/element_battery.png",
+          spritePath = "Sprites/element_battery.png",
           gridW = 2, gridH = 3, componentType = "source" },
+        -- No defaultProperties (placement grid asks for NAME only) — a
+        -- bus's own VOLTAGE/CURRENT are SENSED, not authored (see
+        -- schematicElementSensedValues' read-only PROPERTIES-menu header),
+        -- so a manually-typed VOLTAGE/CURRENT property would only ever sit
+        -- there unused, disagreeing with whatever the solver actually infers.
         { label = "BUS", abbrev = "BUS",       kind = "element", shapeType = "rect",
-          defaultProperties = {"VOLTAGE", "CURRENT"}, spritePath = "Sprites/element_bus.png",
+          spritePath = "Sprites/element_bus.png",
           gridW = 4, gridH = 2, componentType = "path" },
         -- Anode (flow "in") on the left, cathode (flow "out") on the right,
         -- matching rotation 0 conducting +x (model/graph.lua's
@@ -460,17 +472,23 @@ local SCHEMATIC_CATALOG = {
         -- present whenever placed, like a battery) plus a pilot-switchable
         -- source control (reuses GENERATOR's own spinning-gear-overlay
         -- affordance — a motor/engine-driven pump "spinning up" reads the
-        -- same way a generator does). Placing either prompts for its
-        -- nominal PRESSURE the same way a new electrical source prompts
-        -- for VOLTAGE (model/media/hydraulic.lua's own magnitudeLabel —
-        -- see schematicSourceElementPlaced).
+        -- same way a generator does). Placing either asks for its nominal
+        -- PRESSURE the same way a new electrical source asks for VOLTAGE,
+        -- right in the unified placement grid (model/media/hydraulic.lua's
+        -- own magnitudeLabel — see main.lua's schematicElementPlacementExtraRows).
+        -- No defaultProperties — PRESSURE already comes from the placement
+        -- grid's own source TYPE/VALUE row (same reasoning BATTERY's own
+        -- comment, above in the ELECTRICAL catalog, gives for VOLTAGE).
         { label = "ACCUMULATOR", abbrev = "ACUM", kind = "element", shapeType = "rect",
-          defaultProperties = {"PRESSURE"}, gridW = 2, gridH = 3, componentType = "source" },
+          gridW = 2, gridH = 3, componentType = "source" },
         { label = "PUMP", abbrev = "PUMP", kind = "control", presets = { {"OFF", "ON"} },
           spritePaths = _GENERATOR_SPRITE_PATHS, overlaySpritePath = _GENERATOR_OVERLAY_SPRITE_PATH,
           gridSize = 2, componentType = "source" },
+        -- No defaultProperties — PRESSURE is SENSED (schematic
+        -- ElementSensedValues' read-only PROPERTIES-menu header), not
+        -- authored, same as BUS above.
         { label = "MANIFOLD", abbrev = "MNFD", kind = "element", shapeType = "rect",
-          defaultProperties = {"PRESSURE"}, gridW = 4, gridH = 2, componentType = "path" },
+          gridW = 4, gridH = 2, componentType = "path" },
         -- Non-user-operated, one-way flow — same role/geometry-derived
         -- conduction direction as ELECTRICAL's own DIODE above (see
         -- model/graph.lua's _resolveDirectionalEdges), just reusing that
@@ -497,8 +515,11 @@ local SCHEMATIC_CATALOG = {
         { label = "FUEL PUMP", abbrev = "FPMP", kind = "control", presets = { {"OFF", "ON"} },
           spritePaths = _GENERATOR_SPRITE_PATHS, overlaySpritePath = _GENERATOR_OVERLAY_SPRITE_PATH,
           gridSize = 2, componentType = "source" },
+        -- No defaultProperties — PRESSURE is sensed, not authored (same
+        -- reasoning MANIFOLD's own comment, above in the HYDRAULIC catalog,
+        -- gives).
         { label = "FUEL MANIFOLD", abbrev = "FMFD", kind = "element", shapeType = "rect",
-          defaultProperties = {"PRESSURE"}, gridW = 4, gridH = 2, componentType = "path" },
+          gridW = 4, gridH = 2, componentType = "path" },
         -- Same non-user-operated, one-way role as HYDRAULIC's own CHECK
         -- VALVE above (e.g. an anti-siphon or crossfeed check valve).
         { label = "CHECK VALVE", abbrev = "CKVL", kind = "element", shapeType = "diode",
@@ -514,10 +535,16 @@ local SCHEMATIC_CATALOG = {
         -- the engine's running, same always-on-when-placed role as BATTERY/
         -- FUEL TANK above (this system has no separate switchable-source
         -- control; bleed is throttled downstream by BLEED VALVE instead).
+        -- No defaultProperties — PRESSURE already comes from the placement
+        -- grid's own source TYPE/VALUE row (same reasoning BATTERY's own
+        -- comment, above in the ELECTRICAL catalog, gives for VOLTAGE).
         { label = "BLEED AIR SOURCE", abbrev = "BSRC", kind = "element", shapeType = "circle",
-          defaultProperties = {"PRESSURE"}, gridW = 3, gridH = 3, componentType = "source" },
+          gridW = 3, gridH = 3, componentType = "source" },
+        -- No defaultProperties — PRESSURE is sensed, not authored (same
+        -- reasoning MANIFOLD's own comment, above in the HYDRAULIC catalog,
+        -- gives).
         { label = "DUCT", abbrev = "DUCT", kind = "element", shapeType = "rect",
-          defaultProperties = {"PRESSURE"}, gridW = 4, gridH = 2, componentType = "path" },
+          gridW = 4, gridH = 2, componentType = "path" },
         -- Same non-user-operated, one-way role as the other systems' own
         -- CHECK VALVE above (e.g. an engine-to-engine isolation check
         -- valve preventing backflow).
@@ -583,11 +610,6 @@ local _controlMenuIds           = {}
 local _controlMenuSelectedId    = nil
 local _pendingSnapshotPlan      = nil
 
--- Phase 5 (inference-schematic-assistance plan) UI state: the detents the
--- open SUGGEST NEXT SNAPSHOT menu's APPLY action would jump to — see
--- _openSuggestNextSnapshotMenu below and its *Chosen callback further down
--- the file. (The GATE RULES detail menu's pending gate lives in _relays.)
-local _pendingSuggestedDetents  = nil
 -- RELAY GATES (a BUS TIE contactor): a "gate" whose position nobody sets
 -- directly, decided instead by logic learned from painted snapshots — see
 -- model/relay.lua. One table rather than separate locals: main.lua sits at
@@ -832,6 +854,17 @@ end
 local function _currentMedium()
     local sys = schematicStore and _findSystem(schematicStore.currentSystemId)
     return (sys and require("model.media.registry").get(sys.systemType)) or ELECTRICAL_MEDIUM
+end
+
+-- Only ELECTRICAL sources (BATTERY, GENERATOR, ...) ever need a VDC/VAC
+-- distinction — a HYDRAULIC/FUEL/BLEED AIR source's magnitude is a PRESSURE
+-- (PSI), which has no AC/DC concept at all. Gates the extra SOURCE TYPE menu
+-- step in both the new-source-placement and PER-SOURCE SETTINGS voltage
+-- flows below. Global, not local — this file is already at Lua's
+-- 200-top-level-local ceiling (see _openFundamentalsMenu's own comment on
+-- the same constraint).
+function _mediumUsesVoltageType()
+    return _currentMedium().name == "ELECTRICAL"
 end
 
 -- Per-systemType gallery tile thumbnail, keyed by SCHEMATIC_CATALOG's own
@@ -1487,11 +1520,15 @@ end
 
 -- GEAR: the aircraft's global gear position — DOWN = on the ground, UP =
 -- airborne — set by the GEAR buttons (schematicGearBtnPressed) and kept in
--- appSettings.gearDown. A system with a bus tie carries it as a hidden
--- control, GEAR, so it's part of every snapshot's combination (and PREV/
--- NEXT step through it) like any switch, and bus tie logic can depend on
--- it. _relays.syncGearControl adds/removes that control as bus ties come
--- and go; _relays.applyGlobalGear copies the global position onto it.
+-- appSettings.gearDown. A system carries it as a hidden control, GEAR, so
+-- it's part of every snapshot's combination (and PREV/NEXT step through it)
+-- like any switch, whenever EITHER a bus tie exists (relay logic can always
+-- depend on it) OR at least one element/control's own GROUND SWITCH
+-- DEPENDENT property is ON (see _groundDependentItemExists below and the
+-- PROPERTIES menu's own row — main.lua's schematicElementPlacementExtraRows/
+-- schematicElementPropertiesExtraRows). _relays.syncGearControl adds/removes
+-- that control as either condition comes and goes; _relays.applyGlobalGear
+-- copies the global position onto it.
 _relays.GEAR_ID = "GEAR"
 _relays.GEAR_POSITIONS = { "DOWN", "UP" }
 
@@ -1513,26 +1550,45 @@ function _relays.applyGlobalGear(canvas)
     if gear then gear.detentIndex = appSettings.gearDown and 0 or 1 end
 end
 
--- Hidden GEAR control present exactly when the canvas has a bus tie.
+-- Whether any element/control (the hidden GEAR control itself excluded) has
+-- its own GROUND SWITCH DEPENDENT property set to "ON" — the second of the
+-- two conditions _relays.syncGearControl below keeps the hidden GEAR
+-- control present for (the other being "a bus tie exists at all").
+function _groundDependentItemExists(canvas)
+    for _, e in ipairs(canvas.elements) do
+        if e.groundDependent == "ON" then return true end
+    end
+    for _, c in ipairs(canvas.controls) do
+        if c.id ~= _relays.GEAR_ID and c.groundDependent == "ON" then return true end
+    end
+    return false
+end
+
+-- Hidden GEAR control present exactly when the canvas has a bus tie OR any
+-- item has opted into GROUND SWITCH DEPENDENT (see this section's own
+-- header comment).
 function _relays.syncGearControl(canvas)
-    local hasRelay = next(_relays.idSet(canvas)) ~= nil
+    local needsGear = next(_relays.idSet(canvas)) ~= nil or _groundDependentItemExists(canvas)
     local gear = _relays.gearControl(canvas)
-    if hasRelay and not gear then
+    if needsGear and not gear then
         gdsGui_schematic_addControl(canvas.name, _relays.GEAR_ID, 0, 0, _relays.GEAR_POSITIONS,
             appSettings.gearDown and 0 or 1, "GEAR")
         gear = _relays.gearControl(canvas)
-    elseif gear and not hasRelay then
+    elseif gear and not needsGear then
         gdsGui_schematic_removeControl(canvas.name, _relays.GEAR_ID)
         return
     end
     if gear then gear.hidden, gear.noPaint, gear.noDelete, gear.noAddWire = true, true, true, true end
 end
 
--- Both GEAR buttons (design dock and control mode) show the global position.
+-- All three GEAR buttons (design dock, control mode, and full-screen) show
+-- the global position. schematicGearFullScreenBtn is never hidden — see its
+-- own creation comment.
 function _relays.refreshGearButtons(designing)
     local state = appSettings.gearDown and "pushed" or "released"
     gdsGui_button_setState("schematicGearBtn", state)
     gdsGui_button_setState("schematicGearCtlBtn", state)
+    gdsGui_button_setState("schematicGearFullScreenBtn", state)
     if designing ~= nil then
         gdsGui_button_setHidden("schematicGearBtn", not designing)
         gdsGui_button_setHidden("schematicGearCtlBtn", designing)
@@ -1602,9 +1658,12 @@ end
 -- pre-filled from whatever it already has. Mirror-image rows (terminals
 -- swapped) are kept in agreement as the user picks — see
 -- schematicRelayLogicChanged — so the logic can never contradict itself.
--- Mandatory (SAVE only) when opened because logic is missing; fromGateRules
--- (editing from DESIGN ACTIONS > GATE RULES) adds CANCEL, and either button
--- returns to the GATE RULES list.
+-- CANCEL is always offered now, even when opened because logic is missing —
+-- it just leaves the relay without logic for now rather than forcing it on
+-- the spot (the mandatory poll — see love.update()'s own checkLogic check —
+-- will simply ask again the next time nothing else is open). fromGateRules
+-- (editing from DESIGN ACTIONS > GATE RULES) only changes where SAVE/CANCEL
+-- return to — see schematicRelayLogicSaved/Cancelled.
 function _relays.openLogicGrid(canvas, relay, fromGateRules)
     local function volts(v) return v .. "V" end
     local rows, rowByKey = {}, {}
@@ -1625,7 +1684,7 @@ function _relays.openLogicGrid(canvas, relay, fromGateRules)
         (relay.label or relay.id) .. (fromGateRules and ": BUS TIE LOGIC\nTap OPEN or CLOSED to change a row"
             or ": SET BUS TIE LOGIC\nPick OPEN or CLOSED for every row"),
         "GEAR / SW / T1 | T2", rows, { "OPEN", "CLOSED" }, "schematicRelayLogicChanged", "schematicRelayLogicSaved",
-        fromGateRules and "schematicRelayLogicCancelled" or nil)
+        "schematicRelayLogicCancelled")
 end
 
 -- Draws each relay element open or closed per gateStates.
@@ -2748,20 +2807,6 @@ local function _combinationIndexForDetents(canvas, detents)
     return idx + 1
 end
 
-local function _controlsForSuggest(canvas)
-    local list = {}
-    for _, c in ipairs(canvas.controls) do
-        table.insert(list, { id = c.id, numDetents = c.numDetents })
-    end
-    return list
-end
-
-local function _capturedSignaturesSet(canvas)
-    local set = {}
-    for signature in pairs(canvas.snapshots) do set[signature] = true end
-    return set
-end
-
 -- {combinationIndex, combinationTotal, confidencePercent,
 -- primaryReasonText, primaryReasonNodeId, fixInstructionText} for
 -- whichever system mainCanvas currently has open — confidencePercent is
@@ -3482,9 +3527,7 @@ local function _openDesignActionsMenu(canvasName)
     -- GATE RULES only offered once the canvas actually has a "gate"-role
     -- node to show a rule for (see model/learner.lua's findSimplestRule,
     -- Phase 3) — nothing untyped/non-electrical schematics could ever
-    -- populate. SUGGEST NEXT SNAPSHOT only needs controls to exist at all
-    -- (model/suggest.lua's heuristic is domain-agnostic — see its own
-    -- comment), so it's offered for any system with at least one.
+    -- populate.
     local canvas = _findSchematicCanvas()
     if canvas then
         local componentTypes = _buildComponentTypeMap(canvas)
@@ -3497,7 +3540,6 @@ local function _openDesignActionsMenu(canvasName)
         if next(canvas.attributionRules or {}) ~= nil then
             table.insert(options, "ATTRIBUTION RULES")
         end
-        if #canvas.controls > 0 then table.insert(options, "SUGGEST NEXT SNAPSHOT") end
     end
     -- <MEDIUM> COLORS lets the user pick their own powered/unpowered
     -- display colors (default yellow/gray, or whatever this medium's own
@@ -3653,37 +3695,6 @@ local function _openAttributionRuleDetailMenu(canvasName, nodeId)
 end
 
 -------------------------------------------------------------------------------
--- SYSTEM SCHEMATIC — SUGGEST NEXT SNAPSHOT (Phase 5): surfaces
--- model/suggest.lua's one-flip-from-an-existing-capture heuristic, and lets
--- the user jump the live combination straight to it (APPLY) instead of
--- hunting for an untested combination by hand.
--------------------------------------------------------------------------------
-
-local function _openSuggestNextSnapshotMenu(canvasName)
-    local canvas = _findSchematicCanvas()
-    if not canvas then return end
-    local suggestion = ModelSuggest.suggestNextSnapshot(_controlsForSuggest(canvas), _capturedSignaturesSet(canvas))
-    if not suggestion then
-        gdsGui_schematic_openMenu(canvasName,
-            "Every one-flip combination from an existing snapshot is already captured.",
-            { "OK" }, "schematicSuggestNextSnapshotDismissed", nil)
-        return
-    end
-
-    local labelsById = _labelsByIdForCanvas(canvas)
-    local parts = {}
-    for _, c in ipairs(canvas.controls) do
-        local detentIndex = suggestion.detents[c.id]
-        local positionLabel = (detentIndex and c.positions and c.positions[detentIndex + 1]) or tostring(detentIndex)
-        table.insert(parts, (labelsById[c.id] or c.id) .. "=" .. positionLabel)
-    end
-
-    _pendingSuggestedDetents = suggestion.detents
-    gdsGui_schematic_openMenu(canvasName, "TRY: " .. table.concat(parts, ", "),
-        { "APPLY", "CANCEL" }, "schematicSuggestNextSnapshotChosen", "schematicSuggestNextSnapshotDismissed", nil, 0.8)
-end
-
--------------------------------------------------------------------------------
 -- SYSTEM SCHEMATIC — ELECTRICAL COLORS: lets the user pick their own
 -- powered/unpowered display color (default yellow/gray — see
 -- ELECTRICAL_MEDIUM.style) instead of being stuck with the medium's
@@ -3761,7 +3772,7 @@ local function _openPerSourceSettingsListMenu(canvasName)
     for _, id in ipairs(sourceIds) do
         local entity = _findSourceEntity(canvas, id)
         local voltage = entity and entity.voltage
-        local voltageDescription = voltage and (voltage .. unit) or ("? " .. unit)
+        local voltageDescription = voltage and (voltage .. ((entity and entity.voltageType) or unit)) or ("? " .. unit)
         local colorDescription = voltage and _voltageColorDescription(canvas, voltage) or "default"
         table.insert(options, (labelsById[id] or id) .. " (" .. voltageDescription .. ", " .. colorDescription .. ")")
     end
@@ -4282,8 +4293,6 @@ function schematicDesignActionChosen(canvasName, index, optionText)
         _openGateRulesListMenu(canvasName)
     elseif optionText == "ATTRIBUTION RULES" then
         _openAttributionRulesListMenu(canvasName)
-    elseif optionText == "SUGGEST NEXT SNAPSHOT" then
-        _openSuggestNextSnapshotMenu(canvasName)
     elseif optionText == (_currentMedium().name or "ELECTRICAL") .. " COLORS" then
         _openElectricalColorsMenu(canvasName)
     elseif optionText == "CLEAR PAGE" then
@@ -5663,16 +5672,37 @@ function love.load()
     -- so in-progress work survives a quit/background without waiting for the
     -- next page-nav save point.
     _findSchematicCanvas().onChange = "schematicCanvasChanged"
-    -- Fires once, right after a freshly-placed element/control is named —
-    -- see schematicSourceElementPlaced below, which chains straight into the
-    -- VOLTAGE prompt for a "source"-role item (BATTERY, GENERATOR, ...) and
-    -- ignores everything else.
+    -- Fires once, right after a freshly-placed element/control is created —
+    -- see schematicSourceElementPlaced below, which now only ever acts on a
+    -- relay (BUS TIE): everything else a "source"-role item or a plain
+    -- element's own default properties need is collected up front by the
+    -- placement grid itself, via the two hooks right below instead.
     _findSchematicCanvas().onElementPlaced = "schematicSourceElementPlaced"
+    -- Extra rows (SOURCE TYPE/VOLTAGE for a "source"-role item) appended
+    -- right after NAME in that one unified placement grid — see
+    -- schematic_gdsGuiLib.lua's _openElementPlacementGrid and main.lua's
+    -- own schematicElementPlacementExtraRows.
+    _findSchematicCanvas().elementPlacementExtraRows = "schematicElementPlacementExtraRows"
+    -- Fires once every row from that same grid has actually been written
+    -- onto the brand new element/control — see schematicElementPlacementConfigured.
+    _findSchematicCanvas().elementPlacementConfigured = "schematicElementPlacementConfigured"
     -- Read-only VOLTAGE/CURRENT rows (schematicElementSensedValues below)
     -- shown above an element's own custom properties in its PROPERTIES menu
     -- — previously VOLTAGE alone was appended to the edit-menu's own TITLE
     -- (canvas.elementMenuTitleSuffix) instead.
     _findSchematicCanvas().elementSensedValues = "schematicElementSensedValues"
+    -- Extra EDITABLE rows shown ahead of an element/control's own custom
+    -- properties in its PROPERTIES menu — main.lua uses this for a source's
+    -- own TYPE/VOLTAGE/POWERED COLOR rows (see schematicElementPropertiesExtraRows).
+    _findSchematicCanvas().elementPropertiesExtraRows = "schematicElementPropertiesExtraRows"
+    -- Fires once per saved row from the hook above whose target isn't the
+    -- generic "field" write the library already handles — see
+    -- schematicElementPropertiesRowSaved.
+    _findSchematicCanvas().elementPropertiesRowSaved = "schematicElementPropertiesRowSaved"
+    -- Fires once every row from the PROPERTIES grid (TYPE/VOLTAGE/POWERED
+    -- COLOR and any custom properties) has actually been written back onto
+    -- the entity — see schematicElementPropertiesSaved.
+    _findSchematicCanvas().elementPropertiesSaved = "schematicElementPropertiesSaved"
     -- On-canvas row-2 status text under an element's own label (see
     -- schematic_gdsGuiLib.lua's canvas.elementStatusText hook / _drawElement)
     -- — the element equivalent of a control's own position readout
@@ -5698,15 +5728,28 @@ function love.load()
         _schematicCanvasZoomedLayout.x, _schematicCanvasZoomedLayout.y, _schematicCanvasZoomedLayout.anchorPoint,
         _schematicCanvasZoomedLayout.wFrac, _schematicCanvasZoomedLayout.hFrac)
 
-    -- FULL-SCREEN RETURN BUTTON — the only control on the dedicated full-
-    -- screen page; tapping it hands mainCanvas back to its normal embedded
-    -- layout on SystemSchematic (see schematicFullScreenReturnPressed).
+    -- FULL-SCREEN RETURN BUTTON — tapping it hands mainCanvas back to its
+    -- normal embedded layout on SystemSchematic (see
+    -- schematicFullScreenReturnPressed).
     gdsGui_button_create("schematicFullScreenReturnBtn", "SchematicFullScreen", "pushonoff",
         "Sprites/button_smallerScreen_pressed.png",
         "Sprites/button_smallerScreen_released.png",
         "Sprites/button_smallerScreen_deactivated.png",
         0.95, 0.04, "RT", 36, 36,
         "schematicFullScreenReturnPressed", globApp.BUTTON_STATES.RELEASED, true, nil
+    )
+    -- GEAR — this page is only ever reached from control mode (FULL SCREEN
+    -- is disabled while designing — see schematicFullScreenToggle's own
+    -- comment), so unlike schematicGearBtn/schematicGearCtlBtn above, this
+    -- copy is never hidden; it just mirrors the aircraft's global gear
+    -- position same as the other two (see _relays.refreshGearButtons).
+    -- Docked left of the RETURN button, same row.
+    gdsGui_button_create("schematicGearFullScreenBtn", "SchematicFullScreen", "toggle",
+        "Sprites/button_schematicGear_pressed.png",
+        "Sprites/button_schematicGear_released.png",
+        "Sprites/button_schematicGear_deactivated.png",
+        0.95 - (36 + 10) / globApp.safeScreenArea.w, 0.04, "RT", 36, 36,
+        "schematicGearBtnPressed", globApp.BUTTON_STATES.RELEASED, true, nil
     )
 
     ---------------------------------------------------------------------------
@@ -7238,31 +7281,6 @@ function schematicAttributionRuleDetailCancelled()
     _pendingAttributionRuleNodeId = nil
 end
 
--- APPLY jumps the live combination straight to the suggested detents (same
--- level of directness gdsGui_schematic_stepCombination already uses
--- internally for c.detentIndex) and re-solves/re-saves exactly like
--- PREV/NEXT above; CANCEL (or tapping outside) leaves the combination
--- untouched.
-function schematicSuggestNextSnapshotChosen(canvasName, index, optionText)
-    if optionText == "APPLY" and _pendingSuggestedDetents then
-        local canvas = _findSchematicCanvas()
-        if canvas then
-            gdsGui_schematic_pushUndo(canvasName)
-            for _, c in ipairs(canvas.controls) do
-                local detentIndex = _pendingSuggestedDetents[c.id]
-                if detentIndex then c.detentIndex = detentIndex end
-            end
-            _applySolvedColorsToCurrentCombination()
-            _requestSchematicSave()
-        end
-    end
-    _pendingSuggestedDetents = nil
-end
-
-function schematicSuggestNextSnapshotDismissed()
-    _pendingSuggestedDetents = nil
-end
-
 function schematicElectricalColorsChosen(canvasName, index, optionText)
     if optionText == "POWERED COLOR" then
         gdsGui_schematic_openGenericColorPicker(canvasName,
@@ -7293,72 +7311,24 @@ function schematicPerSourceSettingsListChosen(canvasName, index, optionText)
 end
 
 -------------------------------------------------------------------------------
--- SYSTEM SCHEMATIC — VOLTAGE -> COLOR REGISTRATION: the single place a
--- voltage's powered color actually gets picked. Shared by both the
--- initial-placement flow further down (schematicSourceElementPlaced) and
--- PER-SOURCE SETTINGS' own VOLTAGE edit just below — either path lands
--- here once a source's voltage is known, and either registers that voltage
--- a NEW color on THIS system (first use) or silently reuses whatever this
--- system already has registered for it (every use after the first), which
--- is the whole point of keying color by voltage instead of by individual
--- source. Lives on canvas.voltageColors, NOT an appSettings global — a
--- fresh system (new, or re-created after deleting it or its whole
--- aircraft) starts with nothing registered, same as it starts with no
--- snapshots/rules taught, so every voltage has to be taught again. Declared
--- ahead of every caller below since _ensureVoltageHasColor is a local
--- (upvalue, not a by-name global callback) — Lua doesn't hoist local
--- functions.
+-- SYSTEM SCHEMATIC — VOLTAGE -> COLOR REGISTRATION: a voltage's powered
+-- color, registered on canvas.voltageColors (NOT an appSettings global — a
+-- fresh system, new or re-created after deleting it or its whole aircraft,
+-- starts with nothing registered, same as it starts with no snapshots/
+-- rules taught, so every voltage has to be taught again). Picking the SAME
+-- color for a voltage that already has one registered is a harmless no-op
+-- (it's keyed by voltage, not by individual source, so every source sharing
+-- it just keeps reading the same way); picking a DIFFERENT one simply
+-- re-registers it for every source at that magnitude, on this system, all
+-- at once. Both placement (schematicElementPlacementExtraRows) and editing
+-- (schematicElementPropertiesExtraRows/elementPropertiesRowSaved below)
+-- collect this the exact same way, as one more mandatory row in their own
+-- propertyGrid — there's no separate color-picker popup anywhere anymore.
 -------------------------------------------------------------------------------
-
--- Which voltage the open swatch picker (armed by _ensureVoltageHasColor
--- below) is registering a color FOR — only one such pick is ever in
--- flight at a time, same convention as _pendingPerSourceTargetId.
-local _pendingVoltageColorPickValue = nil
 
 local function _resolveAndSaveSchematic()
     _requestSchematicSave()
     _applySolvedColorsToCurrentCombination()
-end
-
-local function _ensureVoltageHasColor(canvasName, voltage)
-    local canvas = _findSchematicCanvas()
-    if not canvas then return end
-    -- canvas.voltageColors is an app-added field (not part of the library's
-    -- own canvas schema), normally set by _openSystemIntoCanvas/
-    -- _clearMainCanvas before any element could be placed at all — self-heals
-    -- to an empty table here rather than crashing on a nil index if either
-    -- of those somehow hasn't run yet for this canvas.
-    canvas.voltageColors = canvas.voltageColors or {}
-    if canvas.voltageColors[voltage] then
-        _resolveAndSaveSchematic()
-        return
-    end
-    _pendingVoltageColorPickValue = voltage
-    gdsGui_schematic_openGenericColorPicker(canvasName,
-        voltage .. (_currentMedium().magnitudeUnit or "V")
-            .. " POWERED COLOR (every source at this magnitude, on this system, will share it)",
-        "schematicVoltageColorChosen", "schematicVoltageColorCancelled")
-end
-
-function schematicVoltageColorChosen(canvasName, index)
-    local color = gdsGui_schematic_getColorPaletteEntry(index)
-    local canvas = _findSchematicCanvas()
-    if color and canvas and _pendingVoltageColorPickValue then
-        canvas.voltageColors = canvas.voltageColors or {}
-        canvas.voltageColors[_pendingVoltageColorPickValue] = color
-    end
-    _pendingVoltageColorPickValue = nil
-    _resolveAndSaveSchematic()
-end
-
-function schematicVoltageColorCancelled(canvasName)
-    -- The voltage itself is already set on the source either way — it'll
-    -- just show the system-wide default POWERED COLOR (see
-    -- _colorForPoweredNode's defaultColor fallback) until a color is
-    -- registered for it some other time (PER-SOURCE SETTINGS > VOLTAGE,
-    -- re-entering the same value, revisits this picker).
-    _pendingVoltageColorPickValue = nil
-    _resolveAndSaveSchematic()
 end
 
 -- Reverse of the registration above: "24V" (or "1500PSI", ... — see
@@ -7383,7 +7353,8 @@ function schematicElementSensedVoltage(canvasName, elementId)
     for voltage, color in pairs(canvas.voltageColors) do
         if math.abs(color[1] - r) < 0.01 and math.abs(color[2] - g) < 0.01
            and math.abs(color[3] - b) < 0.01 and math.abs((color[4] or 1) - a) < 0.01 then
-            return voltage .. (_currentMedium().magnitudeUnit or "V")
+            local entity = _findSourceEntity(canvas, elementId)
+            return voltage .. ((entity and entity.voltageType) or _currentMedium().magnitudeUnit or "V")
         end
     end
     return nil
@@ -7421,14 +7392,200 @@ function schematicElementStatusText(canvasName, elementId)
     return schematicElementSensedVoltage(canvasName, elementId)
 end
 
+-- A source's own TYPE (VDC/VAC, ELECTRICAL only) + magnitude NUMBER rows,
+-- shared by both the element-placement grid's own extra-rows hook
+-- (schematicElementPlacementExtraRows below) and the PROPERTIES-menu edit
+-- flow (schematicElementPropertiesExtraRows below) so a source's nominal
+-- values are always collected the same way, in the same gdsGui_schematic_
+-- openPropertyGrid-style grid, whether at creation or edited afterward.
+-- entity (optional): an already-placed source to pre-fill from — nil for a
+-- freshly-placed one with nothing to show yet. target = "field" on both
+-- rows tells whoever applies them (_applyPlacementExtraRows in the library
+-- for placement, or its generic "field" branch in gdsGui_schematic_
+-- internal_onPropertiesSaved for editing) to write straight onto the
+-- entity (.voltageType/.voltage) rather than into its .properties list.
+function _sourceTypeVoltageRows(entity)
+    local rows = {}
+    if _mediumUsesVoltageType() then
+        table.insert(rows, { key = "voltageType", label = "TYPE", target = "field",
+            value = (entity and entity.voltageType) or "", choices = { "VDC", "VAC" } })
+    end
+    local label = _currentMedium().magnitudeLabel or "VOLTAGE"
+    table.insert(rows, { key = "voltage", label = label, target = "field", numeric = true, numericOnly = true,
+        value = (entity and entity.voltage and tostring(entity.voltage)) or "" })
+    return rows
+end
+
+-------------------------------------------------------------------------------
+-- SYSTEM SCHEMATIC — NEW ELEMENT/CONTROL PLACEMENT: every placement (tap-to-
+-- place — see schematic_gdsGuiLib.lua's _openElementPlacementGrid) now opens
+-- one grid for NAME plus whatever else this item needs: a "source" item's
+-- TYPE/VOLTAGE here (canvas.elementPlacementExtraRows), or a plain
+-- element's own catalog defaultPropertyKeys (handled entirely by the
+-- library itself — nothing app-specific to add for those). Required, since
+-- a source with no magnitude can never get an automatic powered color of
+-- its own (see _colorForPoweredNode's defaultColor fallback).
+-------------------------------------------------------------------------------
+
+-- Shared by both POWERED COLOR rows below (placement and PROPERTIES-edit) —
+-- a propertyGrid swatch row needs its choices (names) and swatchColors
+-- (the matching actual colors, parallel array) built together, since the
+-- grid itself only ever draws whatever colors it's handed (schematic_
+-- gdsGuiLib.lua's own row.swatchColors comment).
+function _colorPaletteNamesAndSwatches()
+    local names = gdsGui_schematic_getColorPaletteNames()
+    local swatches = {}
+    for i, name in ipairs(names) do swatches[i] = gdsGui_schematic_colorForPaletteName(name) end
+    return names, swatches
+end
+
+-- GROUND SWITCH DEPENDENT: a plain ON/OFF choice row, shared by both the
+-- placement grid and the PROPERTIES-edit grid below, offered on EVERY
+-- element/control (not just sources) — whether its own color/state should
+-- be taught/predicted separately for each GEAR position (ON GROUND vs
+-- AIRBORNE) rather than the same regardless of it. Stored straight onto
+-- the entity as entity.groundDependent, the literal string "ON"/"OFF" (same
+-- plain-string-field convention entity.voltageType already uses for VDC/
+-- VAC) — target == "field" writes it there with no library changes needed.
+-- Toggling it on/off (schematicElementPlacementConfigured/
+-- ElementPropertiesSaved below, via _relays.syncGearControl) is what
+-- actually adds/removes the hidden GEAR control that puts GEAR into every
+-- snapshot's own combination — see that section's own header comment.
+function _groundDependentRow(entity)
+    return { key = "groundDependent", label = "GROUND SWITCH DEPENDENT", target = "field",
+        choices = { "OFF", "ON" }, value = (entity and entity.groundDependent) or "OFF" }
+end
+
+-- canvas.elementPlacementExtraRows hook (wired up once in love.load()):
+-- called right after NAME while building that one unified placement grid.
+-- GROUND SWITCH DEPENDENT always shows (every item gets one); TYPE/VOLTAGE/
+-- POWERED COLOR (same swatch row schematicElementPropertiesExtraRows below
+-- shows when editing) only for a "source" item, right after it — mandatory
+-- same as every other row here (_openElementPlacementGrid's own
+-- requireAll), so a source can no longer be created without an explicit
+-- color pick, even for a voltage this system has already registered one
+-- for (re-picking the same swatch is a one-tap no-op — row.value just needs
+-- to be the SAME palette name, applied via _applyPlacementExtraRows/
+-- elementPropertiesRowSaved below, same as editing an existing source's
+-- color ever does). POWERED COLOR starts blank — unlike the edit-time row,
+-- there's no live entity yet whose already-registered color could be looked
+-- up and pre-selected.
+function schematicElementPlacementExtraRows(canvasName, componentType)
+    local rows = { _groundDependentRow(nil) }
+    if componentType == "source" then
+        for _, r in ipairs(_sourceTypeVoltageRows(nil)) do table.insert(rows, r) end
+        local names, swatches = _colorPaletteNamesAndSwatches()
+        table.insert(rows, { key = "poweredColor", label = "POWERED COLOR", target = "voltageColor",
+            choices = names, swatchColors = swatches, value = "" })
+    end
+    return rows
+end
+
+-- canvas.elementPlacementConfigured hook: fired once every row from the
+-- placement grid above (GROUND SWITCH DEPENDENT, TYPE/VOLTAGE/POWERED COLOR
+-- if this was a source, and any default properties) has actually been
+-- written onto the brand new element/control — the POWERED COLOR row's own
+-- value already landed in canvas.voltageColors by then
+-- (_applyPlacementExtraRows calls elementPropertiesRowSaved inline, in row
+-- order, so VOLTAGE is on the entity before POWERED COLOR's own hook ever
+-- runs). Re-syncs the hidden GEAR control in case GROUND SWITCH DEPENDENT
+-- just turned itself on for the very first time on this canvas, and flags a
+-- bus tie's logic as possibly needing a new row for a brand new voltage.
+function schematicElementPlacementConfigured(canvasName, elementId)
+    local canvas = _findSchematicCanvas()
+    if not canvas then return end
+    _relays.syncGearControl(canvas)
+    local entity = _findSourceEntity(canvas, elementId)
+    if entity and entity.voltage then _relays.checkLogic = true end
+end
+
+-------------------------------------------------------------------------------
+-- SYSTEM SCHEMATIC — PROPERTIES MENU > TYPE/VOLTAGE/POWERED COLOR: a
+-- source's own TYPE/VOLTAGE/POWERED COLOR, shown as the same rows — same
+-- order, same pre-fill behavior — the placement grid collects when that
+-- source is first created (schematicElementPlacementExtraRows above), just
+-- appended here instead to whatever custom properties it already has
+-- (schematic_gdsGuiLib.lua's canvas.elementPropertiesExtraRows/
+-- elementPropertiesRowSaved hooks) — the element/control edit menu's own
+-- PROPERTIES button is now THE one place either creating or editing a
+-- source ever collects these, no second/separate grid anywhere.
+-------------------------------------------------------------------------------
+
+-- canvas.elementPropertiesExtraRows hook: GROUND SWITCH DEPENDENT always
+-- shows, pre-filled from entity.groundDependent (every element/control has
+-- one); TYPE/VOLTAGE/POWERED COLOR only for an actual source
+-- (entity.componentType == "source") — NOT gated on whether VOLTAGE happens
+-- to be set yet, since that's exactly one of the rows this returns.
+-- POWERED COLOR's own value is the palette NAME matching
+-- canvas.voltageColors[entity.voltage] right now (blank if that voltage has
+-- never been registered a color, OR if VOLTAGE itself isn't set yet).
+function schematicElementPropertiesExtraRows(canvasName, elementId)
+    local canvas = _findSchematicCanvas()
+    local entity = canvas and _findSourceEntity(canvas, elementId)
+    if not entity then return nil end
+    local rows = { _groundDependentRow(entity) }
+    if entity.componentType == "source" then
+        for _, r in ipairs(_sourceTypeVoltageRows(entity)) do table.insert(rows, r) end
+        local currentColor = entity.voltage and canvas.voltageColors and canvas.voltageColors[entity.voltage]
+        local names, swatches = _colorPaletteNamesAndSwatches()
+        table.insert(rows, { key = "poweredColor", label = "POWERED COLOR", target = "voltageColor",
+            choices = names, swatchColors = swatches,
+            value = gdsGui_schematic_colorPaletteNameForColor(currentColor) or "" })
+    end
+    return rows
+end
+
+-- canvas.elementPropertiesRowSaved hook: fired once per saved row whose
+-- target the library itself doesn't know how to write (i.e. not "field") —
+-- the only one main.lua ever hands it is the POWERED COLOR row above.
+-- Registers the picked color for every source sharing THIS voltage on this
+-- system (same per-voltage keying _ensureVoltageHasColor uses), then
+-- resolves/saves same as every other color-registration path here.
+function schematicElementPropertiesRowSaved(canvasName, elementId, row)
+    if row.target ~= "voltageColor" then return end
+    local canvas = _findSchematicCanvas()
+    local entity = canvas and _findSourceEntity(canvas, elementId)
+    local color = row.value and row.value ~= "" and gdsGui_schematic_colorForPaletteName(row.value)
+    if not entity or not entity.voltage or not color then return end
+    canvas.voltageColors = canvas.voltageColors or {}
+    canvas.voltageColors[entity.voltage] = color
+    _resolveAndSaveSchematic()
+end
+
+-- canvas.elementPropertiesSaved hook: fired once every row from the
+-- PROPERTIES grid above (GROUND SWITCH DEPENDENT, TYPE/VOLTAGE/POWERED
+-- COLOR if this was a source, plus any custom properties) has actually
+-- been written back onto the entity — the editing-flow sibling of
+-- schematicElementPlacementConfigured above. Re-syncs the hidden GEAR
+-- control (GROUND SWITCH DEPENDENT may have just flipped on or off) and
+-- re-flags a bus tie's logic as possibly needing a new row, same as
+-- placement does, in case VOLTAGE itself just changed; harmless to also
+-- fire for a source whose VOLTAGE didn't actually change, or for anything
+-- that isn't a source at all (entity.voltage is nil either way).
+function schematicElementPropertiesSaved(canvasName, elementId)
+    local canvas = _findSchematicCanvas()
+    if not canvas then return end
+    _relays.syncGearControl(canvas)
+    local entity = _findSourceEntity(canvas, elementId)
+    if entity and entity.voltage then _relays.checkLogic = true end
+end
+
+-------------------------------------------------------------------------------
+-- SYSTEM SCHEMATIC — PER-SOURCE SETTINGS > VOLTAGE: editing an existing
+-- source's TYPE/VOLTAGE after the fact. This now opens the exact same
+-- PROPERTIES grid its own element/control edit menu's PROPERTIES button
+-- does (gdsGui_schematic_openPropertiesMenu) — TYPE/VOLTAGE are just more
+-- rows in that one grid now (schematicElementPropertiesExtraRows), right
+-- alongside POWERED COLOR and any custom properties, rather than a second,
+-- separate VOLTAGE-only grid duplicating what PROPERTIES already collects.
+-------------------------------------------------------------------------------
+
 function schematicPerSourceSettingDetailChosen(canvasName, index, optionText)
     if optionText == (_currentMedium().magnitudeLabel or "VOLTAGE") and _pendingPerSourceTargetId then
-        local canvas = _findSchematicCanvas()
-        local entity = canvas and _findSourceEntity(canvas, _pendingPerSourceTargetId)
-        local label = _currentMedium().magnitudeLabel or "VOLTAGE"
-        gdsGui_textPrompt_open("SOURCE " .. label .. " (NUMBER)", entity and entity.voltage and tostring(entity.voltage) or "",
-            6, "schematicPerSourceVoltageConfirmed", nil, true, "e.g. 24 or 28")
-        return -- keep _pendingPerSourceTargetId set for the text-prompt's own callback
+        local targetId = _pendingPerSourceTargetId
+        _pendingPerSourceTargetId = nil
+        gdsGui_schematic_openPropertiesMenu(canvasName, targetId)
+        return
     elseif optionText == "RETURN" then
         _pendingPerSourceTargetId = nil
         _openPerSourceSettingsListMenu(canvasName)
@@ -7440,51 +7597,6 @@ end
 function schematicPerSourceSettingDetailCancelled()
     _pendingPerSourceTargetId = nil
 end
-
--- Writes straight onto the targeted source's own element/control table
--- (voltage — see _openPerSourceSettingsListMenu's own comment), then makes
--- sure that voltage has a registered color (_ensureVoltageHasColor, which
--- itself re-solves/re-saves once it's done — see that function's own
--- comment) so the canvas reflects the change right away, same as the
--- system-wide POWERED COLOR/UNPOWERED COLOR callbacks above.
-function schematicPerSourceVoltageConfirmed(text)
-    local canvas = _findSchematicCanvas()
-    local entity = canvas and _pendingPerSourceTargetId and _findSourceEntity(canvas, _pendingPerSourceTargetId)
-    _pendingPerSourceTargetId = nil
-    if not entity or not canvas then return end
-    local voltage = tonumber(text)
-    entity.voltage = voltage -- nil (cleared) if text wasn't a valid number, same as an empty field
-    _relays.checkLogic = true -- a new voltage adds bus tie combinations to set
-    if voltage then
-        _ensureVoltageHasColor(canvas.name, voltage)
-    else
-        _requestSchematicSave()
-        _applySolvedColorsToCurrentCombination()
-    end
-end
-
--------------------------------------------------------------------------------
--- SYSTEM SCHEMATIC — NEW SOURCE PLACEMENT: a freshly-placed "source"-role
--- element/control (BATTERY, GENERATOR, HYDRAULIC PUMP, ...) is prompted for
--- its nominal magnitude immediately, via mainCanvas.onElementPlaced (wired
--- in love.load()) — required, since a source with none can never get an
--- automatic powered color of its own (see _colorForPoweredNode's
--- defaultColor fallback). The element/control already exists on the canvas
--- by the time this fires (the library's placement commit runs first), so
--- cancelling out of the prompt just leaves it unset rather than undoing the
--- placement — there'd be nothing left to put it back the way it was.
--- The prompt's own wording is pulled from the CURRENT medium's
--- magnitudeLabel ("VOLTAGE" for ELECTRICAL, "PRESSURE" for HYDRAULIC/FUEL/
--- BLEED AIR — see model/media/hydraulic.lua's own comment) so a freshly-
--- placed hydraulic PUMP isn't asked for a "VOLTAGE" — still stored on the
--- entity as .voltage internally either way; only the prompt's own text
--- changes per medium, not the field name underneath it.
--------------------------------------------------------------------------------
-
--- Which newly-placed source the open magnitude prompt belongs to — only one
--- placement is ever in flight at a time, same convention as
--- _pendingPerSourceTargetId.
-local _pendingNewSourceId = nil
 
 -- SET BUS TIE LOGIC grid (see _relays.openLogicGrid): a pick on one row is
 -- copied to its mirror-image row, so the two can never disagree.
@@ -7507,11 +7619,23 @@ function schematicRelayLogicSaved(canvasName)
     if editing.fromGateRules then _openGateRulesListMenu(canvasName) end
 end
 
+-- Mandatory opens (fromGateRules nil — see love.update()'s own checkLogic
+-- poll) just close back to whatever was already on screen — nothing got
+-- saved, so checkLogic stays false until some later event re-flags it (same
+-- "ask again next time" reasoning as openLogicGrid's own comment above).
+-- SAVE's own fromGateRules check (schematicRelayLogicSaved below) does the
+-- same return-to-the-list-or-not split.
 function schematicRelayLogicCancelled(canvasName)
+    local editing = _relays.editing
     _relays.editing = nil
-    _openGateRulesListMenu(canvasName)
+    if editing and editing.fromGateRules then _openGateRulesListMenu(canvasName) end
 end
 
+-- Only a freshly-placed relay (BUS TIE) needs this hook at all now — a
+-- source's TYPE/VOLTAGE and any plain element's defaultProperties are
+-- collected up front by the unified placement grid itself (see
+-- schematicElementPlacementExtraRows/Configured above), not chased down
+-- afterward the way they used to be.
 function schematicSourceElementPlaced(canvasName, kind, newId, componentType)
     -- A freshly-placed relay (BUS TIE) gets its command switch: placed above
     -- it and wired from the switch's own terminal to the relay's signal
@@ -7520,45 +7644,17 @@ function schematicSourceElementPlaced(canvasName, kind, newId, componentType)
     local canvas = _findSchematicCanvas()
     local relay = canvas and componentType == "gate" and _findSourceEntity(canvas, newId)
     local signalIndex = relay and _relays.signalTerminal(relay)
-    if signalIndex then
-        local switchId = gdsGui_schematic_addLinkedControl(canvasName, newId, signalIndex, 4, "SWITCH", (relay.label or newId) .. " SW",
-            { "OPEN", "CLOSED" }, { "Sprites/control_tieSwitchOpen.png", "Sprites/control_tieSwitchClosed.png" }, 2, nil,
-            { { x = 0.014, y = 0.426, exitX = 0, exitY = 1 } }, 1)
-        local switch = switchId and _findSourceEntity(canvas, switchId)
-        if switch then switch.relayOf = newId end
-        _relays.syncGearControl(canvas)
-        -- The placement's own change notice fired before the switch existed;
-        -- this one also flags the new relay's logic as missing, so the SET
-        -- LOGIC grid opens next (see _relays.checkLogic).
-        schematicCanvasChanged()
-        return
-    end
-    if componentType ~= "source" then return end
-    _pendingNewSourceId = newId
-    local label = _currentMedium().magnitudeLabel or "VOLTAGE"
-    gdsGui_textPrompt_open("SOURCE " .. label .. " (NUMBER)", "", 6,
-        "schematicNewSourceVoltageConfirmed", "schematicNewSourceVoltageCancelled", true, "e.g. 24 or 28")
-end
-
-function schematicNewSourceVoltageConfirmed(text)
-    local voltage = tonumber(text)
-    if not voltage then
-        local label = _currentMedium().magnitudeLabel or "VOLTAGE"
-        gdsGui_textPrompt_open(label .. " REQUIRED (NUMBER), TRY AGAIN", text or "", 6,
-            "schematicNewSourceVoltageConfirmed", "schematicNewSourceVoltageCancelled", true, "e.g. 24 or 28")
-        return
-    end
-    local canvas = _findSchematicCanvas()
-    local entity = canvas and _pendingNewSourceId and _findSourceEntity(canvas, _pendingNewSourceId)
-    _pendingNewSourceId = nil
-    if not entity or not canvas then return end
-    entity.voltage = voltage
-    _ensureVoltageHasColor(canvas.name, voltage)
-    _relays.checkLogic = true -- a new voltage adds bus tie combinations to set
-end
-
-function schematicNewSourceVoltageCancelled()
-    _pendingNewSourceId = nil
+    if not signalIndex then return end
+    local switchId = gdsGui_schematic_addLinkedControl(canvasName, newId, signalIndex, 4, "SWITCH", (relay.label or newId) .. " SW",
+        { "OPEN", "CLOSED" }, { "Sprites/control_tieSwitchOpen.png", "Sprites/control_tieSwitchClosed.png" }, 2, nil,
+        { { x = 0.014, y = 0.426, exitX = 0, exitY = 1 } }, 1)
+    local switch = switchId and _findSourceEntity(canvas, switchId)
+    if switch then switch.relayOf = newId end
+    _relays.syncGearControl(canvas)
+    -- The placement's own change notice fired before the switch existed;
+    -- this one also flags the new relay's logic as missing, so the SET
+    -- LOGIC grid opens next (see _relays.checkLogic).
+    schematicCanvasChanged()
 end
 
 -- Both callbacks below: the CURRENT medium's own .style is the ONE table
@@ -8106,9 +8202,10 @@ end
 
 -- The management panel's edit menu's DELETE option: DELETE is that menu's
 -- own confirmIndex row (see gdsGui_schematic_openAnnunciatorEditMenu), so
--- the held-to-completion hold and the plain-tap RENAME/COLOR rows share one
--- onSelect dispatch — calling it directly with optionText "DELETE" is
--- exactly what a completed hold fires, no separate confirm popup involved.
+-- the held-to-completion hold and the plain-tap RENAME/PROPERTIES rows
+-- share one onSelect dispatch — calling it directly with optionText
+-- "DELETE" is exactly what a completed hold fires, no separate confirm
+-- popup involved.
 function schematicAnnunciatorDeleteTest()
     gdsGui_schematic_delete("unitTestCanvas11")
     gdsGui_schematic_create("unitTestCanvas11", "UnitTestPage", 0, 0, "LT", 1, 1)
@@ -8140,18 +8237,21 @@ function schematicAnnunciatorRenameTest()
     return "not found"
 end
 
--- The edit menu's COLOR option, end to end: open the menu, choose COLOR,
--- pick a swatch through the same callback the swatch picker itself uses —
--- mirrors the creation-time color pick (gdsGui_schematic_internal_
--- onAnnunciatorColorChosen) but mutates the existing entry's .color in
--- place instead of building a new one.
+-- The edit menu's PROPERTIES option, end to end: open the menu, choose
+-- PROPERTIES (the same propertyGrid chrome every element/control's own
+-- PROPERTIES menu uses), pick the COLOR row's RED swatch (same choice-row
+-- tap _propertyGrid.release itself applies straight onto row.value — see
+-- that function's own "choice" branch) then SAVE, mirroring the creation-
+-- time color pick (gdsGui_schematic_internal_onAnnunciatorColorChosen) but
+-- mutating the existing entry's .color in place instead of building a new one.
 function schematicAnnunciatorColorEditTest()
     gdsGui_schematic_delete("unitTestCanvas14")
     gdsGui_schematic_create("unitTestCanvas14", "UnitTestPage", 0, 0, "LT", 1, 1)
     gdsGui_schematic_addAnnunciator("unitTestCanvas14", "a1", "MASTER CAUTION", {1, 1, 1, 1}, true)
     gdsGui_schematic_openAnnunciatorEditMenu("unitTestCanvas14", "a1")
-    gdsGui_schematic_internal_onAnnunciatorEditChosen("unitTestCanvas14", 2, "COLOR")
-    gdsGui_schematic_internal_onAnnunciatorColorEditChosen("unitTestCanvas14", 1)
+    gdsGui_schematic_internal_onAnnunciatorEditChosen("unitTestCanvas14", 2, "PROPERTIES")
+    _pendingAnnunciatorPropertyEdit.rows[1].value = "RED"
+    gdsGui_schematic_internal_onAnnunciatorPropertiesSaved("unitTestCanvas14")
     for _, c in ipairs(globApp.objects.schematics) do
         if c.name == "unitTestCanvas14" then
             for _, a in ipairs(c.annunciators) do

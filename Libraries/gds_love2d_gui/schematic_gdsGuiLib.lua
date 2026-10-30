@@ -384,10 +384,20 @@ local function _suggestedPlacementName(canvas, typeLabel)
     return typeLabel .. "_" .. (maxN + 1)
 end
 
--- Set while the "name this element/control" prompt is open after a design-mode
--- placement tap; holds everything gdsGui_schematic_placementNameConfirmed needs
--- to actually create the element/control once a valid, unique name is given.
+-- Set while either naming flow below is open — the plain text prompt
+-- (gdsGui_schematic_placementNameConfirmed, annunciators only) or the
+-- unified placement grid (_openElementPlacementGrid, every element/
+-- control) — holding everything needed to actually create the thing once a
+-- valid, unique name (and, for the grid, everything else it collected) is
+-- confirmed.
 local _pendingNamedPlacement = nil
+-- _openElementPlacementGrid's own shadow rows (NAME + whatever
+-- canvas.elementPlacementExtraRows/defaultPropertyKeys add) while that grid
+-- is open — read back in gdsGui_schematic_internal_onElementPlacementSaved,
+-- same "stash it, the grid's own canvas.menu is already gone by the time
+-- the callback fires" reasoning _openPropertiesMenu's own
+-- canvas._pendingPropertyRows uses.
+local _pendingPlacementRows = nil
 
 local function _openPlacementNamePrompt(title, initialText)
     gdsGui_textPrompt_open(title, initialText, 24,
@@ -466,8 +476,145 @@ local function _commitNamedPlacement(canvas, pending, trimmed)
     end
 end
 
+-- Finalizes everything beyond NAME that _openElementPlacementGrid's own grid
+-- collected (SOURCE TYPE/VOLTAGE/POWERED COLOR via canvas.
+-- elementPlacementExtraRows, any defaultPropertyKeys), once the element/
+-- control itself already exists (_commitNamedPlacement already ran by the
+-- time either call site below reaches this). Rows apply strictly IN ORDER
+-- (not two passes) so an earlier row's write is already live by the time a
+-- later row's own hook runs — e.g. POWERED COLOR's own
+-- canvas.elementPropertiesRowSaved reads entity.voltage, which only exists
+-- because VOLTAGE (always the row right before it) already landed. A row
+-- with target == "field" is written straight onto the entity by its own key
+-- (e.g. .voltage, .voltageType — main.lua reads these directly, same as it
+-- always has); a row with any OTHER target (e.g. "voltageColor") is left
+-- entirely to canvas.elementPropertiesRowSaved — the exact same by-name hook
+-- the PROPERTIES edit grid's own onPropertiesSaved defers to, so a row
+-- shape only ever needs one app-side handler regardless of which grid
+-- collected it; a row with no target at all (the default) goes through the
+-- normal gdsGui_schematic_setElementProperty path, same as any other custom
+-- property. Row 1 (NAME) is skipped here — _commitNamedPlacement already
+-- consumed it. Fires canvas.elementPlacementConfigured (optional, by-name)
+-- once everything's written, for the app to react to the FINAL state (e.g.
+-- flagging a bus tie's logic as possibly needing a new row for the new
+-- voltage) — separate from canvas.onElementPlaced, which
+-- _commitNamedPlacement already fired earlier while these fields were all
+-- still blank.
+-- Global, not local — this file is already at Lua's 200-top-level-local
+-- ceiling (same constraint main.lua's own _openFundamentalsMenu comment
+-- describes).
+function _applyPlacementExtraRows(canvasName, canvas, newId, rows)
+    local entity = _findAnchor(canvas, newId)
+    if not entity then return end
+    for i = 2, #rows do
+        local row = rows[i]
+        if row.target == "field" then
+            entity[row.key] = (row.numeric and tonumber(row.value)) or row.value
+        elseif row.target then
+            if canvas.elementPropertiesRowSaved then
+                local fn = _G[canvas.elementPropertiesRowSaved]
+                if fn then fn(canvasName, newId, row) end
+            end
+        else
+            gdsGui_schematic_setElementProperty(canvasName, newId, row.key, row.value or "")
+        end
+    end
+    _notifyChanged(canvas)
+    if canvas.elementPlacementConfigured then
+        local fn = _G[canvas.elementPlacementConfigured]
+        if fn then fn(canvasName, newId) end
+    end
+end
+
+-- Replaces the old "NAME THIS <KIND>" text prompt for every element/control
+-- placement (tap-to-place path below) with one unified grid: NAME (always,
+-- pre-filled with the same auto-suggested unique name the old prompt
+-- started with), plus whatever extra rows canvas.elementPlacementExtraRows
+-- supplies for this item's own componentType (main.lua uses this for a
+-- "source" item's SOURCE TYPE/VOLTAGE), plus one row per defaultPropertyKeys
+-- — all mandatory (requireAll), same "fill it in before moving on"
+-- treatment a bus tie's own missing logic gets (see _relays.checkLogic in
+-- main.lua), just collected up front instead of chased down after the fact.
+-- The validate closure enforces the exact same non-empty/unique NAME rule
+-- gdsGui_schematic_placementNameConfirmed always has, just in-place instead
+-- of closing and reopening a separate prompt on rejection.
+-- Global, not local — same 200-top-level-local ceiling as
+-- _applyPlacementExtraRows just above.
+function _openElementPlacementGrid(canvasName, pending)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return end
+    local rows = { { key = "__name", label = "NAME", value = _suggestedPlacementName(canvas, pending.label) } }
+    if canvas.elementPlacementExtraRows then
+        local fn = _G[canvas.elementPlacementExtraRows]
+        local extra = fn and fn(canvasName, pending.componentType)
+        for _, r in ipairs(extra or {}) do table.insert(rows, r) end
+    end
+    for _, key in ipairs(pending.defaultPropertyKeys or {}) do
+        table.insert(rows, { key = key, label = key, value = "" })
+    end
+    _pendingNamedPlacement = pending
+    _pendingPlacementRows = rows
+    gdsGui_schematic_openPropertyGrid(canvasName, "NAME THIS " .. pending.kind:upper(), nil, rows, true,
+        "gdsGui_schematic_internal_onElementPlacementSaved", "gdsGui_schematic_internal_onElementPlacementCancelled",
+        function(gridRows)
+            local trimmed = (gridRows[1].value or ""):gsub("^%s*(.-)%s*$", "%1")
+            if trimmed == "" then return false, 1, "NAME REQUIRED" end
+            if _labelInUse(canvas, trimmed) then return false, 1, "NAME TAKEN, TRY ANOTHER" end
+            return true
+        end)
+    -- Auto-focuses NAME the instant the grid opens, matching the old
+    -- standalone text prompt's own immediate-keyboard behavior — the user
+    -- still has to tap into every OTHER row, just not this near-universal
+    -- first one.
+    canvas.menu.activeRow = 1
+    local g = _propertyGrid.geometry(canvas, canvas.menu)
+    love.keyboard.setTextInput(true, _propertyGrid.valueBoxRect(g, g.bodyY))
+end
+
+function gdsGui_schematic_internal_onElementPlacementSaved(canvasName)
+    local pending = _pendingNamedPlacement
+    local rows = _pendingPlacementRows
+    _pendingNamedPlacement, _pendingPlacementRows = nil, nil
+    if not pending or not rows then return end
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return end
+    local trimmed = (rows[1].value or ""):gsub("^%s*(.-)%s*$", "%1")
+    -- _commitNamedPlacement unconditionally wipes every snapshot — worth an
+    -- explicit "are you sure" only when there's actually something to lose,
+    -- same gate gdsGui_schematic_placementNameConfirmed's own equivalent
+    -- step uses (gdsGui_schematic_internal_onPlacementSnapshotWipeConfirmed
+    -- below is shared with that older flow — pending.confirmedRows, only
+    -- ever set here, is what tells its own CONTINUE branch there's more to
+    -- apply than just the name).
+    local snapshotCount = gdsGui_schematic_countSnapshots(canvasName)
+    if snapshotCount > 0 then
+        pending.confirmedName = trimmed
+        pending.confirmedRows = rows
+        _pendingNamedPlacement = pending
+        gdsGui_schematic_openMenu(canvasName,
+            "ADDING A NEW " .. pending.kind:upper() .. " WILL DELETE ALL " ..
+            snapshotCount .. " SNAPSHOT(S). CONTINUE?",
+            {"CONTINUE", "CANCEL"},
+            "gdsGui_schematic_internal_onPlacementSnapshotWipeConfirmed",
+            "gdsGui_schematic_internal_onPlacementSnapshotWipeConfirmed", 1)
+        return
+    end
+    _commitNamedPlacement(canvas, pending, trimmed)
+    _applyPlacementExtraRows(canvasName, canvas, pending.newId, rows)
+end
+
+function gdsGui_schematic_internal_onElementPlacementCancelled()
+    _pendingNamedPlacement = nil
+    _pendingPlacementRows = nil
+end
+
 -- Resolved by name via _G[...] from textPrompt_gdsGuiLib.lua, like every other
--- string-registered callback in this library.
+-- string-registered callback in this library. Only ever reached for
+-- pending.kind == "annunciator" now (gdsGui_schematic_armAnnunciatorCreation
+-- below is this prompt's only remaining entry point) — every element/
+-- control placement goes through _openElementPlacementGrid instead, which
+-- enforces this same non-empty/unique NAME rule itself (see its own
+-- validate closure).
 function gdsGui_schematic_placementNameConfirmed(name)
     local pending = _pendingNamedPlacement
     if not pending then return end
@@ -482,30 +629,8 @@ function gdsGui_schematic_placementNameConfirmed(name)
         _openPlacementNamePrompt("NAME TAKEN, TRY AGAIN", trimmed)
         return
     end
-    -- An annunciator has no position to place and doesn't participate in
-    -- control-combination snapshots (see the ANNUNCIATORS section below) —
-    -- name confirmed, so the only step left is picking its color, never the
-    -- snapshot-wipe confirm the element/control path below needs.
-    if pending.kind == "annunciator" then
-        pending.confirmedName = trimmed
-        _openAnnunciatorColorMenu(pending.canvasName)
-        return
-    end
-    -- _commitNamedPlacement unconditionally wipes every snapshot — worth an
-    -- explicit "are you sure" only when there's actually something to lose.
-    local snapshotCount = gdsGui_schematic_countSnapshots(pending.canvasName)
-    if snapshotCount > 0 then
-        pending.confirmedName = trimmed
-        gdsGui_schematic_openMenu(pending.canvasName,
-            "ADDING A NEW " .. pending.kind:upper() .. " WILL DELETE ALL " ..
-            snapshotCount .. " SNAPSHOT(S). CONTINUE?",
-            {"CONTINUE", "CANCEL"},
-            "gdsGui_schematic_internal_onPlacementSnapshotWipeConfirmed",
-            "gdsGui_schematic_internal_onPlacementSnapshotWipeConfirmed", 1)
-        return
-    end
-    _commitNamedPlacement(canvas, pending, trimmed)
-    _pendingNamedPlacement = nil
+    pending.confirmedName = trimmed
+    _openAnnunciatorColorMenu(pending.canvasName)
 end
 
 function gdsGui_schematic_placementNameCancelled()
@@ -517,9 +642,10 @@ end
 -- other catalog item, an annunciator has no canvas position to tap for: it
 -- always renders in the fixed, alphabetically-stacked top-left corner (see
 -- _drawAnnunciators further down), so there's no pendingPlacement/tap-to-
--- place step — choosing it jumps straight to the name prompt, reusing the
--- very same gdsGui_schematic_placementNameConfirmed/_Cancelled pair every
--- other placement's name prompt uses (branched there by pending.kind).
+-- place step — choosing it jumps straight to the plain NAME text prompt
+-- (gdsGui_schematic_placementNameConfirmed/_Cancelled), the one placement
+-- kind still simple enough not to need the full unified grid every
+-- element/control placement opens instead.
 function gdsGui_schematic_armAnnunciatorCreation(canvasName)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
@@ -539,7 +665,16 @@ function gdsGui_schematic_internal_onPlacementSnapshotWipeConfirmed(canvasName, 
     if not pending or pending.canvasName ~= canvasName then return end
     if optionText == "CONTINUE" then
         local canvas = _findCanvas(canvasName)
-        if canvas then _commitNamedPlacement(canvas, pending, pending.confirmedName) end
+        if canvas then
+            _commitNamedPlacement(canvas, pending, pending.confirmedName)
+            -- Only set when this came from _openElementPlacementGrid's own
+            -- SAVE (gdsGui_schematic_internal_onElementPlacementSaved
+            -- above) — the older plain-text NAME prompt never sets it, so
+            -- this is a no-op for that path.
+            if pending.confirmedRows then
+                _applyPlacementExtraRows(canvasName, canvas, pending.newId, pending.confirmedRows)
+            end
+        end
     end
 end
 
@@ -766,6 +901,11 @@ end
 local _terminals = {}
 -- The CHOICE GRID modal form's helpers (see gdsGui_schematic_openChoiceGrid).
 local _choiceGrid = {}
+-- The PROPERTY GRID modal form's helpers (see gdsGui_schematic_openPropertyGrid).
+-- Global, not local like _choiceGrid above — this file is already at Lua's
+-- 200-top-level-local ceiling (same constraint main.lua's own comments on
+-- _openFundamentalsMenu describe).
+_propertyGrid = {}
 -- The powered-glow helpers (see gdsGui_schematic_setGlow).
 local _glow = {}
 
@@ -1055,8 +1195,9 @@ function gdsGui_schematic_create(name, page, x, y, anchorPoint, wFrac, hFrac)
     canvas._elementEditTargetId = nil  -- elementId while the design-mode edit (color+properties+delete) menu is open
     canvas._wireEditTargetId    = nil  -- wireId while the design-mode wire edit (color+delete) menu is open
     canvas._controlEditTargetId = nil  -- controlId while the design-mode control edit (position+delete) menu is open
-    canvas._propertyEditTargetId = nil -- elementId while the PROPERTIES submenu is open
-    canvas._propertyActionKey    = nil -- property key targeted by the EDIT VALUE/DELETE PROPERTY submenu
+    canvas._propertyEditTargetId = nil -- element/control id while the PROPERTIES grid is open
+    canvas._propertyEditTargetIsControl = nil -- whether the id above is a control (vs an element)
+    canvas._pendingPropertyRows  = nil -- that grid's own shadow rows — see _openPropertiesMenu's own comment
     canvas._undoStack            = {}  -- array of {elements,wires,controls} snapshots, most recent last
 
     -- Pan/zoom view state: zoom 1 = fully zoomed out (the whole canvas box
@@ -1364,11 +1505,13 @@ function gdsGui_schematic_addElement(canvasName, id, shapeType, x, y, w, h, labe
 end
 
 -- Upserts a property by key (case-sensitive), preserving insertion order for
--- display. value is a plain string — units/formatting are the app layer's concern.
+-- display. value is a plain string — units/formatting are the app layer's
+-- concern. elementId may name either an element OR a control (_findAnchor) —
+-- both carry their own .properties list (see gdsGui_schematic_addControl).
 function gdsGui_schematic_setElementProperty(canvasName, elementId, key, value)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
-    local el = _findElement(canvas, elementId)
+    local el = _findAnchor(canvas, elementId)
     if not el then return end
     el.properties = el.properties or {}
     for _, p in ipairs(el.properties) do
@@ -1377,20 +1520,11 @@ function gdsGui_schematic_setElementProperty(canvasName, elementId, key, value)
     table.insert(el.properties, { key = key, value = value })
 end
 
-function gdsGui_schematic_removeElementProperty(canvasName, elementId, key)
-    local canvas = _findCanvas(canvasName)
-    if not canvas then return end
-    local el = _findElement(canvas, elementId)
-    if not el or not el.properties then return end
-    for i = #el.properties, 1, -1 do
-        if el.properties[i].key == key then table.remove(el.properties, i) end
-    end
-end
 
 function gdsGui_schematic_getElementProperties(canvasName, elementId)
     local canvas = _findCanvas(canvasName)
     if not canvas then return {} end
-    local el = _findElement(canvas, elementId)
+    local el = _findAnchor(canvas, elementId)
     return (el and el.properties) or {}
 end
 
@@ -1941,6 +2075,58 @@ function gdsGui_schematic_isMenuOpen(canvasName)
     return canvas ~= nil and canvas.menu ~= nil
 end
 
+-- True if the ACTIVE page currently has any modal schematic surface open —
+-- a canvas's openMenu (ADD catalog, element/wire/control/annunciator edit,
+-- properties grid, etc.), its annunciator panel, or a gallery's action
+-- menu. gdsGui_schematic_pressed/_released and gdsGui_schematicGallery_
+-- pressed/_released already give these top priority WITHIN their own
+-- canvas/gallery, but every OTHER control on the page (buttons, text boxes,
+-- tables, scrollbars, rotary knobs) has no such awareness on its own —
+-- general_gdsGuiLib.lua's input dispatchers call this to keep those from
+-- also reacting to a tap that a modal surface elsewhere on the page should
+-- have exclusive priority over, the same "modal takes priority" treatment
+-- gdsGui_textPrompt_isOpen/gdsGui_choiceMenu_isOpen already get.
+function gdsGui_schematic_isAnyMenuOpen()
+    local activePageName = _getActivePageName()
+    for _, canvas in ipairs(globApp.objects.schematics) do
+        if canvas.page == activePageName and (canvas.menu or canvas.annunciatorPanelOpen) then
+            return true
+        end
+    end
+    for _, gallery in ipairs(globApp.objects.schematicGalleries) do
+        if gallery.page == activePageName and gallery.menu then
+            return true
+        end
+    end
+    return false
+end
+
+-- Narrower than gdsGui_schematic_isAnyMenuOpen above: true only for a true
+-- full-overlay modal (a canvas's own openMenu, or a gallery's menu) — one
+-- that can legitimately render on top of some OTHER button elsewhere on the
+-- page, which is why gdsGui_button_pressed/_released skip themselves while
+-- this is true. The annunciator panel deliberately does NOT count here even
+-- though isAnyMenuOpen treats it the same way everywhere else: it's docked
+-- just left of its own ANNUNCIATOR button (see _toolPopupOrigin), never
+-- over any other button, and that same button is the ONLY way to close it
+-- (see _handleAnnunciatorPanelPress's own comment) — gating gdsGui_button_
+-- pressed/_released behind the panel being open would make that one button
+-- unpressable for as long as its own panel stayed up.
+function gdsGui_schematic_isHardMenuOpen()
+    local activePageName = _getActivePageName()
+    for _, canvas in ipairs(globApp.objects.schematics) do
+        if canvas.page == activePageName and canvas.menu then
+            return true
+        end
+    end
+    for _, gallery in ipairs(globApp.objects.schematicGalleries) do
+        if gallery.page == activePageName and gallery.menu then
+            return true
+        end
+    end
+    return false
+end
+
 -- Measures how tall the title row needs to be so a long, wrapped title (e.g.
 -- the "ADDING A NEW ELEMENT WILL DELETE ALL N SNAPSHOT(S)..." confirm
 -- warning, longer still once _markConfirmMenu appends its "PRESS & HOLD"
@@ -2180,6 +2366,7 @@ end
 -- Shared modal-menu box drawing for any owner with a .menu.
 local function _drawMenuBox(owner, menu)
     if menu.choiceGrid then return _choiceGrid.draw(owner, menu) end
+    if menu.propertyGrid then return _propertyGrid.draw(owner, menu) end
     love.graphics.setColor(0, 0, 0, 0.6)
     love.graphics.rectangle("fill", owner.x, owner.y, owner.w, owner.h)
 
@@ -2447,6 +2634,392 @@ function _choiceGrid.draw(owner, menu)
 end
 
 --------------------------------------------------------------------------------
+-- PUBLIC API — PROPERTY GRID: same modal chrome as the CHOICE GRID just
+-- above (title bar, scrollable rows, SAVE/CANCEL footer, yellow border) but
+-- each row is either a tappable inline text field or, when the row itself
+-- asks for it, a fixed set of choice buttons (_choiceGrid's own cell style)
+-- — for an element's own free-text custom properties (main.lua's
+-- defaultProperties) and, via main.lua's element-placement grid, a few
+-- fixed-choice fields like SOURCE TYPE (VDC/VAC) alongside them, all in one
+-- scrollable form instead of a drill-down per field. rows: array of
+-- {key, label, value = string, choices = nil | array of strings,
+-- numericOnly = nil | true}, kept by reference so the app can read back
+-- whatever the user entered after SAVE fires, same "rows live on past menu
+-- close" convention _relays.editing/_choiceGrid's own callers already rely
+-- on. A row with `choices` set renders/behaves exactly like one of
+-- _choiceGrid's own rows (tap a cell, it's immediately selected into
+-- row.value — no keyboard involved); omitted, it's a free-text box.
+-- numericOnly (text rows only): same digit/one-decimal-point filter
+-- gdsGui_textPrompt_open's own numericOnly uses, applied per keystroke by
+-- gdsGui_schematic_propertyGridTextInput below. requireAll (optional): true
+-- gates SAVE on every row having a non-empty value (same "remaining" gate
+-- _choiceGrid.remaining enforces); false/omitted lets SAVE commit as-is,
+-- blank rows included. validateFunc (optional, a plain Lua function, NOT a
+-- by-name string — only ever used library-internally, see
+-- _openElementPlacementGrid below): fn(rows) -> true | false, rowIndex,
+-- errorText, run right before SAVE actually commits (after the requireAll
+-- gate already passed); a false keeps the grid open with that row flagged
+-- and errorText shown in place of the header, so e.g. a taken NAME can be
+-- caught and retried in place instead of closing and reopening. CANCEL is
+-- always offered (unlike _choiceGrid, where it's conditional on
+-- fromGateRules) — tapping it or SAVE both close the grid and release the
+-- keyboard the same way. Only one row can be mid-edit at a time
+-- (menu.activeRow) — LÖVE's own love.keyboard.setTextInput positions a
+-- single OS/IME capture region, so this follows the same one-active-field-
+-- at-a-time convention textPrompt_gdsGuiLib.lua's single global prompt
+-- already established, just inline inside this grid instead of a separate
+-- floating popup.
+--------------------------------------------------------------------------------
+
+_propertyGrid.ROW_H, _propertyGrid.FOOTER_H = 46, 44
+_propertyGrid.MAX_CHARS = 24
+
+-- header (optional): a read-only caption drawn above the rows, same slot
+-- _choiceGrid's own header fills — main.lua uses it for an element's sensed
+-- values (VOLTAGE/CURRENT, ...), which aren't part of `rows` since they're
+-- never editable. While validateFunc has flagged an error (menu.errorText),
+-- that takes over this same slot instead — see _propertyGrid.draw.
+function gdsGui_schematic_openPropertyGrid(canvasName, title, header, rows, requireAll, onSaveFunc, onCancelFunc, validateFunc)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return end
+    canvas.annunciatorPanelOpen = false
+    canvas.menu = { propertyGrid = true, title = title, header = header, rows = rows, requireAll = requireAll,
+        onSave = onSaveFunc, onCancel = onCancelFunc, validate = validateFunc, scroll = 0, activeRow = nil }
+    love.keyboard.setTextInput(false)
+end
+
+-- Rows with no value yet only count against SAVE when requireAll asked for
+-- every row filled in (see openPropertyGrid's own comment).
+function _propertyGrid.remaining(menu)
+    if not menu.requireAll then return 0 end
+    local n = 0
+    for _, row in ipairs(menu.rows) do if (row.value or "") == "" then n = n + 1 end end
+    return n
+end
+
+-- Footer is always SAVE+CANCEL split evenly — no single-button fallback
+-- like _choiceGrid.footerButtons has, since this grid's CANCEL is never omitted.
+function _propertyGrid.footerButtons(g)
+    local y, h = g.footerY + 4, _propertyGrid.FOOTER_H - 8
+    local half = (g.w - 12) / 2
+    return { cancel = { x = g.x + 4, y = y, w = half, h = h }, save = { x = g.x + 8 + half, y = y, w = half, h = h } }
+end
+
+function _propertyGrid.geometry(owner, menu)
+    local w = owner.w * 0.94
+    local titleH = _titleHeight(w, menu.title)
+    -- errorText takes over the header's own slot (see _propertyGrid.draw),
+    -- so it reserves the same space whichever of the two is actually showing.
+    local headerText = menu.errorText or menu.header
+    local headerH = headerText and _titleHeight(w - 16, headerText) or 0
+    local rowH = _propertyGrid.ROW_H
+    local contentH = math.max(1, #menu.rows) * rowH
+    local maxBodyH = owner.h * 0.92 - titleH - headerH - _propertyGrid.FOOTER_H
+    local bodyH = math.max(rowH, math.min(contentH, maxBodyH))
+    local h = titleH + headerH + bodyH + _propertyGrid.FOOTER_H
+    local x = owner.x + (owner.w - w) / 2
+    local y = owner.y + math.max(0, (owner.h - h) / 2)
+    return { x = x, y = y, w = w, h = h, titleH = titleH, headerH = headerH, rowH = rowH,
+        bodyY = y + titleH + headerH, bodyH = bodyH, footerY = y + h - _propertyGrid.FOOTER_H,
+        maxScroll = math.max(0, contentH - bodyH) }
+end
+
+-- The value box's rect within a row — right-hand half, same label-left/
+-- control-right split _choiceGrid's own cells use.
+function _propertyGrid.valueBoxRect(g, rowY)
+    local bx = g.x + g.w * 0.5
+    local bw = g.w * 0.5 - 8
+    return bx, rowY + 6, bw, g.rowH - 12
+end
+
+-- A choice row's own cell rect (one of row.choices) — same right-hand-half,
+-- split-evenly layout _choiceGrid.cellRect uses for its own (single, grid-
+-- wide) choices array, just per-row here since different rows can offer
+-- different choice sets.
+function _propertyGrid.cellRect(g, rowY, row, choiceIndex)
+    local areaX = g.x + g.w * 0.5
+    local cellW = (g.w * 0.5 - 8) / #row.choices
+    return areaX + (choiceIndex - 1) * cellW, rowY + 6, cellW, g.rowH - 12
+end
+
+-- {kind = "row", row} | {kind = "choice", row, choice} | {kind = "save"} |
+-- {kind = "cancel"} | nil.
+function _propertyGrid.hit(owner, menu, px, py)
+    local g = _propertyGrid.geometry(owner, menu)
+    if px < g.x or px > g.x + g.w then return nil end
+    if py >= g.footerY and py <= g.footerY + _propertyGrid.FOOTER_H then
+        local buttons = _propertyGrid.footerButtons(g)
+        if px < buttons.cancel.x + buttons.cancel.w then return { kind = "cancel" } end
+        return { kind = "save" }
+    end
+    if py < g.bodyY or py >= g.bodyY + g.bodyH then return nil end
+    local rowIndex = math.floor((py - g.bodyY + menu.scroll) / g.rowH) + 1
+    local row = menu.rows[rowIndex]
+    if not row then return nil end
+    if row.choices then
+        local rowY = g.bodyY + (rowIndex - 1) * g.rowH - menu.scroll
+        for c = 1, #row.choices do
+            local cx, _, cw = _propertyGrid.cellRect(g, rowY, row, c)
+            if px >= cx and px < cx + cw then return { kind = "choice", row = rowIndex, choice = c } end
+        end
+        return nil
+    end
+    return { kind = "row", row = rowIndex }
+end
+
+function _propertyGrid.press(owner, touchId, px, py)
+    local menu = owner.menu
+    if menu._pressedTouchId ~= nil and menu._pressedTouchId ~= touchId then return end
+    menu._pressedTouchId, menu._pressY, menu._pressScroll, menu._dragging = touchId, py, menu.scroll, false
+end
+
+function _propertyGrid.move(owner, touchId, px, py)
+    local menu = owner.menu
+    if menu._pressedTouchId ~= touchId then return end
+    local dy = py - menu._pressY
+    if math.abs(dy) > _ELEMENT_TAP_SLOP_PX then menu._dragging = true end
+    if menu._dragging then
+        local g = _propertyGrid.geometry(owner, menu)
+        menu.scroll = math.max(0, math.min(g.maxScroll, menu._pressScroll - dy))
+    end
+end
+
+-- Focuses the tapped row's text field (positioning the OS/IME capture
+-- region over its on-screen box), or SAVEs/CANCELs the whole grid — a tap
+-- that lands on nothing (outside any row, scrolled past the last one)
+-- simply blurs whatever row was active, same as tapping away from a normal
+-- text field anywhere else in this app.
+function _propertyGrid.release(owner, touchId, px, py)
+    local menu = owner.menu
+    if menu._pressedTouchId ~= touchId then return end
+    menu._pressedTouchId = nil
+    if menu._dragging then return end
+    local hit = _propertyGrid.hit(owner, menu, px, py)
+    if not hit then
+        menu.activeRow = nil
+        love.keyboard.setTextInput(false)
+        return
+    end
+    if hit.kind == "row" then
+        menu.activeRow = hit.row
+        menu.errorRow, menu.errorText = nil, nil
+        local g = _propertyGrid.geometry(owner, menu)
+        local rowY = g.bodyY + (hit.row - 1) * g.rowH - menu.scroll
+        love.keyboard.setTextInput(true, _propertyGrid.valueBoxRect(g, rowY))
+    elseif hit.kind == "choice" then
+        -- One-tap selection, same as _choiceGrid's own cells — no keyboard
+        -- involved, so any text field mid-edit elsewhere in this grid is
+        -- left exactly as it was.
+        menu.rows[hit.row].value = menu.rows[hit.row].choices[hit.choice]
+        menu.errorRow, menu.errorText = nil, nil
+    elseif hit.kind == "save" and _propertyGrid.remaining(menu) == 0 then
+        if menu.validate then
+            local ok, badRow, errText = menu.validate(menu.rows)
+            if not ok then
+                menu.errorRow, menu.errorText = badRow, errText
+                return
+            end
+        end
+        local cb = menu.onSave
+        owner.menu = nil
+        love.keyboard.setTextInput(false)
+        if cb and _G[cb] then _G[cb](owner.name) end
+    elseif hit.kind == "cancel" then
+        local cb = menu.onCancel
+        owner.menu = nil
+        love.keyboard.setTextInput(false)
+        if cb and _G[cb] then _G[cb](owner.name) end
+    end
+end
+
+function _propertyGrid.wheel(owner, dy)
+    local menu = owner.menu
+    local g = _propertyGrid.geometry(owner, menu)
+    menu.scroll = math.max(0, math.min(g.maxScroll, menu.scroll - dy * g.rowH))
+end
+
+-- Whichever canvas/menu currently has a focused property-grid row, or nil —
+-- queried by love.textinput/love.keypressed (general_gdsGuiLib.lua) to know
+-- whether a keystroke belongs here instead of the single global textPrompt
+-- or an inputTxtBox field.
+function _propertyGrid.activeTarget()
+    for _, canvas in ipairs(globApp.objects.schematics) do
+        local menu = canvas.menu
+        if menu and menu.propertyGrid and menu.activeRow then return canvas, menu end
+    end
+    return nil
+end
+
+function gdsGui_schematic_propertyGridIsActive()
+    return _propertyGrid.activeTarget() ~= nil
+end
+
+-- Called from love.textinput when _propertyGridIsActive() — appends straight
+-- onto the focused row's own value, capped at MAX_CHARS (silently drops
+-- anything past it, same "just stop accepting" behavior maxChars already
+-- has elsewhere). row.numericOnly (optional): same digit/one-decimal-point
+-- filter gdsGui_textPrompt_textinput's own numericOnly applies, rejecting
+-- the whole input event (t can be more than one character on some input
+-- methods) rather than stripping just the invalid part — no reject-flash
+-- here though, unlike that prompt; this field just silently keeps whatever
+-- it already had.
+function gdsGui_schematic_propertyGridTextInput(t)
+    local _, menu = _propertyGrid.activeTarget()
+    if not menu then return end
+    local row = menu.rows[menu.activeRow]
+    if not row then return end
+    if row.numericOnly and t:find("[^%d%.]") then return end
+    local combined = (row.value or "") .. t
+    if row.numericOnly and combined:find("%..*%.") then return end
+    if #combined > _propertyGrid.MAX_CHARS then return end
+    row.value = combined
+end
+
+-- Called from love.keypressed when _propertyGridIsActive(). RETURN just
+-- blurs the field (hides the keyboard) rather than saving the whole
+-- grid — SAVE is its own explicit footer tap, same as every other field
+-- here, so one stray RETURN can't commit a grid the user hasn't finished.
+function gdsGui_schematic_propertyGridKeypressed(key)
+    local _, menu = _propertyGrid.activeTarget()
+    if not menu then return end
+    local row = menu.rows[menu.activeRow]
+    if not row then return end
+    if key == "backspace" then
+        row.value = (row.value or ""):sub(1, -2)
+    elseif key == "return" or key == "kpenter" then
+        menu.activeRow = nil
+        love.keyboard.setTextInput(false)
+    end
+end
+
+function _propertyGrid.draw(owner, menu)
+    love.graphics.setColor(0, 0, 0, 0.6)
+    love.graphics.rectangle("fill", owner.x, owner.y, owner.w, owner.h)
+    local g = _propertyGrid.geometry(owner, menu)
+    love.graphics.setColor(0.15, 0.15, 0.18, _MENU_OPACITY)
+    love.graphics.rectangle("fill", g.x, g.y, g.w, g.h)
+
+    love.graphics.setColor(0.25, 0.25, 0.25, _MENU_OPACITY)
+    love.graphics.rectangle("fill", g.x, g.y, g.w, g.titleH)
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.printf(menu.title or "", g.x, g.y + 8, g.w, "center")
+    if menu.errorText then
+        love.graphics.setColor(1, 0.4, 0.4, 1)
+        love.graphics.printf(menu.errorText, g.x + 8, g.y + g.titleH + 8, g.w - 16, "left")
+    elseif menu.header then
+        love.graphics.setColor(1, 1, 1, 0.7)
+        love.graphics.printf(menu.header, g.x + 8, g.y + g.titleH + 8, g.w - 16, "left")
+    end
+
+    local prevScX, prevScY, prevScW, prevScH = love.graphics.getScissor()
+    love.graphics.intersectScissor(g.x, g.bodyY, g.w, g.bodyH)
+    local font = love.graphics.getFont()
+    if #menu.rows == 0 then
+        love.graphics.setColor(1, 1, 1, 0.5)
+        love.graphics.printf("NO PROPERTIES", g.x, g.bodyY + (g.bodyH - font:getHeight()) / 2, g.w, "center")
+    end
+    for i, row in ipairs(menu.rows) do
+        local rowY = g.bodyY + (i - 1) * g.rowH - menu.scroll
+        if rowY + g.rowH >= g.bodyY and rowY <= g.bodyY + g.bodyH then
+            -- An unfilled row is flagged the same red tint _choiceGrid uses
+            -- for an unanswered one (while requireAll is actually gating
+            -- SAVE on it), same as a row validateFunc just rejected.
+            if (menu.requireAll and (row.value or "") == "") or menu.errorRow == i then
+                love.graphics.setColor(0.6, 0.15, 0.15, 0.35)
+                love.graphics.rectangle("fill", g.x + 2, rowY + 1, g.w - 4, g.rowH - 2)
+            end
+            love.graphics.setColor(1, 1, 1, 1)
+            love.graphics.print(row.label, g.x + 8, rowY + (g.rowH - font:getHeight()) / 2)
+
+            if row.choices then
+                for c, choiceLabel in ipairs(row.choices) do
+                    local cx, cy, cw, ch = _propertyGrid.cellRect(g, rowY, row, c)
+                    -- swatchColors (optional, parallel to row.choices — e.g.
+                    -- main.lua's POWERED COLOR row, or this file's own
+                    -- annunciator COLOR row further down): each cell is
+                    -- filled with its own actual color instead of the plain
+                    -- yellow-highlight/outline every other choice row
+                    -- uses — the swatch itself IS the label, so no text is
+                    -- drawn over it. Whoever builds the row supplies the
+                    -- colors directly (app-side via gdsGui_schematic_
+                    -- colorForPaletteName, or library-side straight off
+                    -- _ANNUNCIATOR_COLORS) — this grid has no opinion on
+                    -- where a choice's color comes from.
+                    if row.swatchColors then
+                        local swatch = row.swatchColors[c] or { 0.3, 0.3, 0.3, 1 }
+                        love.graphics.setColor(swatch[1], swatch[2], swatch[3], swatch[4] or 1)
+                        love.graphics.rectangle("fill", cx + 2, cy, cw - 4, ch)
+                        if row.value == choiceLabel then
+                            love.graphics.setColor(1, 1, 0, 1)
+                            love.graphics.rectangle("line", cx + 1, cy - 1, cw - 2, ch + 2)
+                        else
+                            love.graphics.setColor(1, 1, 1, 0.4)
+                            love.graphics.rectangle("line", cx + 2, cy, cw - 4, ch)
+                        end
+                    elseif row.value == choiceLabel then
+                        love.graphics.setColor(1, 1, 0, 1)
+                        love.graphics.rectangle("fill", cx + 2, cy, cw - 4, ch)
+                        love.graphics.setColor(0, 0, 0, 1)
+                        local textW = font:getWidth(choiceLabel)
+                        local fit = math.min(1, (cw - 8) / textW)
+                        love.graphics.print(choiceLabel, cx + (cw - textW * fit) / 2,
+                            cy + (ch - font:getHeight() * fit) / 2, 0, fit, fit)
+                    else
+                        love.graphics.setColor(1, 1, 1, 0.4)
+                        love.graphics.rectangle("line", cx + 2, cy, cw - 4, ch)
+                        love.graphics.setColor(1, 1, 1, 1)
+                        local textW = font:getWidth(choiceLabel)
+                        local fit = math.min(1, (cw - 8) / textW)
+                        love.graphics.print(choiceLabel, cx + (cw - textW * fit) / 2,
+                            cy + (ch - font:getHeight() * fit) / 2, 0, fit, fit)
+                    end
+                end
+            else
+                local bx, by, bw, bh = _propertyGrid.valueBoxRect(g, rowY)
+                local active = menu.activeRow == i
+                if active then love.graphics.setColor(1, 1, 0, 1) else love.graphics.setColor(1, 1, 1, 1) end
+                love.graphics.rectangle(active and "fill" or "line", bx, by, bw, bh)
+
+                local value = row.value or ""
+                local showPlaceholder = value == "" and not active
+                if active then
+                    love.graphics.setColor(0, 0, 0, 1)
+                else
+                    love.graphics.setColor(1, 1, 1, showPlaceholder and 0.4 or 1)
+                end
+                -- Trailing "|" while focused — same static (non-blinking)
+                -- cursor convention gdsGui_textPrompt_draw's own buffer uses.
+                local text = showPlaceholder and "TAP TO ENTER" or (active and (value .. "|") or value)
+                love.graphics.print(text, bx + 6, by + (bh - font:getHeight()) / 2)
+            end
+        end
+    end
+    if prevScX then love.graphics.setScissor(prevScX, prevScY, prevScW, prevScH) else love.graphics.setScissor() end
+
+    if g.maxScroll > 0 then
+        local barH = g.bodyH * g.bodyH / (g.bodyH + g.maxScroll)
+        local barY = g.bodyY + (g.bodyH - barH) * (menu.scroll / g.maxScroll)
+        love.graphics.setColor(1, 1, 1, 0.5)
+        love.graphics.rectangle("fill", g.x + g.w - 4, barY, 3, barH)
+    end
+
+    local remaining = _propertyGrid.remaining(menu)
+    local buttons = _propertyGrid.footerButtons(g)
+    local function button(rect, label, fill, textAlpha)
+        love.graphics.setColor(fill)
+        love.graphics.rectangle("fill", rect.x, rect.y, rect.w, rect.h)
+        love.graphics.setColor(1, 1, 1, textAlpha)
+        love.graphics.printf(label, rect.x, rect.y + (rect.h - font:getHeight()) / 2, rect.w, "center")
+    end
+    button(buttons.cancel, "CANCEL", { 0.35, 0.35, 0.35, 1 }, 1)
+    local saveLabel = remaining == 0 and "SAVE" or (remaining .. " LEFT")
+    button(buttons.save, saveLabel, remaining == 0 and { 0.15, 0.55, 0.2, 1 } or { 0.3, 0.3, 0.3, 1 }, remaining == 0 and 1 or 0.6)
+    love.graphics.setColor(1, 1, 0, 1)
+    love.graphics.rectangle("line", g.x, g.y, g.w, g.h)
+    love.graphics.setColor(1, 1, 1, 1)
+end
+
+--------------------------------------------------------------------------------
 -- PUBLIC API — BUILT-IN COLOR PICKER (opens a swatch-style menu: one row of
 -- actual-color squares, one per _COLOR_PALETTE entry, plus any extraOptions
 -- as ordinary text rows below — e.g. "DELETE" for the element-edit menu
@@ -2498,6 +3071,40 @@ end
 function gdsGui_schematic_getColorPaletteEntry(index)
     local entry = _COLOR_PALETTE[index]
     return entry and entry.color, entry and entry.name
+end
+
+-- By-name siblings of the by-index lookup above — used by a propertyGrid
+-- swatch row (see _openPropertiesMenu's own POWERED COLOR row and
+-- _propertyGrid.draw's own row.swatchColors), where the chosen value is
+-- stored as the palette entry's NAME (a plain row.value string, same as
+-- any other choice row)
+-- rather than an index. gdsGui_schematic_getColorPaletteNames feeds that
+-- row's own `choices` list.
+function gdsGui_schematic_getColorPaletteNames()
+    local names = {}
+    for _, entry in ipairs(_COLOR_PALETTE) do table.insert(names, entry.name) end
+    return names
+end
+
+function gdsGui_schematic_colorForPaletteName(name)
+    for _, entry in ipairs(_COLOR_PALETTE) do
+        if entry.name == name then return entry.color end
+    end
+    return nil
+end
+
+-- Reverse of the above — which palette entry (if any) an already-resolved
+-- color matches, so a row can be pre-filled with its current selection.
+function gdsGui_schematic_colorPaletteNameForColor(color)
+    if not color then return nil end
+    for _, entry in ipairs(_COLOR_PALETTE) do
+        local c = entry.color
+        if math.abs(c[1] - color[1]) < 0.01 and math.abs(c[2] - color[2]) < 0.01
+           and math.abs(c[3] - color[3]) < 0.01 and math.abs((c[4] or 1) - (color[4] or 1)) < 0.01 then
+            return entry.name
+        end
+    end
+    return nil
 end
 
 function gdsGui_schematic_setPendingColor(canvasName, targetKind, targetId, color)
@@ -2899,34 +3506,38 @@ function gdsGui_schematic_drawAnnunciatorPanelOverlay(pageName)
 end
 
 --------------------------------------------------------------------------------
--- PUBLIC API — DESIGN-MODE ANNUNCIATOR EDIT MENU (rename + color + delete,
--- opened by a tap-and-HOLD on a row in the management panel — see the
--- canvas._annunciatorPanelLongPressElapsed poll in gdsGui_schematic_update
--- and _handleAnnunciatorPanelPress/_annunciatorRowAt above). A plain tap
--- keeps toggling active/inactive; this is the deliberate-hold path to the
--- rarer rename/color/delete actions, same split the element/control/wire
--- edit menus use between a tap (opens their menu) and a held drag (moves
--- them). COLOR here reuses the same _ANNUNCIATOR_COLORS swatch picker
--- creation uses (_openAnnunciatorColorMenu/_ANNUNCIATOR_COLORS further up),
--- but writes straight to the annunciator's own .color field, same
--- immediate-mutation convention RENAME uses below — UNLIKE the element/
--- wire/control edit menus, which dropped their own embedded color row in
--- favor of paint mode's pendingColor/snapshot workflow: an annunciator's
--- color is a flat, always-on property (never participates in paint mode or
--- per-combination snapshots), so there's nothing to hand off to there.
+-- PUBLIC API — DESIGN-MODE ANNUNCIATOR EDIT MENU (rename + properties +
+-- delete, opened by a tap-and-HOLD on a row in the management panel — see
+-- the canvas._annunciatorPanelLongPressElapsed poll in
+-- gdsGui_schematic_update and _handleAnnunciatorPanelPress/
+-- _annunciatorRowAt above). A plain tap keeps toggling active/inactive;
+-- this is the deliberate-hold path to the rarer rename/properties/delete
+-- actions, same split the element/control/wire edit menus use between a tap
+-- (opens their menu) and a held drag (moves them). PROPERTIES opens the
+-- exact same propertyGrid chrome every element/control's own PROPERTIES
+-- option does (_propertyGrid.draw) — just a COLOR swatch row for now (see
+-- _openAnnunciatorPropertiesMenu below); more rows (actual configurable
+-- RULES, not just color) are deliberately left for later, same deferred
+-- scope _relays' own "future work" comments elsewhere use. COLOR writes
+-- straight to the annunciator's own .color field, same immediate-mutation
+-- convention RENAME uses below — UNLIKE the element/wire/control edit
+-- menus, which dropped their own embedded color row in favor of paint
+-- mode's pendingColor/snapshot workflow: an annunciator's color is a flat,
+-- always-on property (never participates in paint mode or per-combination
+-- snapshots), so there's nothing to hand off to there.
 --------------------------------------------------------------------------------
 
 -- DELETE sits last (index 3) and is passed as this menu's own confirmIndex
 -- (see gdsGui_schematic_openMenu/_markConfirmMenu) — holding IT down for
 -- _CONFIRM_HOLD_SECONDS is the entire confirmation, no separate "DELETE
--- \"X\"?" popup involved. RENAME/COLOR stay plain-tap rows in the same menu.
+-- \"X\"?" popup involved. RENAME/PROPERTIES stay plain-tap rows in the same menu.
 function gdsGui_schematic_openAnnunciatorEditMenu(canvasName, annunciatorId)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     local a = _findAnnunciator(canvas, annunciatorId)
     if not a then return end
     canvas._annunciatorEditTargetId = annunciatorId
-    gdsGui_schematic_openMenu(canvasName, a.label or annunciatorId, {"RENAME", "COLOR", "DELETE"},
+    gdsGui_schematic_openMenu(canvasName, a.label or annunciatorId, {"RENAME", "PROPERTIES", "DELETE"},
         "gdsGui_schematic_internal_onAnnunciatorEditChosen", "gdsGui_schematic_internal_onAnnunciatorEditCancelled", 3)
 end
 
@@ -2941,14 +3552,12 @@ function gdsGui_schematic_internal_onAnnunciatorEditChosen(canvasName, index, op
         canvas._annunciatorEditTargetId = nil
         _openAnnunciatorRenamePrompt(canvasName, annunciatorId)
         return
-    elseif optionText == "COLOR" then
-        -- COLOR tapped: hand off to the same swatch picker creation uses.
-        -- Keep _annunciatorEditTargetId set — the swatch-chosen/cancelled
-        -- handlers below clear it.
-        local a = _findAnnunciator(canvas, annunciatorId)
-        _openSwatchColorMenu(canvasName, "COLOR: " .. (a and (a.label or annunciatorId) or annunciatorId), {},
-            "gdsGui_schematic_internal_onAnnunciatorColorEditChosen",
-            "gdsGui_schematic_internal_onAnnunciatorColorEditCancelled", _ANNUNCIATOR_COLORS)
+    elseif optionText == "PROPERTIES" then
+        -- PROPERTIES tapped: hand off to the properties grid, keeping the
+        -- target id around while that flow is in progress (same convention
+        -- as the element/control edit menus' own PROPERTIES option).
+        canvas._annunciatorEditTargetId = nil
+        _openAnnunciatorPropertiesMenu(canvasName, annunciatorId)
         return
     elseif optionText == "DELETE" then
         -- DELETE only ever reaches here via the sustained hold the menu's
@@ -2966,29 +3575,6 @@ function gdsGui_schematic_internal_onAnnunciatorEditChosen(canvasName, index, op
     canvas._annunciatorEditTargetId = nil
 end
 
--- Shared onSelect/onCancel for the COLOR swatch picker above: both picking a
--- swatch and tapping outside land here (index is nil on cancel, same
--- convention gdsGui_schematic_internal_onAnnunciatorColorChosen's creation
--- counterpart uses).
-function gdsGui_schematic_internal_onAnnunciatorColorEditChosen(canvasName, index)
-    local canvas = _findCanvas(canvasName)
-    if not canvas or not canvas._annunciatorEditTargetId then return end
-    local annunciatorId = canvas._annunciatorEditTargetId
-    canvas._annunciatorEditTargetId = nil
-    local entry = _ANNUNCIATOR_COLORS[index]
-    if not entry then return end
-    local a = _findAnnunciator(canvas, annunciatorId)
-    if not a then return end
-    _pushUndo(canvas)
-    a.color = entry.color
-    _notifyChanged(canvas)
-end
-
-function gdsGui_schematic_internal_onAnnunciatorColorEditCancelled(canvasName)
-    local canvas = _findCanvas(canvasName)
-    if canvas then canvas._annunciatorEditTargetId = nil end
-end
-
 -- Tapping outside the edit menu (or outside the rename/confirm steps it
 -- leads to) just drops the in-flight target — unlike the element/control/
 -- wire edit menus, there's no on-canvas "selected" highlight to also clear
@@ -2996,6 +3582,91 @@ end
 function gdsGui_schematic_internal_onAnnunciatorEditCancelled(canvasName)
     local canvas = _findCanvas(canvasName)
     if canvas then canvas._annunciatorEditTargetId = nil end
+end
+
+--------------------------------------------------------------------------------
+-- PUBLIC API — DESIGN-MODE ANNUNCIATOR PROPERTIES MENU (reached via the edit
+-- menu's PROPERTIES option above) — the same gdsGui_schematic_
+-- openPropertyGrid chrome every element/control's own PROPERTIES menu uses
+-- (_openPropertiesMenu further up), just entirely self-contained here since
+-- an annunciator is a library-owned concept with no app-layer hooks of its
+-- own (unlike _openPropertiesMenu's elementPropertiesExtraRows/RowSaved).
+-- One row for now (COLOR, reusing the same _ANNUNCIATOR_COLORS 4-color set
+-- creation's own picker draws from — _openAnnunciatorColorMenu further up —
+-- rendered as true swatches via row.swatchColors, same as every other
+-- color-choice row this grid supports); real configurable RULES are
+-- deliberately left for later (see this section's own header comment above).
+--------------------------------------------------------------------------------
+
+-- Reverse of _ANNUNCIATOR_COLORS' own by-index lookup — which entry (if
+-- any) an already-resolved color matches, so the COLOR row can be
+-- pre-filled with its current selection, same pattern gdsGui_schematic_
+-- colorPaletteNameForColor uses for the generic 5-color _COLOR_PALETTE.
+-- Global, not local — this file is already at Lua's 200-top-level-local
+-- ceiling (same constraint main.lua's own _openFundamentalsMenu comment
+-- describes).
+function _annunciatorColorName(color)
+    if not color then return nil end
+    for _, entry in ipairs(_ANNUNCIATOR_COLORS) do
+        local c = entry.color
+        if math.abs(c[1] - color[1]) < 0.01 and math.abs(c[2] - color[2]) < 0.01
+           and math.abs(c[3] - color[3]) < 0.01 and math.abs((c[4] or 1) - (color[4] or 1)) < 0.01 then
+            return entry.name
+        end
+    end
+    return nil
+end
+
+-- That grid's own shadow row + target id while it's open — read back in
+-- onAnnunciatorPropertiesSaved below, same "canvas.menu is already gone by
+-- the time SAVE's callback fires" reasoning canvas._pendingPropertyRows
+-- exists for (_openPropertiesMenu's own comment) — annunciators just don't
+-- have a canvas field of their own to stash it on, since they're not drawn
+-- on the canvas at all (see gdsGui_schematic_internal_onAnnunciatorEditCancelled's
+-- own comment). Global, not local — same 200-top-level-local ceiling as
+-- _annunciatorColorName just above.
+_pendingAnnunciatorPropertyEdit = nil -- {canvasName, annunciatorId, rows}
+
+-- Global, not local — same ceiling as _annunciatorColorName above.
+function _openAnnunciatorPropertiesMenu(canvasName, annunciatorId)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return end
+    local a = _findAnnunciator(canvas, annunciatorId)
+    if not a then return end
+    local names, colors = {}, {}
+    for _, entry in ipairs(_ANNUNCIATOR_COLORS) do
+        table.insert(names, entry.name)
+        table.insert(colors, entry.color)
+    end
+    local rows = {
+        { key = "color", label = "COLOR", choices = names, swatchColors = colors,
+            value = _annunciatorColorName(a.color) or "" },
+    }
+    _pendingAnnunciatorPropertyEdit = { canvasName = canvasName, annunciatorId = annunciatorId, rows = rows }
+    gdsGui_schematic_openPropertyGrid(canvasName, "PROPERTIES: " .. (a.label or annunciatorId), nil, rows, false,
+        "gdsGui_schematic_internal_onAnnunciatorPropertiesSaved", "gdsGui_schematic_internal_onAnnunciatorPropertiesCancelled")
+end
+
+function gdsGui_schematic_internal_onAnnunciatorPropertiesSaved(canvasName)
+    local pending = _pendingAnnunciatorPropertyEdit
+    _pendingAnnunciatorPropertyEdit = nil
+    if not pending then return end
+    local canvas = _findCanvas(pending.canvasName)
+    local a = canvas and _findAnnunciator(canvas, pending.annunciatorId)
+    if not a then return end
+    _pushUndo(canvas)
+    for _, row in ipairs(pending.rows) do
+        if row.key == "color" then
+            for _, entry in ipairs(_ANNUNCIATOR_COLORS) do
+                if entry.name == row.value then a.color = entry.color end
+            end
+        end
+    end
+    _notifyChanged(canvas)
+end
+
+function gdsGui_schematic_internal_onAnnunciatorPropertiesCancelled(canvasName)
+    _pendingAnnunciatorPropertyEdit = nil
 end
 
 --------------------------------------------------------------------------------
@@ -3377,16 +4048,19 @@ function gdsGui_schematic_internal_onWireEditCancelled(canvasName)
 end
 
 --------------------------------------------------------------------------------
--- PUBLIC API — DESIGN-MODE CONTROL EDIT MENU (position + delete, opened by a
--- plain tap on a control while in design mode; a drag still repositions it
--- instead, same tap-vs-drag gesture as the element/wire edit menus above).
--- No longer offers a color swatch row — see the matching comment on the
--- element edit menu above. ADD WIRE always leads (index 1) and DELETE always
--- trails (index #positions + 2), checked by INDEX rather than optionText so
--- a control whose own position happens to be named "ADD WIRE" or "DELETE"
--- can't collide with them — DELETE's index doubles as this menu's own
--- confirmIndex (passed to openMenu below), so holding IT down for
--- _CONFIRM_HOLD_SECONDS is the whole confirmation, no separate popup.
+-- PUBLIC API — DESIGN-MODE CONTROL EDIT MENU (properties + position +
+-- delete, opened by a plain tap on a control while in design mode; a drag
+-- still repositions it instead, same tap-vs-drag gesture as the element/wire
+-- edit menus above). No longer offers a color swatch row — see the matching
+-- comment on the element edit menu above (POWERED COLOR, for a source
+-- control, now lives inside PROPERTIES instead — see _openPropertiesMenu).
+-- ADD WIRE always leads (index 1, unless noAddWire), PROPERTIES always
+-- follows it, and DELETE always trails (index #positions + offset + 1),
+-- checked by INDEX rather than optionText so a control whose own position
+-- happens to be named "ADD WIRE", "PROPERTIES", or "DELETE" can't collide
+-- with them — DELETE's index doubles as this menu's own confirmIndex
+-- (passed to openMenu below), so holding IT down for _CONFIRM_HOLD_SECONDS
+-- is the whole confirmation, no separate popup.
 --------------------------------------------------------------------------------
 
 function gdsGui_schematic_openControlEditMenu(canvasName, controlId)
@@ -3396,8 +4070,13 @@ function gdsGui_schematic_openControlEditMenu(canvasName, controlId)
     if not ctrl then return end
     canvas._controlEditTargetId = controlId
     -- noAddWire: an app-set flag for a control whose wiring the app owns
-    -- (e.g. a relay's command switch) — no ADD WIRE row.
+    -- (e.g. a relay's command switch) — no ADD WIRE row. PROPERTIES always
+    -- shows (same reasoning as the element edit menu's own PROPERTIES row
+    -- below) — opens _openPropertiesMenu, the same grid used to edit any
+    -- element/control's custom properties (and a source control's own
+    -- POWERED COLOR row — see _openPropertiesMenu's own comment).
     local options = ctrl.noAddWire and {} or {"ADD WIRE"}
+    table.insert(options, "PROPERTIES")
     for _, p in ipairs(ctrl.positions) do table.insert(options, p) end
     -- No DELETE for a noDelete control (see openWireEditMenu).
     if not ctrl.noDelete then table.insert(options, "DELETE") end
@@ -3412,9 +4091,11 @@ function gdsGui_schematic_internal_onControlEditChosen(canvasName, index, option
     local controlId = canvas._controlEditTargetId
     local ctrl = _findControl(canvas, controlId)
     local nPositions = ctrl and #ctrl.positions or 0
-    -- Rows: [ADD WIRE unless noAddWire], one per position, [DELETE unless noDelete].
-    local offset = (ctrl and ctrl.noAddWire) and 0 or 1
-    if offset == 1 and index == 1 then
+    -- Rows: [ADD WIRE unless noAddWire], PROPERTIES (always), one per
+    -- position, [DELETE unless noDelete].
+    local offsetAddWire = (ctrl and ctrl.noAddWire) and 0 or 1
+    local offset = offsetAddWire + 1
+    if offsetAddWire == 1 and index == 1 then
         -- ADD WIRE tapped: arm a one-shot wire-drag whose fixed start is
         -- this control, same "stay armed, no need to land on an anchor
         -- next press" convention as an element's own ADD WIRE (see
@@ -3423,6 +4104,13 @@ function gdsGui_schematic_internal_onControlEditChosen(canvasName, index, option
         canvas._controlEditTargetId = nil
         gdsGui_schematic_cancelPlacement(canvasName)
         canvas.pendingWireFromId = controlId
+        return
+    elseif index == offsetAddWire + 1 then
+        -- PROPERTIES tapped: hand off to the properties grid, keeping the
+        -- control selected while that flow is in progress (same "stay
+        -- selected mid-flow" convention as ADD WIRE above).
+        canvas._controlEditTargetId = nil
+        _openPropertiesMenu(canvasName, controlId)
         return
     elseif index == nPositions + offset + 1 then
         -- DELETE only ever reaches here via the sustained hold this menu's
@@ -3462,58 +4150,78 @@ function gdsGui_schematic_internal_onControlEditCancelled(canvasName)
 end
 
 --------------------------------------------------------------------------------
--- PUBLIC API — DESIGN-MODE ELEMENT PROPERTIES MENU (generic key/value list,
--- reached via the element edit menu's PROPERTIES option). The app layer
--- assigns meaning to keys (e.g. "VOLTAGE"/"CURRENT" for an electrical
--- element) — this module just stores and lets the user add/edit/delete them.
+-- PUBLIC API — DESIGN-MODE ELEMENT/CONTROL PROPERTIES MENU (generic key/
+-- value grid, reached via either edit menu's own PROPERTIES option — see
+-- gdsGui_schematic_openPropertyGrid above for the widget itself). The app
+-- layer assigns meaning to keys (e.g. "VOLTAGE"/"CURRENT" for an electrical
+-- element) — this module just stores and lets the user edit them, all in
+-- one scrollable grid rather than a drill-down per property. elementId may
+-- name either an element OR a control (_findAnchor) — canvas.
+-- _propertyEditTargetIsControl remembers which, so onPropertiesSaved/
+-- Cancelled below know which of selectedElementId/selectedControlId to
+-- clear again once this flow ends.
 --------------------------------------------------------------------------------
-
--- Two-step "type a key, then type a value" text entry, shared by ADD PROPERTY
--- (key starts empty) and EDIT VALUE (key is already known). Only one of these
--- is ever in flight at a time, same as _pendingNamedPlacement above.
-local _pendingPropertyEntry = nil
 
 -- canvas.elementSensedValues (optional, by-name like canvas.onChange and
 -- every other string-registered hook): called as fn(canvasName, elementId)
--- just before the PROPERTIES menu opens, returning an array of
+-- just before the PROPERTIES grid opens, returning an array of
 -- {label=string, value=string|nil} READ-ONLY sensed readings (e.g. VOLTAGE,
 -- eventually CURRENT once current is modeled — see main.lua's
--- schematicElementSensedValues) to show above the element's own
--- user-editable custom properties. A nil/empty value displays "N/A" —
--- distinct from a custom property's "(not set)", since these rows were
--- never meant to be typed into in the first place. They're prepended to
--- `options` ahead of el.properties, so gdsGui_schematic_internal_
--- onPropertyRowChosen below has to offset its index into el.properties by
--- however many of these rows there are (canvas._propertySensedRowCount) —
--- tapping one of these rows itself is a no-op (nothing to edit).
+-- schematicElementSensedValues), shown as the grid's own header caption
+-- rather than rows — these were never meant to be typed into, and the grid's
+-- rows are now all uniformly editable (see openPropertyGrid's own header
+-- comment). canvas.elementPropertiesExtraRows (same by-name convention,
+-- optional): called as fn(canvasName, elementId) right after the sensed-
+-- values header is built, returning an array of EDITABLE rows (same shape
+-- _openElementPlacementGrid's own extra rows use — target == "field" writes
+-- straight onto the entity by key, anything else is deferred entirely to
+-- canvas.elementPropertiesRowSaved below) to show ahead of the item's own
+-- custom properties — main.lua uses this for a source's own TYPE/VOLTAGE/
+-- POWERED COLOR rows (POWERED COLOR is a row.swatchColors choice row — see
+-- _propertyGrid.draw — pre-filled from canvas.voltageColors[entity.voltage]),
+-- letting the user edit all of it right here, the exact same rows (and same
+-- pre-fill behavior) the placement grid collects at creation time, instead
+-- of a second, separate flow. Always opens with requireAll false — a freshly-placed
+-- element's own default properties are collected mandatorily up front
+-- instead, by the placement grid itself (see main.lua's
+-- schematicElementPlacementExtraRows and schematic_gdsGuiLib.lua's own
+-- _openElementPlacementGrid), so by the time this (editing an EXISTING
+-- element/control, reached via its own edit menu's PROPERTIES option below)
+-- ever opens there's nothing left to force full.
+-- Public entry point into the PROPERTIES grid below, for an app-layer call
+-- site that isn't itself an edit-menu PROPERTIES tap (e.g. main.lua's PER-
+-- SOURCE SETTINGS list redirects its own VOLTAGE row straight here instead
+-- of a second, separate grid) — identical to tapping PROPERTIES on the
+-- element/control edit menu.
+function gdsGui_schematic_openPropertiesMenu(canvasName, elementId)
+    _openPropertiesMenu(canvasName, elementId)
+end
+
 function _openPropertiesMenu(canvasName, elementId)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
-    local el = _findElement(canvas, elementId)
+    local el = _findAnchor(canvas, elementId)
     if not el then return end
+    local isControl = _findControl(canvas, elementId) ~= nil
     canvas._elementEditTargetId = nil
+    canvas._controlEditTargetId = nil
     canvas._propertyEditTargetId = elementId
-    canvas.selectedElementId = elementId
-    local options = {}
-    local sensedCount = 0
-    local sensedLabels = {}
+    canvas._propertyEditTargetIsControl = isControl
+    if isControl then canvas.selectedControlId = elementId else canvas.selectedElementId = elementId end
+    local headerLines, sensedLabels = {}, {}
     if canvas.elementSensedValues then
         local fn = _G[canvas.elementSensedValues]
         local sensed = fn and fn(canvasName, elementId)
         for _, s in ipairs(sensed or {}) do
-            table.insert(options, s.label .. ": " .. ((s.value == nil or s.value == "") and "N/A" or s.value))
+            table.insert(headerLines, s.label .. ": " .. ((s.value == nil or s.value == "") and "N/A" or s.value))
             sensedLabels[s.label:upper()] = true
-            sensedCount = sensedCount + 1
         end
     end
-    canvas._propertySensedRowCount = sensedCount
     -- A custom property sharing a reserved sensed-value label (e.g. a
     -- "VOLTAGE" property hand-added before this feature existed) would
-    -- otherwise show a second, user-editable "VOLTAGE: (not set)" row right
-    -- next to the real read-only one above — stale/confusing, so it's
-    -- stripped on sight rather than merely hidden (gdsGui_schematic_
-    -- propertyKeyConfirmed blocks creating a new one the same way going
-    -- forward). Not pushed onto the undo stack — this is a one-time data
+    -- otherwise show a second, user-editable "VOLTAGE" row right next to the
+    -- real read-only one above — stale/confusing, so it's stripped on
+    -- sight. Not pushed onto the undo stack — this is a one-time data
     -- migration, not a user edit the user would ever want to "undo" back in.
     if next(sensedLabels) ~= nil and el.properties then
         local removedAny = false
@@ -3525,139 +4233,107 @@ function _openPropertiesMenu(canvasName, elementId)
         end
         if removedAny then _notifyChanged(canvas) end
     end
-    for _, p in ipairs(el.properties or {}) do
-        table.insert(options, p.key .. ": " .. ((p.value == "" or p.value == nil) and "(not set)" or p.value))
+    -- Row 1 is always NAME (key "__name", same sentinel _openElementPlacementGrid's
+    -- own row 1 uses) — the exact same row/validation the placement grid
+    -- collects it with, just pre-filled from the live label instead of a
+    -- fresh suggestion, and excluding the item's OWN current label from the
+    -- uniqueness check (_labelInUse's own excludeKind/excludeId) so leaving
+    -- it unchanged (or just re-casing it) never falsely collides with itself.
+    local rows = { { key = "__name", label = "NAME", value = el.label or elementId } }
+    if canvas.elementPropertiesExtraRows then
+        local fn = _G[canvas.elementPropertiesExtraRows]
+        for _, r in ipairs((fn and fn(canvasName, elementId)) or {}) do table.insert(rows, r) end
     end
-    table.insert(options, "ADD PROPERTY")
-    table.insert(options, "RETURN")
-    gdsGui_schematic_openMenu(canvasName, "PROPERTIES: " .. (el.label or elementId), options,
-        "gdsGui_schematic_internal_onPropertyRowChosen", "gdsGui_schematic_internal_onPropertiesCancelled")
+    for _, p in ipairs(el.properties or {}) do
+        table.insert(rows, { key = p.key, label = p.key, value = p.value or "" })
+    end
+    -- Stashed here, not read back via canvas.menu.rows in onPropertiesSaved
+    -- below — by the time SAVE's callback fires, _propertyGrid.release has
+    -- already cleared canvas.menu (same "closes first, callback after"
+    -- order _choiceGrid's own save/cancel release use).
+    canvas._pendingPropertyRows = rows
+    gdsGui_schematic_openPropertyGrid(canvasName, "PROPERTIES: " .. (el.label or elementId),
+        (#headerLines > 0) and table.concat(headerLines, "\n") or nil, rows, false,
+        "gdsGui_schematic_internal_onPropertiesSaved", "gdsGui_schematic_internal_onPropertiesCancelled",
+        function(gridRows)
+            local trimmed = (gridRows[1].value or ""):gsub("^%s*(.-)%s*$", "%1")
+            if trimmed == "" then return false, 1, "NAME REQUIRED" end
+            if _labelInUse(canvas, trimmed, isControl and "control" or "element", elementId) then
+                return false, 1, "NAME TAKEN, TRY ANOTHER"
+            end
+            return true
+        end)
 end
 
 function gdsGui_schematic_internal_onPropertiesCancelled(canvasName)
     local canvas = _findCanvas(canvasName)
     if canvas then
         canvas._propertyEditTargetId = nil
+        canvas._propertyEditTargetIsControl = nil
+        canvas._pendingPropertyRows = nil
         canvas.selectedElementId = nil
+        canvas.selectedControlId = nil
     end
 end
 
-function gdsGui_schematic_internal_onPropertyRowChosen(canvasName, index, optionText)
+-- SAVE writes every row straight back onto the element/control (the grid's
+-- own rows were a shadow copy — see openPropertyGrid's own comment — so
+-- nothing changed on the real entity until now), then un-selects it the same
+-- way every other edit-menu flow's own finish does. A row with target ==
+-- "field" writes straight onto the entity by key (same convention
+-- _applyPlacementExtraRows uses for the placement grid); any OTHER target
+-- (e.g. "voltageColor" — main.lua's POWERED COLOR row) is left entirely to
+-- canvas.elementPropertiesRowSaved below, fired once per such row AFTER
+-- every plain row/field write above has landed — the library has no idea
+-- what "voltageColor" means (canvas.voltageColors is an app-added field, not
+-- part of this library's own canvas schema — see main.lua's own VOLTAGE ->
+-- COLOR REGISTRATION section comment). A row with no target at all is an
+-- ordinary custom property, same as before this hook existed. Row 1 (NAME)
+-- is consumed directly onto el.label here, same as _commitNamedPlacement
+-- does for the placement grid's own row 1 — already validated non-empty/
+-- unique by this grid's own validateFunc (see _openPropertiesMenu above)
+-- before SAVE could ever reach here, so no re-check needed. Fires
+-- canvas.elementPropertiesSaved (optional, by-name) once everything above
+-- has landed, for the app to react to the FINAL state (e.g. flagging a bus
+-- tie's logic as possibly needing a new row for a changed VOLTAGE) — the
+-- editing-flow sibling of canvas.elementPlacementConfigured.
+function gdsGui_schematic_internal_onPropertiesSaved(canvasName)
     local canvas = _findCanvas(canvasName)
     if not canvas or not canvas._propertyEditTargetId then return end
     local elementId = canvas._propertyEditTargetId
-    if optionText == "RETURN" then
-        canvas._propertyEditTargetId = nil
-        canvas.selectedElementId = nil
-        return
-    elseif optionText == "ADD PROPERTY" then
-        _pendingPropertyEntry = { canvasName = canvasName, elementId = elementId }
-        -- VOLTAGE is no longer a free-form example here — it's a reserved,
-        -- auto-populated sensed-value row above these (see
-        -- canvas.elementSensedValues) — PART NUMBER avoids suggesting the
-        -- user re-type something already shown read-only.
-        gdsGui_textPrompt_open("NEW PROPERTY NAME (e.g. PART NUMBER)", "", 20,
-            "gdsGui_schematic_propertyKeyConfirmed", "gdsGui_schematic_propertyEntryCancelled")
-        return
-    end
-    -- Rows above the user's own custom properties are the read-only sensed
-    -- values _openPropertiesMenu prepended (VOLTAGE, CURRENT, ...) — see its
-    -- own comment. Tapping one is a no-op; el.properties' own indices start
-    -- right after them.
-    local sensedCount = canvas._propertySensedRowCount or 0
-    if index <= sensedCount then return end
-    local el = _findElement(canvas, elementId)
-    local prop = el and el.properties and el.properties[index - sensedCount]
-    if not prop then return end
-    canvas._propertyActionKey = prop.key
-    -- DELETE PROPERTY (index 2) is this menu's own confirmIndex row, same
-    -- treatment as every sibling DELETE action (element/control/wire/
-    -- annunciator edit menus) — previously the one DELETE-shaped row in the
-    -- whole editor that fired on a plain tap with no hold-to-confirm gate
-    -- at all, an inconsistency rather than a deliberate lower-stakes case
-    -- (contrast CLEAR SNAPSHOT in _openDesignActionsMenu, which stays
-    -- plain-tap on purpose — see that call site's own comment).
-    gdsGui_schematic_openMenu(canvasName, prop.key, {"EDIT VALUE", "DELETE PROPERTY", "RETURN"},
-        "gdsGui_schematic_internal_onPropertyActionChosen", "gdsGui_schematic_internal_onPropertyActionCancelled", 2)
-end
-
-function gdsGui_schematic_internal_onPropertyActionChosen(canvasName, index, optionText)
-    local canvas = _findCanvas(canvasName)
-    if not canvas or not canvas._propertyEditTargetId then return end
-    local elementId = canvas._propertyEditTargetId
-    local key = canvas._propertyActionKey
-    if optionText == "EDIT VALUE" then
-        local el = _findElement(canvas, elementId)
-        local current = ""
-        for _, p in ipairs((el and el.properties) or {}) do
-            if p.key == key then current = p.value end
+    local el = _findAnchor(canvas, elementId)
+    local rows = canvas._pendingPropertyRows
+    canvas._propertyEditTargetId = nil
+    canvas._propertyEditTargetIsControl = nil
+    canvas._pendingPropertyRows = nil
+    canvas.selectedElementId = nil
+    canvas.selectedControlId = nil
+    if not el or not rows then return end
+    _pushUndo(canvas)
+    local trimmedName = (rows[1] and rows[1].value or ""):gsub("^%s*(.-)%s*$", "%1")
+    if trimmedName ~= "" then el.label = trimmedName end
+    for i = 2, #rows do
+        local row = rows[i]
+        if row.target == "field" then
+            el[row.key] = (row.numeric and tonumber(row.value)) or row.value
+        elseif not row.target then
+            gdsGui_schematic_setElementProperty(canvasName, elementId, row.key, row.value or "")
         end
-        _pendingPropertyEntry = { canvasName = canvasName, elementId = elementId, key = key }
-        gdsGui_textPrompt_open("VALUE FOR " .. key, current, 20,
-            "gdsGui_schematic_propertyValueConfirmed", "gdsGui_schematic_propertyEntryCancelled")
-    elseif optionText == "DELETE PROPERTY" then
-        _pushUndo(canvas)
-        gdsGui_schematic_removeElementProperty(canvasName, elementId, key)
-        _notifyChanged(canvas)
-        _openPropertiesMenu(canvasName, elementId)
-    else -- RETURN
-        _openPropertiesMenu(canvasName, elementId)
     end
-end
-
-function gdsGui_schematic_internal_onPropertyActionCancelled(canvasName)
-    local canvas = _findCanvas(canvasName)
-    if canvas and canvas._propertyEditTargetId then
-        _openPropertiesMenu(canvasName, canvas._propertyEditTargetId)
-    end
-end
-
--- Resolved by name via _G[...] from textPrompt_gdsGuiLib.lua, like every other
--- string-registered callback in this library.
-function gdsGui_schematic_propertyKeyConfirmed(text)
-    local pending = _pendingPropertyEntry
-    if not pending then return end
-    local trimmed = (text or ""):gsub("^%s*(.-)%s*$", "%1"):upper()
-    if trimmed == "" then
-        gdsGui_textPrompt_open("NAME REQUIRED, TRY AGAIN", "", 20,
-            "gdsGui_schematic_propertyKeyConfirmed", "gdsGui_schematic_propertyEntryCancelled")
-        return
-    end
-    -- VOLTAGE/CURRENT (or whatever canvas.elementSensedValues currently
-    -- reports for this element — see _openPropertiesMenu) are reserved,
-    -- read-only sensed rows; a same-named custom property would just create
-    -- a second, confusing, user-editable row right next to the real one.
-    local canvas = _findCanvas(pending.canvasName)
-    if canvas and canvas.elementSensedValues and _G[canvas.elementSensedValues] then
-        local sensed = _G[canvas.elementSensedValues](pending.canvasName, pending.elementId) or {}
-        for _, s in ipairs(sensed) do
-            if s.label:upper() == trimmed then
-                gdsGui_textPrompt_open("\"" .. trimmed .. "\" IS RESERVED, TRY AGAIN", "", 20,
-                    "gdsGui_schematic_propertyKeyConfirmed", "gdsGui_schematic_propertyEntryCancelled")
-                return
+    if canvas.elementPropertiesRowSaved then
+        local fn = _G[canvas.elementPropertiesRowSaved]
+        if fn then
+            for i = 2, #rows do
+                local row = rows[i]
+                if row.target and row.target ~= "field" then fn(canvasName, elementId, row) end
             end
         end
     end
-    pending.key = trimmed
-    gdsGui_textPrompt_open("VALUE FOR " .. trimmed, "", 20,
-        "gdsGui_schematic_propertyValueConfirmed", "gdsGui_schematic_propertyEntryCancelled")
-end
-
-function gdsGui_schematic_propertyValueConfirmed(text)
-    local pending = _pendingPropertyEntry
-    _pendingPropertyEntry = nil
-    if not pending then return end
-    local canvas = _findCanvas(pending.canvasName)
-    if canvas then _pushUndo(canvas) end
-    gdsGui_schematic_setElementProperty(pending.canvasName, pending.elementId, pending.key, text or "")
-    if canvas then _notifyChanged(canvas) end
-    _openPropertiesMenu(pending.canvasName, pending.elementId)
-end
-
-function gdsGui_schematic_propertyEntryCancelled()
-    local pending = _pendingPropertyEntry
-    _pendingPropertyEntry = nil
-    if pending then _openPropertiesMenu(pending.canvasName, pending.elementId) end
+    _notifyChanged(canvas)
+    if canvas.elementPropertiesSaved then
+        local fn = _G[canvas.elementPropertiesSaved]
+        if fn then fn(canvasName, elementId) end
+    end
 end
 
 --------------------------------------------------------------------------------
@@ -6085,6 +6761,10 @@ function gdsGui_schematic_wheelZoom(x, y, dy)
             _choiceGrid.wheel(canvas, dy)
             return
         end
+        if canvas.page == activePageName and canvas.menu and canvas.menu.propertyGrid then
+            _propertyGrid.wheel(canvas, dy)
+            return
+        end
         if canvas.page == activePageName and not canvas.menu
            and x >= canvas.x and x <= canvas.x + canvas.w
            and y >= canvas.y and y <= canvas.y + canvas.h then
@@ -6158,6 +6838,8 @@ function gdsGui_schematic_pressed(touchId, x, y)
         if canvas.menu then
             if canvas.menu.choiceGrid then
                 _choiceGrid.press(canvas, touchId, x, y)
+            elseif canvas.menu.propertyGrid then
+                _propertyGrid.press(canvas, touchId, x, y)
             else
                 _handleMenuPress(canvas, touchId, x, y)
             end
@@ -6279,6 +6961,7 @@ function gdsGui_schematic_pressed(touchId, x, y)
             local newId = canvas.pendingPlacement.idPrefix .. "_" .. canvas._placementCounter
             _pendingNamedPlacement = {
                 canvasName = canvas.name, newId = newId, fracX = fracX, fracY = fracY,
+                label = canvas.pendingPlacement.label,
                 kind = canvas.pendingPlacement.kind, shapeType = canvas.pendingPlacement.shapeType,
                 positions = canvas.pendingPlacement.positions, defaultColor = canvas.pendingPlacement.defaultColor,
                 callbackFunc = canvas.pendingPlacement.callbackFunc,
@@ -6303,8 +6986,13 @@ function gdsGui_schematic_pressed(touchId, x, y)
                 colorDarkenMul = canvas.pendingPlacement.colorDarkenMul,
                 terminals = canvas.pendingPlacement.terminals,
             }
-            _openPlacementNamePrompt("NAME THIS " .. canvas.pendingPlacement.kind:upper(),
-                _suggestedPlacementName(canvas, canvas.pendingPlacement.label))
+            -- Every tap-to-place item (element or control — never an
+            -- annunciator, which has no canvas position to tap for and
+            -- goes straight from gdsGui_schematic_armAnnunciatorCreation to
+            -- the plain _openPlacementNamePrompt below instead) now opens
+            -- one unified NAME(+TYPE/VOLTAGE/PROPERTIES) grid — see
+            -- _openElementPlacementGrid.
+            _openElementPlacementGrid(canvas.name, _pendingNamedPlacement)
             canvas.pendingPlacement = nil
             goto continue
         end
@@ -6377,9 +7065,11 @@ function gdsGui_schematic_pressed(touchId, x, y)
                 canvas._paintTarget = { kind = targetKind, id = target.id }
             else
                 -- A miss (empty canvas space, no item drawn there) pans the
-                -- view instead, same as a plain miss outside paint mode —
-                -- only the PAINT dock button itself
-                -- (gdsGui_schematic_disarmPaintMode) disarms paint mode now.
+                -- view instead, same as a plain miss outside paint mode — a
+                -- clean TAP here (not an actual pan/pinch) also disarms the
+                -- brush on release though, same as the PAINT dock button
+                -- itself (gdsGui_schematic_disarmPaintMode) — see
+                -- gdsGui_schematic_released's own dragKind == "pan" branch.
                 canvas.focusTouchId = touchId
                 canvas.dragKind     = "pan"
                 canvas.dragStartX   = x
@@ -6651,6 +7341,7 @@ function gdsGui_schematic_moved(touchId, x, y)
         if canvas.page ~= activePageName then goto continue end
         if canvas.menu then
             if canvas.menu.choiceGrid then _choiceGrid.move(canvas, touchId, x, y) end
+            if canvas.menu.propertyGrid then _propertyGrid.move(canvas, touchId, x, y) end
             goto continue
         end
         if canvas.annunciatorPanelOpen then
@@ -6986,6 +7677,8 @@ function gdsGui_schematic_released(touchId, x, y)
             end
             if canvas.menu.choiceGrid then
                 _choiceGrid.release(canvas, touchId, x, y)
+            elseif canvas.menu.propertyGrid then
+                _propertyGrid.release(canvas, touchId, x, y)
             else
                 _handleMenuRelease(canvas, touchId, x, y)
             end
@@ -7121,6 +7814,20 @@ function gdsGui_schematic_released(touchId, x, y)
                 -- Same move->rotate overlay switch as an element's "rotate"
                 -- branch above, instead of opening the edit menu.
                 canvas.rotateModeActive = true
+            elseif canvas.dragKind == "pan" and canvas.paintMode and not canvas.dragMoved then
+                -- PAINT MODE's own press handler only ever starts a "pan"
+                -- here on a genuine miss — every element/wire/control (and
+                -- the swatch palette itself) resolves to dragKind == "paint"
+                -- instead (see gdsGui_schematic_pressed's own paintMode
+                -- branch) — so reaching this with dragMoved still false
+                -- means a clean tap landed on empty canvas space with
+                -- nothing painted. Same "it's just quietly treated as a pan
+                -- start" miss every other mode gives an empty tap, except
+                -- here it also disarms the brush — same convention the
+                -- PAINT dock button's own gdsGui_schematic_disarmPaintMode
+                -- uses, just reached by tapping away instead of the button.
+                -- An actual pan/pinch (dragMoved true) leaves it armed.
+                canvas.paintMode = nil
             end
             -- An actual drag (element/rotate/control/controlRotate moved,
             -- not just tapped) settled at its final position/angle here —

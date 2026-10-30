@@ -897,6 +897,32 @@ function gdsGui_general_mousepressed (x, y, button, istouch, presses)
 		return
 	end
 
+	-- gdsGui_button_pressed below is the only thing that (re)sets this flag,
+	-- and it's skipped entirely whenever a schematic modal is already open
+	-- (see schematicModalOpen below) — so without this reset, a press on a
+	-- menu row while that modal is open would still see whatever stale value
+	-- was left behind by the PREVIOUS press (true, if that previous press is
+	-- what opened the modal, which it always is), and gdsGui_schematic_
+	-- pressed's own buttonPressConsumed guard would then wrongly swallow
+	-- every press for as long as the modal stays open — the menu can be
+	-- opened but never actually used. Reset here, every press, before
+	-- anything reads it.
+	globApp.buttonPressConsumed = false
+
+	-- A schematic canvas menu/annunciator panel or gallery menu open on the
+	-- active page is just as modal as textPrompt/choiceMenu above, but it's
+	-- owned by a specific canvas/gallery object rather than a single global,
+	-- so it can't take the same early-return shortcut — gdsGui_schematic_
+	-- pressed/gdsGui_schematicGallery_pressed below still need this same
+	-- press to resolve what the tap landed on (they already give their own
+	-- menu/panel top priority internally). This flag instead keeps every
+	-- OTHER control on the page from also reacting to the same tap.
+	local schematicModalOpen = gdsGui_schematic_isAnyMenuOpen()
+	-- Buttons use the narrower check (see gdsGui_schematic_isHardMenuOpen's
+	-- own comment) — the annunciator panel's own dock button must stay
+	-- pressable while that panel is the only "modal" open.
+	local schematicHardMenuOpen = gdsGui_schematic_isHardMenuOpen()
+
 	if istouch == false then
 
 		local buttonName = gdsGui_general_convertButtonNumToString (button)
@@ -904,38 +930,48 @@ function gdsGui_general_mousepressed (x, y, button, istouch, presses)
 		local calledFunction = (buttonName .. " click pressed")
 		globApp.userInput = calledFunction
 
-gdsGui_button_pressed (x,y,button,istouch) --runs when clicked on created buttons
-		
-		gdsGui_inputTxtBox_pressed (x,y,button,istouch) --runs when clicked or touched on textboxes
+		if not schematicHardMenuOpen then
+			gdsGui_button_pressed (x,y,button,istouch) --runs when clicked on created buttons
+		end
 
-		gdsGui_table_buttonsPressed (x,y,button,istouch)
+		if not schematicModalOpen then
 
-		gdsGui_scrollBar_focus ("mouse", x,y,button,istouch)
+			gdsGui_inputTxtBox_pressed (x,y,button,istouch) --runs when clicked or touched on textboxes
 
-		gdsGui_outputTxtBox_scrollbarPressed("mouse", x, y, button, istouch)
+			gdsGui_table_buttonsPressed (x,y,button,istouch)
 
-		gdsGui_rotaryKnob_pressed ("mouse", x, y)
+			gdsGui_scrollBar_focus ("mouse", x,y,button,istouch)
+
+			gdsGui_outputTxtBox_scrollbarPressed("mouse", x, y, button, istouch)
+
+			gdsGui_rotaryKnob_pressed ("mouse", x, y)
+
+		end
 
 		gdsGui_schematic_pressed ("mouse", x, y)
 
 		gdsGui_schematicGallery_pressed ("mouse", x, y)
 
-		-- Mark tables where mouse press started inside the scrollable area.
-		local activePage = gdsGui_page_currentName()
-		for _, tbl in ipairs(globApp.objects.tables) do
-			if tbl.scroll and tbl.page == activePage then
-				if x >= tbl.scrollBox.x and x <= (tbl.scrollBox.x + tbl.scrollBox.width) and
-				   y >= tbl.scrollBox.y and y <= (tbl.scrollBox.y + tbl.scrollBox.height) then
-					tbl.scroll.touchStartedInside = true
+		if not schematicModalOpen then
+
+			-- Mark tables where mouse press started inside the scrollable area.
+			local activePage = gdsGui_page_currentName()
+			for _, tbl in ipairs(globApp.objects.tables) do
+				if tbl.scroll and tbl.page == activePage then
+					if x >= tbl.scrollBox.x and x <= (tbl.scrollBox.x + tbl.scrollBox.width) and
+					   y >= tbl.scrollBox.y and y <= (tbl.scrollBox.y + tbl.scrollBox.height) then
+						tbl.scroll.touchStartedInside = true
+					end
 				end
 			end
-		end
 
-		gdsGui_container_markTouchStart(x, y)
+			gdsGui_container_markTouchStart(x, y)
 
-		if x >= .8 * globApp.safeScreenArea.xw and y >= .9 * globApp.safeScreenArea.yh then
+			if x >= .8 * globApp.safeScreenArea.xw and y >= .9 * globApp.safeScreenArea.yh then
 
-			gdsGui_dev_openByEightTap (x,y,button,istouch) -- opens and closes devPage
+				gdsGui_dev_openByEightTap (x,y,button,istouch) -- opens and closes devPage
+
+			end
 
 		end
 
@@ -967,6 +1003,16 @@ function gdsGui_general_mousereleased (x, y, button, istouch, presses)
 		return
 	end
 
+	-- Same modal flag as gdsGui_general_mousepressed above — captured
+	-- BEFORE gdsGui_schematic_released/gdsGui_schematicGallery_released run
+	-- below (they're what may actually close the menu/panel via onSelect/
+	-- onCancel), so every other control still sees "a modal owned this
+	-- release" even once it's gone.
+	local schematicModalOpen = gdsGui_schematic_isAnyMenuOpen()
+	-- Same narrower check as gdsGui_general_mousepressed above — see its
+	-- comment on gdsGui_schematic_isHardMenuOpen.
+	local schematicHardMenuOpen = gdsGui_schematic_isHardMenuOpen()
+
 	if istouch == false then
 
 		local buttonName = gdsGui_general_convertButtonNumToString (button)
@@ -982,14 +1028,16 @@ function gdsGui_general_mousereleased (x, y, button, istouch, presses)
 			-- re-hit-tested against the new page's loading-link hit box.
 			gdsGui_page_loadingTouched (x, y)
 
-			gdsGui_button_released (x, y, 1, istouch, presses)
+			if not schematicHardMenuOpen then
+				gdsGui_button_released (x, y, 1, istouch, presses)
+			end
 
 			-- gdsGui_button_released above may itself have run a callback
 			-- that opened a text prompt or choice menu (e.g.
 			-- schematicHomeNewPressed -> gdsGui_textPrompt_open). The rest
 			-- of this release must not also dispatch to table/schematic/
 			-- scrollbar/etc. handlers against the pre-modal page state.
-			if not (gdsGui_textPrompt_isOpen() or gdsGui_choiceMenu_isOpen()) then
+			if not (gdsGui_textPrompt_isOpen() or gdsGui_choiceMenu_isOpen() or schematicModalOpen) then
 
 				gdsGui_table_rowSelect (x,y,button,istouch)
 
@@ -999,9 +1047,13 @@ function gdsGui_general_mousereleased (x, y, button, istouch, presses)
 
 				gdsGui_rotaryKnob_released ("mouse")
 
-				gdsGui_schematic_released ("mouse", x, y)
+			end
 
-				gdsGui_schematicGallery_released ("mouse", x, y)
+			gdsGui_schematic_released ("mouse", x, y)
+
+			gdsGui_schematicGallery_released ("mouse", x, y)
+
+			if not (gdsGui_textPrompt_isOpen() or gdsGui_choiceMenu_isOpen() or schematicModalOpen) then
 
 				gdsGui_outputTxtBox_touchReleased ("mouse", x, y)
 				gdsGui_table_touchReleasedScroll (x, y)
@@ -1051,6 +1103,7 @@ function gdsGui_general_wheelmoved (dx, dy)
 
 	if gdsGui_textPrompt_isOpen() then return end
 	if gdsGui_choiceMenu_isOpen() then return end
+	if gdsGui_schematic_isAnyMenuOpen() then return end
 
 	local mx, my = love.mouse.getPosition()
 	gdsGui_schematic_wheelZoom (mx, my, dy)
@@ -1069,7 +1122,19 @@ function love.textinput(t)
 		return
 	end
 
+	if gdsGui_schematic_propertyGridIsActive() then
+		gdsGui_schematic_propertyGridTextInput (t)
+		return
+	end
+
 	if gdsGui_choiceMenu_isOpen() then
+		return
+	end
+
+	-- A canvas's annunciator panel or a non-propertyGrid menu (the
+	-- propertyGrid case is already handled above) is just as modal as
+	-- textPrompt/choiceMenu for keyboard input too.
+	if gdsGui_schematic_isAnyMenuOpen() then
 		return
 	end
 
@@ -1085,7 +1150,17 @@ function love.keypressed(key, unicode)
 		return
 	end
 
+	if gdsGui_schematic_propertyGridIsActive() then
+		gdsGui_schematic_propertyGridKeypressed (key)
+		return
+	end
+
 	if gdsGui_choiceMenu_isOpen() then
+		return
+	end
+
+	-- Same modal guard as love.textinput above.
+	if gdsGui_schematic_isAnyMenuOpen() then
 		return
 	end
 
@@ -1136,38 +1211,60 @@ function gdsGui_general_touchpressed (id, x, y, dx, dy, pressure)
 		return
 	end
 
+	-- Same stale-flag reset as gdsGui_general_mousepressed above — see its
+	-- comment. Must happen before schematicModalOpen below is used to skip
+	-- gdsGui_button_pressed.
+	globApp.buttonPressConsumed = false
+
+	-- Same modal flag as gdsGui_general_mousepressed above — see its
+	-- comment.
+	local schematicModalOpen = gdsGui_schematic_isAnyMenuOpen()
+	-- Same narrower check as gdsGui_general_mousepressed above — see its
+	-- comment on gdsGui_schematic_isHardMenuOpen.
+	local schematicHardMenuOpen = gdsGui_schematic_isHardMenuOpen()
+
 	local calledFunction = "touch pressed"
 
 	globApp.userInput = calledFunction -- insert code below this line to user glob var
 
-	gdsGui_button_pressed (x,y,1,true) --runs when clicked on created buttons
+	if not schematicHardMenuOpen then
+		gdsGui_button_pressed (x,y,1,true) --runs when clicked on created buttons
+	end
 
-	gdsGui_table_buttonsPressed (x,y,1,true)
+	if not schematicModalOpen then
 
-	gdsGui_scrollBar_focus (id, x,y,1,true)
+		gdsGui_table_buttonsPressed (x,y,1,true)
 
-	gdsGui_outputTxtBox_scrollbarPressed(id, x, y, 1, true)
+		gdsGui_scrollBar_focus (id, x,y,1,true)
 
-	gdsGui_rotaryKnob_pressed (id, x, y)
+		gdsGui_outputTxtBox_scrollbarPressed(id, x, y, 1, true)
+
+		gdsGui_rotaryKnob_pressed (id, x, y)
+
+	end
 
 	gdsGui_schematic_pressed (id, x, y)
 
 	gdsGui_schematicGallery_pressed (id, x, y)
 
-	gdsGui_table_rowSelect (x,y,1,true)
+	if not schematicModalOpen then
 
-	-- Mark tables where touch started inside the scrollable area.
-	local activePage = gdsGui_page_currentName()
-	for _, tbl in ipairs(globApp.objects.tables) do
-		if tbl.scroll and tbl.page == activePage then
-			if x >= tbl.scrollBox.x and x <= (tbl.scrollBox.x + tbl.scrollBox.width) and
-			   y >= tbl.scrollBox.y and y <= (tbl.scrollBox.y + tbl.scrollBox.height) then
-				tbl.scroll.touchStartedInside = true
+		gdsGui_table_rowSelect (x,y,1,true)
+
+		-- Mark tables where touch started inside the scrollable area.
+		local activePage = gdsGui_page_currentName()
+		for _, tbl in ipairs(globApp.objects.tables) do
+			if tbl.scroll and tbl.page == activePage then
+				if x >= tbl.scrollBox.x and x <= (tbl.scrollBox.x + tbl.scrollBox.width) and
+				   y >= tbl.scrollBox.y and y <= (tbl.scrollBox.y + tbl.scrollBox.height) then
+					tbl.scroll.touchStartedInside = true
+				end
 			end
 		end
-	end
 
-	gdsGui_container_markTouchStart(x, y)
+		gdsGui_container_markTouchStart(x, y)
+
+	end
 
 end
 
@@ -1180,9 +1277,18 @@ function gdsGui_general_touchmoved (id, x, y, dx, dy, pressure)
 	local slideSensitivityPixelsPositive = slideSensitivity
 	local slideSensitivityPixelsNegative = -(slideSensitivity)
 
+	-- Same modal flag as gdsGui_general_touchpressed above — see its
+	-- comment on gdsGui_general_mousepressed.
+	local schematicModalOpen = gdsGui_schematic_isAnyMenuOpen()
+	-- Same narrower check as gdsGui_general_mousepressed above — see its
+	-- comment on gdsGui_schematic_isHardMenuOpen.
+	local schematicHardMenuOpen = gdsGui_schematic_isHardMenuOpen()
+
 	-- Handle scrollbar and knob drag for this specific touch independently.
-	gdsGui_scrollBar_holdAndDrag (id, x, y, 1, true)
-	gdsGui_rotaryKnob_moved (id, x, y, dx, dy)
+	if not schematicModalOpen then
+		gdsGui_scrollBar_holdAndDrag (id, x, y, 1, true)
+		gdsGui_rotaryKnob_moved (id, x, y, dx, dy)
+	end
 	gdsGui_schematic_moved (id, x, y)
 	gdsGui_schematicGallery_moved (id, x, y)
 
@@ -1196,12 +1302,18 @@ function gdsGui_general_touchmoved (id, x, y, dx, dy, pressure)
 
 			end
 
-			gdsGui_button_released (x, y, 1, true)
+			if not schematicHardMenuOpen then
+				gdsGui_button_released (x, y, 1, true)
+			end
 
-			gdsGui_table_touchScroll (id, x, y, dx, dy, pressure, nil, true)
+			if not schematicModalOpen then
 
-			gdsGui_outputTxtBox_touchScroll (id, x, y, dx, dy, pressure, nil, true)
-			gdsGui_container_touchScroll(id, x, y, dx, dy)
+				gdsGui_table_touchScroll (id, x, y, dx, dy, pressure, nil, true)
+
+				gdsGui_outputTxtBox_touchScroll (id, x, y, dx, dy, pressure, nil, true)
+				gdsGui_container_touchScroll(id, x, y, dx, dy)
+
+			end
 
 		end
 
@@ -1225,15 +1337,22 @@ function gdsGui_general_touchreleased (id, x, y, dx, dy, pressure)
 		return
 	end
 
+	-- Same modal flag as gdsGui_general_mousereleased above — see its
+	-- comment.
+	local schematicModalOpen = gdsGui_schematic_isAnyMenuOpen()
+	-- Same narrower check as gdsGui_general_mousepressed above — see its
+	-- comment on gdsGui_schematic_isHardMenuOpen.
+	local schematicHardMenuOpen = gdsGui_schematic_isHardMenuOpen()
+
 	local calledFunction = "touch released"
 
 	if globApp.userInput == "touch pressed" then
 
 		globApp.userInput = "tap"
 
-	end 
+	end
 
-	
+
 	if 	globApp.userInput == "tap" then
 
 		-- buttons_pressed (x,y,button,istouch) --runs when clicked on created buttons
@@ -1244,11 +1363,16 @@ function gdsGui_general_touchreleased (id, x, y, dx, dy, pressure)
 		-- re-hit-tested against the new page's loading-link hit box.
 		gdsGui_page_loadingTouched (x, y)
 
-		gdsGui_button_released (x, y, 1, istouch, presses)		gdsGui_inputTxtBox_pressed (x,y,button,istouch) --runs when clicked or touched on textboxes
-		gdsGui_table_rowSelect (x,y,button,true)
+		if not schematicHardMenuOpen then
+			gdsGui_button_released (x, y, 1, istouch, presses)		gdsGui_inputTxtBox_pressed (x,y,button,istouch) --runs when clicked or touched on textboxes
+		end
 
-		if x >= .8 * globApp.safeScreenArea.xw and y >= .9 * globApp.safeScreenArea.yh then
-			gdsGui_dev_openByEightTap (x,y,button,istouch) -- opens and closes devPage
+		if not schematicModalOpen then
+			gdsGui_table_rowSelect (x,y,button,true)
+
+			if x >= .8 * globApp.safeScreenArea.xw and y >= .9 * globApp.safeScreenArea.yh then
+				gdsGui_dev_openByEightTap (x,y,button,istouch) -- opens and closes devPage
+			end
 		end
 
 	end
@@ -1259,7 +1383,7 @@ function gdsGui_general_touchreleased (id, x, y, dx, dy, pressure)
 	-- have run a callback that opened a text prompt or choice menu — see
 	-- the matching comment in gdsGui_general_mousereleased. The rest of
 	-- this release must not also dispatch against the pre-modal page state.
-	if not (gdsGui_textPrompt_isOpen() or gdsGui_choiceMenu_isOpen()) then
+	if not (gdsGui_textPrompt_isOpen() or gdsGui_choiceMenu_isOpen() or schematicModalOpen) then
 
 		gdsGui_table_buttonsReleased (x,y,button,istouch)
 
@@ -1267,9 +1391,13 @@ function gdsGui_general_touchreleased (id, x, y, dx, dy, pressure)
 
 		gdsGui_rotaryKnob_released (id)
 
-		gdsGui_schematic_released (id, x, y)
+	end
 
-		gdsGui_schematicGallery_released (id, x, y)
+	gdsGui_schematic_released (id, x, y)
+
+	gdsGui_schematicGallery_released (id, x, y)
+
+	if not (gdsGui_textPrompt_isOpen() or gdsGui_choiceMenu_isOpen() or schematicModalOpen) then
 
 		gdsGui_outputTxtBox_touchReleased (id, x, y)
 		gdsGui_table_touchReleasedScroll (x, y)
