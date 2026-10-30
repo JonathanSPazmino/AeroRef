@@ -388,6 +388,10 @@ end
 -- abbrev: the short (up to 4-letter) name the "NAME THIS ..." prompt
 -- suggests for a newly placed item, as ABBREV_N (e.g. BATT_1) — see
 -- schematicCatalogItemChosen/_suggestedPlacementName.
+-- pipeConnectors: this system's connectors draw as pipes with fluid inside
+-- (see schematic_gdsGuiLib.lua's gdsGui_schematic_setPipeConnectors), rather
+-- than as plain wires, and this is what its menus call them: PIPE for a system
+-- carrying liquid, DUCT for one carrying gas.
 local SCHEMATIC_CATALOG = {
     { system = "ELECTRICAL", items = {
         -- componentType: this item's role in the inference model's graph
@@ -482,7 +486,7 @@ local SCHEMATIC_CATALOG = {
               { x =  0.008, y = -0.18,  exitX =  0, exitY = -1, signal = true },
           } },
     }},
-    { system = "HYDRAULIC", items = {
+    { system = "HYDRAULIC", pipeConnectors = "PIPE", items = {
         -- ACCUMULATOR/PUMP mirror BATTERY/GENERATOR's own split exactly: a
         -- passive always-pressurized element (stored residual pressure,
         -- present whenever placed, like a battery) plus a pilot-switchable
@@ -522,9 +526,11 @@ local SCHEMATIC_CATALOG = {
         { label = "RESERVOIR", abbrev = "RSVR", kind = "element", shapeType = "circle",
           gridW = 3, gridH = 3, componentType = "sink" },
     }},
-    { system = "FUEL", items = {
-        { label = "FUEL TANK", abbrev = "FTNK", kind = "element", shapeType = "circle",
-          defaultProperties = {"QUANTITY"}, gridW = 3, gridH = 3, componentType = "source" },
+    { system = "FUEL", pipeConnectors = "PIPE", items = {
+        -- reshapable: its outline can be redrawn and it rotates to any angle
+        -- on the canvas — see gdsGui_schematic_setReshapableKind.
+        { label = "FUEL TANK", abbrev = "FTNK", kind = "element", shapeType = "rect",
+          defaultProperties = {"QUANTITY"}, gridW = 3, gridH = 3, componentType = "source", reshapable = true },
         -- Boost pump: mirrors HYDRAULIC's own PUMP control above (and
         -- ELECTRICAL's GENERATOR) — a pilot-switchable source, not the
         -- always-present FUEL TANK itself.
@@ -546,7 +552,7 @@ local SCHEMATIC_CATALOG = {
         { label = "ENGINE", abbrev = "ENGN", kind = "element", shapeType = "rect",
           defaultProperties = {"FUEL FLOW"}, gridW = 3, gridH = 2, componentType = "sink" },
     }},
-    { system = "BLEED AIR", items = {
+    { system = "BLEED AIR", pipeConnectors = "DUCT", items = {
         -- The engine/APU's own bleed air supply — always "there" whenever
         -- the engine's running, same always-on-when-placed role as BATTERY/
         -- FUEL TANK above (this system has no separate switchable-source
@@ -572,7 +578,7 @@ local SCHEMATIC_CATALOG = {
         { label = "BLEED VALVE", abbrev = "BVLV", kind = "control", presets = { {"CLOSED", "OPEN"} },
           spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate" },
     }},
-    { system = "PRESSURIZATION", items = {
+    { system = "PRESSURIZATION", pipeConnectors = "DUCT", items = {
         -- Converted from a static element to a control (like ELECTRICAL's
         -- own SWITCH) — a real outflow valve IS pilot-operable in MANUAL
         -- mode, not a fixed symbol. componentType = "gate": open lets
@@ -1809,6 +1815,20 @@ local function _isGenuinelyColorAmbiguous(canvas, contributingIds)
     return maxCount == 1 or topColorsDiffer
 end
 
+-- True when nodeId is an active source running in parallel with others but
+-- with none above its own voltage: its own body keeps its own color, since it
+-- isn't in any doubt about what's feeding it. Only the paths it shares get the
+-- mixed colors. Global, not local: this file sits at Lua's 200-local ceiling.
+function _sourceKeepsOwnColor(canvas, nodeId, contributingIds)
+    local entity = _findSourceEntity(canvas, nodeId)
+    if not (entity and entity.componentType == "source" and entity.voltage and contributingIds[nodeId]) then return false end
+    for id in pairs(contributingIds) do
+        local other = _findSourceEntity(canvas, id)
+        if not (other and other.voltage) or other.voltage > entity.voltage then return false end
+    end
+    return true
+end
+
 -- (The single-highest-voltage-contributor pick this same reasoning needs
 -- for canvas.voltageDominanceRule lives as a nested local inside
 -- _recomputeAttributionRules below — its only caller — rather than here
@@ -1967,13 +1987,21 @@ local function _solveCurrentSchematic()
     -- Phase 4 couldn't actually resolve.
     _relays.updateSprites(canvas, finalGateStates)
     local result = { elements = {}, wires = {}, controls = {} }
+    -- An element's/control's own body; a wire uses _colorForPoweredNode directly,
+    -- so a source's own wires still show every source sharing them.
+    local function bodyColor(id)
+        if attribution[id] and _sourceKeepsOwnColor(canvas, id, attribution[id]) then
+            return _colorForSource(canvas, _findSourceEntity(canvas, id), medium.style.powered)
+        end
+        return _colorForPoweredNode(id, attribution, canvas, medium.style.powered, nodeStates)
+    end
     for _, e in ipairs(canvas.elements) do
         local state = nodeStates[e.id]
         if state and not oscillatingIds[e.id] then
             -- An open relay's body reads gray, same as an open switch below.
             local isOpenGate = componentTypes[e.id] == "gate" and finalGateStates[e.id] ~= "closed"
             result.elements[e.id] = (state == ModelSolver.POWERED and not isOpenGate)
-                and _colorForPoweredNode(e.id, attribution, canvas, medium.style.powered, nodeStates)
+                and bodyColor(e.id)
                 or medium.style.unpowered
         end
     end
@@ -1999,7 +2027,7 @@ local function _solveCurrentSchematic()
             -- powered or not; its wires show each pole's own color.
             local isMultiPole = graph.nodes[c.id] and graph.nodes[c.id].poles
             result.controls[c.id] = (state == ModelSolver.POWERED and not isOpenGate and not isOffSource and not isMultiPole)
-                and _colorForPoweredNode(c.id, attribution, canvas, medium.style.powered, nodeStates)
+                and bodyColor(c.id)
                 or medium.style.unpowered
         end
     end
@@ -2788,6 +2816,7 @@ local function _aiColorAttributionConfidence(canvas, attribution, nodeStates, no
     if sourceStates and sourceStates[nodeId] == false then return 1 end
     local contributingIds = attribution[nodeId]
     if not contributingIds or not _isGenuinelyColorAmbiguous(canvas, contributingIds) then return 1 end
+    if _sourceKeepsOwnColor(canvas, nodeId, contributingIds) then return 1 end
 
     local rule = canvas.attributionRules and canvas.attributionRules[nodeId]
     if rule and (rule.status == "learned" or rule.status == "locked") then
@@ -3451,6 +3480,7 @@ local function _openSystemIntoCanvas(systemId, mode)
             local el = canvas.elements[#canvas.elements]
             el.voltage = e.voltage
             el.poweredColor = _deepCopyTable(e.poweredColor)
+            el.shapeRows = _deepCopyTable(e.shapeRows)
             el.busLoadAmps = e.busLoadAmps
             el.relayLogic = _deepCopyTable(e.relayLogic)
         end
@@ -3491,6 +3521,20 @@ local function _openSystemIntoCanvas(systemId, mode)
 
     schematicStore.currentSystemId = systemId
     schematicRefreshGlow()
+    local catalogEntry = sys.systemType and _findCatalogEntryForType(sys.systemType)
+    gdsGui_schematic_setPipeConnectors("mainCanvas", catalogEntry and catalogEntry.pipeConnectors)
+    local reshapableItem
+    for _, item in ipairs(catalogEntry and catalogEntry.items or {}) do
+        if item.reshapable then reshapableItem = item end
+    end
+    gdsGui_schematic_setReshapableKind("mainCanvas", reshapableItem and reshapableItem.shapeType,
+        reshapableItem and reshapableItem.componentType)
+    -- Tanks saved back when the catalog placed them as circles start square too.
+    for _, e in ipairs(canvas and canvas.elements or {}) do
+        if reshapableItem and e.componentType == reshapableItem.componentType and e.shapeType == "circle" then
+            e.shapeType = reshapableItem.shapeType
+        end
+    end
     local designing = (mode == "design")
     -- Every initial open (design or control) lands at a fixed 1.4x zoom,
     -- vertically centered (see gdsGui_schematic_resetView) rather than the
@@ -7890,6 +7934,20 @@ function colorForPoweredNode_tieEqualVoltageSharedOwnColorTest()
     return color[1] .. "," .. tostring(_isGenuinelyColorAmbiguous(canvas, contributors))
 end
 
+-- Parallel sources of one voltage keep their own colors. One below the top
+-- voltage, or sharing with a source whose voltage isn't set, doesn't.
+function sourceKeepsOwnColorTest()
+    local canvas = {
+        elements = { { id = "batt1", componentType = "source", voltage = 24 }, { id = "bus1", componentType = "path" },
+                     { id = "unset1", componentType = "source" } },
+        controls = { { id = "gen1", componentType = "source", voltage = 28 }, { id = "gen2", componentType = "source", voltage = 28 } },
+    }
+    local all = { batt1 = true, gen1 = true, gen2 = true }
+    return tostring(_sourceKeepsOwnColor(canvas, "gen1", all)) .. "," .. tostring(_sourceKeepsOwnColor(canvas, "batt1", all))
+        .. "," .. tostring(_sourceKeepsOwnColor(canvas, "bus1", all))
+        .. "," .. tostring(_sourceKeepsOwnColor(canvas, "gen1", { gen1 = true, unset1 = true }))
+end
+
 function busLoadText_setTest()
     return _busLoadText({ busLoadAmps = 42 })
 end
@@ -8367,6 +8425,154 @@ function schematicAnnunciatorColorEditTest()
         end
     end
     return -1
+end
+
+-- Builds a lone reshapable 3x3 square at the top-left of a fresh test canvas,
+-- so the real press/move/release handlers can drive it. Returns the canvas,
+-- the element, and a function that undoes the setup.
+local function _reshapeTestSetup(canvasName)
+    gdsGui_schematic_delete(canvasName)
+    gdsGui_schematic_create(canvasName, "UnitTestPage", 0, 0, "LT", 1, 1)
+    local canvas
+    for _, c in ipairs(globApp.objects.schematics) do
+        if c.name == canvasName then canvas = c end
+    end
+    -- "UnitTestPage" isn't a real page, so it's made the active one just for
+    -- this test; the handlers below skip any canvas that isn't on-screen.
+    local previousPage = globApp.currentPageIndex
+    local testPage = { index = -1, name = "UnitTestPage" }
+    table.insert(pages, testPage)
+    globApp.currentPageIndex = testPage.index
+    canvas.zoom = 8
+    gdsGui_schematic_setReshapableKind(canvasName, "rect", "source")
+    local w, h = 6 / canvas.contentW, 6 / canvas.contentH
+    gdsGui_schematic_addElement(canvasName, "tank", "rect", 0, 0, w, h, "T", nil, nil, nil, nil, "source")
+    return canvas, canvas.elements[1], function()
+        gdsGui_schematic_delete(canvasName)
+        globApp.currentPageIndex = previousPage
+        for i = #pages, 1, -1 do
+            if pages[i] == testPage then table.remove(pages, i) end
+        end
+    end
+end
+
+local function _reshapeTestTap(x, y)
+    gdsGui_schematic_pressed("t", x, y)
+    gdsGui_schematic_released("t", x, y)
+end
+
+-- Holding short of 2 seconds must not unlock anything; holding the full 2 and
+-- then tapping twice lands in reshape mode, and one more tap returns to move.
+function schematicReshapeGestureTest()
+    local canvas, tank, restore = _reshapeTestSetup("unitTestCanvasReshape1")
+    local x, y = canvas.x + canvas.panX + 24, canvas.y + canvas.panY + 24
+    local result = 1
+    gdsGui_schematic_pressed("t", x, y)
+    gdsGui_schematic_update(1.9)
+    if canvas.selectionMoveModeActive then result = -1 end
+    gdsGui_schematic_update(0.2)
+    gdsGui_schematic_released("t", x, y)
+    if not canvas.selectionMoveModeActive or canvas.reshapeModeActive then result = -2 end
+    _reshapeTestTap(x, y)
+    if not canvas.rotateModeActive or canvas.reshapeModeActive then result = -3 end
+    _reshapeTestTap(x, y)
+    if canvas.rotateModeActive or not canvas.reshapeModeActive then result = -4 end
+    _reshapeTestTap(x, y)
+    if canvas.rotateModeActive or canvas.reshapeModeActive or not canvas.selectionMoveModeActive then result = -5 end
+    restore()
+    return result
+end
+
+-- Drags corner handles through the real handlers: an outward pull grows the
+-- whole box, an inward push cuts a square notch, and undo restores the original.
+function schematicReshapeCornerDragTest()
+    local canvas, tank, restore = _reshapeTestSetup("unitTestCanvasReshape2")
+    local cell = 16 -- 2 world units per grid cell at zoom 8
+    local x0, y0 = canvas.x + canvas.panX, canvas.y + canvas.panY
+    canvas.selectedElementId = "tank"
+    canvas.selectionMoveModeActive, canvas.reshapeModeActive = true, true
+    local result = 1
+
+    -- Bottom-right corner, 2 cells right and 1 down: 3x3 becomes 5x4, in place.
+    gdsGui_schematic_pressed("t", x0 + 3 * cell, y0 + 3 * cell)
+    gdsGui_schematic_moved("t", x0 + 5 * cell, y0 + 4 * cell)
+    gdsGui_schematic_released("t", x0 + 5 * cell, y0 + 4 * cell)
+    if table.concat(tank.shapeRows or {}, "/") ~= "#####/#####/#####/#####" then result = -1 end
+    if math.abs(tank.x) > 0.0001 or math.abs(tank.y) > 0.0001 then result = -2 end
+
+    -- Top-right corner, pushed 2 left and 1 down: a square notch.
+    gdsGui_schematic_pressed("t", x0 + 5 * cell, y0)
+    gdsGui_schematic_moved("t", x0 + 3 * cell, y0 + 1 * cell)
+    gdsGui_schematic_released("t", x0 + 3 * cell, y0 + 1 * cell)
+    if table.concat(tank.shapeRows or {}, "/") ~= "###../#####/#####/#####" then result = -3 end
+
+    -- The new concave corner, pulled back into its notch, fills it again.
+    gdsGui_schematic_pressed("t", x0 + 3 * cell, y0 + 1 * cell)
+    gdsGui_schematic_moved("t", x0 + 5 * cell, y0)
+    gdsGui_schematic_released("t", x0 + 5 * cell, y0)
+    if table.concat(tank.shapeRows or {}, "/") ~= "#####/#####/#####/#####" then result = -4 end
+
+    gdsGui_schematic_undo(canvas.name)
+    gdsGui_schematic_undo(canvas.name)
+    gdsGui_schematic_undo(canvas.name)
+    if canvas.elements[1].shapeRows ~= nil or math.abs(canvas.elements[1].w * canvas.contentW - 6) > 0.0001 then result = -5 end
+    restore()
+    return result
+end
+
+-- A cut that would split the tank in two, or leave nothing, isn't a valid shape.
+function schematicReshapeRejectsSplitTest()
+    if _shapeCells.encode(_shapeCells.candidateSet(_shapeCells.parse({ "##" , "##" }), { c = 2, r = 0 }, 0, 2)) then return -1 end
+    local split = _shapeCells.candidateSet(_shapeCells.parse({ "#.#", "###" }), { c = 3, r = 2 }, 0, 1)
+    if _shapeCells.encode(split) then return -2 end
+    return 1
+end
+
+-- A wire reaching a shaped tank stops at its real body, not the bounding box.
+-- Center row of this L is 1, whose only filled cell is at the left, so a wire
+-- arriving from the right runs through the notch to that cell's right edge.
+function schematicReshapeWireEdgeTest()
+    local canvas, tank, restore = _reshapeTestSetup("unitTestCanvasReshape3")
+    tank.shapeRows = { "#..", "#..", "###" }
+    local cx, cy = tank.x + tank.w / 2, tank.y + tank.h / 2
+    local px = canvas.x + canvas.panX + cx * canvas.contentW * canvas.zoom
+    local py = canvas.y + canvas.panY + cy * canvas.contentH * canvas.zoom
+    local ex, ey = _shapeCells.edgePoint(canvas, tank, px, py, "x", 1)
+    local result = (math.abs(ex - (px - 8)) < 0.001 and math.abs(ey - py) < 0.001) and 1 or -1
+    restore()
+    return result
+end
+
+-- A tank's rotate drag lands on any whole degree (settling on a cardinal when
+-- within 3 of one), a tap's finger jitter doesn't turn it, and its hit-test and
+-- wire endpoints follow the true angle rather than its enclosing box.
+function schematicReshapeFreeRotationTest()
+    local canvas, tank, restore = _reshapeTestSetup("unitTestCanvasReshape4")
+    local cx, cy = canvas.x + canvas.panX + 24, canvas.y + canvas.panY + 24
+    local function at(deg)
+        return cx + 100 * math.cos(math.rad(deg)), cy + 100 * math.sin(math.rad(deg))
+    end
+    canvas.selectedElementId = "tank"
+    canvas.selectionMoveModeActive = true
+    local result = 1
+    gdsGui_schematic_pressed("t", cx + 16, cy)
+    gdsGui_schematic_moved("t", cx + 18, cy + 2)
+    if tank.rotation ~= 0 then result = -1 end
+    gdsGui_schematic_moved("t", at(37))
+    if tank.rotation ~= 37 then result = -2 end
+    gdsGui_schematic_moved("t", at(88))
+    if tank.rotation ~= 90 then result = -3 end
+    gdsGui_schematic_moved("t", at(45))
+    gdsGui_schematic_released("t", at(45))
+    if tank.rotation ~= 45 then result = -4 end
+    -- At 45 degrees the enclosing box's corner is empty, and the side-on tip
+    -- is half a diagonal out: 24 * sqrt(2) pixels for this 48px square.
+    if _shapeCells.containsPoint(canvas, tank, cx + 23, cy + 23) then result = -5 end
+    if not _shapeCells.containsPoint(canvas, tank, cx + 32, cy) then result = -6 end
+    local ex, ey = _shapeCells.edgePoint(canvas, tank, cx, cy, "x", 1)
+    if math.abs(ex - (cx + 24 * math.sqrt(2))) > 0.001 or math.abs(ey - cy) > 0.001 then result = -7 end
+    restore()
+    return result
 end
 
 -- Renaming to a label already in use by another annunciator (shared
@@ -9854,6 +10060,11 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcParameters"]={0},
         ["funcExpctOutput"]={"1,false"}}
 
+    gdsGui_dev_testExecute {["id"]="sourceKeepsOwnColor",
+        ["funcName"]={"sourceKeepsOwnColorTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"true,false,false,false"}}
+
     gdsGui_dev_testExecute {["id"]="busLoadText_set",
         ["funcName"]={"busLoadText_setTest"},
         ["funcParameters"]={0},
@@ -9908,6 +10119,31 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcName"]={"schematicAnnunciatorRenameTest"},
         ["funcParameters"]={0},
         ["funcExpctOutput"]={"FIRE WARN"}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_reshape_holdThenTwoTapsEntersMode",
+        ["funcName"]={"schematicReshapeGestureTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_reshape_cornerDragGrowsAndNotches",
+        ["funcName"]={"schematicReshapeCornerDragTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_reshape_rejectsSplitShapes",
+        ["funcName"]={"schematicReshapeRejectsSplitTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_reshape_wireStopsAtRealBody",
+        ["funcName"]={"schematicReshapeWireEdgeTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_reshape_tankRotatesToAnyAngle",
+        ["funcName"]={"schematicReshapeFreeRotationTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
 
     gdsGui_dev_testExecute {["id"]="schematic_annunciatorEditMenu_recolors",
         ["funcName"]={"schematicAnnunciatorColorEditTest"},

@@ -814,9 +814,10 @@ local function _elementCenter(canvas, e)
 end
 
 -- True for a quarter-turn (90 or 270, mod 360) — the only rotations
--- (alongside 0/180, which leave w/h as-is) a rotatable element ever sits at
--- (see _snapRotationDegrees), and the only ones where its own axis-aligned
--- footprint comes out with width/height swapped from its stored w/h.
+-- (alongside 0/180, which leave w/h as-is) a rotatable element sits at unless
+-- it's reshapable (see _snapRotationDegrees, _shapeCells.freeRotationDegrees),
+-- and the only ones where its own axis-aligned footprint comes out with
+-- width/height swapped from its stored w/h.
 local function _isQuarterTurnRotation(rotationDeg)
     return ((rotationDeg or 0) % 180) == 90
 end
@@ -825,15 +826,20 @@ end
 -- hit-test/collision/selection site should measure against, as opposed to
 -- _elementPixelRect's own ew,eh, which stay the UNROTATED local dimensions
 -- the draw-time push/rotate transform expects (see _drawElement's
--- drawShapeWithColor). Since rotation is always a cardinal turn, a quarter
--- turn's real footprint is exactly its stored box with width/height
--- swapped — no approximation needed, unlike a true arbitrary-angle OBB.
--- Center stays the same point either way, so it's computed off the
+-- drawShapeWithColor). A quarter turn's real footprint is exactly its stored
+-- box with width/height swapped; a reshapable element at any other angle gets
+-- the box enclosing it, and its own cells do the exact hit/collision tests
+-- (see _shapeCells). Center stays the same point either way, so it's computed off the
 -- original (unswapped) box before swapping.
 local function _elementFootprintRect(canvas, e)
     local ex, ey, ew, eh = _elementPixelRect(canvas, e)
     local cx, cy = ex + ew / 2, ey + eh / 2
-    if _isQuarterTurnRotation(e.rotation) then ew, eh = eh, ew end
+    if _isQuarterTurnRotation(e.rotation) then
+        ew, eh = eh, ew
+    elseif (e.rotation or 0) % 90 ~= 0 then
+        local cosR, sinR = _shapeCells.cosSin(e.rotation)
+        ew, eh = math.abs(ew * cosR) + math.abs(eh * sinR), math.abs(ew * sinR) + math.abs(eh * cosR)
+    end
     return cx - ew / 2, cy - eh / 2, ew, eh
 end
 
@@ -845,6 +851,360 @@ local function _anchorCenter(canvas, anchor)
         return _elementCenter(canvas, anchor)
     end
     return _toPixel(canvas, anchor.x, anchor.y)
+end
+
+-- RESHAPABLE ELEMENTS: an element whose kind the app has named (see
+-- gdsGui_schematic_setReshapableKind — e.g. a fuel tank) can have its outline
+-- redrawn in a third gesture mode after move and rotate. Its shape is stored
+-- as e.shapeRows, one string per grid-unit row with "#" for a filled cell and
+-- "." for an empty one ({"###", "#..", "#.."} is an L), always trimmed to the
+-- filled cells' own bounding box — which e.x/y/w/h keep tracking, so every
+-- bounding-box consumer (rotation, label, move arrows) just keeps working.
+-- Whole cells are why every corner stays square. nil until the first real
+-- edit, so an untouched element keeps drawing as its own plain shapeType.
+-- Global for the same 200-local ceiling as _propertyGrid below.
+_shapeCells = {}
+_shapeCells.HOLD_SECONDS = 2    -- the hold that unlocks a reshapable element's modes, in place of _LONG_PRESS_SECONDS
+_shapeCells.HANDLE_HIT_PX = 14  -- reach of a corner handle, in screen pixels (not zoom-scaled, so a fingertip always fits)
+_shapeCells.parsedCache = setmetatable({}, { __mode = "k" })
+
+-- Decoded shapeRows, cached per table (each edit stores a brand-new one):
+-- set[r][c] for the filled cells, runs (each row's filled spans, half-open
+-- c0..c1), edges (every boundary cell side), corners (the draggable vertices).
+function _shapeCells.parse(rows)
+    local p = _shapeCells.parsedCache[rows]
+    if p then return p end
+    p = { rows = #rows, cols = #rows[1], set = {}, runs = {}, edges = {}, corners = {} }
+    for r = 0, p.rows - 1 do
+        local line, row, runStart = rows[r + 1], {}, nil
+        p.set[r] = row
+        for c = 0, p.cols do
+            local isFilled = line:sub(c + 1, c + 1) == "#"
+            if isFilled then row[c] = true end
+            if isFilled and not runStart then
+                runStart = c
+            elseif runStart and not isFilled then
+                table.insert(p.runs, { c0 = runStart, c1 = c, r = r })
+                runStart = nil
+            end
+        end
+    end
+    local has = _shapeCells.has
+    for r = 0, p.rows - 1 do
+        for c = 0, p.cols - 1 do
+            if has(p.set, c, r) then
+                if not has(p.set, c, r - 1) then table.insert(p.edges, { c, r, c + 1, r }) end
+                if not has(p.set, c, r + 1) then table.insert(p.edges, { c, r + 1, c + 1, r + 1 }) end
+                if not has(p.set, c - 1, r) then table.insert(p.edges, { c, r, c, r + 1 }) end
+                if not has(p.set, c + 1, r) then table.insert(p.edges, { c + 1, r, c + 1, r + 1 }) end
+            end
+        end
+    end
+    for r = 0, p.rows do
+        for c = 0, p.cols do
+            local count = _shapeCells.filledAround(p.set, c, r)
+            if count == 1 or count == 3 then table.insert(p.corners, { c = c, r = r }) end
+        end
+    end
+    _shapeCells.parsedCache[rows] = p
+    return p
+end
+
+function _shapeCells.has(set, c, r)
+    return set[r] ~= nil and set[r][c] == true
+end
+
+-- How many of the 4 cells meeting at grid vertex (c,r) are filled: 1 is a
+-- convex corner, 3 a concave one, 2 a straight edge (or a diagonal pinch).
+function _shapeCells.filledAround(set, c, r)
+    local count = 0
+    for _, q in ipairs({ { c - 1, r - 1 }, { c, r - 1 }, { c - 1, r }, { c, r } }) do
+        if _shapeCells.has(set, q[1], q[2]) then count = count + 1 end
+    end
+    return count
+end
+
+-- The kind check behind every reshape gesture (see gdsGui_schematic_setReshapableKind).
+function _shapeCells.allowed(canvas, e)
+    local kind = canvas.reshapableKind
+    return kind ~= nil and e.shapeType == kind.shapeType and e.componentType == kind.componentType
+end
+
+-- The element in reshape mode right now, or nil.
+function _shapeCells.activeTarget(canvas)
+    if not (canvas.reshapeModeActive and canvas.selectionMoveModeActive and canvas.selectedElementId) then return nil end
+    local e = _findElement(canvas, canvas.selectedElementId)
+    return (e and _shapeCells.allowed(canvas, e)) and e or nil
+end
+
+-- e.shapeRows, or the full box a not-yet-edited element's first edit starts from.
+function _shapeCells.rowsOf(canvas, e)
+    if e.shapeRows then return e.shapeRows end
+    local cols = math.max(1, math.floor(e.w * canvas.contentW / _GRID_SPACING_PX + 0.5))
+    local rowCount = math.max(1, math.floor(e.h * canvas.contentH / _GRID_SPACING_PX + 0.5))
+    local rows = {}
+    for r = 1, rowCount do rows[r] = string.rep("#", cols) end
+    return rows
+end
+
+-- A cardinal turn rounds to exact 0/1/-1 rather than carrying float noise into
+-- wire endpoints, which is what keeps a straight wire exactly straight.
+function _shapeCells.cosSin(rotationDeg)
+    local a = math.rad(rotationDeg or 0)
+    if (rotationDeg or 0) % 90 == 0 then
+        return math.floor(math.cos(a) + 0.5), math.floor(math.sin(a) + 0.5)
+    end
+    return math.cos(a), math.sin(a)
+end
+
+-- A reshapable element's rotate drag: any whole degree, except that within 3
+-- degrees of a cardinal it settles on the cardinal, so getting a tank back to
+-- exactly square with the grid doesn't take a steady hand.
+function _shapeCells.freeRotationDegrees(angleRad)
+    local deg = math.deg(angleRad) % 360
+    local cardinal = math.floor(deg / 90 + 0.5) * 90
+    if math.abs(deg - cardinal) <= 3 then return cardinal % 360 end
+    return math.floor(deg + 0.5) % 360
+end
+
+-- Grid-vertex coordinates (lx,ly, 0..cols/0..rows) to screen pixels, for a
+-- shape centered at cx,cy with cells cw x ch pixels — and back again.
+function _shapeCells.toWorld(cx, cy, cw, ch, p, rotationDeg, lx, ly)
+    local cosR, sinR = _shapeCells.cosSin(rotationDeg)
+    local dx, dy = (lx - p.cols / 2) * cw, (ly - p.rows / 2) * ch
+    return cx + dx * cosR - dy * sinR, cy + dx * sinR + dy * cosR
+end
+
+function _shapeCells.toLocal(cx, cy, cw, ch, p, rotationDeg, x, y)
+    local cosR, sinR = _shapeCells.cosSin(rotationDeg)
+    local dx, dy = x - cx, y - cy
+    return (dx * cosR + dy * sinR) / cw + p.cols / 2, (-dx * sinR + dy * cosR) / ch + p.rows / 2
+end
+
+-- An element's live frame: center, cell size in pixels, and parsed shape.
+function _shapeCells.frame(canvas, e)
+    local ex, ey, ew, eh = _elementPixelRect(canvas, e)
+    local p = _shapeCells.parse(_shapeCells.rowsOf(canvas, e))
+    return ex + ew / 2, ey + eh / 2, ew / p.cols, eh / p.rows, p
+end
+
+function _shapeCells.containsPoint(canvas, e, x, y)
+    local cx, cy, cw, ch, p = _shapeCells.frame(canvas, e)
+    local lx, ly = _shapeCells.toLocal(cx, cy, cw, ch, p, e.rotation, x, y)
+    return _shapeCells.has(p.set, math.floor(lx), math.floor(ly))
+end
+
+-- Calls fn(centerX, centerY, halfX, halfY) with screen-axis-aligned boxes that
+-- together cover the shape, stopping at and returning whatever fn first returns
+-- truthy. Each row span is one exact box at a cardinal turn; at any other angle
+-- each cell gets its own enclosing box, which stays much tighter around the
+-- shape than one enclosing a long diagonal span would.
+function _shapeCells.eachSpanBox(p, cx, cy, cw, ch, rotationDeg, fn)
+    local perCell = (rotationDeg or 0) % 90 ~= 0
+    for _, run in ipairs(p.runs) do
+        local c0 = run.c0
+        while c0 < run.c1 do
+            local c1 = perCell and (c0 + 1) or run.c1
+            local minX, maxX, minY, maxY
+            for _, vertex in ipairs({ { c0, run.r }, { c1, run.r }, { c0, run.r + 1 }, { c1, run.r + 1 } }) do
+                local x, y = _shapeCells.toWorld(cx, cy, cw, ch, p, rotationDeg, vertex[1], vertex[2])
+                minX, maxX = math.min(minX or x, x), math.max(maxX or x, x)
+                minY, maxY = math.min(minY or y, y), math.max(maxY or y, y)
+            end
+            local hit, extra = fn((minX + maxX) / 2, (minY + maxY) / 2, (maxX - minX) / 2, (maxY - minY) / 2)
+            if hit then return hit, extra end
+            c0 = c1
+        end
+    end
+    return false
+end
+
+-- Where a wire running along axis ("x"/"y") in direction sign, through the
+-- point x,y, should stop on this shape: the outermost point of that line on any
+-- filled cell, on the side the wire is arriving from, so a wire whose box center
+-- sits in a cut-away notch runs on through the notch to the tank's actual body.
+-- Only a rotated shape's line can miss every cell, and then the wire just runs
+-- to x,y itself.
+function _shapeCells.edgePoint(canvas, e, x, y, axis, sign)
+    local cx, cy, cw, ch, p = _shapeCells.frame(canvas, e)
+    local lx, ly = _shapeCells.toLocal(cx, cy, cw, ch, p, e.rotation, x, y)
+    local cosR, sinR = _shapeCells.cosSin(e.rotation)
+    local dirX, dirY = (axis == "x") and sign or 0, (axis == "y") and sign or 0
+    local stepC, stepR = (dirX * cosR + dirY * sinR) / cw, (-dirX * sinR + dirY * cosR) / ch
+    local best
+    for _, run in ipairs(p.runs) do
+        local tMin, tMax = -math.huge, math.huge
+        for _, slab in ipairs({ { lx, stepC, run.c0, run.c1 }, { ly, stepR, run.r, run.r + 1 } }) do
+            local from, step, low, high = slab[1], slab[2], slab[3], slab[4]
+            if step ~= 0 then
+                local t1, t2 = (low - from) / step, (high - from) / step
+                tMin, tMax = math.max(tMin, math.min(t1, t2)), math.min(tMax, math.max(t1, t2))
+            elseif from < low or from > high then
+                tMax = -math.huge
+            end
+        end
+        if tMin <= tMax and (not best or tMax > best) then best = tMax end
+    end
+    if not best then return x, y end
+    return _shapeCells.toWorld(cx, cy, cw, ch, p, e.rotation, lx + best * stepC, ly + best * stepR)
+end
+
+-- Filled body and white outline, in the caller's already centered+rotated
+-- space; r,g,b,a is the fill, outlineAlpha the outline (0 for a glow halo).
+function _shapeCells.drawLocal(e, ew, eh, r, g, b, a, outlineAlpha)
+    local p = _shapeCells.parse(e.shapeRows)
+    local cw, ch = ew / p.cols, eh / p.rows
+    love.graphics.setColor(r, g, b, a)
+    for _, run in ipairs(p.runs) do
+        love.graphics.rectangle("fill", -ew / 2 + run.c0 * cw, -eh / 2 + run.r * ch, (run.c1 - run.c0) * cw, ch)
+    end
+    love.graphics.setColor(1, 1, 1, outlineAlpha)
+    _shapeCells.strokeEdges(p, ew, eh)
+end
+
+function _shapeCells.strokeEdges(p, ew, eh)
+    local cw, ch = ew / p.cols, eh / p.rows
+    for _, edge in ipairs(p.edges) do
+        love.graphics.line(-ew / 2 + edge[1] * cw, -eh / 2 + edge[2] * ch, -ew / 2 + edge[3] * cw, -eh / 2 + edge[4] * ch)
+    end
+end
+
+-- The selection/collision outline: the shape's real boundary, in whatever
+-- color the caller has set — the shaped counterpart of _drawElement's plain
+-- footprint rectangle.
+function _shapeCells.strokeOutline(canvas, e)
+    local ex, ey, ew, eh = _elementPixelRect(canvas, e)
+    love.graphics.push()
+    love.graphics.translate(ex + ew / 2, ey + eh / 2)
+    love.graphics.rotate(math.rad(e.rotation or 0))
+    _shapeCells.strokeEdges(_shapeCells.parse(e.shapeRows), ew, eh)
+    love.graphics.pop()
+end
+
+-- Reshape-mode affordance: a square handle on every draggable corner.
+function _shapeCells.drawHandles(canvas, e)
+    local cx, cy, cw, ch, p = _shapeCells.frame(canvas, e)
+    local half = math.max(3, 0.7 * canvas.zoom)
+    love.graphics.setColor(1, 0, 1, 1)
+    for _, corner in ipairs(p.corners) do
+        local x, y = _shapeCells.toWorld(cx, cy, cw, ch, p, e.rotation, corner.c, corner.r)
+        love.graphics.rectangle("fill", x - half, y - half, half * 2, half * 2)
+    end
+end
+
+-- The corner handle under a press, nearest first, or nil.
+function _shapeCells.cornerAt(canvas, e, x, y)
+    local cx, cy, cw, ch, p = _shapeCells.frame(canvas, e)
+    local best, bestDist = nil, _shapeCells.HANDLE_HIT_PX
+    for _, corner in ipairs(p.corners) do
+        local hx, hy = _shapeCells.toWorld(cx, cy, cw, ch, p, e.rotation, corner.c, corner.r)
+        local dist = math.sqrt((hx - x) ^ 2 + (hy - y) ^ 2)
+        if dist <= bestDist then best, bestDist = corner, dist end
+    end
+    return best
+end
+
+function _shapeCells.beginDrag(canvas, e, corner)
+    canvas._shapeDrag = {
+        c = corner.c, r = corner.r, rows = _shapeCells.rowsOf(canvas, e), originalRows = e.shapeRows,
+        x = e.x, y = e.y, w = e.w, h = e.h,
+    }
+end
+
+-- Fills the half-open rectangle between grid vertices (c1,r1) and (c2,r2).
+function _shapeCells.setRect(set, c1, r1, c2, r2, value)
+    for r = math.min(r1, r2), math.max(r1, r2) - 1 do
+        set[r] = set[r] or {}
+        for c = math.min(c1, c2), math.max(c1, c2) - 1 do set[r][c] = value end
+    end
+end
+
+-- The cell set a drag from drag.c,drag.r to grid vertex (fc,fr) produces.
+-- Pushing a corner into the body cuts a square notch out of it. Pulling a
+-- concave corner into its empty quadrant fills that rectangle in. Pulling a
+-- convex corner outward carries its two edges along with it, the way a
+-- rectangle's corner handle works in any drawing program, so a plain tank
+-- just grows into a bigger plain tank. Any axis of a pull that points inward
+-- is ignored rather than undoing the other axis's growth.
+function _shapeCells.candidateSet(p, drag, fc, fr)
+    local set = {}
+    for r, row in pairs(p.set) do
+        set[r] = {}
+        for c in pairs(row) do set[r][c] = true end
+    end
+    local has = _shapeCells.has
+    local vc, vr = drag.c, drag.r
+    local dc, dr = fc - vc, fr - vr
+    if dc == 0 and dr == 0 then return set end
+    local qc = (dc > 0) and vc or (vc - 1)
+    local qr = (dr > 0) and vr or (vr - 1)
+    if dc ~= 0 and dr ~= 0 and has(p.set, qc, qr) then
+        _shapeCells.setRect(set, vc, vr, fc, fr, nil)
+    elseif _shapeCells.filledAround(p.set, vc, vr) == 3 then
+        if dc ~= 0 and dr ~= 0 then _shapeCells.setRect(set, vc, vr, fc, fr, true) end
+    else
+        -- Convex: (oc,or) is the one filled cell at this vertex; (outC,outR)
+        -- point away from it. Each edge is walked back from the corner for as
+        -- long as it stays a boundary, then pushed out to the finger.
+        local oc = has(p.set, vc, vr) and vc or (has(p.set, vc, vr - 1) and vc or (vc - 1))
+        local or_ = has(p.set, oc, vr) and vr or (vr - 1)
+        local outC, outR = (oc == vc) and -1 or 1, (or_ == vr) and -1 or 1
+        local pullC, pullR = dc * outC > 0, dr * outR > 0
+        if pullC then
+            local r = or_
+            while has(p.set, oc, r) and not has(p.set, oc + outC, r) do
+                _shapeCells.setRect(set, vc, r, fc, r + 1, true)
+                r = r - outR
+            end
+        end
+        if pullR then
+            local c = oc
+            while has(p.set, c, or_) and not has(p.set, c, or_ + outR) do
+                _shapeCells.setRect(set, c, vr, c + 1, fr, true)
+                c = c - outC
+            end
+        end
+        if pullC and pullR then _shapeCells.setRect(set, vc, vr, fc, fr, true) end
+    end
+    return set
+end
+
+-- A cell set as trimmed shapeRows plus its box's min corner, or nil if it's
+-- empty or split into more than one piece.
+function _shapeCells.encode(set)
+    local minC, maxC, minR, maxR, startC, startR
+    local total = 0
+    for r, row in pairs(set) do
+        for c in pairs(row) do
+            total = total + 1
+            startC, startR = c, r
+            minC, maxC = math.min(minC or c, c), math.max(maxC or c, c)
+            minR, maxR = math.min(minR or r, r), math.max(maxR or r, r)
+        end
+    end
+    if total == 0 then return nil end
+    local seen, stack, reached = {}, { { startC, startR } }, 0
+    while #stack > 0 do
+        local cell = table.remove(stack)
+        local c, r = cell[1], cell[2]
+        seen[r] = seen[r] or {}
+        if _shapeCells.has(set, c, r) and not seen[r][c] then
+            seen[r][c] = true
+            reached = reached + 1
+            table.insert(stack, { c + 1, r })
+            table.insert(stack, { c - 1, r })
+            table.insert(stack, { c, r + 1 })
+            table.insert(stack, { c, r - 1 })
+        end
+    end
+    if reached ~= total then return nil end
+    local rows = {}
+    for r = minR, maxR do
+        local chars = {}
+        for c = minC, maxC do chars[#chars + 1] = _shapeCells.has(set, c, r) and "#" or "." end
+        rows[#rows + 1] = table.concat(chars)
+    end
+    return rows, minC, minR
 end
 
 -- True if a candidate footprint (cx,cy = pixel-space center, halfX,halfY =
@@ -873,7 +1233,15 @@ end
 local function _footprintOverlapsAnother(canvas, cx, cy, halfX, halfY, excludeId)
     local bufferPx = 1 * _GRID_SPACING_PX * canvas.zoom -- 1 grid unit of required gap
     for _, e in ipairs(canvas.elements) do
-        if e.id ~= excludeId then
+        if e.id ~= excludeId and e.shapeRows then
+            -- A shaped element only blocks where it's actually filled, so
+            -- something can sit in a notch cut out of it.
+            local ecx, ecy, cw, ch, p = _shapeCells.frame(canvas, e)
+            local hit = _shapeCells.eachSpanBox(p, ecx, ecy, cw, ch, e.rotation, function(sx, sy, sHalfX, sHalfY)
+                return math.abs(cx - sx) < halfX + sHalfX + bufferPx and math.abs(cy - sy) < halfY + sHalfY + bufferPx
+            end)
+            if hit then return true, e end
+        elseif e.id ~= excludeId then
             local ex, ey, ew, eh = _elementFootprintRect(canvas, e)
             local ecx, ecy, ehalfX, ehalfY = ex + ew / 2, ey + eh / 2, ew / 2, eh / 2
             if math.abs(cx - ecx) < halfX + ehalfX + bufferPx and math.abs(cy - ecy) < halfY + ehalfY + bufferPx then
@@ -893,6 +1261,63 @@ local function _footprintOverlapsAnother(canvas, cx, cy, halfX, halfY, excludeId
     return false
 end
 
+-- The same check for a shaped element about to sit at center cx,cy with cells
+-- cw x ch pixels: each of its filled spans is its own candidate footprint.
+function _shapeCells.blockedAt(canvas, elem, p, cx, cy, cw, ch, rotationDeg)
+    return _shapeCells.eachSpanBox(p, cx, cy, cw, ch, rotationDeg, function(sx, sy, sHalfX, sHalfY)
+        return _footprintOverlapsAnother(canvas, sx, sy, sHalfX, sHalfY, elem.id)
+    end)
+end
+
+-- Applies the current finger position to an in-progress corner drag. Always
+-- recomputed from the shape the press started on (canvas._shapeDrag), so
+-- dragging back undoes the change live; a result that's split in two, off the
+-- canvas, or on top of a neighbor simply isn't applied — same "stops at the
+-- obstacle" feel as a move drag. Returns true once e differs from that start.
+function _shapeCells.updateDrag(canvas, e, x, y)
+    local drag = canvas._shapeDrag
+    local p = _shapeCells.parse(drag.rows)
+    local bx, by = _toPixel(canvas, drag.x, drag.y)
+    local bw, bh = drag.w * canvas.contentW * canvas.zoom, drag.h * canvas.contentH * canvas.zoom
+    local bcx, bcy, cw, ch = bx + bw / 2, by + bh / 2, bw / p.cols, bh / p.rows
+    local lx, ly = _shapeCells.toLocal(bcx, bcy, cw, ch, p, e.rotation, x, y)
+    local fc, fr = math.floor(lx + 0.5), math.floor(ly + 0.5)
+    local rows, minC, minR = _shapeCells.encode(_shapeCells.candidateSet(p, drag, fc, fr))
+    canvas.collidingObstacleId = nil
+    if not rows then return false end
+    if table.concat(rows, "\n") == table.concat(drag.rows, "\n") then
+        e.shapeRows, e.x, e.y, e.w, e.h = drag.originalRows, drag.x, drag.y, drag.w, drag.h
+        return false
+    end
+    local np = _shapeCells.parse(rows)
+    -- Where the new box's center lands, keeping every surviving cell exactly
+    -- where it already was on screen.
+    local ncx, ncy = _shapeCells.toWorld(bcx, bcy, cw, ch, p, e.rotation, minC + np.cols / 2, minR + np.rows / 2)
+    local cosR, sinR = _shapeCells.cosSin(e.rotation)
+    cosR, sinR = math.abs(cosR), math.abs(sinR)
+    local newW, newH = np.cols * cw, np.rows * ch
+    local halfX, halfY = (newW * cosR + newH * sinR) / 2, (newW * sinR + newH * cosR) / 2
+    local baseHalfX, baseHalfY = (bw * cosR + bh * sinR) / 2, (bw * sinR + bh * cosR) / 2
+    -- Canvas bounds, world-space. A tank already poking past an edge (only
+    -- its center is ever clamped — see _snapToGrid) can still be edited.
+    local originX, originY = _toPixel(canvas, 0, 0)
+    local maxX, maxY = _toPixel(canvas, 1, 1)
+    if ncx - halfX < math.min(originX, bcx - baseHalfX) - 0.001 or ncx + halfX > math.max(maxX, bcx + baseHalfX) + 0.001 or
+       ncy - halfY < math.min(originY, bcy - baseHalfY) - 0.001 or ncy + halfY > math.max(maxY, bcy + baseHalfY) + 0.001 then
+        return false
+    end
+    local blocked, obstacle = _shapeCells.blockedAt(canvas, e, np, ncx, ncy, cw, ch, e.rotation)
+    if blocked then
+        canvas.collidingObstacleId = obstacle and obstacle.id or nil
+        return false
+    end
+    local fracW, fracH = np.cols * drag.w / p.cols, np.rows * drag.h / p.rows
+    local cfx, cfy = _toFraction(canvas, ncx, ncy)
+    e.shapeRows, e.w, e.h = rows, fracW, fracH
+    e.x, e.y = cfx - fracW / 2, cfy - fracH / 2
+    return true
+end
+
 -- Wire-terminal helpers for a control with its own `terminals` list (see
 -- gdsGui_schematic_addControl), e.g. a DPST switch's 4 lugs — one table of
 -- functions, defined just below _hitControl (and _terminals.segments after
@@ -907,6 +1332,8 @@ local _choiceGrid = {}
 _propertyGrid = {}
 -- The powered-glow helpers (see gdsGui_schematic_setGlow).
 local _glow = {}
+-- The pipe-connector helpers (see gdsGui_schematic_setPipeConnectors).
+local _pipes = {}
 
 -- Pivot point for the "spin to set direction" drag on an already-selected
 -- wire — the midpoint between its two ends (anchor centers, or the
@@ -926,7 +1353,8 @@ local function _hitElement(canvas, px, py)
     for i = #canvas.elements, 1, -1 do
         local e = canvas.elements[i]
         local ex, ey, ew, eh = _elementFootprintRect(canvas, e)
-        if px >= ex and px <= ex + ew and py >= ey and py <= ey + eh then
+        if px >= ex and px <= ex + ew and py >= ey and py <= ey + eh
+           and (not e.shapeRows or _shapeCells.containsPoint(canvas, e, px, py)) then
             return e
         end
     end
@@ -1132,6 +1560,11 @@ function gdsGui_schematic_create(name, page, x, y, anchorPoint, wFrac, hFrac)
     -- (4 edge arrows) to "drag to rotate" (ring arrow). Reset alongside
     -- selectionMoveModeActive everywhere above/below it clears.
     canvas.rotateModeActive = false
+    -- The third stop on that same tap cycle, for a reshapable element only
+    -- (see _shapeCells): move -> rotate -> reshape -> move.
+    canvas.reshapeModeActive = false
+    canvas.reshapableKind    = nil   -- see gdsGui_schematic_setReshapableKind
+    canvas._shapeDrag        = nil   -- start-of-gesture state while dragKind is "reshape"
     canvas.wireToolActive    = false
     canvas.wireTool          = { fromId = nil, curX = nil, curY = nil, color = nil }
     canvas.defaultConnectorColor = nil  -- see gdsGui_schematic_setDefaultConnectorColor
@@ -1140,7 +1573,7 @@ function gdsGui_schematic_create(name, page, x, y, anchorPoint, wFrac, hFrac)
     canvas.cornerRightBackgroundImagePath = nil  -- see gdsGui_schematic_setCornerRightBackgroundImage
     canvas.cornerTopRightBackgroundImagePath = nil  -- see gdsGui_schematic_setCornerTopRightBackgroundImage
     canvas.focusTouchId      = nil
-    canvas.dragKind          = nil   -- "element" | "control" | "wire" | "wireDirection" | "rotate" | "controlRotate" | "pendingLongPress" | "pan" | nil
+    canvas.dragKind          = nil   -- "element" | "control" | "wire" | "wireDirection" | "rotate" | "controlRotate" | "reshape" | "reshapeEnter" | "pendingLongPress" | "pan" | nil
     canvas.dragOffsetX       = 0
     canvas.dragOffsetY       = 0
     canvas.dragStartX        = 0
@@ -1378,6 +1811,7 @@ function gdsGui_schematic_setMode(canvasName, mode)
     canvas._pendingDragUndoSnapshot = nil
     canvas.selectionMoveModeActive = false
     canvas.rotateModeActive = false
+    canvas.reshapeModeActive = false
     -- Selection is a design-mode-only concept (every selection-driven drag/
     -- menu branch above gates on canvas.mode == "design") -- leaving an
     -- element/wire selected while switching into control mode would keep it
@@ -3893,7 +4327,7 @@ function gdsGui_schematic_openElementEditMenu(canvasName, elementId)
     local el = _findElement(canvas, elementId)
     if not el then return end
     canvas._elementEditTargetId = elementId
-    local options = {"ADD WIRE", "RENAME", "PROPERTIES", "DELETE"}
+    local options = {_pipes.addLabel(canvas), "RENAME", "PROPERTIES", "DELETE"}
     local title = el.label or elementId
     -- canvas.elementMenuTitleSuffix (optional, by-name like every other
     -- string-registered hook): called as fn(canvasName, elementId) just
@@ -3916,7 +4350,7 @@ function gdsGui_schematic_internal_onElementEditChosen(canvasName, index, option
     local canvas = _findCanvas(canvasName)
     if not canvas or not canvas._elementEditTargetId then return end
     local elementId = canvas._elementEditTargetId
-    if optionText == "ADD WIRE" then
+    if optionText == _pipes.addLabel(canvas) then
         -- ADD WIRE tapped: arm a one-shot wire-drag whose fixed start is
         -- this element (see canvas.pendingWireFromId in
         -- gdsGui_schematic_pressed) — keeps it selected (highlighted)
@@ -4052,11 +4486,11 @@ function gdsGui_schematic_openWireEditMenu(canvasName, wireId)
     -- noDelete: an app-set flag for an item that only goes away along with
     -- whatever owns it (e.g. a relay's command wire and switch).
     if w.noDelete then
-        gdsGui_schematic_openMenu(canvasName, "WIRE: " .. wireId .. "\nCan't be deleted on its own — delete the item it belongs to.",
+        gdsGui_schematic_openMenu(canvasName, _pipes.noun(canvas) .. ": " .. wireId .. "\nCan't be deleted on its own — delete the item it belongs to.",
             {"OK"}, "gdsGui_schematic_internal_onWireEditCancelled", "gdsGui_schematic_internal_onWireEditCancelled")
         return
     end
-    gdsGui_schematic_openMenu(canvasName, "WIRE: " .. wireId, {"DELETE"},
+    gdsGui_schematic_openMenu(canvasName, _pipes.noun(canvas) .. ": " .. wireId, {"DELETE"},
         "gdsGui_schematic_internal_onWireEditChosen", "gdsGui_schematic_internal_onWireEditCancelled", 1)
 end
 
@@ -4119,7 +4553,7 @@ function gdsGui_schematic_openControlEditMenu(canvasName, controlId)
     -- below) — opens _openPropertiesMenu, the same grid used to edit any
     -- element/control's custom properties (and a source control's own
     -- POWERED COLOR row — see _openPropertiesMenu's own comment).
-    local options = ctrl.noAddWire and {} or {"ADD WIRE"}
+    local options = ctrl.noAddWire and {} or {_pipes.addLabel(canvas)}
     table.insert(options, "PROPERTIES")
     for _, p in ipairs(ctrl.positions) do table.insert(options, p) end
     -- No DELETE for a noDelete control (see openWireEditMenu).
@@ -4955,10 +5389,7 @@ end
 -- it under each band means every shape (sprite-tinted or hand-drawn)
 -- stripes correctly with no shape-specific duplication.
 --
--- horizontalBands (optional): bands stack top-to-bottom instead of sitting
--- side-by-side left-to-right — pick whichever axis has the greater extent
--- so a dash pattern is actually visible regardless of a wire's own
--- orientation (see _drawWire). Scissor coordinates are always screen-space
+-- Scissor coordinates are always screen-space
 -- in LÖVE regardless of the current transform, so this always stripes in
 -- SCREEN-space bands, not rotated with the element — a deliberate
 -- simplification (this is a rare ambiguity indicator, not core rendering)
@@ -4968,17 +5399,12 @@ end
 -- caveat as any nested love.graphics.setScissor call.
 -- 6: inlined rather than a named constant purely to stay under this
 -- file's 200-local ceiling.
-local function _drawColorSequenceStriped(boundsX, boundsY, boundsW, boundsH, colors, drawFn, horizontalBands)
+local function _drawColorSequenceStriped(boundsX, boundsY, boundsW, boundsH, colors, drawFn)
     local prevScX, prevScY, prevScW, prevScH = love.graphics.getScissor()
     for i = 0, 6 - 1 do
         local c = colors[(i % #colors) + 1]
-        if horizontalBands then
-            local bandH = boundsH / 6
-            love.graphics.setScissor(boundsX, boundsY + i * bandH, boundsW, bandH + 1)
-        else
-            local bandW = boundsW / 6
-            love.graphics.setScissor(boundsX + i * bandW, boundsY, bandW + 1, boundsH)
-        end
+        local bandW = boundsW / 6
+        love.graphics.setScissor(boundsX + i * bandW, boundsY, bandW + 1, boundsH)
         drawFn(c[1], c[2], c[3], c[4] or 1)
     end
     if prevScX then love.graphics.setScissor(prevScX, prevScY, prevScW, prevScH) else love.graphics.setScissor() end
@@ -5189,6 +5615,12 @@ local function _drawElement(canvas, e, signature)
         if e.spritePath then
             _drawElementSprite(e.spritePath, ex, ey, ew, eh, r, g, b, a, e.rotation)
             love.graphics.setColor(1, 1, 1, 1)
+        elseif e.shapeRows then
+            love.graphics.push()
+            love.graphics.translate(ex + ew / 2, ey + eh / 2)
+            love.graphics.rotate(math.rad(e.rotation or 0))
+            _shapeCells.drawLocal(e, ew, eh, r, g, b, a, outline)
+            love.graphics.pop()
         elseif e.shapeType == "circle" then
             -- Every shapeType is rotatable now (move/rotate mode applies
             -- uniformly — see gdsGui_schematic_pressed's toggle), so an
@@ -5223,6 +5655,7 @@ local function _drawElement(canvas, e, signature)
     -- one band, instead of the normal single resolved color.
     local sequence = gdsGui_schematic_resolveColorSequence(canvas.name, "element", e.id, signature)
     if sequence then
+        _glow.haloStriped(canvas, ex, ey, ew, eh, sequence, drawShapeWithColor)
         _drawColorSequenceStriped(ex, ey, ew, eh, sequence, drawShapeWithColor)
     else
         local r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "element", e.id, signature)
@@ -5247,7 +5680,11 @@ local function _drawElement(canvas, e, signature)
     -- once) the normal selection outline below.
     if canvas.collidingObstacleId == e.id then
         love.graphics.setColor(1, 0, 0, 1)
-        love.graphics.rectangle("line", fex, fey, few, feh)
+        if e.shapeRows then
+            _shapeCells.strokeOutline(canvas, e)
+        else
+            love.graphics.rectangle("line", fex, fey, few, feh)
+        end
     end
     if canvas.selectedElementId == e.id then
         -- Magenta once the 2-second hold has unlocked drag/rotate for it
@@ -5270,15 +5707,22 @@ local function _drawElement(canvas, e, signature)
         -- one, not a separate shared size that only approximated it.
         -- Square, same as a control's own selection box (see _drawControl's
         -- matching "rectangle" line) — one consistent "this is selected"
-        -- shape for every anchor kind.
-        love.graphics.rectangle("line", fex, fey, few, feh)
+        -- shape for every anchor kind. A reshaped element traces its real
+        -- outline instead, which is what it collides against (see _shapeCells).
+        if e.shapeRows then
+            _shapeCells.strokeOutline(canvas, e)
+        else
+            love.graphics.rectangle("line", fex, fey, few, feh)
+        end
         if canvas.selectionMoveModeActive then
             -- Mutually exclusive, not both at once: every further tap on
             -- the active target toggles between them (see
             -- gdsGui_schematic_pressed's isActiveMoveTarget branch) rather
             -- than opening the edit menu. Every element is rotatable now,
             -- same as every control.
-            if canvas.rotateModeActive then
+            if canvas.reshapeModeActive and _shapeCells.allowed(canvas, e) then
+                _shapeCells.drawHandles(canvas, e)
+            elseif canvas.rotateModeActive then
                 -- Half-diagonal, not half-width/height — the smallest
                 -- circle that still fully encloses the (now exact, not
                 -- shared-size) selection box above, so the rotate arc nests
@@ -5451,12 +5895,16 @@ local function _anchorHalfExtent(canvas, anchor, axis)
     if anchor.shapeType == "diode" then return 0 end
     if anchor.w then
         local _, _, ew, eh = _elementPixelRect(canvas, anchor)
+        if anchor.shapeRows then _, _, ew, eh = _elementFootprintRect(canvas, anchor) end
         return (axis == "x") and (ew / 2) or (eh / 2)
     end
     return canvas.controlRadius * canvas.zoom * (anchor.radiusScale or 1)
 end
 
 local function _anchorEdgePoint(canvas, anchor, cx, cy, axis, sign)
+    if anchor and anchor.shapeRows then
+        return _shapeCells.edgePoint(canvas, anchor, cx, cy, axis, sign)
+    end
     if anchor then
         -- Per-side, not symmetric: art that sits off-center in its image
         -- (e.g. a switch's lever swinging to one side of its terminals)
@@ -5672,8 +6120,10 @@ end
 -- normal. No offset/lane math at all — every segment always draws at its
 -- own true, unmoved position; see _computeWirePlans' own comment for why
 -- that's enough now that overlapping wires draw as one shared bundle
--- instead of being nudged apart into separate parallel lines.
-local function _drawSegmentWithHopsAndGaps(x1, y1, x2, y2, hopDistances, bundledRanges, zoom)
+-- instead of being nudged apart into separate parallel lines. lineFn
+-- (optional): called as lineFn(ax, ay, bx, by) to draw each straight stretch,
+-- in place of a plain love.graphics.line.
+local function _drawSegmentWithHopsAndGaps(x1, y1, x2, y2, hopDistances, bundledRanges, zoom, lineFn)
     zoom = zoom or 1
     local hopRadiusPx = _WIRE_CROSS_HOP_RADIUS_PX * zoom
     local horiz = (y1 == y2)
@@ -5726,7 +6176,7 @@ local function _drawSegmentWithHopsAndGaps(x1, y1, x2, y2, hopDistances, bundled
             else
                 local ax, ay = pointAt(a)
                 local bx, by = pointAt(b)
-                love.graphics.line(ax, ay, bx, by)
+                if lineFn then lineFn(ax, ay, bx, by) else love.graphics.line(ax, ay, bx, by) end
             end
         end
     end
@@ -5853,6 +6303,81 @@ local function _drawWirePlanSegments(plan, zoom)
     end
 end
 
+--------------------------------------------------------------------------------
+-- PIPE CONNECTORS: while enabled, a connector is three equal-width lines side
+-- by side — two gray walls that never take a color, around the usual wire line
+-- as the fluid inside. All walls draw in a pass of their own before any fluid,
+-- so where pipes meet the fluid runs unbroken from one into the other.
+--------------------------------------------------------------------------------
+_pipes.WIDTH_MULT = 3                -- full pipe width, as a multiple of a wire's width
+_pipes.WALL_GRAY_DARK = 90 / 255     -- wall shade per theme: distinct from an empty pipe's
+_pipes.WALL_GRAY_LIGHT = 170 / 255   -- gray fluid (see _themedPaletteColor) against either backdrop
+
+-- noun: what the menus call a connector on this canvas ("PIPE", "DUCT"), or nil
+-- for plain wires.
+function gdsGui_schematic_setPipeConnectors(canvasName, noun)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return end
+    canvas.pipeConnectors = noun ~= nil
+    canvas.connectorNoun = noun
+end
+
+-- Names the one kind of element on this canvas whose outline can be redrawn
+-- (see _shapeCells), or nil for none. Matched by kind rather than stored on
+-- each element, so items placed before this existed qualify too.
+function gdsGui_schematic_setReshapableKind(canvasName, shapeType, componentType)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return end
+    canvas.reshapableKind = shapeType and { shapeType = shapeType, componentType = componentType } or nil
+end
+
+function _pipes.noun(canvas)
+    return canvas.connectorNoun or "WIRE"
+end
+
+function _pipes.addLabel(canvas)
+    return "ADD " .. _pipes.noun(canvas)
+end
+
+-- The yellow/magenta emphasis around a selected connector. Magenta once the
+-- hold has unlocked its direction-drag; yellow means a tap opens the menu, or
+-- hold to unlock that.
+function _pipes.drawSelection(canvas, plan, width)
+    if canvas.selectionMoveModeActive then
+        love.graphics.setColor(1, 0, 1, 1)
+    else
+        love.graphics.setColor(1, 1, 0, 1)
+    end
+    love.graphics.setLineWidth(width)
+    _drawWirePlanSegments(plan, canvas.zoom)
+end
+
+function _pipes.setWallColor()
+    local gray = globApp.themeIsDark == false and _pipes.WALL_GRAY_LIGHT or _pipes.WALL_GRAY_DARK
+    love.graphics.setColor(gray, gray, gray, 1)
+end
+
+-- One wire's walls, with its selection emphasis (if any) around them.
+function _pipes.drawWireWalls(canvas, w, plan)
+    local pipeWidth = _WIRE_WIDTH_PX * _pipes.WIDTH_MULT * canvas.zoom
+    if canvas.selectedWireId == w.id then
+        _pipes.drawSelection(canvas, plan, pipeWidth + 1.6 * canvas.zoom)
+    end
+    _pipes.setWallColor()
+    love.graphics.setLineWidth(pipeWidth)
+    _drawWirePlanSegments(plan, canvas.zoom)
+end
+
+-- One bundle zone's walls, cut square half a pipe past each end so bends in a
+-- bundle meet with a full corner (the walls' version of _drawWireBundleSegment).
+function _pipes.drawBundleWalls(canvas, bundle)
+    local half = _WIRE_WIDTH_PX * _pipes.WIDTH_MULT * canvas.zoom / 2
+    local loX, hiX = math.min(bundle.x1, bundle.x2), math.max(bundle.x1, bundle.x2)
+    local loY, hiY = math.min(bundle.y1, bundle.y2), math.max(bundle.y1, bundle.y2)
+    _pipes.setWallColor()
+    love.graphics.rectangle("fill", loX - half, loY - half, hiX - loX + half * 2, hiY - loY + half * 2)
+end
+
 -- Draws an orthogonal connector line between two anchors' centers, clamped
 -- to each anchor's own edge, with no hop/bundle treatment — used by the
 -- live wire-drag preview and the (unrelated-to-other-wires) selection
@@ -5928,9 +6453,11 @@ local function _wirePlansChanged(canvas)
     for i, e in ipairs(canvas.elements) do
         local se = elems[i]
         if not se then se = {}; elems[i] = se end
-        if se.id ~= e.id or se.x ~= e.x or se.y ~= e.y or se.rotation ~= e.rotation then
+        -- shapeRows: a reshaped element's wires stop at its real outline (see
+        -- _shapeCells.edgePoint), and each edit stores a brand-new table.
+        if se.id ~= e.id or se.x ~= e.x or se.y ~= e.y or se.rotation ~= e.rotation or se.shapeRows ~= e.shapeRows then
             changed = true
-            se.id, se.x, se.y, se.rotation = e.id, e.x, e.y, e.rotation
+            se.id, se.x, se.y, se.rotation, se.shapeRows = e.id, e.x, e.y, e.rotation, e.shapeRows
         end
     end
     for i = #canvas.elements + 1, #elems do elems[i] = nil end
@@ -6357,59 +6884,58 @@ function _glow.halo(zoom, r, g, b, drawFn)
     _glow.capture(function() drawFn(r, g, b, 1, true) end)
 end
 
+-- The same for a striped element/control (see _drawColorSequenceStriped): each
+-- band halos in its own color, unless that color doesn't glow. The band bounds
+-- are scaled because a scissor ignores the glow buffer's own scale transform.
+function _glow.haloStriped(canvas, x, y, w, h, colors, drawFn)
+    if not canvas.glow or not canvas.glow.active then return end
+    local scale = _glow.SCALE
+    _glow.capture(function()
+        _drawColorSequenceStriped(x * scale, y * scale, w * scale, h * scale, colors, function(r, g, b)
+            if _glow.applies(canvas, r, g, b) then drawFn(r, g, b, 1, true) end
+        end)
+    end)
+end
+
 local function _drawWire(canvas, w, plan, signature)
     if not plan then return end
     local wireWidth = _WIRE_WIDTH_PX * canvas.zoom
-    if canvas.selectedWireId == w.id then
+    if canvas.selectedWireId == w.id and not canvas.pipeConnectors then
         -- Same yellow/magenta selection emphasis as an element's outline
         -- (see its comment on gdsGui_schematic_update's long-press timer),
         -- drawn as a wider line underneath so it reads as a highlight
-        -- around the wire. Magenta once the hold has unlocked its
-        -- direction-drag; yellow means a tap opens the menu, or hold to
-        -- unlock that.
-        if canvas.selectionMoveModeActive then
-            love.graphics.setColor(1, 0, 1, 1)
-        else
-            love.graphics.setColor(1, 1, 0, 1)
-        end
-        love.graphics.setLineWidth(wireWidth + 2.4 * canvas.zoom)
-        _drawWirePlanSegments(plan, canvas.zoom)
+        -- around the wire. A pipe draws its own with its walls instead.
+        _pipes.drawSelection(canvas, plan, wireWidth + 2.4 * canvas.zoom)
     end
 
-    -- Same "stripe it instead of filling solid" treatment as _drawElement —
-    -- see its own comment and gdsGui_schematic_resolveColorSequence. A
-    -- dash pattern along a wire's own path (rather than a filled shape)
-    -- needs stripe bands oriented along whichever axis the wire actually
-    -- runs — a vertical wire striped by X would never show the
-    -- alternation at all — so this picks bands by the plan's own
-    -- bounding box instead of always using vertical bands like
-    -- _drawElement/_drawControl do.
+    -- A wire fed by more than one source at once (see
+    -- gdsGui_schematic_resolveColorSequence) reads the same as a bundle: one
+    -- line of diagonal one-unit color bands (_drawWireBundleSegment), glowing
+    -- the same way, with each hop arc in its first color.
     local sequence = gdsGui_schematic_resolveColorSequence(canvas.name, "wire", w.id, signature)
     if sequence then
-        -- Screen-space bounding box of every segment endpoint — used only
-        -- to pick stripe bands below, not for hit-testing/layout, so a
-        -- cheap min/max over the already-resolved coordinates is enough.
-        -- Nested (not a top-level local) purely to stay under this file's
-        -- 200-local ceiling — it has exactly one caller.
-        local bx, by, bw, bh
-        do
-            local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
-            for _, seg in ipairs(plan.segments) do
-                minX = math.min(minX, seg[1], seg[3])
-                maxX = math.max(maxX, seg[1], seg[3])
-                minY = math.min(minY, seg[2], seg[4])
-                maxY = math.max(maxY, seg[2], seg[4])
+        local colors = {}
+        for i, c in ipairs(sequence) do colors[i] = { _themedPaletteColor(c[1], c[2], c[3], c[4] or 1) } end
+        local function drawBands(arcColor, arcWidth, isHalo)
+            local function setArcColor() love.graphics.setColor(arcColor[1], arcColor[2], arcColor[3], arcColor[4] or 1) end
+            setArcColor()
+            love.graphics.setLineWidth(arcWidth)
+            for idx, seg in ipairs(plan.segments) do
+                _drawSegmentWithHopsAndGaps(seg[1], seg[2], seg[3], seg[4], plan.hopDistances[idx], plan.bundledRanges[idx], canvas.zoom,
+                    function(ax, ay, bx, by)
+                        if ax > bx or ay > by then ax, ay, bx, by = bx, by, ax, ay end
+                        _drawWireBundleSegment(canvas, ax, ay, bx, by, colors, isHalo)
+                        setArcColor()
+                    end)
             end
-            if minX == math.huge then minX, minY, maxX, maxY = 0, 0, 0, 0 end
-            bx, by, bw, bh = minX, minY, maxX - minX, maxY - minY
         end
-        local padding = wireWidth * 2
-        _drawColorSequenceStriped(bx - padding, by - padding, bw + padding * 2, bh + padding * 2, sequence,
-            function(r, g, b, a)
-                love.graphics.setColor(r, g, b, a)
-                love.graphics.setLineWidth(wireWidth)
-                _drawWirePlanSegments(plan, canvas.zoom)
-            end, bw < bh)
+        for _, c in ipairs(colors) do
+            if _glow.applies(canvas, c[1], c[2], c[3]) then
+                _glow.capture(function() drawBands({ c[1], c[2], c[3], 1 }, wireWidth * _glow.WIRE_WIDTH, true) end)
+                break
+            end
+        end
+        drawBands(colors[1], wireWidth)
     else
         local r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "wire", w.id, signature)
         if _glow.applies(canvas, r, g, b) then _glow.wire(plan, canvas.zoom, wireWidth, r, g, b) end
@@ -6493,6 +7019,7 @@ local function _drawControl(canvas, c, signature)
     local sequence = gdsGui_schematic_resolveColorSequence(canvas.name, "control", c.id, signature)
     if sequence then
         r, g, b, a = sequence[1][1], sequence[1][2], sequence[1][3], sequence[1][4]
+        _glow.haloStriped(canvas, cx - rad, cy - rad, rad * 2, rad * 2, sequence, drawBodyWithColor)
         _drawColorSequenceStriped(cx - rad, cy - rad, rad * 2, rad * 2, sequence, drawBodyWithColor)
     else
         r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "control", c.id, signature)
@@ -6658,15 +7185,14 @@ function gdsGui_schematic_draw(pageName)
             local signature = gdsGui_schematic_computeSignature(canvas.name)
             local wirePlans, wireBundles = _computeWirePlans(canvas)
             _glow.begin(canvas)
-            for _, w in ipairs(canvas.wires) do
-                -- Culled by the bounding box of its own ACTUAL path (every
-                -- segment's endpoints), not just a straight line between its
-                -- two anchors — a jogged/bent wire can swing well outside
-                -- that straight-line box while still having a real anchor
-                -- off-screen on each end. No plan (a dangling wire mid-undo,
-                -- same case _hitWire's own fallback handles) always draws —
-                -- nothing to measure, so nothing safe to cull.
-                local plan = wirePlans[w.id]
+            -- Culled by the bounding box of its own ACTUAL path (every
+            -- segment's endpoints), not just a straight line between its
+            -- two anchors — a jogged/bent wire can swing well outside
+            -- that straight-line box while still having a real anchor
+            -- off-screen on each end. No plan (a dangling wire mid-undo,
+            -- same case _hitWire's own fallback handles) always draws —
+            -- nothing to measure, so nothing safe to cull.
+            local function wireVisible(plan)
                 local visible = true
                 if plan and plan.segments and #plan.segments > 0 then
                     local minX, minY, maxX, maxY
@@ -6680,7 +7206,22 @@ function gdsGui_schematic_draw(pageName)
                     end
                     visible = rectVisible(minX, minY, maxX - minX, maxY - minY)
                 end
-                if visible then _drawWire(canvas, w, plan, signature) end
+                return visible
+            end
+            if canvas.pipeConnectors then
+                for _, w in ipairs(canvas.wires) do
+                    local plan = wirePlans[w.id]
+                    if plan and wireVisible(plan) then _pipes.drawWireWalls(canvas, w, plan) end
+                end
+                for _, bundle in ipairs(wireBundles) do
+                    local loX, hiX = math.min(bundle.x1, bundle.x2), math.max(bundle.x1, bundle.x2)
+                    local loY, hiY = math.min(bundle.y1, bundle.y2), math.max(bundle.y1, bundle.y2)
+                    if rectVisible(loX, loY, hiX - loX, hiY - loY) then _pipes.drawBundleWalls(canvas, bundle) end
+                end
+            end
+            for _, w in ipairs(canvas.wires) do
+                local plan = wirePlans[w.id]
+                if wireVisible(plan) then _drawWire(canvas, w, plan, signature) end
             end
             -- Each bundle zone (see _computeWirePlans) draws as ONE
             -- line with its member wires' own colors, resolved fresh here
@@ -7106,7 +7647,7 @@ function gdsGui_schematic_pressed(touchId, x, y)
                 local pickedWire = _hitWire(canvas, x, y)
                 if pickedWire then
                     gdsGui_schematic_openColorPicker(canvas.name, "wire", pickedWire.id,
-                        "COLOR: WIRE: " .. pickedWire.id)
+                        "COLOR: " .. _pipes.noun(canvas) .. ": " .. pickedWire.id)
                 else
                     local pickedControl = _hitControl(canvas, x, y)
                     if pickedControl then
@@ -7203,6 +7744,23 @@ function gdsGui_schematic_pressed(touchId, x, y)
             goto continue
         end
 
+        -- Reshape mode's corner handles straddle the shape's outline, and an
+        -- outward pull starts on them, so they're checked ahead of any hit-test.
+        local reshapeTarget = _shapeCells.activeTarget(canvas)
+        if reshapeTarget and not (canvas.wireToolActive or canvas.pendingConnectorColor) then
+            local corner = _shapeCells.cornerAt(canvas, reshapeTarget, x, y)
+            if corner then
+                canvas.focusTouchId = touchId
+                canvas.dragKind     = "reshape"
+                canvas.dragStartX   = x
+                canvas.dragStartY   = y
+                canvas.dragMoved    = false
+                canvas._pendingDragUndoSnapshot = _snapshotState(canvas)
+                _shapeCells.beginDrag(canvas, reshapeTarget, corner)
+                goto continue
+            end
+        end
+
         local hitElem = _hitElement(canvas, x, y)
         if canvas.wireToolActive or canvas.pendingConnectorColor then
             -- A connector can start from either an element (box) or a
@@ -7252,7 +7810,16 @@ function gdsGui_schematic_pressed(touchId, x, y)
                 -- Set here (press time), not just on a no-drag release, so
                 -- the overlay already matches for the whole gesture if this
                 -- press goes straight into a real drag.
-                if not canvas.rotateModeActive then
+                -- A reshapable element has a third stop: from rotate, the
+                -- next tap enters reshape (dragging nothing until a corner
+                -- handle is pressed), and a tap on its body, off every handle
+                -- (see the check above), comes back around to move.
+                if canvas.rotateModeActive and _shapeCells.allowed(canvas, hitElem) then
+                    canvas.dragKind = "reshapeEnter"
+                    canvas.rotateModeActive = false
+                    canvas.reshapeModeActive = true
+                    canvas._pendingDragUndoSnapshot = nil
+                elseif not canvas.rotateModeActive and not canvas.reshapeModeActive then
                     canvas.dragKind = "rotate"
                     canvas.rotateModeActive = true
                     local cx, cy = _elementCenter(canvas, hitElem)
@@ -7260,6 +7827,7 @@ function gdsGui_schematic_pressed(touchId, x, y)
                 else
                     canvas.dragKind    = "element"
                     canvas.rotateModeActive = false
+                    canvas.reshapeModeActive = false
                     local ex, ey = _toPixel(canvas, hitElem.x, hitElem.y)
                     canvas.dragOffsetX = x - ex
                     canvas.dragOffsetY = y - ey
@@ -7494,6 +8062,15 @@ function gdsGui_schematic_moved(touchId, x, y)
                 math.abs(y - canvas.dragStartY) > _ELEMENT_TAP_SLOP_PX) then
                 canvas.dragMoved = true
             end
+        elseif canvas.dragKind == "reshape" and canvas.selectedElementId then
+            local elem = _findElement(canvas, canvas.selectedElementId)
+            if elem and canvas._shapeDrag and _shapeCells.updateDrag(canvas, elem, x, y) and not canvas.dragMoved then
+                canvas.dragMoved = true
+                if canvas._pendingDragUndoSnapshot then
+                    _commitUndoSnapshot(canvas, canvas._pendingDragUndoSnapshot)
+                    canvas._pendingDragUndoSnapshot = nil
+                end
+            end
         elseif canvas.dragKind == "element" and canvas.selectedElementId then
             local elem = _findElement(canvas, canvas.selectedElementId)
             if elem then
@@ -7507,7 +8084,15 @@ function gdsGui_schematic_moved(touchId, x, y)
                 local px, py = _toPixel(canvas, candX, candY)
                 local pw, ph = elem.w * canvas.contentW * canvas.zoom, elem.h * canvas.contentH * canvas.zoom
                 if _isQuarterTurnRotation(elem.rotation) then pw, ph = ph, pw end
-                local blocked, obstacle = _footprintOverlapsAnother(canvas, px + pw / 2, py + ph / 2, pw / 2, ph / 2, elem.id)
+                local blocked, obstacle
+                if elem.shapeRows then
+                    local p = _shapeCells.parse(elem.shapeRows)
+                    local bw, bh = elem.w * canvas.contentW * canvas.zoom, elem.h * canvas.contentH * canvas.zoom
+                    blocked, obstacle = _shapeCells.blockedAt(canvas, elem, p, px + bw / 2, py + bh / 2,
+                        bw / p.cols, bh / p.rows, elem.rotation)
+                else
+                    blocked, obstacle = _footprintOverlapsAnother(canvas, px + pw / 2, py + ph / 2, pw / 2, ph / 2, elem.id)
+                end
                 -- Flags the obstacle actually in the way so _drawElement/
                 -- _drawControl can highlight it red for as long as the drag
                 -- keeps pushing into it — cleared the instant it's clear
@@ -7529,7 +8114,24 @@ function gdsGui_schematic_moved(touchId, x, y)
             end
         elseif canvas.dragKind == "rotate" and canvas.selectedElementId then
             local elem = _findElement(canvas, canvas.selectedElementId)
-            if elem then
+            if elem and _shapeCells.allowed(canvas, elem) then
+                -- Any angle, not just the 4 cardinals — which also means a
+                -- tap's own finger jitter would turn it, so nothing applies
+                -- until the press has become a real drag. Off-cardinal angles
+                -- rely on the cell-based hit/collision/wire paths, so its
+                -- shape is made explicit here (it looks the same either way).
+                if canvas.dragMoved or math.abs(x - canvas.dragStartX) > _ELEMENT_TAP_SLOP_PX or
+                   math.abs(y - canvas.dragStartY) > _ELEMENT_TAP_SLOP_PX then
+                    local cx, cy = _elementCenter(canvas, elem)
+                    local rawAngle = math.atan2(y - cy, x - cx) - canvas.rotateGrabAngleOffset
+                    local candRotation = _shapeCells.freeRotationDegrees(rawAngle)
+                    elem.shapeRows = _shapeCells.rowsOf(canvas, elem)
+                    local _, _, cw, ch, p = _shapeCells.frame(canvas, elem)
+                    if not _shapeCells.blockedAt(canvas, elem, p, cx, cy, cw, ch, candRotation) then
+                        elem.rotation = candRotation
+                    end
+                end
+            elseif elem then
                 local cx, cy = _elementCenter(canvas, elem)
                 local rawAngle = math.atan2(y - cy, x - cx) - canvas.rotateGrabAngleOffset
                 local axis = elem.componentType == "directionalGate" and directionalGateWireAxis(canvas, elem)
@@ -7725,7 +8327,7 @@ function gdsGui_schematic_released(touchId, x, y)
             for _, w in ipairs(canvas.wires) do
                 if (w.fromElementId == anchorId and w.fromTerminal == terminalIndex)
                    or (w.toElementId == anchorId and w.toTerminal == terminalIndex) then
-                    return "THAT TERMINAL ALREADY HAS A WIRE."
+                    return "THAT TERMINAL ALREADY HAS A " .. _pipes.noun(canvas) .. "."
                 end
             end
             return nil
@@ -7737,7 +8339,7 @@ function gdsGui_schematic_released(touchId, x, y)
         for _, w in ipairs(canvas.wires) do
             if w.fromElementId == anchorId or w.toElementId == anchorId then count = count + 1 end
         end
-        if count >= 2 then return "A 2-POSITION SWITCH OR DIODE CAN HAVE AT MOST 2 WIRES." end
+        if count >= 2 then return "A 2-POSITION SWITCH OR DIODE CAN HAVE AT MOST 2 " .. _pipes.noun(canvas) .. "S." end
         return nil
     end
 
@@ -7931,11 +8533,12 @@ function gdsGui_schematic_released(touchId, x, y)
             if canvas.mode == "design" and canvas.dragMoved and
                (canvas.dragKind == "element" or canvas.dragKind == "rotate" or
                 canvas.dragKind == "control" or canvas.dragKind == "wireDirection" or
-                canvas.dragKind == "controlRotate") then
+                canvas.dragKind == "controlRotate" or canvas.dragKind == "reshape") then
                 _notifyChanged(canvas)
             end
             canvas.focusTouchId       = nil
             canvas.dragKind           = nil
+            canvas._shapeDrag         = nil
             canvas.wireTool.fromId    = nil
             -- Gesture's over either way (applied or blocked) — nothing left
             -- to flag red (see gdsGui_schematic_moved's "element"/"control"
@@ -7998,7 +8601,10 @@ function gdsGui_schematic_update(dt)
         if not canvas.focusTouchId or canvas.dragMoved then goto continue end
 
         canvas.longPressElapsed = (canvas.longPressElapsed or 0) + dt
-        if canvas.longPressElapsed < _LONG_PRESS_SECONDS then goto continue end
+        local holdElem = canvas.longPressTargetKind == "element" and canvas.selectedElementId
+            and _findElement(canvas, canvas.selectedElementId)
+        local holdSeconds = (holdElem and _shapeCells.allowed(canvas, holdElem)) and _shapeCells.HOLD_SECONDS or _LONG_PRESS_SECONDS
+        if canvas.longPressElapsed < holdSeconds then goto continue end
 
         -- Held long enough — unlock move/rotate mode for whatever's
         -- currently selected, and seamlessly promote this SAME still-held
@@ -8008,6 +8614,7 @@ function gdsGui_schematic_update(dt)
         -- press again.
         canvas.selectionMoveModeActive = true
         canvas.rotateModeActive = false
+        canvas.reshapeModeActive = false
         gdsGui_haptics_vibrate()
         local touch = canvas.touches[canvas.focusTouchId]
         local x = touch and touch.x or canvas.dragStartX
@@ -8277,6 +8884,12 @@ local function _drawMiniDiagram(elements, wires, controls, tx, ty, tw, th)
         local c = e.defaultColor or _DEFAULT_COLOR
         if e.spritePath then
             _drawElementSprite(e.spritePath, ex, ey, ew, eh, c[1], c[2], c[3], c[4], e.rotation)
+        elseif e.shapeRows then
+            love.graphics.push()
+            love.graphics.translate(ex + ew / 2, ey + eh / 2)
+            love.graphics.rotate(math.rad(e.rotation or 0))
+            _shapeCells.drawLocal(e, ew, eh, c[1], c[2], c[3], c[4], 0)
+            love.graphics.pop()
         elseif e.shapeType == "circle" then
             love.graphics.setColor(c[1], c[2], c[3], c[4])
             love.graphics.ellipse("fill", ex + ew / 2, ey + eh / 2, ew / 2, eh / 2)
