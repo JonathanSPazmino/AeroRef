@@ -64,8 +64,7 @@ local _LABEL_MIN_WIDTH_PX     = 160
 local _PINCH_MIN_DIST_PX      = 1      -- guards against a near-zero divisor right as a pinch begins
 local _WIRE_WIDTH_PX         = 2 / 3   -- half of the previous 4/3px width
 local _WIRE_CROSS_HOP_RADIUS_PX = 2.5   -- radius of the little arc hop drawn where a wire crosses an unrelated one
-local _WIRE_BUNDLE_WIDTH_MULT   = 2     -- a "twisted bundle" (see _drawWireBundleSegment) draws this many times as thick as one normal wire
-local _WIRE_BUNDLE_STRIPE_LEN_PX = _GRID_SPACING_PX    -- length of one wire's own diagonal color band along a bundle -- exactly 1 grid unit (see _GRID_SPACING_PX)
+local _WIRE_BUNDLE_STRIPE_LEN_PX = _GRID_SPACING_PX    -- length of one color's own diagonal band along a bundle -- exactly 1 grid unit (see _GRID_SPACING_PX)
 local _CONNECTOR_RELEASE_SLOP_PX = 16  -- forgiveness margin for "which element did the wire-drag land on", since exact-rectangle precision is unreliable on a touchscreen
 local _CONNECTOR_TARGET_RADIUS_PX = 9  -- drawn radius of the green "valid connection point" reticle shown at each element's center while a wire is being dragged
 local _CONNECTOR_SNAP_COLOR  = {0.25, 0.95, 0.35, 1}
@@ -2651,7 +2650,10 @@ end
 -- row.value — no keyboard involved); omitted, it's a free-text box.
 -- numericOnly (text rows only): same digit/one-decimal-point filter
 -- gdsGui_textPrompt_open's own numericOnly uses, applied per keystroke by
--- gdsGui_schematic_propertyGridTextInput below. requireAll (optional): true
+-- gdsGui_schematic_propertyGridTextInput below. slider = {min, max, unit}
+-- (optional): a horizontal scrollbar in place of the value box, dragged or
+-- tapped in whole steps, with row.value as the number in string form and the
+-- current value shown after the row's label. requireAll (optional): true
 -- gates SAVE on every row having a non-empty value (same "remaining" gate
 -- _choiceGrid.remaining enforces); false/omitted lets SAVE commit as-is,
 -- blank rows included. validateFunc (optional, a plain Lua function, NOT a
@@ -2673,6 +2675,7 @@ end
 
 _propertyGrid.ROW_H, _propertyGrid.FOOTER_H = 46, 44
 _propertyGrid.MAX_CHARS = 24
+_propertyGrid.SLIDER_THUMB_W = 16
 
 -- header (optional): a read-only caption drawn above the rows, same slot
 -- _choiceGrid's own header fills — main.lua uses it for an element's sensed
@@ -2742,8 +2745,19 @@ function _propertyGrid.cellRect(g, rowY, row, choiceIndex)
     return areaX + (choiceIndex - 1) * cellW, rowY + 6, cellW, g.rowH - 12
 end
 
--- {kind = "row", row} | {kind = "choice", row, choice} | {kind = "save"} |
--- {kind = "cancel"} | nil.
+-- Sets a slider row's value from a touch at pixel x, across its track (the
+-- same rect a text row's value box uses, less the thumb's own width).
+function _propertyGrid.setSliderFromX(owner, menu, rowIndex, px)
+    local row = menu.rows[rowIndex]
+    local g = _propertyGrid.geometry(owner, menu)
+    local bx, _, bw = _propertyGrid.valueBoxRect(g, 0)
+    local travel = bw - _propertyGrid.SLIDER_THUMB_W
+    local t = math.max(0, math.min(1, (px - bx - _propertyGrid.SLIDER_THUMB_W / 2) / travel))
+    row.value = tostring(math.floor(row.slider.min + t * (row.slider.max - row.slider.min) + 0.5))
+end
+
+-- {kind = "row", row} | {kind = "choice", row, choice} | {kind = "slider", row} |
+-- {kind = "save"} | {kind = "cancel"} | nil.
 function _propertyGrid.hit(owner, menu, px, py)
     local g = _propertyGrid.geometry(owner, menu)
     if px < g.x or px > g.x + g.w then return nil end
@@ -2756,6 +2770,9 @@ function _propertyGrid.hit(owner, menu, px, py)
     local rowIndex = math.floor((py - g.bodyY + menu.scroll) / g.rowH) + 1
     local row = menu.rows[rowIndex]
     if not row then return nil end
+    if row.slider then
+        return px >= g.x + g.w * 0.5 and { kind = "slider", row = rowIndex } or nil
+    end
     if row.choices then
         local rowY = g.bodyY + (rowIndex - 1) * g.rowH - menu.scroll
         for c = 1, #row.choices do
@@ -2771,11 +2788,25 @@ function _propertyGrid.press(owner, touchId, px, py)
     local menu = owner.menu
     if menu._pressedTouchId ~= nil and menu._pressedTouchId ~= touchId then return end
     menu._pressedTouchId, menu._pressY, menu._pressScroll, menu._dragging = touchId, py, menu.scroll, false
+    local hit = _propertyGrid.hit(owner, menu, px, py)
+    menu._sliderRow = hit and hit.kind == "slider" and hit.row or nil
+    if menu._sliderRow then
+        menu.activeRow = nil
+        menu.errorRow, menu.errorText = nil, nil
+        love.keyboard.setTextInput(false)
+        _propertyGrid.setSliderFromX(owner, menu, menu._sliderRow, px)
+    end
 end
 
 function _propertyGrid.move(owner, touchId, px, py)
     local menu = owner.menu
     if menu._pressedTouchId ~= touchId then return end
+    -- A press that started on a slider stays on it, wherever the finger
+    -- wanders, rather than scrolling the grid.
+    if menu._sliderRow then
+        _propertyGrid.setSliderFromX(owner, menu, menu._sliderRow, px)
+        return
+    end
     local dy = py - menu._pressY
     if math.abs(dy) > _ELEMENT_TAP_SLOP_PX then menu._dragging = true end
     if menu._dragging then
@@ -2793,6 +2824,10 @@ function _propertyGrid.release(owner, touchId, px, py)
     local menu = owner.menu
     if menu._pressedTouchId ~= touchId then return end
     menu._pressedTouchId = nil
+    if menu._sliderRow then
+        menu._sliderRow = nil
+        return
+    end
     if menu._dragging then return end
     local hit = _propertyGrid.hit(owner, menu, px, py)
     if not hit then
@@ -2929,9 +2964,18 @@ function _propertyGrid.draw(owner, menu)
                 love.graphics.rectangle("fill", g.x + 2, rowY + 1, g.w - 4, g.rowH - 2)
             end
             love.graphics.setColor(1, 1, 1, 1)
-            love.graphics.print(row.label, g.x + 8, rowY + (g.rowH - font:getHeight()) / 2)
+            local labelText = row.slider and (row.label .. ": " .. (row.value or "") .. " " .. (row.slider.unit or "")) or row.label
+            love.graphics.print(labelText, g.x + 8, rowY + (g.rowH - font:getHeight()) / 2)
 
-            if row.choices then
+            if row.slider then
+                local bx, by, bw, bh = _propertyGrid.valueBoxRect(g, rowY)
+                local thumbW = _propertyGrid.SLIDER_THUMB_W
+                local t = ((tonumber(row.value) or row.slider.min) - row.slider.min) / (row.slider.max - row.slider.min)
+                love.graphics.setColor(1, 1, 1, 0.4)
+                love.graphics.rectangle("line", bx, by + bh * 0.25, bw, bh * 0.5)
+                love.graphics.setColor(1, 1, 0, 1)
+                love.graphics.rectangle("fill", bx + t * (bw - thumbW), by, thumbW, bh)
+            elseif row.choices then
                 for c, choiceLabel in ipairs(row.choices) do
                     local cx, cy, cw, ch = _propertyGrid.cellRect(g, rowY, row, c)
                     -- swatchColors (optional, parallel to row.choices — e.g.
@@ -4178,7 +4222,7 @@ end
 -- canvas.elementPropertiesRowSaved below) to show ahead of the item's own
 -- custom properties — main.lua uses this for a source's own TYPE/VOLTAGE/
 -- POWERED COLOR rows (POWERED COLOR is a row.swatchColors choice row — see
--- _propertyGrid.draw — pre-filled from canvas.voltageColors[entity.voltage]),
+-- _propertyGrid.draw — pre-filled from that source's own color),
 -- letting the user edit all of it right here, the exact same rows (and same
 -- pre-fill behavior) the placement grid collects at creation time, instead
 -- of a second, separate flow. Always opens with requireAll false — a freshly-placed
@@ -5696,37 +5740,77 @@ local function _drawSegmentWithHopsAndGaps(x1, y1, x2, y2, hopDistances, bundled
 end
 
 -- Draws one straight axis-aligned BUNDLE segment (x1,y1)-(x2,y2) as a
--- single line _WIRE_BUNDLE_WIDTH_MULT times a normal wire's width, with
--- each entry in colors (one per wire sharing this stretch, in creation
--- order) repeating as a diagonal band along it — the "twisted cable" look
+-- single line the same width as a normal wire, with
+-- each DISTINCT entry in colors (in creation order of the wires sharing this
+-- stretch) repeating as a diagonal band along it — the "twisted cable" look
 -- replacing the old per-wire parallel-lane offset (see _computeWirePlans'
 -- own comment): instead of N separate thin lines nudged apart, every wire
--- sharing this exact stretch draws as ONE thick shared line instead, with
--- color alone (not position) showing which wires are in it. 3 colors
--- bundled draws color1,color2,color3,color1,... all the way down. The
--- band at either end is whatever fraction of a full
--- _WIRE_BUNDLE_STRIPE_LEN_PX band fits there — no attempt to center the
--- pattern or evenly divide it into the segment's exact length, same as a
--- real twisted bundle just gets cut wherever it ends.
-local function _drawWireBundleSegment(x1, y1, x2, y2, colors, zoom)
+-- sharing this exact stretch draws as ONE shared line instead, with
+-- color alone (not position) showing what feeds it. Wires sharing a color
+-- share one band, so every band is exactly _WIRE_BUNDLE_STRIPE_LEN_PX (1 grid
+-- unit) long: 3 wires in 2 colors draw color1,color2,color1,... rather than
+-- color1,color1,color2,... and 2 wires in one color draw solid. Bands sit on
+-- the world grid (see _drawGrid), not the segment's own start, so the pattern
+-- runs unbroken across adjacent bundle zones along one line and doesn't crawl
+-- on pan/zoom. Each end is cut square, half the line's width past its
+-- endpoint so a bundle's bends meet with a full corner. isHalo: drawing the
+-- powered-glow copy (captured at the bundle draw site) — wider, and only the bands that glow.
+local function _drawWireBundleSegment(canvas, x1, y1, x2, y2, colors, isHalo)
     local length = math.sqrt((x2 - x1) ^ 2 + (y2 - y1) ^ 2)
     if length < 0.01 or #colors == 0 then return end
-    local thickness = _WIRE_WIDTH_PX * _WIRE_BUNDLE_WIDTH_MULT * zoom
-    local stripeLen = _WIRE_BUNDLE_STRIPE_LEN_PX * zoom
+
+    local distinct = {}
+    for _, c in ipairs(colors) do
+        local seen = false
+        for _, d in ipairs(distinct) do
+            if d[1] == c[1] and d[2] == c[2] and d[3] == c[3] and (d[4] or 1) == (c[4] or 1) then seen = true break end
+        end
+        if not seen then table.insert(distinct, c) end
+    end
+
+    local thickness = _WIRE_WIDTH_PX * canvas.zoom * (isHalo and _glow.WIRE_WIDTH or 1)
+    local stripeLen = _WIRE_BUNDLE_STRIPE_LEN_PX * canvas.zoom
+    local halfT = thickness / 2
+    local capLo, capHi = -halfT, length + halfT
+
+    -- Keeps the part of a convex polygon on one side of the vertical line
+    -- x = bound (sign 1 keeps x >= bound, sign -1 keeps x <= bound).
+    local function clip(pts, bound, sign)
+        local out = {}
+        for i = 1, #pts - 1, 2 do
+            local ax, ay = pts[i], pts[i + 1]
+            local bx, by = pts[(i + 1) % #pts + 1], pts[(i + 2) % #pts + 1]
+            local aIn, bIn = (ax - bound) * sign >= 0, (bx - bound) * sign >= 0
+            if aIn then out[#out + 1] = ax; out[#out + 1] = ay end
+            if aIn ~= bIn then
+                out[#out + 1] = bound
+                out[#out + 1] = ay + (by - ay) * (bound - ax) / (bx - ax)
+            end
+        end
+        return out
+    end
+
+    -- World-grid distance of (x1,y1) along this segment's own axis.
+    local along = (y1 == y2) and (x1 - canvas.x - canvas.panX) or (y1 - canvas.y - canvas.panY)
+    local band = math.floor((along - thickness) / stripeLen)
     love.graphics.push()
     love.graphics.translate(x1, y1)
     love.graphics.rotate(math.atan2(y2 - y1, x2 - x1))
-    local d, i = 0, 0
-    while d < length do
-        local d2 = math.min(d + stripeLen, length)
-        local c = colors[(i % #colors) + 1]
-        love.graphics.setColor(c[1], c[2], c[3], c[4] or 1)
-        love.graphics.polygon("fill",
-            d, -thickness / 2,
-            d2, -thickness / 2,
-            d2 - thickness, thickness / 2,
-            d - thickness, thickness / 2)
-        d, i = d2, i + 1
+    while true do
+        local d = band * stripeLen - along
+        if d >= length + thickness then break end
+        local pts = clip(clip({
+            d + halfT, -halfT,
+            d + stripeLen + halfT, -halfT,
+            d + stripeLen - halfT, halfT,
+            d - halfT, halfT,
+        }, capLo, 1), capHi, -1)
+        local c = distinct[(band % #distinct) + 1]
+        if #pts >= 6 and (not isHalo or _glow.applies(canvas, c[1], c[2], c[3])) then
+            love.graphics.setColor(c[1], c[2], c[3], c[4] or 1)
+            love.graphics.polygon("fill", pts)
+        end
+        band = band + 1
     end
     love.graphics.setColor(1, 1, 1, 1)
     love.graphics.pop()
@@ -6598,7 +6682,7 @@ function gdsGui_schematic_draw(pageName)
                 end
                 if visible then _drawWire(canvas, w, plan, signature) end
             end
-            -- Each bundle zone (see _computeWirePlans) draws as ONE thick
+            -- Each bundle zone (see _computeWirePlans) draws as ONE
             -- line with its member wires' own colors, resolved fresh here
             -- (not cached in the plan) same as every other entity's color —
             -- see _drawWireBundleSegment. Culled by its own two endpoints
@@ -6610,10 +6694,21 @@ function gdsGui_schematic_draw(pageName)
                 if rectVisible(loX, loY, hiX - loX, hiY - loY) then
                     local colors = {}
                     for _, wireId in ipairs(bundle.wireIds) do
-                        local r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "wire", wireId, signature)
-                        table.insert(colors, { r, g, b, a })
+                        local sequence = gdsGui_schematic_resolveColorSequence(canvas.name, "wire", wireId, signature)
+                        if sequence then
+                            for _, c in ipairs(sequence) do
+                                table.insert(colors, { _themedPaletteColor(c[1], c[2], c[3], c[4] or 1) })
+                            end
+                        else
+                            table.insert(colors, { gdsGui_schematic_resolveDisplayColor(canvas.name, "wire", wireId, signature) })
+                        end
                     end
-                    _drawWireBundleSegment(bundle.x1, bundle.y1, bundle.x2, bundle.y2, colors, canvas.zoom)
+                    if canvas.glow and canvas.glow.active then
+                        _glow.capture(function()
+                            _drawWireBundleSegment(canvas, bundle.x1, bundle.y1, bundle.x2, bundle.y2, colors, true)
+                        end)
+                    end
+                    _drawWireBundleSegment(canvas, bundle.x1, bundle.y1, bundle.x2, bundle.y2, colors)
                 end
             end
             for _, e in ipairs(canvas.elements) do

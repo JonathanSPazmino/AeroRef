@@ -369,6 +369,22 @@ local _SWITCH_SPRITE_PATHS = {"Sprites/control_switchOpen.png", "Sprites/control
 local _GENERATOR_SPRITE_PATHS = {"Sprites/control_generatorHousing.png", "Sprites/control_generatorHousing.png"}
 local _GENERATOR_OVERLAY_SPRITE_PATH = "Sprites/control_generatorGear.png"
 
+-- BATTERY's one wire terminal, the top of the cap in its artwork. Globals, not
+-- locals: this file sits at Lua's 200-local ceiling. Also read by
+-- _openSystemIntoCanvas, which gives it to batteries saved before they had one.
+_BATTERY_SPRITE_PATH = "Sprites/element_battery.png"
+_BATTERY_TERMINALS = { { x = -0.011, y = -0.476, exitX = 0, exitY = -1 } }
+
+-- A BUS's load (entity.busLoadAmps, nil reads as 0), set on the slider in its
+-- PROPERTIES menu and shown in its diagram label.
+_BUS_SPRITE_PATH = "Sprites/element_bus.png"
+_BUS_LOAD_MAX_AMPS = 100
+
+function _busLoadText(entity)
+    local amps = entity.busLoadAmps or 0
+    return string.format("%g %s", amps, amps == 1 and "amp" or "amps")
+end
+
 -- abbrev: the short (up to 4-letter) name the "NAME THIS ..." prompt
 -- suggests for a newly placed item, as ABBREV_N (e.g. BATT_1) — see
 -- schematicCatalogItemChosen/_suggestedPlacementName.
@@ -406,15 +422,15 @@ local SCHEMATIC_CATALOG = {
         -- a manual property would just sit there duplicating/disagreeing
         -- with it, same reasoning BUS below has for its own VOLTAGE/CURRENT.
         { label = "BATTERY", abbrev = "BATT",   kind = "element", shapeType = "rect",
-          spritePath = "Sprites/element_battery.png",
-          gridW = 2, gridH = 3, componentType = "source" },
+          spritePath = _BATTERY_SPRITE_PATH,
+          gridW = 2, gridH = 3, componentType = "source", terminals = _BATTERY_TERMINALS },
         -- No defaultProperties (placement grid asks for NAME only) — a
         -- bus's own VOLTAGE/CURRENT are SENSED, not authored (see
         -- schematicElementSensedValues' read-only PROPERTIES-menu header),
         -- so a manually-typed VOLTAGE/CURRENT property would only ever sit
         -- there unused, disagreeing with whatever the solver actually infers.
         { label = "BUS", abbrev = "BUS",       kind = "element", shapeType = "rect",
-          spritePath = "Sprites/element_bus.png",
+          spritePath = _BUS_SPRITE_PATH,
           gridW = 4, gridH = 2, componentType = "path" },
         -- Anode (flow "in") on the left, cathode (flow "out") on the right,
         -- matching rotation 0 conducting +x (model/graph.lua's
@@ -1437,18 +1453,27 @@ function _relays.sourceVoltages(canvas)
     return voltages
 end
 
+-- Exact color equality; two nils (no color registered on either) count as equal.
+function _relays.sameColor(a, b)
+    if not a or not b then return a == b end
+    return a[1] == b[1] and a[2] == b[2] and a[3] == b[3] and (a[4] or 1) == (b[4] or 1)
+end
+
 -- "powered"/"unpowered" for a painted relay body color — powered being the
 -- medium's own powered color or any registered voltage color — else nil.
 function _relays.bodyState(canvas, color)
     if not color then return nil end
-    local function same(a, b)
-        return a[1] == b[1] and a[2] == b[2] and a[3] == b[3] and (a[4] or 1) == (b[4] or 1)
-    end
+    local same = _relays.sameColor
     local style = _currentMedium().style
     if same(color, style.unpowered) then return "unpowered" end
     if same(color, style.powered) then return "powered" end
     for _, voltageColor in pairs(canvas.voltageColors or {}) do
         if same(color, voltageColor) then return "powered" end
+    end
+    for _, entities in ipairs({ canvas.elements, canvas.controls }) do
+        for _, entity in ipairs(entities) do
+            if entity.poweredColor and same(color, entity.poweredColor) then return "powered" end
+        end
     end
     return nil
 end
@@ -1708,10 +1733,11 @@ end
 -- _findSchematicCanvas); a throwaway-canvas unit test exercises the smaller
 -- pieces (_buildComponentTypeMap/_currentGateStates/_currentSourceStates,
 -- which DO take an explicit canvas table) directly instead.
--- The color registered for a given nominal voltage on THIS system
--- (canvas.voltageColors, keyed by the plain voltage number — see
--- _ensureVoltageHasColor), or defaultColor if that voltage has none yet
--- registered on this particular system. voltage == nil (the source was
+-- A source's own powered color (entity.poweredColor, its POWERED COLOR row —
+-- see schematicElementPropertiesRowSaved), else the color registered for its
+-- voltage on THIS system (canvas.voltageColors, which only systems saved
+-- before colors became per-source still carry), or defaultColor if it has
+-- neither. voltage == nil (the source was
 -- never assigned one at all, e.g. a freshly-placed BATTERY whose VOLTAGE
 -- prompt hasn't been answered yet) is a DIFFERENT case from that —
 -- there's no "powered, color just not picked yet" state to show; it reads
@@ -1719,9 +1745,10 @@ end
 -- off, rather than defaultColor (every production caller passes
 -- _currentMedium().style.powered there, which would otherwise show an
 -- unassigned source as a generic energized yellow it hasn't earned yet).
-local function _colorForVoltage(canvas, voltage, defaultColor)
+local function _colorForSource(canvas, entity, defaultColor)
+    local voltage = entity and entity.voltage
     if not voltage then return _currentMedium().style.unpowered end
-    local registered = canvas.voltageColors and canvas.voltageColors[voltage]
+    local registered = entity.poweredColor or (canvas.voltageColors and canvas.voltageColors[voltage])
     return registered or defaultColor
 end
 
@@ -1745,16 +1772,16 @@ end
 -- highest-voltage pick is an actual, unverified assumption about which
 -- contributor dominates, not a foregone conclusion. False (not ambiguous
 -- at all, nothing to teach or distrust) when the TOP voltage among the
--- contributors is shared by two or more of them — a true parallel tie
--- (e.g. two 28V generators feeding the same bus) always resolves to the
--- identical registered color regardless of which one "really" explains
--- it, exactly like _colorForPoweredNode's own "a tie in voltage is never
--- ambiguous on its own" case. Only when the top voltage belongs to
--- exactly ONE contributor (a genuine highest-vs-the-rest pick that could
--- be wrong — see the single-shared-gate-node case in
--- _colorForPoweredNode's own comment) or some contributor's voltage is
--- unset at all (the dashed-sequence fallback, truly unknowable) does this
--- return true. Shared by _deduceAttributionWinnersForSnapshot (only
+-- contributors is shared by two or more of them AND they all have the same
+-- color — a true parallel tie (e.g. two 28V generators feeding the same
+-- bus) resolves to that one color regardless of which one "really"
+-- explains it. When the top voltage belongs to exactly ONE contributor (a
+-- genuine highest-vs-the-rest pick that could be wrong — see the
+-- single-shared-gate-node case in _colorForPoweredNode's own comment),
+-- when contributors tied at the top have DIFFERENT colors (nothing says
+-- which of them to show), or some contributor's voltage is unset at all
+-- (the dashed-sequence fallback, truly unknowable) this returns true.
+-- Shared by _deduceAttributionWinnersForSnapshot (only
 -- worth teaching a winner for a genuinely ambiguous node — trying to
 -- match a tied-but-same-color case would just find the painted color
 -- matching BOTH tied contributors at once and get correctly skipped as
@@ -1762,6 +1789,7 @@ end
 -- _aiColorAttributionConfidence (only worth scoring unconfident for one).
 local function _isGenuinelyColorAmbiguous(canvas, contributingIds)
     local count, maxVoltage, maxCount, allHaveVoltage = 0, -math.huge, 0, true
+    local topColor, topColorsDiffer
     for id in pairs(contributingIds) do
         count = count + 1
         local entity = _findSourceEntity(canvas, id)
@@ -1770,13 +1798,15 @@ local function _isGenuinelyColorAmbiguous(canvas, contributingIds)
             allHaveVoltage = false
         elseif voltage > maxVoltage then
             maxVoltage, maxCount = voltage, 1
+            topColor, topColorsDiffer = _colorForSource(canvas, entity), false
         elseif voltage == maxVoltage then
             maxCount = maxCount + 1
+            if not _relays.sameColor(topColor, _colorForSource(canvas, entity)) then topColorsDiffer = true end
         end
     end
     if count <= 1 then return false end
     if not allHaveVoltage then return true end
-    return maxCount == 1
+    return maxCount == 1 or topColorsDiffer
 end
 
 -- (The single-highest-voltage-contributor pick this same reasoning needs
@@ -1788,16 +1818,16 @@ end
 -- of colors) a powered node should show, given attribution[nodeId] (the
 -- set of currently-active sources actually reaching it — see
 -- model/solver.lua's solveSourceAttribution) and each source's own
--- optional VOLTAGE (see _openPerSourceSettingsListMenu). Color is keyed by
--- VOLTAGE now, not by individual source (_colorForVoltage above) — so two
--- sources sharing a voltage always share a color too, automatically.
+-- optional VOLTAGE (see _openPerSourceSettingsListMenu). Color belongs to
+-- each individual source (_colorForSource above), so two sources sharing a
+-- voltage can each show their own.
 -- nodeStates (optional, defaults to {}) is this combination's own solved
 -- "powered"/"unpowered" state per node — needed only to look up an
 -- attribution rule's condition match; every existing caller that doesn't
 -- care about rules (e.g. a hand-built test canvas) can omit it and falls
 -- straight through to the voltage heuristic below, unchanged.
 --
--- A node reached by exactly one active source shows that source's voltage
+-- A node reached by exactly one active source shows that source's own
 -- color (falling back to the system-wide default powered color if it has
 -- no voltage registered). A node reached by TWO OR MORE at once (an
 -- un-isolated tie, e.g. a bus-tie relay left closed with both sides live,
@@ -1812,10 +1842,10 @@ end
 -- genuinely dominate/back-feed a lower one, though this is exactly the
 -- assumption that can be WRONG for the single-shared-node case above
 -- (see _aiColorAttributionConfidence, which scores this fallback as
--- unconfident for precisely that reason). A tie in voltage is never
--- ambiguous on its own: equal voltages already resolve to the identical
--- registered color. Only when some contributor's voltage is UNSET does
--- this stay genuinely unknowable — that source's real color can't be
+-- unconfident for precisely that reason). Contributors tied at the top
+-- voltage show their one shared color, or, when they have different colors,
+-- all of those colors as a SEQUENCE. When some contributor's voltage is
+-- UNSET this stays genuinely unknowable — that source's real color can't be
 -- derived, so this returns every contributor's color as a SEQUENCE
 -- instead of a single color — the caller threads this through
 -- applySolvedColors as-is, and the draw functions render a sequence as an
@@ -1831,21 +1861,19 @@ local function _colorForPoweredNode(nodeId, attribution, canvas, defaultColor, n
     table.sort(sortedIds)
 
     if #sortedIds == 1 then
-        local entity = _findSourceEntity(canvas, sortedIds[1])
-        return _colorForVoltage(canvas, entity and entity.voltage, defaultColor)
+        return _colorForSource(canvas, _findSourceEntity(canvas, sortedIds[1]), defaultColor)
     end
 
     local winnerId = _attributionRuleWinner(canvas, nodeId, nodeStates)
     if winnerId then
-        local entity = _findSourceEntity(canvas, winnerId)
-        return _colorForVoltage(canvas, entity and entity.voltage, defaultColor)
+        return _colorForSource(canvas, _findSourceEntity(canvas, winnerId), defaultColor)
     end
 
     local colors, allHaveVoltage, maxVoltage = {}, true, -math.huge
     for _, id in ipairs(sortedIds) do
         local entity = _findSourceEntity(canvas, id)
         local voltage = entity and entity.voltage
-        table.insert(colors, _colorForVoltage(canvas, voltage, defaultColor))
+        table.insert(colors, _colorForSource(canvas, entity, defaultColor))
         if not voltage then
             allHaveVoltage = false
         elseif voltage > maxVoltage then
@@ -1853,7 +1881,21 @@ local function _colorForPoweredNode(nodeId, attribution, canvas, defaultColor, n
         end
     end
 
-    if allHaveVoltage then return _colorForVoltage(canvas, maxVoltage, defaultColor) end
+    if allHaveVoltage then
+        local topColors = {}
+        for _, id in ipairs(sortedIds) do
+            local entity = _findSourceEntity(canvas, id)
+            if entity.voltage == maxVoltage then
+                local color = _colorForSource(canvas, entity, defaultColor)
+                local seen = false
+                for _, c in ipairs(topColors) do
+                    if _relays.sameColor(c, color) then seen = true end
+                end
+                if not seen then table.insert(topColors, color) end
+            end
+        end
+        return #topColors == 1 and topColors[1] or topColors
+    end
 
     return colors -- a sequence (length 2+) -- see this function's own comment
 end
@@ -2169,9 +2211,8 @@ end
 -- color would match every tied contributor's identical registered color
 -- at once, correctly skipped below as inconclusive, so there's nothing
 -- real to learn from it), checks whether the snapshot's own painted color
--- exactly matches exactly one contributor's registered voltage color
--- (canvas.voltageColors, via that source's own .voltage — see
--- _colorForVoltage). An exact, UNIQUE match is a positive "this source
+-- exactly matches exactly one contributor's own color (see
+-- _colorForSource). An exact, UNIQUE match is a positive "this source
 -- actually explains this node" example; no match, or a match shared by
 -- two or more contributors that happen to share the same registered
 -- color, is inconclusive and skipped — same "never guess" discipline
@@ -2190,7 +2231,7 @@ local function _deduceAttributionWinnersForSnapshot(canvas, graph, signature, sn
                 local matchedId, matchCount = nil, 0
                 for id in pairs(contributingIds) do
                     local entity = _findSourceEntity(canvas, id)
-                    local color = entity and entity.voltage and canvas.voltageColors and canvas.voltageColors[entity.voltage]
+                    local color = entity and entity.voltage and _colorForSource(canvas, entity)
                     if color and color[1] == paintedColor[1] and color[2] == paintedColor[2]
                        and color[3] == paintedColor[3] and (color[4] or 1) == (paintedColor[4] or 1) then
                         matchedId, matchCount = id, matchCount + 1
@@ -3020,9 +3061,8 @@ local function _computeAiPanelStats()
             for sourceId in pairs(contributingIds) do onlySourceId = sourceId end
             if not onlySourceId then return nil end
             local entity = _findSourceEntity(canvas, onlySourceId)
-            local voltage = entity and entity.voltage
-            if not voltage then return nil end
-            return _colorForVoltage(canvas, voltage, _currentMedium().style.powered), onlySourceId
+            if not (entity and entity.voltage) then return nil end
+            return _colorForSource(canvas, entity, _currentMedium().style.powered), onlySourceId
         end
 
         local mismatches = {}
@@ -3374,6 +3414,19 @@ end
 local function _openSystemIntoCanvas(systemId, mode)
     local sys = _findSystem(systemId)
     if not sys then return end
+    -- The LOAD element was removed along with its sprite: any saved one goes,
+    -- with its wires, since its image no longer exists to draw.
+    local retired = {}
+    for i = #(sys.elements or {}), 1, -1 do
+        if sys.elements[i].spritePath == "Sprites/element_load.png" then
+            retired[sys.elements[i].id] = true
+            table.remove(sys.elements, i)
+        end
+    end
+    for i = #(sys.wires or {}), 1, -1 do
+        local w = sys.wires[i]
+        if retired[w.fromElementId] or retired[w.toElementId] then table.remove(sys.wires, i) end
+    end
     -- A leftover undo snapshot could otherwise splice a DIFFERENT system's
     -- elements/wires/controls back in if "undo" were used right after this.
     gdsGui_schematic_clearUndo("mainCanvas")
@@ -3386,19 +3439,19 @@ local function _openSystemIntoCanvas(systemId, mode)
     for _, e in ipairs(sys.elements or {}) do
         gdsGui_schematic_addElement("mainCanvas", e.id, e.shapeType, e.x, e.y, e.w, e.h, e.label,
             _deepCopyTable(e.defaultColor), _deepCopyTable(e.properties), e.rotation or 0, e.spritePath,
-            e.componentType, _deepCopyTable(e.terminals))
+            e.componentType, _deepCopyTable(e.terminals or (e.spritePath == _BATTERY_SPRITE_PATH and _BATTERY_TERMINALS or nil)))
         -- voltage (per-source display setting — see
         -- _openPerSourceSettingsMenu) isn't among addElement's own
         -- parameters, so it doesn't round-trip through it like
         -- componentType does — attached directly here instead, same as
         -- how a loaded canvas's predictedColor is never trusted from disk
         -- in the first place (always nil-safe, re-derived or re-set,
-        -- never a required field). Color itself is never stored per-source
-        -- any more — it's derived live from voltage via this system's own
-        -- canvas.voltageColors, set just below (see _colorForPoweredNode).
+        -- never a required field).
         if canvas then
             local el = canvas.elements[#canvas.elements]
             el.voltage = e.voltage
+            el.poweredColor = _deepCopyTable(e.poweredColor)
+            el.busLoadAmps = e.busLoadAmps
             el.relayLogic = _deepCopyTable(e.relayLogic)
         end
     end
@@ -3409,6 +3462,7 @@ local function _openSystemIntoCanvas(systemId, mode)
         if canvas then
             local ctrl = canvas.controls[#canvas.controls]
             ctrl.voltage = c.voltage
+            ctrl.poweredColor = _deepCopyTable(c.poweredColor)
             ctrl.relayOf = c.relayOf
         end
     end
@@ -3423,11 +3477,8 @@ local function _openSystemIntoCanvas(systemId, mode)
         canvas.snapshots = _deepCopyTable(sys.snapshots or {})
         canvas.rules = _deepCopyTable(sys.rules or {})
         canvas.attributionRules = _deepCopyTable(sys.attributionRules or {})
-        -- Starts empty for a system that's never had a voltage taught yet
-        -- (new system, or one re-created after deleting it or its whole
-        -- aircraft) — same "has to be taught again" lifecycle as
-        -- snapshots/rules just above, deliberately not an appSettings
-        -- global (see _ensureVoltageHasColor's own comment).
+        -- Only systems saved before colors became per-source have entries
+        -- here (see _colorForSource) — nothing writes new ones.
         canvas.voltageColors = _deepCopyTable(sys.voltageColors or {})
     end
     if canvas then
@@ -3722,11 +3773,9 @@ end
 
 -------------------------------------------------------------------------------
 -- SYSTEM SCHEMATIC — PER-SOURCE SETTINGS: an individual source (BATTERY,
--- GENERATOR, ...) is given a nominal VOLTAGE — its powered color is never
--- set directly any more; it's always whatever color is registered for that
--- VOLTAGE on THIS system (canvas.voltageColors — see
--- _ensureVoltageHasColor), so any two sources sharing a voltage on the
--- same system always read as the same color automatically. Purely a
+-- GENERATOR, ...) is given a nominal VOLTAGE and its own powered color (see
+-- _colorForSource), so two sources sharing a voltage can read as the same
+-- color or different ones. Purely a
 -- display-layer setting consulted only by _solveCurrentSchematic's color
 -- provenance step (see model/solver.lua's solveSourceAttribution), never
 -- by the solver's own logical powered/unpowered vocabulary or the
@@ -3737,19 +3786,17 @@ end
 -- (a genuine tie, e.g. an unisolated bus-tie), _solveCurrentSchematic picks
 -- the single highest-VOLTAGE contributor's color outright, as long as
 -- every contributor's voltage is known (the higher-voltage source would
--- actually dominate/back-feed the lower one on a real bus) — a tie in
--- voltage no longer needs special-casing, since equal voltages already
--- share the identical registered color. Only when voltage is genuinely
--- unset on some contributor does it fall back to an alternating dashed mix
--- of every contributor's color.
+-- actually dominate/back-feed the lower one on a real bus). Contributors
+-- tied at that voltage with different colors show an alternating dashed mix
+-- of those colors, and so does every contributor when voltage is genuinely
+-- unset on some of them.
 -------------------------------------------------------------------------------
 
--- The palette name of the color currently registered for a voltage ON THIS
--- SYSTEM (canvas.voltageColors — see _ensureVoltageHasColor), or
--- "UNASSIGNED" if that voltage has no color yet (nil voltage reads as
--- "? V" by its caller instead of hitting this).
-local function _voltageColorDescription(canvas, voltage)
-    local c = canvas.voltageColors and canvas.voltageColors[voltage]
+-- The palette name of a source's own color (see _colorForSource), or
+-- "UNASSIGNED" if it has none yet (nil voltage reads as "? V" by its caller
+-- instead of hitting this).
+local function _sourceColorDescription(canvas, entity)
+    local c = _colorForSource(canvas, entity)
     if not c then return "UNASSIGNED" end
     for i = 1, 5 do
         local paletteColor, paletteName = gdsGui_schematic_getColorPaletteEntry(i)
@@ -3773,7 +3820,7 @@ local function _openPerSourceSettingsListMenu(canvasName)
         local entity = _findSourceEntity(canvas, id)
         local voltage = entity and entity.voltage
         local voltageDescription = voltage and (voltage .. ((entity and entity.voltageType) or unit)) or ("? " .. unit)
-        local colorDescription = voltage and _voltageColorDescription(canvas, voltage) or "default"
+        local colorDescription = voltage and _sourceColorDescription(canvas, entity) or "default"
         table.insert(options, (labelsById[id] or id) .. " (" .. voltageDescription .. ", " .. colorDescription .. ")")
     end
     table.insert(options, "RETURN")
@@ -4868,14 +4915,8 @@ function love.load()
     -- overriding it here keeps both consistent without touching either.
     if appSettings.electricalPoweredColor then ELECTRICAL_MEDIUM.style.powered = appSettings.electricalPoweredColor end
     if appSettings.electricalUnpoweredColor then ELECTRICAL_MEDIUM.style.unpowered = appSettings.electricalUnpoweredColor end
-    -- Voltage -> powered color is PER-SYSTEM (canvas.voltageColors — see
-    -- _clearMainCanvas/_openSystemIntoCanvas below), not an appSettings
-    -- global: every source sharing a nominal VOLTAGE within the SAME system
-    -- shares a display color automatically, picked once (see
-    -- _ensureVoltageHasColor) and reused for the rest of that system's
-    -- life — but a fresh system (a brand new one, or re-creating one after
-    -- deleting it or its whole aircraft) starts with no voltage colors
-    -- taught at all, same as it starts with no snapshots/rules taught.
+    -- A source's powered color lives on the source itself (see
+    -- _colorForSource), not in appSettings.
     _syncPaidLoadingScreenSkip()
 
     -- Loads the aircraft/systems store (see _loadSchematicStoreSafely for the
@@ -7077,9 +7118,8 @@ function captureSchematicSnapshot()
                 for sourceId in pairs(contributingIds) do onlySourceId = sourceId end
                 if not onlySourceId then return nil end
                 local entity = _findSourceEntity(canvas, onlySourceId)
-                local voltage = entity and entity.voltage
-                if not voltage then return nil end
-                return _colorForVoltage(canvas, voltage, _currentMedium().style.powered), onlySourceId
+                if not (entity and entity.voltage) then return nil end
+                return _colorForSource(canvas, entity, _currentMedium().style.powered), onlySourceId
             end
 
             for _, e in ipairs(canvas.elements) do
@@ -7311,16 +7351,10 @@ function schematicPerSourceSettingsListChosen(canvasName, index, optionText)
 end
 
 -------------------------------------------------------------------------------
--- SYSTEM SCHEMATIC — VOLTAGE -> COLOR REGISTRATION: a voltage's powered
--- color, registered on canvas.voltageColors (NOT an appSettings global — a
--- fresh system, new or re-created after deleting it or its whole aircraft,
--- starts with nothing registered, same as it starts with no snapshots/
--- rules taught, so every voltage has to be taught again). Picking the SAME
--- color for a voltage that already has one registered is a harmless no-op
--- (it's keyed by voltage, not by individual source, so every source sharing
--- it just keeps reading the same way); picking a DIFFERENT one simply
--- re-registers it for every source at that magnitude, on this system, all
--- at once. Both placement (schematicElementPlacementExtraRows) and editing
+-- SYSTEM SCHEMATIC — SOURCE COLOR REGISTRATION: each source's own powered
+-- color, stored on the source itself (entity.poweredColor — see
+-- _colorForSource), so picking one never changes any other source, whatever
+-- voltage it shares. Both placement (schematicElementPlacementExtraRows) and editing
 -- (schematicElementPropertiesExtraRows/elementPropertiesRowSaved below)
 -- collect this the exact same way, as one more mandatory row in their own
 -- propertyGrid — there's no separate color-picker popup anywhere anymore.
@@ -7333,31 +7367,40 @@ end
 
 -- Reverse of the registration above: "24V" (or "1500PSI", ... — see
 -- _currentMedium's own magnitudeUnit) when elementId's CURRENTLY DISPLAYED
--- color (gdsGui_schematic_resolveColor — the exact same tiered
+-- color or dashed color sequence (gdsGui_schematic_resolveColor/
+-- resolveColorSequence — the exact same tiered
 -- pendingColor/snapshot/predictedColor/default lookup the live canvas
 -- itself paints with, so this can never disagree with what's actually on
--- screen) matches one of this system's own registered voltageColors
--- entries, else nil — an unpowered element (flat gray), a legacy/untyped
--- system predating "one system type per aircraft" (no voltageColors
--- concept at all), or a multi-source dashed sequence with no single flat
--- color all read as "no one sensed a magnitude to report," same as the
--- hook simply returning nothing.
+-- screen) matches some source's own color, else nil — an unpowered element
+-- (flat gray) reads as "no one sensed a magnitude to report," same as the
+-- hook simply returning nothing. A color several sources share reads as the
+-- highest of their voltages, same as _colorForPoweredNode's own pick.
 -- Formerly shown appended to the element edit menu's own title
 -- (schematic_gdsGuiLib.lua's canvas.elementMenuTitleSuffix hook); now one of
 -- the read-only rows schematicElementSensedValues below hands to the
 -- PROPERTIES menu instead (canvas.elementSensedValues), alongside CURRENT.
 function schematicElementSensedVoltage(canvasName, elementId)
     local canvas = _findSchematicCanvas()
-    if not canvas or not canvas.voltageColors then return nil end
-    local r, g, b, a = gdsGui_schematic_resolveColor(canvasName, "element", elementId)
-    for voltage, color in pairs(canvas.voltageColors) do
-        if math.abs(color[1] - r) < 0.01 and math.abs(color[2] - g) < 0.01
-           and math.abs(color[3] - b) < 0.01 and math.abs((color[4] or 1) - a) < 0.01 then
-            local entity = _findSourceEntity(canvas, elementId)
-            return voltage .. ((entity and entity.voltageType) or _currentMedium().magnitudeUnit or "V")
+    if not canvas then return nil end
+    local shown = gdsGui_schematic_resolveColorSequence(canvasName, "element", elementId)
+    if not shown then shown = { { gdsGui_schematic_resolveColor(canvasName, "element", elementId) } } end
+    local highest
+    for _, entities in ipairs({ canvas.elements, canvas.controls }) do
+        for _, source in ipairs(entities) do
+            local color = source.componentType == "source" and source.voltage and _colorForSource(canvas, source)
+            if color and (not highest or source.voltage > highest) then
+                for _, c in ipairs(shown) do
+                    if math.abs(color[1] - c[1]) < 0.01 and math.abs(color[2] - c[2]) < 0.01
+                       and math.abs(color[3] - c[3]) < 0.01 and math.abs((color[4] or 1) - (c[4] or 1)) < 0.01 then
+                        highest = source.voltage
+                    end
+                end
+            end
         end
     end
-    return nil
+    if not highest then return nil end
+    local entity = _findSourceEntity(canvas, elementId)
+    return highest .. ((entity and entity.voltageType) or _currentMedium().magnitudeUnit or "V")
 end
 
 -- Current is not modeled anywhere yet (model/solver.lua's graph is a pure
@@ -7376,10 +7419,16 @@ end
 -- CURRENT rows shown above an element's own custom properties. Order here
 -- is display order.
 function schematicElementSensedValues(canvasName, elementId)
-    return {
+    local values = {
         { label = _currentMedium().magnitudeLabel or "VOLTAGE", value = schematicElementSensedVoltage(canvasName, elementId) },
-        { label = "CURRENT", value = schematicElementSensedCurrent(canvasName, elementId) },
     }
+    -- A bus sets its load on its own slider in this same menu instead.
+    local canvas = _findSchematicCanvas()
+    local entity = canvas and _findSourceEntity(canvas, elementId)
+    if not (entity and entity.spritePath == _BUS_SPRITE_PATH) then
+        table.insert(values, { label = "CURRENT", value = schematicElementSensedCurrent(canvasName, elementId) })
+    end
+    return values
 end
 
 -- canvas.elementStatusText hook (schematic_gdsGuiLib.lua's _drawElement):
@@ -7389,7 +7438,13 @@ end
 -- taught voltage, same as that menu's own "N/A" case resolves to nothing
 -- here instead (a canvas label has no room for a literal "N/A").
 function schematicElementStatusText(canvasName, elementId)
-    return schematicElementSensedVoltage(canvasName, elementId)
+    local voltage = schematicElementSensedVoltage(canvasName, elementId)
+    local canvas = _findSchematicCanvas()
+    local entity = canvas and _findSourceEntity(canvas, elementId)
+    if entity and entity.spritePath == _BUS_SPRITE_PATH then
+        return (voltage and (voltage .. "  ") or "") .. _busLoadText(entity)
+    end
+    return voltage
 end
 
 -- A source's own TYPE (VDC/VAC, ELECTRICAL only) + magnitude NUMBER rows,
@@ -7462,14 +7517,12 @@ end
 -- POWERED COLOR (same swatch row schematicElementPropertiesExtraRows below
 -- shows when editing) only for a "source" item, right after it — mandatory
 -- same as every other row here (_openElementPlacementGrid's own
--- requireAll), so a source can no longer be created without an explicit
--- color pick, even for a voltage this system has already registered one
--- for (re-picking the same swatch is a one-tap no-op — row.value just needs
--- to be the SAME palette name, applied via _applyPlacementExtraRows/
+-- requireAll), so a source can no longer be created without its own
+-- explicit color pick, applied via _applyPlacementExtraRows/
 -- elementPropertiesRowSaved below, same as editing an existing source's
--- color ever does). POWERED COLOR starts blank — unlike the edit-time row,
--- there's no live entity yet whose already-registered color could be looked
--- up and pre-selected.
+-- color ever does. POWERED COLOR starts blank — unlike the edit-time row,
+-- there's no live entity yet whose own color could be looked up and
+-- pre-selected.
 function schematicElementPlacementExtraRows(canvasName, componentType)
     local rows = { _groundDependentRow(nil) }
     if componentType == "source" then
@@ -7485,7 +7538,7 @@ end
 -- placement grid above (GROUND SWITCH DEPENDENT, TYPE/VOLTAGE/POWERED COLOR
 -- if this was a source, and any default properties) has actually been
 -- written onto the brand new element/control — the POWERED COLOR row's own
--- value already landed in canvas.voltageColors by then
+-- value already landed in entity.poweredColor by then
 -- (_applyPlacementExtraRows calls elementPropertiesRowSaved inline, in row
 -- order, so VOLTAGE is on the entity before POWERED COLOR's own hook ever
 -- runs). Re-syncs the hidden GEAR control in case GROUND SWITCH DEPENDENT
@@ -7516,9 +7569,9 @@ end
 -- one); TYPE/VOLTAGE/POWERED COLOR only for an actual source
 -- (entity.componentType == "source") — NOT gated on whether VOLTAGE happens
 -- to be set yet, since that's exactly one of the rows this returns.
--- POWERED COLOR's own value is the palette NAME matching
--- canvas.voltageColors[entity.voltage] right now (blank if that voltage has
--- never been registered a color, OR if VOLTAGE itself isn't set yet).
+-- POWERED COLOR's own value is the palette NAME matching this source's own
+-- color right now (see _colorForSource; blank if it has none, OR if VOLTAGE
+-- itself isn't set yet).
 function schematicElementPropertiesExtraRows(canvasName, elementId)
     local canvas = _findSchematicCanvas()
     local entity = canvas and _findSourceEntity(canvas, elementId)
@@ -7526,11 +7579,21 @@ function schematicElementPropertiesExtraRows(canvasName, elementId)
     local rows = { _groundDependentRow(entity) }
     if entity.componentType == "source" then
         for _, r in ipairs(_sourceTypeVoltageRows(entity)) do table.insert(rows, r) end
-        local currentColor = entity.voltage and canvas.voltageColors and canvas.voltageColors[entity.voltage]
+        local currentColor = entity.voltage and _colorForSource(canvas, entity)
         local names, swatches = _colorPaletteNamesAndSwatches()
         table.insert(rows, { key = "poweredColor", label = "POWERED COLOR", target = "voltageColor",
             choices = names, swatchColors = swatches,
             value = gdsGui_schematic_colorPaletteNameForColor(currentColor) or "" })
+    end
+    if entity.spritePath == _BUS_SPRITE_PATH then
+        -- A CURRENT property hand-added to an older bus: the slider below
+        -- replaces it, and the library only strips a label it shows as sensed.
+        for i = #(entity.properties or {}), 1, -1 do
+            if entity.properties[i].key:upper() == "CURRENT" then table.remove(entity.properties, i) end
+        end
+        table.insert(rows, { key = "busLoadAmps", label = "LOAD", target = "field", numeric = true,
+            value = string.format("%g", entity.busLoadAmps or 0),
+            slider = { min = 0, max = _BUS_LOAD_MAX_AMPS, unit = "A" } })
     end
     return rows
 end
@@ -7538,17 +7601,16 @@ end
 -- canvas.elementPropertiesRowSaved hook: fired once per saved row whose
 -- target the library itself doesn't know how to write (i.e. not "field") —
 -- the only one main.lua ever hands it is the POWERED COLOR row above.
--- Registers the picked color for every source sharing THIS voltage on this
--- system (same per-voltage keying _ensureVoltageHasColor uses), then
--- resolves/saves same as every other color-registration path here.
+-- Stores the picked color on this one source, leaving every other source
+-- alone, then resolves/saves same as every other color-registration path
+-- here.
 function schematicElementPropertiesRowSaved(canvasName, elementId, row)
     if row.target ~= "voltageColor" then return end
     local canvas = _findSchematicCanvas()
     local entity = canvas and _findSourceEntity(canvas, elementId)
     local color = row.value and row.value ~= "" and gdsGui_schematic_colorForPaletteName(row.value)
     if not entity or not entity.voltage or not color then return end
-    canvas.voltageColors = canvas.voltageColors or {}
-    canvas.voltageColors[entity.voltage] = color
+    entity.poweredColor = color
     _resolveAndSaveSchematic()
 end
 
@@ -7733,13 +7795,12 @@ function mediaRegistryCurrentMediumTest()
     return fallbackIsElectrical, registryRoundTrips, unregisteredIsNil
 end
 
--- _colorForPoweredNode tests (voltage-keyed powered colors, see that
+-- _colorForPoweredNode tests (per-source powered colors, see that
 -- function's own comment above _solveCurrentSchematic). Hand-built
 -- {elements=..., controls=..., voltageColors=...} tables, not a real
 -- schematic canvas -- _colorForPoweredNode/_findSourceEntity only ever
--- read .id/.voltage off elements/controls, and voltageColors directly
--- (canvas.voltageColors is per-system, not an appSettings global — see
--- _ensureVoltageHasColor's own comment).
+-- read .id/.voltage/.poweredColor off elements/controls, and voltageColors
+-- directly.
 local _TEST_RED, _TEST_YELLOW, _TEST_DEFAULT = { 1, 0, 0, 1 }, { 1, 1, 0, 1 }, { 0.9, 0.9, 0.9, 1 }
 
 function colorForPoweredNode_singleSourceOwnColorTest()
@@ -7775,11 +7836,9 @@ function colorForPoweredNode_tieNoVoltageDashesTest()
     return #color
 end
 
--- Equal voltages no longer need a dashed fallback at all: both contributors
--- share the IDENTICAL registered color for that voltage now, so this
--- asserts a single flat color instead of the old 2-entry dashed sequence —
--- the exact behavior change this refactor (color keyed by voltage, not by
--- individual source) was for.
+-- A source saved before colors became per-source still reads its voltage's
+-- registered color, and equal voltages sharing one color stay a single flat
+-- color rather than a dashed sequence.
 function colorForPoweredNode_tieEqualVoltageSameColorTest()
     local canvas = {
         elements = { { id = "batt1", voltage = 24 } },
@@ -7789,6 +7848,54 @@ function colorForPoweredNode_tieEqualVoltageSameColorTest()
     local color = _colorForPoweredNode("bus1", { bus1 = { batt1 = true, gen1 = true } }, canvas, _TEST_DEFAULT)
     if type(color[1]) == "table" then return "unexpected sequence" end
     return color[1], color[2], color[3]
+end
+
+-- A source's own color beats its voltage's registered one, so two sources
+-- of one voltage can differ.
+function colorForPoweredNode_sameVoltageOwnColorsTest()
+    local canvas = {
+        elements = { { id = "batt1", voltage = 28, poweredColor = _TEST_RED } },
+        controls = { { id = "gen1", voltage = 28, poweredColor = _TEST_YELLOW } },
+        voltageColors = { [28] = _TEST_DEFAULT },
+    }
+    local batt = _colorForPoweredNode("n1", { n1 = { batt1 = true } }, canvas, _TEST_DEFAULT)
+    local gen = _colorForPoweredNode("n2", { n2 = { gen1 = true } }, canvas, _TEST_DEFAULT)
+    return batt[2] .. "," .. gen[2]
+end
+
+-- Tied at the top voltage in different colors: dashes those colors only (the
+-- lower-voltage contributor stays out), and is ambiguous enough to teach.
+function colorForPoweredNode_tieEqualVoltageDifferentColorsTest()
+    local canvas = {
+        elements = { { id = "batt1", voltage = 24, poweredColor = _TEST_DEFAULT } },
+        controls = { { id = "gen1", voltage = 28, poweredColor = _TEST_RED }, { id = "gen2", voltage = 28, poweredColor = _TEST_YELLOW } },
+        voltageColors = {},
+    }
+    local contributors = { batt1 = true, gen1 = true, gen2 = true }
+    local color = _colorForPoweredNode("bus1", { bus1 = contributors }, canvas, _TEST_DEFAULT)
+    if type(color[1]) ~= "table" then return "not a sequence" end
+    return #color .. "," .. color[1][2] .. "," .. color[2][2] .. "," .. tostring(_isGenuinelyColorAmbiguous(canvas, contributors))
+end
+
+-- Tied at the top voltage in the same color: flat, and nothing to teach.
+function colorForPoweredNode_tieEqualVoltageSharedOwnColorTest()
+    local canvas = {
+        elements = {},
+        controls = { { id = "gen1", voltage = 28, poweredColor = _TEST_RED }, { id = "gen2", voltage = 28, poweredColor = { 1, 0, 0, 1 } } },
+        voltageColors = {},
+    }
+    local contributors = { gen1 = true, gen2 = true }
+    local color = _colorForPoweredNode("bus1", { bus1 = contributors }, canvas, _TEST_DEFAULT)
+    if type(color[1]) == "table" then return "unexpected sequence" end
+    return color[1] .. "," .. tostring(_isGenuinelyColorAmbiguous(canvas, contributors))
+end
+
+function busLoadText_setTest()
+    return _busLoadText({ busLoadAmps = 42 })
+end
+
+function busLoadText_unsetTest()
+    return _busLoadText({})
 end
 
 -- Full-stack integration: two real sources (BATT 1 element, GEN 1 control)
@@ -9731,6 +9838,31 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcName"]={"colorForPoweredNode_tieEqualVoltageSameColorTest"},
         ["funcParameters"]={0},
         ["funcExpctOutput"]={1, 0, 0}}
+
+    gdsGui_dev_testExecute {["id"]="colorForPoweredNode_sameVoltageOwnColors",
+        ["funcName"]={"colorForPoweredNode_sameVoltageOwnColorsTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"0,1"}}
+
+    gdsGui_dev_testExecute {["id"]="colorForPoweredNode_tieEqualVoltageDifferentColors",
+        ["funcName"]={"colorForPoweredNode_tieEqualVoltageDifferentColorsTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"2,0,1,true"}}
+
+    gdsGui_dev_testExecute {["id"]="colorForPoweredNode_tieEqualVoltageSharedOwnColor",
+        ["funcName"]={"colorForPoweredNode_tieEqualVoltageSharedOwnColorTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"1,false"}}
+
+    gdsGui_dev_testExecute {["id"]="busLoadText_set",
+        ["funcName"]={"busLoadText_setTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"42 amps"}}
+
+    gdsGui_dev_testExecute {["id"]="busLoadText_unset",
+        ["funcName"]={"busLoadText_unsetTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={"0 amps"}}
 
     gdsGui_dev_testExecute {["id"]="schematic_voltageTieBreak_integration",
         ["funcName"]={"schematicVoltageTieBreakIntegrationTest"},
