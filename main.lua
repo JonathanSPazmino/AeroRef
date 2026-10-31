@@ -25,7 +25,7 @@ require("model.media.hydraulic")
 require("model.media.fuel")
 require("model.media.bleedAir")
 
-APP_VERSION = "1.0.32"
+APP_VERSION = "1.0.33"
 
 -- Shape version of schematicProjects.lua's data, independent of APP_VERSION
 -- (an app update can ship with no data-shape change at all, or vice versa).
@@ -3499,6 +3499,14 @@ local function _openSystemIntoCanvas(systemId, mode)
     for _, w in ipairs(sys.wires or {}) do
         gdsGui_schematic_addWire("mainCanvas", w.id, w.fromElementId, w.toElementId, _deepCopyTable(w.defaultColor),
             w.directionOverride, w.fromTerminal, w.toTerminal)
+        -- gravityDirection (a liquid PIPE's own flow-direction chevrons —
+        -- see schematic_gdsGuiLib.lua's _pipes.cycleGravityDirection) isn't
+        -- among addWire's own parameters, so it doesn't round-trip through
+        -- it like directionOverride does — attached directly here, same as
+        -- el.voltage/ctrl.voltage just above.
+        if canvas then
+            canvas.wires[#canvas.wires].gravityDirection = w.gravityDirection
+        end
     end
     for _, a in ipairs(sys.annunciators or {}) do
         gdsGui_schematic_addAnnunciator("mainCanvas", a.id, a.label, _deepCopyTable(a.color), a.active)

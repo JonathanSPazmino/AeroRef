@@ -6341,7 +6341,10 @@ end
 
 -- The yellow/magenta emphasis around a selected connector. Magenta once the
 -- hold has unlocked its direction-drag; yellow means a tap opens the menu, or
--- hold to unlock that.
+-- hold to unlock that. Once magenta (rebending mode) on a LIQUID pipe (see
+-- _pipes.isLiquid) specifically, a plain tap no longer reopens the menu —
+-- see gdsGui_schematic_released's "wireDirection" branch — it cycles
+-- w.gravityDirection instead, same spot a drag there changes the bend.
 function _pipes.drawSelection(canvas, plan, width)
     if canvas.selectionMoveModeActive then
         love.graphics.setColor(1, 0, 1, 1)
@@ -6376,6 +6379,86 @@ function _pipes.drawBundleWalls(canvas, bundle)
     local loY, hiY = math.min(bundle.y1, bundle.y2), math.max(bundle.y1, bundle.y2)
     _pipes.setWallColor()
     love.graphics.rectangle("fill", loX - half, loY - half, hiX - loX + half * 2, hiY - loY + half * 2)
+end
+
+--------------------------------------------------------------------------------
+-- GRAVITY DIRECTION: a LIQUID pipe (connectorNoun == "PIPE" — HYDRAULIC/FUEL,
+-- not a gas DUCT) can mark which way gravity drives the fluid through that
+-- particular run, shown as a row of open chevrons (>) along its own center
+-- pointing that way — or no chevrons at all for "none" (e.g. a run that sits
+-- level, so gravity alone doesn't move anything through it). Purely a visual
+-- annotation, not fed into the solver: the same "nil means automatic/unset"
+-- convention as w.directionOverride, just for flow direction instead of bend
+-- shape. Cycled by a plain tap once rebending/direction mode has already
+-- unlocked on the wire (gdsGui_schematic_released's own "wireDirection"
+-- branch), not a menu row — meant to be as quick and repeatable as the
+-- direction-drag itself while routing a run of pipe.
+--------------------------------------------------------------------------------
+
+-- w.gravityDirection: nil ("none"), "forward" (fromElementId -> toElementId)
+-- or "reverse" (toElementId -> fromElementId).
+function _pipes.isLiquid(canvas)
+    return canvas.pipeConnectors and canvas.connectorNoun == "PIPE"
+end
+
+-- none -> forward -> reverse -> none -> ...
+function _pipes.cycleGravityDirection(w)
+    if w.gravityDirection == nil then
+        w.gravityDirection = "forward"
+    elseif w.gravityDirection == "forward" then
+        w.gravityDirection = "reverse"
+    else
+        w.gravityDirection = nil
+    end
+end
+
+_pipes.GRAVITY_CHEVRON_SPACING = _GRID_SPACING_PX * 2  -- world units between chevrons
+
+-- One open ">"-shaped chevron centered at (cx,cy), pointing in unit direction
+-- (dx,dy) — a 3-point polyline (never filled), so it reads as a notch across
+-- the fluid rather than a solid arrowhead.
+function _pipes.drawChevron(cx, cy, dx, dy, size)
+    local perpX, perpY = -dy, dx
+    local tipX,  tipY  = cx + dx * size * 0.5, cy + dy * size * 0.5
+    local backX, backY = cx - dx * size * 0.5, cy - dy * size * 0.5
+    love.graphics.line(
+        backX + perpX * size * 0.45, backY + perpY * size * 0.45,
+        tipX, tipY,
+        backX - perpX * size * 0.45, backY - perpY * size * 0.45)
+end
+
+-- Every chevron along one wire's plan, evenly spaced along its WHOLE path
+-- (the running "carry" phase below keeps the interval continuous across a
+-- bend from one segment into the next) — nothing drawn at all for "none".
+-- Drawn in the wall's own gray (_pipes.setWallColor) so it reads consistently
+-- regardless of the fluid's own (per-source) color.
+function _pipes.drawGravityChevrons(canvas, w, plan)
+    local dir = w.gravityDirection
+    if not dir then return end
+    local pointBackward = (dir == "reverse")
+    local pipeWidth = _WIRE_WIDTH_PX * _pipes.WIDTH_MULT * canvas.zoom
+    local size = pipeWidth * 0.9
+    local spacing = math.max(size * 2.2, _pipes.GRAVITY_CHEVRON_SPACING * canvas.zoom)
+    _pipes.setWallColor()
+    love.graphics.setLineWidth(math.max(1, pipeWidth * 0.35))
+    local carry = spacing / 2
+    for _, seg in ipairs(plan.segments) do
+        local x1, y1, x2, y2 = seg[1], seg[2], seg[3], seg[4]
+        local dx, dy = x2 - x1, y2 - y1
+        local len = math.sqrt(dx * dx + dy * dy)
+        if len > 0.001 then
+            local ux, uy = dx / len, dy / len
+            local pointX = pointBackward and -ux or ux
+            local pointY = pointBackward and -uy or uy
+            local d = carry
+            while d < len do
+                _pipes.drawChevron(x1 + ux * d, y1 + uy * d, pointX, pointY, size)
+                d = d + spacing
+            end
+            carry = d - len
+        end
+    end
+    love.graphics.setLineWidth(1)
 end
 
 -- Draws an orthogonal connector line between two anchors' centers, clamped
@@ -7250,6 +7333,17 @@ function gdsGui_schematic_draw(pageName)
                         end)
                     end
                     _drawWireBundleSegment(canvas, bundle.x1, bundle.y1, bundle.x2, bundle.y2, colors)
+                end
+            end
+            -- Gravity-direction chevrons (see _pipes.drawGravityChevrons):
+            -- drawn in their own pass, after both the per-wire fluid lines
+            -- AND the bundle color bands above, so a chevron on a stretch
+            -- shared with another pipe (bundled) still shows on top instead
+            -- of being painted over by that later bundle-band pass.
+            if _pipes.isLiquid(canvas) then
+                for _, w in ipairs(canvas.wires) do
+                    local plan = wirePlans[w.id]
+                    if plan and wireVisible(plan) then _pipes.drawGravityChevrons(canvas, w, plan) end
                 end
             end
             for _, e in ipairs(canvas.elements) do
@@ -8495,9 +8589,23 @@ function gdsGui_schematic_released(touchId, x, y)
                 gdsGui_schematic_openWireEditMenu(canvas.name, canvas.selectedWireId)
             elseif canvas.mode == "design" and canvas.dragKind == "wireDirection" and
                    canvas.selectedWireId and not canvas.dragMoved then
-                -- Same tap-to-edit gesture as a plain wire drag: a tap with
-                -- no actual direction change opens the edit menu instead.
-                gdsGui_schematic_openWireEditMenu(canvas.name, canvas.selectedWireId)
+                -- Rebending/direction mode is already unlocked on this wire
+                -- (see gdsGui_schematic_pressed's isActiveMoveTarget branch)
+                -- and this tap never actually dragged a new bend direction.
+                -- For a LIQUID pipe (_pipes.isLiquid — HYDRAULIC/FUEL, not a
+                -- gas DUCT), that plain tap cycles its gravity-flow direction
+                -- instead of reopening the edit menu (see
+                -- _pipes.cycleGravityDirection) — quick and repeatable, same
+                -- spirit as the direction-drag itself. Every other wire
+                -- keeps the previous tap-to-edit behavior.
+                local w = _pipes.isLiquid(canvas) and _findWire(canvas, canvas.selectedWireId)
+                if w then
+                    _pushUndo(canvas)
+                    _pipes.cycleGravityDirection(w)
+                    _notifyChanged(canvas)
+                else
+                    gdsGui_schematic_openWireEditMenu(canvas.name, canvas.selectedWireId)
+                end
             elseif canvas.mode == "design" and canvas.dragKind == "control" and
                    canvas.selectedControlId and not canvas.dragMoved then
                 -- Same no-menu move-mode tap as an element above (every
