@@ -24,6 +24,8 @@ local ELECTRICAL_MEDIUM = require("model.media.electrical")
 require("model.media.hydraulic")
 require("model.media.fuel")
 require("model.media.bleedAir")
+-- Global, not local: this file is at Lua's 200-top-level-local ceiling.
+ModelFluid = require("model.fluid")
 
 APP_VERSION = "1.0.33"
 
@@ -528,9 +530,11 @@ local SCHEMATIC_CATALOG = {
     }},
     { system = "FUEL", pipeConnectors = "PIPE", items = {
         -- reshapable: its outline can be redrawn and it rotates to any angle
-        -- on the canvas — see gdsGui_schematic_setReshapableKind.
+        -- on the canvas — see gdsGui_schematic_setReshapableKind. Its MAX
+        -- CAPACITY, LEVEL and QUANTITY rows come from _tankRows, not
+        -- defaultProperties, since LEVEL is a slider linked to QUANTITY.
         { label = "FUEL TANK", abbrev = "FTNK", kind = "element", shapeType = "rect",
-          defaultProperties = {"QUANTITY"}, gridW = 3, gridH = 3, componentType = "source", reshapable = true },
+          gridW = 3, gridH = 3, componentType = "source", reshapable = true },
         -- Boost pump: mirrors HYDRAULIC's own PUMP control above (and
         -- ELECTRICAL's GENERATOR) — a pilot-switchable source, not the
         -- always-present FUEL TANK itself.
@@ -1102,6 +1106,13 @@ local function _verifyAndRepairSchematicStore(store)
             sys.annunciators = sys.annunciators or {}
             sys.snapshots    = sys.snapshots    or {}
             local sysLabel = sys.name or sys.id or "?"
+            -- Reshaped tanks saved back when their outline was rows of grid squares.
+            for _, e in ipairs(sys.elements) do
+                if e.shapeRows then
+                    e.shapePoints = _shapePoly.pointsFromRows(e.shapeRows)
+                    e.shapeRows = nil
+                end
+            end
             _dedupeIds(sys.elements, "id", function(old, new)
                 return "system '" .. sysLabel .. "': duplicate element id '" .. old .. "' renamed to '" .. new .. "'"
             end, notes)
@@ -1338,11 +1349,14 @@ end
 
 -- A "source" element (e.g. BATTERY) has no detent of its own, so it's
 -- simply on whenever it's present; a "source" control (e.g. GENERATOR) is
--- on only in its active position.
+-- on only in its active position. A store that's run dry (see _fluidTick) stops
+-- once the last of its fluid has left its pipes too.
 local function _currentSourceStates(canvas, componentTypes)
     local states = {}
     for _, e in ipairs(canvas.elements) do
-        if componentTypes[e.id] == "source" then states[e.id] = true end
+        if componentTypes[e.id] == "source" then
+            states[e.id] = e.fillPercent ~= 0 or (canvas._fluidStillFeeding and canvas._fluidStillFeeding[e.id]) or false
+        end
     end
     for _, c in ipairs(canvas.controls) do
         if componentTypes[c.id] == "source" then states[c.id] = _isActivePosition(c) end
@@ -3480,8 +3494,10 @@ local function _openSystemIntoCanvas(systemId, mode)
             local el = canvas.elements[#canvas.elements]
             el.voltage = e.voltage
             el.poweredColor = _deepCopyTable(e.poweredColor)
-            el.shapeRows = _deepCopyTable(e.shapeRows)
+            el.shapePoints = _deepCopyTable(e.shapePoints)
             el.busLoadAmps = e.busLoadAmps
+            el.tankMaxCapacity = e.tankMaxCapacity
+            el.fillPercent = e.fillPercent
             el.relayLogic = _deepCopyTable(e.relayLogic)
         end
     end
@@ -3506,6 +3522,7 @@ local function _openSystemIntoCanvas(systemId, mode)
         -- el.voltage/ctrl.voltage just above.
         if canvas then
             canvas.wires[#canvas.wires].gravityDirection = w.gravityDirection
+            canvas.wires[#canvas.wires].fluidPercent = w.fluidPercent
         end
     end
     for _, a in ipairs(sys.annunciators or {}) do
@@ -3541,6 +3558,9 @@ local function _openSystemIntoCanvas(systemId, mode)
     for _, e in ipairs(canvas and canvas.elements or {}) do
         if reshapableItem and e.componentType == reshapableItem.componentType and e.shapeType == "circle" then
             e.shapeType = reshapableItem.shapeType
+        end
+        if reshapableItem and e.componentType == reshapableItem.componentType and e.shapeType == reshapableItem.shapeType then
+            schematicDropOldTankQuantity(e)
         end
     end
     local designing = (mode == "design")
@@ -5997,7 +6017,55 @@ function love.load()
     selectedTime = 0
 end
 
+-- Runs the gravity drain (model/fluid.lua) on the open liquid system, a few
+-- times a second, while it's being operated rather than edited. Valve positions
+-- are read literally here: a valve labeled CLOSED holds fluid back, whatever
+-- _isActivePosition's electrical convention says for coloring.
+function _fluidTick(dt)
+    local canvas = _findSchematicCanvas()
+    if not canvas or canvas.connectorNoun ~= "PIPE" or canvas.mode ~= "control"
+       or gdsGui_page_currentName() ~= "SystemSchematic" then
+        return
+    end
+    _fluidTickElapsed = (_fluidTickElapsed or 0) + dt
+    if _fluidTickElapsed < 0.25 then return end
+    -- At most a second's worth at once, so a suspended app doesn't lose fuel for the time it was away.
+    local elapsed = math.min(_fluidTickElapsed, 1)
+    _fluidTickElapsed = 0
+
+    local componentTypes = _buildComponentTypeMap(canvas)
+    local positions = _nodePositionsForGraph(canvas)
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes, positions)
+    local conducting = {}
+    for _, c in ipairs(canvas.controls) do
+        local label = c.positions and c.positions[c.detentIndex + 1]
+        if componentTypes[c.id] == "gate" and label ~= "CLOSED" and label ~= "OFF" then conducting[c.id] = true end
+    end
+    local stores, pipeUnits = {}, {}
+    for _, e in ipairs(canvas.elements) do
+        if _holdsFluid(canvas, e) then stores[e.id] = e end
+    end
+    for _, w in ipairs(canvas.wires) do
+        local a, b = positions[w.fromElementId], positions[w.toElementId]
+        -- Pipes run square, so its length is the two sides; 2 world units a grid unit.
+        if a and b then pipeUnits[w.id] = (math.abs(a.x - b.x) * canvas.contentW + math.abs(a.y - b.y) * canvas.contentH) / 2 end
+    end
+    local before = _currentSourceStates(canvas, componentTypes)
+    local flow = ModelFluid.computeFlow(graph, canvas.wires, conducting)
+    local changed, stillFeeding = ModelFluid.step(flow, stores, pipeUnits, elapsed)
+    canvas._fluidStillFeeding = stillFeeding
+    canvas.emptyPipeColor = _currentMedium().style.unpowered
+    if changed then _requestSchematicSave() end
+    for id, on in pairs(_currentSourceStates(canvas, componentTypes)) do
+        if on ~= before[id] then
+            _applySolvedColorsToCurrentCombination()
+            break
+        end
+    end
+end
+
 function love.update(dt)
+    _fluidTick(dt)
     -- Catches up any schematic save _requestSchematicSave() deferred (see its
     -- own comment) once the throttle window elapses, even if no further edit
     -- comes along to trigger the write itself.
@@ -7563,6 +7631,61 @@ function _groundDependentRow(entity)
         choices = { "OFF", "ON" }, value = (entity and entity.groundDependent) or "OFF" }
 end
 
+-- Whether entity stores liquid that can run out: an element-kind source in a
+-- piped liquid system (a FUEL TANK, an ACCUMULATOR). Pumps are controls.
+function _holdsFluid(canvas, entity)
+    return canvas.connectorNoun == "PIPE" and entity.componentType == "source" and entity.shapeType ~= nil
+end
+
+-- Tanks used to be placed with a plain QUANTITY property, which would show as a
+-- second, unlinked QUANTITY box right beside the real one in _tankRows. It has no
+-- capacity to be a fraction of, so its value can't carry over to the level.
+function schematicDropOldTankQuantity(entity)
+    for i = #(entity.properties or {}), 1, -1 do
+        if entity.properties[i].key:upper() == "QUANTITY" then table.remove(entity.properties, i) end
+    end
+end
+
+-- A fuel tank's own rows, shown both when it's created and in its PROPERTIES
+-- menu; entity is nil for a tank that doesn't exist yet. LEVEL and QUANTITY are
+-- two ways to set the one stored value, entity.fillPercent (which the schematic
+-- paints; see _shapePoly.levelLineY): moving the slider recalculates the
+-- quantity, typing a quantity moves the slider. QUANTITY needs a MAX CAPACITY to
+-- be a fraction of, so it takes no typing until there is one, and it stops at
+-- full. It isn't stored itself, so its target is one the save hook ignores
+-- (schematicElementPropertiesRowSaved). A tank nobody's set reads as full.
+function _tankRows(entity)
+    local capacityRow = { key = "tankMaxCapacity", label = "MAX CAPACITY", target = "field", numeric = true, numericOnly = true,
+        value = tostring(entity and entity.tankMaxCapacity or "") }
+    local levelRow = { key = "fillPercent", label = "LEVEL", target = "field", numeric = true,
+        value = string.format("%.12g", entity and entity.fillPercent or 100),
+        slider = { min = 0, max = 100, unit = "%", format = "%.0f" } }
+    local quantityRow = { key = "tankQuantity", label = "QUANTITY", target = "derived", numericOnly = true, value = "" }
+    local function quantityFromLevel()
+        local capacity = tonumber(capacityRow.value)
+        local quantity = capacity and math.floor(capacity * tonumber(levelRow.value) / 100 * 10 + 0.5) / 10
+        quantityRow.value = quantity and string.format("%g", quantity) or ""
+    end
+    capacityRow.onChange = quantityFromLevel
+    levelRow.onChange = quantityFromLevel
+    quantityRow.onChange = function()
+        local capacity = tonumber(capacityRow.value)
+        if not capacity or capacity <= 0 then
+            quantityRow.value = ""
+            return
+        end
+        local quantity = tonumber(quantityRow.value)
+        if not quantity then return end
+        if quantity > capacity then
+            quantity = capacity
+            quantityRow.value = string.format("%g", capacity)
+        end
+        levelRow.value = string.format("%.12g", quantity / capacity * 100)
+    end
+    quantityFromLevel()
+    return { capacityRow, levelRow, quantityRow }
+end
+
 -- canvas.elementPlacementExtraRows hook (wired up once in love.load()):
 -- called right after NAME while building that one unified placement grid.
 -- GROUND SWITCH DEPENDENT always shows (every item gets one); TYPE/VOLTAGE/
@@ -7575,13 +7698,17 @@ end
 -- color ever does. POWERED COLOR starts blank — unlike the edit-time row,
 -- there's no live entity yet whose own color could be looked up and
 -- pre-selected.
-function schematicElementPlacementExtraRows(canvasName, componentType)
+function schematicElementPlacementExtraRows(canvasName, componentType, pending)
     local rows = { _groundDependentRow(nil) }
     if componentType == "source" then
         for _, r in ipairs(_sourceTypeVoltageRows(nil)) do table.insert(rows, r) end
         local names, swatches = _colorPaletteNamesAndSwatches()
         table.insert(rows, { key = "poweredColor", label = "POWERED COLOR", target = "voltageColor",
             choices = names, swatchColors = swatches, value = "" })
+    end
+    local canvas = _findSchematicCanvas()
+    if canvas and pending and _holdsFluid(canvas, pending) then
+        for _, r in ipairs(_tankRows(nil)) do table.insert(rows, r) end
     end
     return rows
 end
@@ -7636,6 +7763,9 @@ function schematicElementPropertiesExtraRows(canvasName, elementId)
         table.insert(rows, { key = "poweredColor", label = "POWERED COLOR", target = "voltageColor",
             choices = names, swatchColors = swatches,
             value = gdsGui_schematic_colorPaletteNameForColor(currentColor) or "" })
+    end
+    if _holdsFluid(canvas, entity) then
+        for _, r in ipairs(_tankRows(entity)) do table.insert(rows, r) end
     end
     if entity.spritePath == _BUS_SPRITE_PATH then
         -- A CURRENT property hand-added to an older bus: the slider below
@@ -8435,6 +8565,155 @@ function schematicAnnunciatorColorEditTest()
     return -1
 end
 
+-- A tank's PROPERTIES rows through the real grid: the slider and a typed
+-- quantity each move the other, a quantity stops at full and needs a capacity,
+-- and only the capacity and level get saved.
+function schematicTankLevelRowsTest()
+    local canvasName = "unitTestCanvasTankLevel"
+    gdsGui_schematic_delete(canvasName)
+    gdsGui_schematic_create(canvasName, "UnitTestPage", 0, 0, "LT", 1, 1)
+    local canvas
+    for _, c in ipairs(globApp.objects.schematics) do
+        if c.name == canvasName then canvas = c end
+    end
+    gdsGui_schematic_addElement(canvasName, "tank", "rect", 0, 0, 6 / canvas.contentW, 6 / canvas.contentH, "T", nil, nil, nil, nil, "source")
+    local tank = canvas.elements[1]
+    testTankRowsHook = function() return _tankRows(tank) end
+    canvas.elementPropertiesExtraRows = "testTankRowsHook"
+    local function openProperties()
+        gdsGui_schematic_openElementEditMenu(canvasName, "tank")
+        gdsGui_schematic_internal_onElementEditChosen(canvasName, 2, "PROPERTIES")
+        return canvas.menu.rows
+    end
+    local result = 1
+
+    local rows = openProperties()
+    local capacity, level, quantity = rows[2], rows[3], rows[4]
+    if capacity.label ~= "MAX CAPACITY" or level.label ~= "LEVEL" or quantity.label ~= "QUANTITY" then result = -1 end
+    -- No capacity yet: full, nothing to show, and typing a quantity doesn't take.
+    quantity.value = "5"
+    quantity.onChange()
+    if level.value ~= "100" or quantity.value ~= "" then result = -2 end
+
+    capacity.value = "500"
+    capacity.onChange()
+    if quantity.value ~= "500" then result = -3 end
+    local g = _propertyGrid.geometry(canvas, canvas.menu)
+    local bx, _, bw = _propertyGrid.valueBoxRect(g, 0)
+    _propertyGrid.setSliderFromX(canvas, canvas.menu, 3, bx + bw / 2)
+    if level.value ~= "50" or quantity.value ~= "250" then result = -4 end
+    quantity.value = "600"
+    quantity.onChange()
+    if level.value ~= "100" or quantity.value ~= "500" then result = -5 end
+    quantity.value = "123"
+    quantity.onChange()
+    if tonumber(level.value) ~= 24.6 then result = -6 end
+
+    canvas.menu = nil
+    gdsGui_schematic_internal_onPropertiesSaved(canvasName)
+    if tank.fillPercent ~= 24.6 or tank.tankMaxCapacity ~= 500 then result = -7 end
+    if tank.tankQuantity ~= nil or #tank.properties ~= 0 then result = -8 end
+
+    rows = openProperties()
+    if rows[2].value ~= "500" or rows[4].value ~= "123" then result = -9 end
+    canvas.menu = nil
+    canvas._pendingPropertyRows, canvas._propertyEditTargetId = nil, nil
+
+    testTankRowsHook = nil
+    gdsGui_schematic_delete(canvasName)
+    return result
+end
+
+-- An older tank's plain QUANTITY property goes; anything else on it stays.
+function schematicTankDropsOldQuantityTest()
+    local tank = { properties = { { key = "NOTE", value = "L" }, { key = "QUANTITY", value = "500" }, { key = "quantity", value = "1" } } }
+    schematicDropOldTankQuantity(tank)
+    if #tank.properties ~= 1 or tank.properties[1].key ~= "NOTE" then return -1 end
+    schematicDropOldTankQuantity({})
+    return 1
+end
+
+-- Whether a store drains, through hand-built graphs: only with every pipe on the
+-- way pointing downstream and somewhere for the fluid to go. elements/controls
+-- are {id, role}, pipes {from, to, direction}, open the open valves' ids.
+local function _fluidTankDrop(nodes, pipes, open)
+    local elements, controls, componentTypes, wires, conducting = {}, {}, {}, {}, {}
+    for _, n in ipairs(nodes) do
+        componentTypes[n[1]] = n[2]
+        table.insert(n[2] == "gate" and controls or elements, { id = n[1] })
+    end
+    for i, p in ipairs(pipes) do
+        wires[i] = { id = "p" .. i, fromElementId = p[1], toElementId = p[2], gravityDirection = p[3] }
+    end
+    for _, id in ipairs(open or {}) do conducting[id] = true end
+    local graph = ModelGraph.buildGraph(elements, controls, wires, componentTypes)
+    local tank = { tankMaxCapacity = 100 }
+    ModelFluid.step(ModelFluid.computeFlow(graph, wires, conducting), { T = tank }, {}, 10)
+    return 100 - (tank.fillPercent or 100)
+end
+
+function schematicFluidPathsTest()
+    local T, E = { "T", "source" }, { "E", "sink" }
+    local rate = ModelFluid.DRAIN_RATE * 10 -- gallons in 10 seconds, which is that percent of 100
+    local function drains(n, p, open) return math.abs(_fluidTankDrop(n, p, open) - rate) < 0.0001 end
+    local function holds(n, p, open) return _fluidTankDrop(n, p, open) == 0 end
+
+    if not drains({ T, E }, { { "T", "E", "forward" } }) then return -1 end
+    if not drains({ T, E }, { { "E", "T", "reverse" } }) then return -2 end
+    if not holds({ T, E }, { { "T", "E", "reverse" } }) then return -3 end
+    if not holds({ T, E }, { { "T", "E", nil } }) then return -4 end
+    -- Another tank at the far end blocks it, either way round.
+    if not holds({ T, { "U", "source" } }, { { "T", "U", "forward" } }) then return -5 end
+    if not holds({ T, { "U", "source" } }, { { "T", "U", "reverse" } }) then return -6 end
+    -- A valve: closed holds, open passes along to the engine, or spills with nothing beyond it.
+    local V = { "V", "gate" }
+    local throughValve = { { "T", "V", "forward" }, { "V", "E", "forward" } }
+    if not holds({ T, V, E }, throughValve) then return -7 end
+    if not drains({ T, V, E }, throughValve, { "V" }) then return -8 end
+    if not drains({ T, V }, { { "T", "V", "forward" } }, { "V" }) then return -9 end
+    if not holds({ T, V }, { { "T", "V", "forward" } }) then return -10 end
+    -- A manifold passes along, but is sealed if nothing leads on.
+    local M = { "M", "path" }
+    if not holds({ T, M }, { { "T", "M", "forward" } }) then return -11 end
+    if not drains({ T, M, E }, { { "T", "M", "forward" }, { "M", "E", "forward" } }) then return -12 end
+    -- Every pipe on the way counts: level or uphill further on holds it all back.
+    if not holds({ T, M, E }, { { "T", "M", "forward" }, { "M", "E", nil } }) then return -13 end
+    if not holds({ T, M, E }, { { "T", "M", "forward" }, { "M", "E", "reverse" } }) then return -14 end
+    -- A branch to a second tank doesn't stop the branch that's open.
+    if not drains({ T, M, E, { "U", "source" } }, { { "T", "M", "forward" }, { "M", "E", "forward" }, { "M", "U", "forward" } }) then return -15 end
+    return 1
+end
+
+-- A tank's fluid runs out at a constant rate, its pipe empties after it, the
+-- source stays on until that's done, and refilling the tank fills the pipe.
+function schematicFluidEmptiesTest()
+    local wires = { { id = "p", fromElementId = "T", toElementId = "E", gravityDirection = "forward" } }
+    local graph = ModelGraph.buildGraph({ { id = "T" }, { id = "E" } }, {}, wires, { T = "source", E = "sink" })
+    local flow = ModelFluid.computeFlow(graph, wires, {})
+    local tank = { tankMaxCapacity = 1, fillPercent = 50 }
+    local stores, units = { T = tank }, { p = 30 }
+    local _, feeding = ModelFluid.step(flow, stores, units, 2)
+    if math.abs(tank.fillPercent - 30) > 0.0001 or wires[1].fluidPercent or not feeding.T then return -1 end
+    ModelFluid.step(flow, stores, units, 1)
+    if math.abs(tank.fillPercent - 20) > 0.0001 or wires[1].fluidPercent then return -2 end
+    -- 2 more seconds runs the tank dry, and the pipe starts emptying straight
+    -- after: 30 units is 0.3 gallons, 3 seconds at 0.1 a second.
+    ModelFluid.step(flow, stores, units, 2)
+    if tank.fillPercent ~= 0 or math.abs(wires[1].fluidPercent - 100 / 3) > 0.0001 then return -3 end
+    _, feeding = ModelFluid.step(flow, stores, units, 0.5)
+    if math.abs(wires[1].fluidPercent - 100 / 6) > 0.0001 or not feeding.T then return -4 end
+    _, feeding = ModelFluid.step(flow, stores, units, 1)
+    if wires[1].fluidPercent ~= 0 or feeding.T then return -5 end
+    tank.fillPercent = 10
+    ModelFluid.step(flow, stores, units, 0.1)
+    if wires[1].fluidPercent ~= nil then return -6 end
+    -- No capacity entered: no percent to work with, so nothing changes.
+    local unknown = {}
+    ModelFluid.step(flow, { T = unknown }, units, 10)
+    if unknown.fillPercent ~= nil or wires[1].fluidPercent ~= nil then return -7 end
+    return 1
+end
+
 -- Builds a lone reshapable 3x3 square at the top-left of a fresh test canvas,
 -- so the real press/move/release handlers can drive it. Returns the canvas,
 -- the element, and a function that undoes the setup.
@@ -8491,62 +8770,187 @@ function schematicReshapeGestureTest()
     return result
 end
 
--- Drags corner handles through the real handlers: an outward pull grows the
--- whole box, an inward push cuts a square notch, and undo restores the original.
+-- Drags corner handles through the real handlers: only that corner moves (the
+-- box growing to fit), its neighbors staying put, and undo restores the original.
 function schematicReshapeCornerDragTest()
     local canvas, tank, restore = _reshapeTestSetup("unitTestCanvasReshape2")
-    local cell = 16 -- 2 world units per grid cell at zoom 8
+    local cell = 16 -- 2 world units per grid unit at zoom 8
     local x0, y0 = canvas.x + canvas.panX, canvas.y + canvas.panY
     canvas.selectedElementId = "tank"
     canvas.selectionMoveModeActive, canvas.reshapeModeActive = true, true
     local result = 1
 
-    -- Bottom-right corner, 2 cells right and 1 down: 3x3 becomes 5x4, in place.
+    -- Bottom-right corner, 1 right and 1 down: a 4x4 box, top-left unmoved.
     gdsGui_schematic_pressed("t", x0 + 3 * cell, y0 + 3 * cell)
-    gdsGui_schematic_moved("t", x0 + 5 * cell, y0 + 4 * cell)
-    gdsGui_schematic_released("t", x0 + 5 * cell, y0 + 4 * cell)
-    if table.concat(tank.shapeRows or {}, "/") ~= "#####/#####/#####/#####" then result = -1 end
+    gdsGui_schematic_moved("t", x0 + 4 * cell, y0 + 4 * cell)
+    gdsGui_schematic_released("t", x0 + 4 * cell, y0 + 4 * cell)
+    if table.concat(tank.shapePoints or {}, ",") ~= "0,0,3,0,4,4,0,3" then result = -1 end
     if math.abs(tank.x) > 0.0001 or math.abs(tank.y) > 0.0001 then result = -2 end
+    if math.abs(tank.w * canvas.contentW - 8) > 0.0001 or math.abs(tank.h * canvas.contentH - 8) > 0.0001 then result = -3 end
 
-    -- Top-right corner, pushed 2 left and 1 down: a square notch.
-    gdsGui_schematic_pressed("t", x0 + 5 * cell, y0)
-    gdsGui_schematic_moved("t", x0 + 3 * cell, y0 + 1 * cell)
-    gdsGui_schematic_released("t", x0 + 3 * cell, y0 + 1 * cell)
-    if table.concat(tank.shapeRows or {}, "/") ~= "###../#####/#####/#####" then result = -3 end
+    -- Top-right corner pushed down: a slanted side, nothing else moving.
+    gdsGui_schematic_pressed("t", x0 + 3 * cell, y0)
+    gdsGui_schematic_moved("t", x0 + 3 * cell, y0 + 2 * cell)
+    gdsGui_schematic_released("t", x0 + 3 * cell, y0 + 2 * cell)
+    if table.concat(tank.shapePoints or {}, ",") ~= "0,0,3,2,4,4,0,3" then result = -4 end
 
-    -- The new concave corner, pulled back into its notch, fills it again.
-    gdsGui_schematic_pressed("t", x0 + 3 * cell, y0 + 1 * cell)
-    gdsGui_schematic_moved("t", x0 + 5 * cell, y0)
-    gdsGui_schematic_released("t", x0 + 5 * cell, y0)
-    if table.concat(tank.shapeRows or {}, "/") ~= "#####/#####/#####/#####" then result = -4 end
+    -- Dragged flat onto the line between its neighbors, a corner just goes away.
+    gdsGui_schematic_pressed("t", x0 + 3 * cell, y0 + 2 * cell)
+    gdsGui_schematic_moved("t", x0 + 2 * cell, y0 + 2 * cell)
+    gdsGui_schematic_released("t", x0 + 2 * cell, y0 + 2 * cell)
+    if table.concat(tank.shapePoints or {}, ",") ~= "0,0,4,4,0,3" then result = -5 end
 
     gdsGui_schematic_undo(canvas.name)
     gdsGui_schematic_undo(canvas.name)
     gdsGui_schematic_undo(canvas.name)
-    if canvas.elements[1].shapeRows ~= nil or math.abs(canvas.elements[1].w * canvas.contentW - 6) > 0.0001 then result = -5 end
+    if canvas.elements[1].shapePoints ~= nil or math.abs(canvas.elements[1].w * canvas.contentW - 6) > 0.0001 then result = -6 end
     restore()
     return result
 end
 
--- A cut that would split the tank in two, or leave nothing, isn't a valid shape.
-function schematicReshapeRejectsSplitTest()
-    if _shapeCells.encode(_shapeCells.candidateSet(_shapeCells.parse({ "##" , "##" }), { c = 2, r = 0 }, 0, 2)) then return -1 end
-    local split = _shapeCells.candidateSet(_shapeCells.parse({ "#.#", "###" }), { c = 3, r = 2 }, 0, 1)
-    if _shapeCells.encode(split) then return -2 end
+-- Dragging a side, wherever along it, pulls a brand-new corner out of its exact
+-- center, even on an odd-length side whose center isn't on the grid. A tap
+-- creates nothing, it just leaves reshape mode like a tap on the body.
+function schematicReshapeSideDragTest()
+    local canvas, tank, restore = _reshapeTestSetup("unitTestCanvasReshape5")
+    local cell = 16
+    tank.x, tank.y = 8 / canvas.contentW, 8 / canvas.contentH
+    local x0, y0 = canvas.x + canvas.panX + 4 * cell, canvas.y + canvas.panY + 4 * cell
+    canvas.selectedElementId = "tank"
+    canvas.selectionMoveModeActive, canvas.reshapeModeActive = true, true
+    local result = 1
+
+    -- Top side, grabbed 1 unit from its left end, pulled 2 straight up: the
+    -- point rises from the center (1.5), not the grab spot, and the box's new
+    -- top moves up on screen while the rest of the tank stays where it was.
+    gdsGui_schematic_pressed("t", x0 + 1 * cell, y0)
+    gdsGui_schematic_moved("t", x0 + 1 * cell, y0 - 2 * cell)
+    if table.concat(tank.shapePoints or {}, ",") ~= "0,2,1.5,0,3,2,3,5,0,5" then result = -1 end
+    if math.abs(tank.y * canvas.contentH - 4) > 0.0001 then result = -9 end
+    -- Dragged back to the side, the new point is gone again, live.
+    gdsGui_schematic_moved("t", x0 + 1 * cell, y0)
+    if tank.shapePoints ~= nil then result = -2 end
+    gdsGui_schematic_moved("t", x0 + 1 * cell, y0 + 1 * cell)
+    gdsGui_schematic_released("t", x0 + 1 * cell, y0 + 1 * cell)
+    if table.concat(tank.shapePoints or {}, ",") ~= "0,0,1.5,1,3,0,3,3,0,3" then result = -3 end
+    local _, _, _, _, p = _shapePoly.frame(canvas, tank)
+    if #p.corners ~= 5 or #p.triangles ~= 3 then result = -4 end
+    -- The notch it left is outside the body now, and just below its tip isn't.
+    if _shapePoly.containsPoint(canvas, tank, x0 + 1.5 * cell, y0 + 0.5 * cell) then result = -5 end
+    if not _shapePoly.containsPoint(canvas, tank, x0 + 1.5 * cell, y0 + 1.5 * cell) then result = -6 end
+
+    -- Tapped rather than dragged: same shape, and back around to move mode.
+    local before = tank.shapePoints
+    gdsGui_schematic_pressed("t", x0 + 3 * cell, y0 + 1.5 * cell)
+    gdsGui_schematic_released("t", x0 + 3 * cell, y0 + 1.5 * cell)
+    if tank.shapePoints ~= before then result = -7 end
+    if canvas.reshapeModeActive or not canvas.selectionMoveModeActive then result = -8 end
+    restore()
+    return result
+end
+
+-- An outline that crosses or touches itself, or has no area, isn't a valid shape.
+function schematicReshapeRejectsCrossingTest()
+    if _shapePoly.encode({ 0, 0, 2, 2, 2, 0, 0, 2 }) then return -1 end
+    if _shapePoly.encode({ 0, 0, 3, 0, 1, 0 }) then return -2 end
+    if _shapePoly.encode({ 0, 0, 4, 0, 4, 4, 2, 0, 0, 4 }) then return -3 end
     return 1
 end
 
+-- Tanks saved as rows of grid squares come back as the same outline.
+function schematicReshapeMigratesRowsTest()
+    local function traced(rows) return table.concat(_shapePoly.pointsFromRows(rows), ",") end
+    if traced({ "###", "###" }) ~= "0,0,3,0,3,2,0,2" then return -1 end
+    if traced({ "#..", "#..", "###" }) ~= "0,0,1,0,1,2,3,2,3,3,0,3" then return -2 end
+    if traced({ "###..", "#####", "#####", "#####" }) ~= "0,0,3,0,3,1,5,1,5,4,0,4" then return -3 end
+    if traced({ ".##", "###" }) ~= "1,0,3,0,3,2,0,2,0,1,1,1" then return -4 end
+    return 1
+end
+
+-- MIRROR sits right below RENAME, prompts through the placement grid, and makes
+-- a flipped twin across the centerline; undo takes it back off.
+function schematicReshapeMirrorTest()
+    local canvas, tank, restore = _reshapeTestSetup("unitTestCanvasReshape6")
+    local result = 1
+    tank.shapePoints = { 0, 0, 1, 0, 1, 2, 3, 2, 3, 3, 0, 3 }
+    tank.rotation = 90
+    tank.properties = { { key = "QUANTITY", value = "500" } }
+    gdsGui_schematic_openElementEditMenu(canvas.name, "tank")
+    if canvas.menu.options[2] ~= "RENAME" or canvas.menu.options[3] ~= "MIRROR" then result = -1 end
+    gdsGui_schematic_internal_onElementEditChosen(canvas.name, 3, "MIRROR")
+    local rows = canvas.menu and canvas.menu.rows
+    if not rows or rows[2].key ~= "QUANTITY" or rows[2].value ~= "" then result = -2 end
+    if #canvas.elements ~= 1 then result = -3 end
+    gdsGui_schematic_internal_onElementPlacementSaved(canvas.name)
+    canvas.menu = nil
+    local twin = canvas.elements[2]
+    if not twin then
+        restore()
+        return -4
+    end
+    if table.concat(twin.shapePoints, ",") ~= "3,0,2,0,2,2,0,2,0,3,3,3" then result = -5 end
+    if twin.rotation ~= 270 or twin.componentType ~= tank.componentType then result = -6 end
+    local spacing = 2 / canvas.contentW
+    if math.abs((twin.x + twin.w / 2) - (1 - (tank.x + tank.w / 2))) > spacing then result = -7 end
+    if math.abs(twin.y - tank.y) > 0.0001 then result = -11 end
+    gdsGui_schematic_undo(canvas.name)
+    if #canvas.elements ~= 1 then result = -8 end
+
+    -- A tank on the centerline is its own reflection, so its twin moves aside.
+    tank = canvas.elements[1]
+    tank.x = 0.5 - tank.w / 2
+    tank.rotation = 0
+    gdsGui_schematic_openElementEditMenu(canvas.name, "tank")
+    gdsGui_schematic_internal_onElementEditChosen(canvas.name, 3, "MIRROR")
+    gdsGui_schematic_internal_onElementPlacementSaved(canvas.name)
+    canvas.menu = nil
+    twin = canvas.elements[2]
+    if not twin or twin.x == tank.x then
+        result = -9
+    else
+        local cx, cy, cw, ch, p = _shapePoly.frame(canvas, twin)
+        if _shapePoly.blockedAt(canvas, twin, p, cx, cy, cw, ch, twin.rotation) then result = -10 end
+    end
+    restore()
+    return result
+end
+
 -- A wire reaching a shaped tank stops at its real body, not the bounding box.
--- Center row of this L is 1, whose only filled cell is at the left, so a wire
--- arriving from the right runs through the notch to that cell's right edge.
+-- Center row of this L is 1, whose only filled part is at the left, so a wire
+-- arriving from the right runs through the notch to that part's right edge.
 function schematicReshapeWireEdgeTest()
     local canvas, tank, restore = _reshapeTestSetup("unitTestCanvasReshape3")
-    tank.shapeRows = { "#..", "#..", "###" }
+    tank.shapePoints = { 0, 0, 1, 0, 1, 2, 3, 2, 3, 3, 0, 3 }
     local cx, cy = tank.x + tank.w / 2, tank.y + tank.h / 2
     local px = canvas.x + canvas.panX + cx * canvas.contentW * canvas.zoom
     local py = canvas.y + canvas.panY + cy * canvas.contentH * canvas.zoom
-    local ex, ey = _shapeCells.edgePoint(canvas, tank, px, py, "x", 1)
+    local ex, ey = _shapePoly.edgePoint(canvas, tank, px, py, "x", 1)
     local result = (math.abs(ex - (px - 8)) < 0.001 and math.abs(ey - py) < 0.001) and 1 or -1
+    restore()
+    return result
+end
+
+-- The fill line sits by screen height whichever way the tank is turned.
+function schematicTankLevelLineTest()
+    local canvas, tank, restore = _reshapeTestSetup("unitTestCanvasTankLine")
+    local result = 1
+    local cy = canvas.y + canvas.panY + 24
+    local function lineOffset(percent, rotation)
+        tank.fillPercent, tank.rotation = percent, rotation
+        return _shapePoly.levelLineY(canvas, tank) - cy
+    end
+    -- A 48px square, so 24px either way from center when square-on.
+    if math.abs(lineOffset(100, 0) + 24) > 0.001 then result = -1 end
+    if math.abs(lineOffset(0, 0) - 24) > 0.001 then result = -2 end
+    if math.abs(lineOffset(50, 0)) > 0.001 then result = -3 end
+    -- Upside down, 25% is still near the screen's bottom.
+    if math.abs(lineOffset(25, 180) - 12) > 0.001 then result = -4 end
+    -- Turned 45 degrees, its top and bottom points are half a diagonal out.
+    if math.abs(lineOffset(100, 45) + 24 * math.sqrt(2)) > 0.001 then result = -5 end
+    -- A shape's own extent counts, not its box: this triangle turned 90 degrees
+    -- spans its full 3 units of width on screen, top to bottom.
+    tank.shapePoints = { 0, 0, 3, 3, 0, 3 }
+    if math.abs(lineOffset(100, 90) + 24) > 0.001 then result = -6 end
     restore()
     return result
 end
@@ -8575,9 +8979,9 @@ function schematicReshapeFreeRotationTest()
     if tank.rotation ~= 45 then result = -4 end
     -- At 45 degrees the enclosing box's corner is empty, and the side-on tip
     -- is half a diagonal out: 24 * sqrt(2) pixels for this 48px square.
-    if _shapeCells.containsPoint(canvas, tank, cx + 23, cy + 23) then result = -5 end
-    if not _shapeCells.containsPoint(canvas, tank, cx + 32, cy) then result = -6 end
-    local ex, ey = _shapeCells.edgePoint(canvas, tank, cx, cy, "x", 1)
+    if _shapePoly.containsPoint(canvas, tank, cx + 23, cy + 23) then result = -5 end
+    if not _shapePoly.containsPoint(canvas, tank, cx + 32, cy) then result = -6 end
+    local ex, ey = _shapePoly.edgePoint(canvas, tank, cx, cy, "x", 1)
     if math.abs(ex - (cx + 24 * math.sqrt(2))) > 0.001 or math.abs(ey - cy) > 0.001 then result = -7 end
     restore()
     return result
@@ -10128,18 +10532,53 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcParameters"]={0},
         ["funcExpctOutput"]={"FIRE WARN"}}
 
+    gdsGui_dev_testExecute {["id"]="schematic_tank_dropsOldUnlinkedQuantity",
+        ["funcName"]={"schematicTankDropsOldQuantityTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+
+    gdsGui_dev_testExecute {["id"]="modelFluid_drainsOnlyWithOpenGravityPath",
+        ["funcName"]={"schematicFluidPathsTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+    gdsGui_dev_testExecute {["id"]="modelFluid_tankThenPipeEmptyAtConstantRate",
+        ["funcName"]={"schematicFluidEmptiesTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_tank_levelAndQuantityRowsLinked",
+        ["funcName"]={"schematicTankLevelRowsTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+    gdsGui_dev_testExecute {["id"]="schematic_tank_fillLineFollowsScreen",
+        ["funcName"]={"schematicTankLevelLineTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+
     gdsGui_dev_testExecute {["id"]="schematic_reshape_holdThenTwoTapsEntersMode",
         ["funcName"]={"schematicReshapeGestureTest"},
         ["funcParameters"]={0},
         ["funcExpctOutput"]={1}}
 
-    gdsGui_dev_testExecute {["id"]="schematic_reshape_cornerDragGrowsAndNotches",
+    gdsGui_dev_testExecute {["id"]="schematic_reshape_cornerDragMovesOneCorner",
         ["funcName"]={"schematicReshapeCornerDragTest"},
         ["funcParameters"]={0},
         ["funcExpctOutput"]={1}}
 
-    gdsGui_dev_testExecute {["id"]="schematic_reshape_rejectsSplitShapes",
-        ["funcName"]={"schematicReshapeRejectsSplitTest"},
+    gdsGui_dev_testExecute {["id"]="schematic_reshape_sideDragExtrudesCenterPoint",
+        ["funcName"]={"schematicReshapeSideDragTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+    gdsGui_dev_testExecute {["id"]="schematic_reshape_migratesRowsToPolygon",
+        ["funcName"]={"schematicReshapeMigratesRowsTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+    gdsGui_dev_testExecute {["id"]="schematic_reshape_mirrorCreatesFlippedTank",
+        ["funcName"]={"schematicReshapeMirrorTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+    gdsGui_dev_testExecute {["id"]="schematic_reshape_rejectsSelfCrossingShapes",
+        ["funcName"]={"schematicReshapeRejectsCrossingTest"},
         ["funcParameters"]={0},
         ["funcExpctOutput"]={1}}
 

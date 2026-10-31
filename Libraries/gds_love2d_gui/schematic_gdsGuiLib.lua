@@ -437,6 +437,7 @@ end
 -- (which runs before the element exists, at the initial-tap call site)
 -- uses the element's true gridW/gridH footprint.
 local function _pendingElementSizeFrac(canvas, pending)
+    if pending.wFrac then return pending.wFrac, pending.hFrac end
     return _elementGridFootprintFrac(canvas, pending.gridW, pending.gridH)
 end
 
@@ -450,8 +451,9 @@ local function _commitNamedPlacement(canvas, pending, trimmed)
         local wFrac, hFrac = _pendingElementSizeFrac(canvas, pending)
         gdsGui_schematic_addElement(pending.canvasName, pending.newId, pending.shapeType,
             pending.fracX, pending.fracY, wFrac, hFrac,
-            trimmed, pending.defaultColor, properties, nil, pending.spritePath, pending.componentType,
+            trimmed, pending.defaultColor, properties, pending.rotation, pending.spritePath, pending.componentType,
             _deepCopy(pending.terminals))
+        canvas.elements[#canvas.elements].shapePoints = pending.shapePoints
         canvas.snapshots = {}
         _notifyChanged(canvas)
     else
@@ -545,7 +547,7 @@ function _openElementPlacementGrid(canvasName, pending)
     local rows = { { key = "__name", label = "NAME", value = _suggestedPlacementName(canvas, pending.label) } }
     if canvas.elementPlacementExtraRows then
         local fn = _G[canvas.elementPlacementExtraRows]
-        local extra = fn and fn(canvasName, pending.componentType)
+        local extra = fn and fn(canvasName, pending.componentType, pending)
         for _, r in ipairs(extra or {}) do table.insert(rows, r) end
     end
     for _, key in ipairs(pending.defaultPropertyKeys or {}) do
@@ -553,7 +555,7 @@ function _openElementPlacementGrid(canvasName, pending)
     end
     _pendingNamedPlacement = pending
     _pendingPlacementRows = rows
-    gdsGui_schematic_openPropertyGrid(canvasName, "NAME THIS " .. pending.kind:upper(), nil, rows, true,
+    gdsGui_schematic_openPropertyGrid(canvasName, pending.title or ("NAME THIS " .. pending.kind:upper()), nil, rows, true,
         "gdsGui_schematic_internal_onElementPlacementSaved", "gdsGui_schematic_internal_onElementPlacementCancelled",
         function(gridRows)
             local trimmed = (gridRows[1].value or ""):gsub("^%s*(.-)%s*$", "%1")
@@ -815,7 +817,7 @@ end
 
 -- True for a quarter-turn (90 or 270, mod 360) — the only rotations
 -- (alongside 0/180, which leave w/h as-is) a rotatable element sits at unless
--- it's reshapable (see _snapRotationDegrees, _shapeCells.freeRotationDegrees),
+-- it's reshapable (see _snapRotationDegrees, _shapePoly.freeRotationDegrees),
 -- and the only ones where its own axis-aligned footprint comes out with
 -- width/height swapped from its stored w/h.
 local function _isQuarterTurnRotation(rotationDeg)
@@ -828,8 +830,8 @@ end
 -- the draw-time push/rotate transform expects (see _drawElement's
 -- drawShapeWithColor). A quarter turn's real footprint is exactly its stored
 -- box with width/height swapped; a reshapable element at any other angle gets
--- the box enclosing it, and its own cells do the exact hit/collision tests
--- (see _shapeCells). Center stays the same point either way, so it's computed off the
+-- the box enclosing it, and its own outline does the exact hit/collision tests
+-- (see _shapePoly). Center stays the same point either way, so it's computed off the
 -- original (unswapped) box before swapping.
 local function _elementFootprintRect(canvas, e)
     local ex, ey, ew, eh = _elementPixelRect(canvas, e)
@@ -837,7 +839,7 @@ local function _elementFootprintRect(canvas, e)
     if _isQuarterTurnRotation(e.rotation) then
         ew, eh = eh, ew
     elseif (e.rotation or 0) % 90 ~= 0 then
-        local cosR, sinR = _shapeCells.cosSin(e.rotation)
+        local cosR, sinR = _shapePoly.cosSin(e.rotation)
         ew, eh = math.abs(ew * cosR) + math.abs(eh * sinR), math.abs(ew * sinR) + math.abs(eh * cosR)
     end
     return cx - ew / 2, cy - eh / 2, ew, eh
@@ -856,100 +858,140 @@ end
 -- RESHAPABLE ELEMENTS: an element whose kind the app has named (see
 -- gdsGui_schematic_setReshapableKind — e.g. a fuel tank) can have its outline
 -- redrawn in a third gesture mode after move and rotate. Its shape is stored
--- as e.shapeRows, one string per grid-unit row with "#" for a filled cell and
--- "." for an empty one ({"###", "#..", "#.."} is an L), always trimmed to the
--- filled cells' own bounding box — which e.x/y/w/h keep tracking, so every
--- bounding-box consumer (rotation, label, move arrows) just keeps working.
--- Whole cells are why every corner stays square. nil until the first real
+-- as e.shapePoints, a flat { c1, r1, c2, r2, ... } list of polygon corners in
+-- grid units, always shifted so the corners' own bounding box starts at 0,0 —
+-- which e.x/y/w/h keep tracking, so every bounding-box consumer (rotation,
+-- label, move arrows) just keeps working. Always a simple polygon with no
+-- straight-through corners (see _shapePoly.encode). nil until the first real
 -- edit, so an untouched element keeps drawing as its own plain shapeType.
 -- Global for the same 200-local ceiling as _propertyGrid below.
-_shapeCells = {}
-_shapeCells.HOLD_SECONDS = 2    -- the hold that unlocks a reshapable element's modes, in place of _LONG_PRESS_SECONDS
-_shapeCells.HANDLE_HIT_PX = 14  -- reach of a corner handle, in screen pixels (not zoom-scaled, so a fingertip always fits)
-_shapeCells.parsedCache = setmetatable({}, { __mode = "k" })
+_shapePoly = {}
+_shapePoly.HOLD_SECONDS = 2    -- the hold that unlocks a reshapable element's modes, in place of _LONG_PRESS_SECONDS
+_shapePoly.HANDLE_HIT_PX = 14  -- reach of a corner handle or side, in screen pixels (not zoom-scaled, so a fingertip always fits)
+_shapePoly.EMPTY_SHADE = 0.25  -- brightness of the part of a tank above its fill line (see drawLevel)
+_shapePoly.parsedCache = setmetatable({}, { __mode = "k" })
 
--- Decoded shapeRows, cached per table (each edit stores a brand-new one):
--- set[r][c] for the filled cells, runs (each row's filled spans, half-open
--- c0..c1), edges (every boundary cell side), corners (the draggable vertices).
-function _shapeCells.parse(rows)
-    local p = _shapeCells.parsedCache[rows]
+-- Decoded shapePoints, cached per table (each edit stores a brand-new one):
+-- corners (the draggable vertices), edges (each corner to the next), triangles
+-- (the fill), and runs (each row's spans of grid squares the shape reaches
+-- into, half-open c0..c1, which is what it collides with — see eachSpanBox).
+function _shapePoly.parse(points)
+    local p = _shapePoly.parsedCache[points]
     if p then return p end
-    p = { rows = #rows, cols = #rows[1], set = {}, runs = {}, edges = {}, corners = {} }
-    for r = 0, p.rows - 1 do
-        local line, row, runStart = rows[r + 1], {}, nil
-        p.set[r] = row
-        for c = 0, p.cols do
-            local isFilled = line:sub(c + 1, c + 1) == "#"
-            if isFilled then row[c] = true end
-            if isFilled and not runStart then
+    p = { rows = 0, cols = 0, corners = {}, edges = {}, runs = {}, triangles = love.math.triangulate(points) }
+    for i = 1, #points, 2 do
+        local c, r = points[i], points[i + 1]
+        table.insert(p.corners, { c = c, r = r })
+        table.insert(p.edges, { c, r, points[i + 2] or points[1], points[i + 3] or points[2] })
+        p.cols, p.rows = math.max(p.cols, c), math.max(p.rows, r)
+    end
+    local lastC, lastR = math.ceil(p.cols) - 1, math.ceil(p.rows) - 1
+    for r = 0, lastR do
+        local runStart
+        for c = 0, lastC + 1 do
+            local reached = c <= lastC and _shapePoly.reachesSquare(p, c, r)
+            if reached and not runStart then
                 runStart = c
-            elseif runStart and not isFilled then
+            elseif runStart and not reached then
                 table.insert(p.runs, { c0 = runStart, c1 = c, r = r })
                 runStart = nil
             end
         end
     end
-    local has = _shapeCells.has
-    for r = 0, p.rows - 1 do
-        for c = 0, p.cols - 1 do
-            if has(p.set, c, r) then
-                if not has(p.set, c, r - 1) then table.insert(p.edges, { c, r, c + 1, r }) end
-                if not has(p.set, c, r + 1) then table.insert(p.edges, { c, r + 1, c + 1, r + 1 }) end
-                if not has(p.set, c - 1, r) then table.insert(p.edges, { c, r, c, r + 1 }) end
-                if not has(p.set, c + 1, r) then table.insert(p.edges, { c + 1, r, c + 1, r + 1 }) end
-            end
-        end
-    end
-    for r = 0, p.rows do
-        for c = 0, p.cols do
-            local count = _shapeCells.filledAround(p.set, c, r)
-            if count == 1 or count == 3 then table.insert(p.corners, { c = c, r = r }) end
-        end
-    end
-    _shapeCells.parsedCache[rows] = p
+    _shapePoly.parsedCache[points] = p
     return p
 end
 
-function _shapeCells.has(set, c, r)
-    return set[r] ~= nil and set[r][c] == true
+-- Even-odd test, in grid units.
+function _shapePoly.containsLocal(p, lx, ly)
+    local inside = false
+    for _, edge in ipairs(p.edges) do
+        local c1, r1, c2, r2 = edge[1], edge[2], edge[3], edge[4]
+        if (r1 > ly) ~= (r2 > ly) and lx < c1 + (ly - r1) / (r2 - r1) * (c2 - c1) then
+            inside = not inside
+        end
+    end
+    return inside
 end
 
--- How many of the 4 cells meeting at grid vertex (c,r) are filled: 1 is a
--- convex corner, 3 a concave one, 2 a straight edge (or a diagonal pinch).
-function _shapeCells.filledAround(set, c, r)
-    local count = 0
-    for _, q in ipairs({ { c - 1, r - 1 }, { c, r - 1 }, { c - 1, r }, { c, r } }) do
-        if _shapeCells.has(set, q[1], q[2]) then count = count + 1 end
+-- Whether the shape overlaps the inside of grid square c,r: either the square
+-- sits within it, or its outline passes through the square (running along the
+-- square's border doesn't count).
+function _shapePoly.reachesSquare(p, c, r)
+    if _shapePoly.containsLocal(p, c + 0.5, r + 0.5) then return true end
+    for _, edge in ipairs(p.edges) do
+        local tMin, tMax = 0, 1
+        for _, slab in ipairs({ { edge[1], edge[3] - edge[1], c }, { edge[2], edge[4] - edge[2], r } }) do
+            local from, step, low = slab[1], slab[2], slab[3]
+            if step ~= 0 then
+                local t1, t2 = (low - from) / step, (low + 1 - from) / step
+                tMin, tMax = math.max(tMin, math.min(t1, t2)), math.min(tMax, math.max(t1, t2))
+            elseif from <= low or from >= low + 1 then
+                tMax = -1
+            end
+        end
+        if tMin < tMax then return true end
     end
-    return count
+    return false
 end
 
 -- The kind check behind every reshape gesture (see gdsGui_schematic_setReshapableKind).
-function _shapeCells.allowed(canvas, e)
+function _shapePoly.allowed(canvas, e)
     local kind = canvas.reshapableKind
     return kind ~= nil and e.shapeType == kind.shapeType and e.componentType == kind.componentType
 end
 
 -- The element in reshape mode right now, or nil.
-function _shapeCells.activeTarget(canvas)
+function _shapePoly.activeTarget(canvas)
     if not (canvas.reshapeModeActive and canvas.selectionMoveModeActive and canvas.selectedElementId) then return nil end
     local e = _findElement(canvas, canvas.selectedElementId)
-    return (e and _shapeCells.allowed(canvas, e)) and e or nil
+    return (e and _shapePoly.allowed(canvas, e)) and e or nil
 end
 
--- e.shapeRows, or the full box a not-yet-edited element's first edit starts from.
-function _shapeCells.rowsOf(canvas, e)
-    if e.shapeRows then return e.shapeRows end
+-- e.shapePoints, or the full box a not-yet-edited element's first edit starts from.
+function _shapePoly.pointsOf(canvas, e)
+    if e.shapePoints then return e.shapePoints end
     local cols = math.max(1, math.floor(e.w * canvas.contentW / _GRID_SPACING_PX + 0.5))
-    local rowCount = math.max(1, math.floor(e.h * canvas.contentH / _GRID_SPACING_PX + 0.5))
-    local rows = {}
-    for r = 1, rowCount do rows[r] = string.rep("#", cols) end
-    return rows
+    local rows = math.max(1, math.floor(e.h * canvas.contentH / _GRID_SPACING_PX + 0.5))
+    return { 0, 0, cols, 0, cols, rows, 0, rows }
+end
+
+-- The polygon for a shape saved as the rows of "#"/"." grid squares tanks used
+-- before they became polygons ({"###", "#..", "#.."} is an L): walks its outer
+-- boundary clockwise from its top-left corner, taking the right-hand way at a
+-- diagonal pinch so the walk stays on the outer boundary. Keeps the bounding
+-- box exactly, so the saved e.x/y/w/h still fit it.
+function _shapePoly.pointsFromRows(rows)
+    local function filled(c, r, offsetC, offsetR)
+        local line = rows[math.floor(r + offsetR / 2) + 1]
+        return line ~= nil and line:sub(math.floor(c + offsetC / 2) + 1, math.floor(c + offsetC / 2) + 1) == "#"
+    end
+    local startC = rows[1]:find("#", 1, true) - 1
+    local points = { startC, 0 }
+    local c, r, dirC, dirR = startC + 1, 0, 1, 0
+    while c ~= startC or r ~= 0 do
+        -- The body stays on the walk's right, so the two squares just ahead
+        -- decide the next step: right if the right one's empty, left if the
+        -- left one's filled too, otherwise straight on.
+        local nextC, nextR = dirC, dirR
+        if not filled(c, r, dirC - dirR, dirR + dirC) then
+            nextC, nextR = -dirR, dirC
+        elseif filled(c, r, dirC + dirR, dirR - dirC) then
+            nextC, nextR = dirR, -dirC
+        end
+        if nextC ~= dirC or nextR ~= dirR then
+            table.insert(points, c)
+            table.insert(points, r)
+        end
+        dirC, dirR = nextC, nextR
+        c, r = c + dirC, r + dirR
+    end
+    return (_shapePoly.encode(points))
 end
 
 -- A cardinal turn rounds to exact 0/1/-1 rather than carrying float noise into
 -- wire endpoints, which is what keeps a straight wire exactly straight.
-function _shapeCells.cosSin(rotationDeg)
+function _shapePoly.cosSin(rotationDeg)
     local a = math.rad(rotationDeg or 0)
     if (rotationDeg or 0) % 90 == 0 then
         return math.floor(math.cos(a) + 0.5), math.floor(math.sin(a) + 0.5)
@@ -960,46 +1002,45 @@ end
 -- A reshapable element's rotate drag: any whole degree, except that within 3
 -- degrees of a cardinal it settles on the cardinal, so getting a tank back to
 -- exactly square with the grid doesn't take a steady hand.
-function _shapeCells.freeRotationDegrees(angleRad)
+function _shapePoly.freeRotationDegrees(angleRad)
     local deg = math.deg(angleRad) % 360
     local cardinal = math.floor(deg / 90 + 0.5) * 90
     if math.abs(deg - cardinal) <= 3 then return cardinal % 360 end
     return math.floor(deg + 0.5) % 360
 end
 
--- Grid-vertex coordinates (lx,ly, 0..cols/0..rows) to screen pixels, for a
--- shape centered at cx,cy with cells cw x ch pixels — and back again.
-function _shapeCells.toWorld(cx, cy, cw, ch, p, rotationDeg, lx, ly)
-    local cosR, sinR = _shapeCells.cosSin(rotationDeg)
+-- Grid-unit coordinates (lx,ly, 0..cols/0..rows) to screen pixels, for a
+-- shape centered at cx,cy with grid units cw x ch pixels — and back again.
+function _shapePoly.toWorld(cx, cy, cw, ch, p, rotationDeg, lx, ly)
+    local cosR, sinR = _shapePoly.cosSin(rotationDeg)
     local dx, dy = (lx - p.cols / 2) * cw, (ly - p.rows / 2) * ch
     return cx + dx * cosR - dy * sinR, cy + dx * sinR + dy * cosR
 end
 
-function _shapeCells.toLocal(cx, cy, cw, ch, p, rotationDeg, x, y)
-    local cosR, sinR = _shapeCells.cosSin(rotationDeg)
+function _shapePoly.toLocal(cx, cy, cw, ch, p, rotationDeg, x, y)
+    local cosR, sinR = _shapePoly.cosSin(rotationDeg)
     local dx, dy = x - cx, y - cy
     return (dx * cosR + dy * sinR) / cw + p.cols / 2, (-dx * sinR + dy * cosR) / ch + p.rows / 2
 end
 
--- An element's live frame: center, cell size in pixels, and parsed shape.
-function _shapeCells.frame(canvas, e)
+-- An element's live frame: center, grid unit size in pixels, and parsed shape.
+function _shapePoly.frame(canvas, e)
     local ex, ey, ew, eh = _elementPixelRect(canvas, e)
-    local p = _shapeCells.parse(_shapeCells.rowsOf(canvas, e))
+    local p = _shapePoly.parse(_shapePoly.pointsOf(canvas, e))
     return ex + ew / 2, ey + eh / 2, ew / p.cols, eh / p.rows, p
 end
 
-function _shapeCells.containsPoint(canvas, e, x, y)
-    local cx, cy, cw, ch, p = _shapeCells.frame(canvas, e)
-    local lx, ly = _shapeCells.toLocal(cx, cy, cw, ch, p, e.rotation, x, y)
-    return _shapeCells.has(p.set, math.floor(lx), math.floor(ly))
+function _shapePoly.containsPoint(canvas, e, x, y)
+    local cx, cy, cw, ch, p = _shapePoly.frame(canvas, e)
+    return _shapePoly.containsLocal(p, _shapePoly.toLocal(cx, cy, cw, ch, p, e.rotation, x, y))
 end
 
 -- Calls fn(centerX, centerY, halfX, halfY) with screen-axis-aligned boxes that
 -- together cover the shape, stopping at and returning whatever fn first returns
 -- truthy. Each row span is one exact box at a cardinal turn; at any other angle
--- each cell gets its own enclosing box, which stays much tighter around the
--- shape than one enclosing a long diagonal span would.
-function _shapeCells.eachSpanBox(p, cx, cy, cw, ch, rotationDeg, fn)
+-- each grid square gets its own enclosing box, which stays much tighter around
+-- the shape than one enclosing a long diagonal span would.
+function _shapePoly.eachSpanBox(p, cx, cy, cw, ch, rotationDeg, fn)
     local perCell = (rotationDeg or 0) % 90 ~= 0
     for _, run in ipairs(p.runs) do
         local c0 = run.c0
@@ -1007,7 +1048,7 @@ function _shapeCells.eachSpanBox(p, cx, cy, cw, ch, rotationDeg, fn)
             local c1 = perCell and (c0 + 1) or run.c1
             local minX, maxX, minY, maxY
             for _, vertex in ipairs({ { c0, run.r }, { c1, run.r }, { c0, run.r + 1 }, { c1, run.r + 1 } }) do
-                local x, y = _shapeCells.toWorld(cx, cy, cw, ch, p, rotationDeg, vertex[1], vertex[2])
+                local x, y = _shapePoly.toWorld(cx, cy, cw, ch, p, rotationDeg, vertex[1], vertex[2])
                 minX, maxX = math.min(minX or x, x), math.max(maxX or x, x)
                 minY, maxY = math.min(minY or y, y), math.max(maxY or y, y)
             end
@@ -1020,49 +1061,50 @@ function _shapeCells.eachSpanBox(p, cx, cy, cw, ch, rotationDeg, fn)
 end
 
 -- Where a wire running along axis ("x"/"y") in direction sign, through the
--- point x,y, should stop on this shape: the outermost point of that line on any
--- filled cell, on the side the wire is arriving from, so a wire whose box center
--- sits in a cut-away notch runs on through the notch to the tank's actual body.
--- Only a rotated shape's line can miss every cell, and then the wire just runs
--- to x,y itself.
-function _shapeCells.edgePoint(canvas, e, x, y, axis, sign)
-    local cx, cy, cw, ch, p = _shapeCells.frame(canvas, e)
-    local lx, ly = _shapeCells.toLocal(cx, cy, cw, ch, p, e.rotation, x, y)
-    local cosR, sinR = _shapeCells.cosSin(e.rotation)
+-- point x,y, should stop on this shape: the outermost point where that line
+-- crosses the outline, on the side the wire is arriving from, so a wire whose
+-- box center sits in a cut-away notch runs on through the notch to the tank's
+-- actual body. Only a rotated shape's line can miss the outline, and then the
+-- wire just runs to x,y itself.
+function _shapePoly.edgePoint(canvas, e, x, y, axis, sign)
+    local cx, cy, cw, ch, p = _shapePoly.frame(canvas, e)
+    local lx, ly = _shapePoly.toLocal(cx, cy, cw, ch, p, e.rotation, x, y)
+    local cosR, sinR = _shapePoly.cosSin(e.rotation)
     local dirX, dirY = (axis == "x") and sign or 0, (axis == "y") and sign or 0
     local stepC, stepR = (dirX * cosR + dirY * sinR) / cw, (-dirX * sinR + dirY * cosR) / ch
     local best
-    for _, run in ipairs(p.runs) do
-        local tMin, tMax = -math.huge, math.huge
-        for _, slab in ipairs({ { lx, stepC, run.c0, run.c1 }, { ly, stepR, run.r, run.r + 1 } }) do
-            local from, step, low, high = slab[1], slab[2], slab[3], slab[4]
-            if step ~= 0 then
-                local t1, t2 = (low - from) / step, (high - from) / step
-                tMin, tMax = math.max(tMin, math.min(t1, t2)), math.min(tMax, math.max(t1, t2))
-            elseif from < low or from > high then
-                tMax = -math.huge
+    for _, edge in ipairs(p.edges) do
+        local edgeC, edgeR = edge[3] - edge[1], edge[4] - edge[2]
+        local denom = stepC * edgeR - stepR * edgeC
+        if denom ~= 0 then
+            local toC, toR = edge[1] - lx, edge[2] - ly
+            local alongEdge = (toC * stepR - toR * stepC) / denom
+            if alongEdge >= 0 and alongEdge <= 1 then
+                local t = (toC * edgeR - toR * edgeC) / denom
+                if not best or t > best then best = t end
             end
         end
-        if tMin <= tMax and (not best or tMax > best) then best = tMax end
     end
     if not best then return x, y end
-    return _shapeCells.toWorld(cx, cy, cw, ch, p, e.rotation, lx + best * stepC, ly + best * stepR)
+    return _shapePoly.toWorld(cx, cy, cw, ch, p, e.rotation, lx + best * stepC, ly + best * stepR)
 end
 
 -- Filled body and white outline, in the caller's already centered+rotated
 -- space; r,g,b,a is the fill, outlineAlpha the outline (0 for a glow halo).
-function _shapeCells.drawLocal(e, ew, eh, r, g, b, a, outlineAlpha)
-    local p = _shapeCells.parse(e.shapeRows)
+function _shapePoly.drawLocal(e, ew, eh, r, g, b, a, outlineAlpha)
+    local p = _shapePoly.parse(e.shapePoints)
     local cw, ch = ew / p.cols, eh / p.rows
+    local left, top = -ew / 2, -eh / 2
     love.graphics.setColor(r, g, b, a)
-    for _, run in ipairs(p.runs) do
-        love.graphics.rectangle("fill", -ew / 2 + run.c0 * cw, -eh / 2 + run.r * ch, (run.c1 - run.c0) * cw, ch)
+    for _, t in ipairs(p.triangles) do
+        love.graphics.polygon("fill", left + t[1] * cw, top + t[2] * ch, left + t[3] * cw, top + t[4] * ch,
+            left + t[5] * cw, top + t[6] * ch)
     end
     love.graphics.setColor(1, 1, 1, outlineAlpha)
-    _shapeCells.strokeEdges(p, ew, eh)
+    _shapePoly.strokeEdges(p, ew, eh)
 end
 
-function _shapeCells.strokeEdges(p, ew, eh)
+function _shapePoly.strokeEdges(p, ew, eh)
     local cw, ch = ew / p.cols, eh / p.rows
     for _, edge in ipairs(p.edges) do
         love.graphics.line(-ew / 2 + edge[1] * cw, -eh / 2 + edge[2] * ch, -ew / 2 + edge[3] * cw, -eh / 2 + edge[4] * ch)
@@ -1072,139 +1114,160 @@ end
 -- The selection/collision outline: the shape's real boundary, in whatever
 -- color the caller has set — the shaped counterpart of _drawElement's plain
 -- footprint rectangle.
-function _shapeCells.strokeOutline(canvas, e)
+function _shapePoly.strokeOutline(canvas, e)
     local ex, ey, ew, eh = _elementPixelRect(canvas, e)
     love.graphics.push()
     love.graphics.translate(ex + ew / 2, ey + eh / 2)
     love.graphics.rotate(math.rad(e.rotation or 0))
-    _shapeCells.strokeEdges(_shapeCells.parse(e.shapeRows), ew, eh)
+    _shapePoly.strokeEdges(_shapePoly.parse(e.shapePoints), ew, eh)
     love.graphics.pop()
 end
 
+-- The screen height of an element's fill line (e.fillPercent, set by the app; nil
+-- is full): 100% at the shape's topmost point on screen, 0% at its bottommost,
+-- however the element is turned, the way liquid settles.
+function _shapePoly.levelLineY(canvas, e)
+    local cx, cy, cw, ch, p = _shapePoly.frame(canvas, e)
+    local minY, maxY
+    for _, corner in ipairs(p.corners) do
+        local _, y = _shapePoly.toWorld(cx, cy, cw, ch, p, e.rotation, corner.c, corner.r)
+        minY, maxY = math.min(minY or y, y), math.max(maxY or y, y)
+    end
+    return maxY - (maxY - minY) * e.fillPercent / 100, maxY
+end
+
+-- Draws an element's whole body dimmed, then again in full color below its fill
+-- line, by way of drawBody(r, g, b, a). A scissor is what keeps that line level
+-- on screen while the body draws turned.
+function _shapePoly.drawLevel(canvas, e, drawBody, r, g, b, a)
+    local shade = _shapePoly.EMPTY_SHADE
+    drawBody(r * shade, g * shade, b * shade, a)
+    if e.fillPercent <= 0 then return end
+    local lineY, maxY = _shapePoly.levelLineY(canvas, e)
+    local top = math.floor(lineY + 0.5)
+    local prevX, prevY, prevW, prevH = love.graphics.getScissor()
+    love.graphics.intersectScissor(0, top, love.graphics.getWidth(), math.ceil(maxY) + 1 - top)
+    drawBody(r, g, b, a)
+    if prevX then love.graphics.setScissor(prevX, prevY, prevW, prevH) else love.graphics.setScissor() end
+end
+
 -- Reshape-mode affordance: a square handle on every draggable corner.
-function _shapeCells.drawHandles(canvas, e)
-    local cx, cy, cw, ch, p = _shapeCells.frame(canvas, e)
+function _shapePoly.drawHandles(canvas, e)
+    local cx, cy, cw, ch, p = _shapePoly.frame(canvas, e)
     local half = math.max(3, 0.7 * canvas.zoom)
     love.graphics.setColor(1, 0, 1, 1)
     for _, corner in ipairs(p.corners) do
-        local x, y = _shapeCells.toWorld(cx, cy, cw, ch, p, e.rotation, corner.c, corner.r)
+        local x, y = _shapePoly.toWorld(cx, cy, cw, ch, p, e.rotation, corner.c, corner.r)
         love.graphics.rectangle("fill", x - half, y - half, half * 2, half * 2)
     end
 end
 
--- The corner handle under a press, nearest first, or nil.
-function _shapeCells.cornerAt(canvas, e, x, y)
-    local cx, cy, cw, ch, p = _shapeCells.frame(canvas, e)
-    local best, bestDist = nil, _shapeCells.HANDLE_HIT_PX
-    for _, corner in ipairs(p.corners) do
-        local hx, hy = _shapeCells.toWorld(cx, cy, cw, ch, p, e.rotation, corner.c, corner.r)
-        local dist = math.sqrt((hx - x) ^ 2 + (hy - y) ^ 2)
-        if dist <= bestDist then best, bestDist = corner, dist end
+-- What a press grabbed, as the corner's index in p.corners plus isSide (the
+-- index then names the side running from that corner to the next), or nil.
+-- Nearest corner first. The middle third of a side is the exception: on a tank
+-- small enough on screen for its corners' reach to cover every side whole, that
+-- stretch still has to be able to grab the side.
+function _shapePoly.handleAt(canvas, e, x, y)
+    local cx, cy, cw, ch, p = _shapePoly.frame(canvas, e)
+    local corner, cornerDist = nil, _shapePoly.HANDLE_HIT_PX
+    local side, sideDist, sideIsMiddle = nil, _shapePoly.HANDLE_HIT_PX, false
+    for i, edge in ipairs(p.edges) do
+        local x1, y1 = _shapePoly.toWorld(cx, cy, cw, ch, p, e.rotation, edge[1], edge[2])
+        local x2, y2 = _shapePoly.toWorld(cx, cy, cw, ch, p, e.rotation, edge[3], edge[4])
+        local dist = math.sqrt((x1 - x) ^ 2 + (y1 - y) ^ 2)
+        if dist <= cornerDist then corner, cornerDist = i, dist end
+        local segX, segY = x2 - x1, y2 - y1
+        local t = math.max(0, math.min(1, ((x - x1) * segX + (y - y1) * segY) / (segX * segX + segY * segY)))
+        dist = math.sqrt((x1 + t * segX - x) ^ 2 + (y1 + t * segY - y) ^ 2)
+        if dist <= sideDist then side, sideDist, sideIsMiddle = i, dist, t >= 1 / 3 and t <= 2 / 3 end
     end
-    return best
+    if corner and not (side and sideIsMiddle and sideDist < cornerDist) then return corner, false end
+    if side then return side, true end
+    return nil
 end
 
-function _shapeCells.beginDrag(canvas, e, corner)
+function _shapePoly.beginDrag(canvas, e, index, isSide)
     canvas._shapeDrag = {
-        c = corner.c, r = corner.r, rows = _shapeCells.rowsOf(canvas, e), originalRows = e.shapeRows,
+        index = index, isSide = isSide, points = _shapePoly.pointsOf(canvas, e), originalPoints = e.shapePoints,
         x = e.x, y = e.y, w = e.w, h = e.h,
     }
 end
 
--- Fills the half-open rectangle between grid vertices (c1,r1) and (c2,r2).
-function _shapeCells.setRect(set, c1, r1, c2, r2, value)
-    for r = math.min(r1, r2), math.max(r1, r2) - 1 do
-        set[r] = set[r] or {}
-        for c = math.min(c1, c2), math.max(c1, c2) - 1 do set[r][c] = value end
+-- The corner list a drag offset by whole grid units (dc,dr) produces: a grabbed
+-- corner moves that far, and a grabbed side gains a new corner that far from
+-- the exact center of the side. Moving by whole units from where it started
+-- keeps that new corner dead center on an odd-length side pulled straight out.
+function _shapePoly.candidatePoints(p, drag, dc, dr)
+    local points = {}
+    for i, corner in ipairs(p.corners) do
+        local moved = i == drag.index and not drag.isSide
+        table.insert(points, moved and corner.c + dc or corner.c)
+        table.insert(points, moved and corner.r + dr or corner.r)
+        if i == drag.index and drag.isSide then
+            local nextCorner = p.corners[i % #p.corners + 1]
+            table.insert(points, (corner.c + nextCorner.c) / 2 + dc)
+            table.insert(points, (corner.r + nextCorner.r) / 2 + dr)
+        end
     end
+    return points
 end
 
--- The cell set a drag from drag.c,drag.r to grid vertex (fc,fr) produces.
--- Pushing a corner into the body cuts a square notch out of it. Pulling a
--- concave corner into its empty quadrant fills that rectangle in. Pulling a
--- convex corner outward carries its two edges along with it, the way a
--- rectangle's corner handle works in any drawing program, so a plain tank
--- just grows into a bigger plain tank. Any axis of a pull that points inward
--- is ignored rather than undoing the other axis's growth.
-function _shapeCells.candidateSet(p, drag, fc, fr)
-    local set = {}
-    for r, row in pairs(p.set) do
-        set[r] = {}
-        for c in pairs(row) do set[r][c] = true end
-    end
-    local has = _shapeCells.has
-    local vc, vr = drag.c, drag.r
-    local dc, dr = fc - vc, fr - vr
-    if dc == 0 and dr == 0 then return set end
-    local qc = (dc > 0) and vc or (vc - 1)
-    local qr = (dr > 0) and vr or (vr - 1)
-    if dc ~= 0 and dr ~= 0 and has(p.set, qc, qr) then
-        _shapeCells.setRect(set, vc, vr, fc, fr, nil)
-    elseif _shapeCells.filledAround(p.set, vc, vr) == 3 then
-        if dc ~= 0 and dr ~= 0 then _shapeCells.setRect(set, vc, vr, fc, fr, true) end
-    else
-        -- Convex: (oc,or) is the one filled cell at this vertex; (outC,outR)
-        -- point away from it. Each edge is walked back from the corner for as
-        -- long as it stays a boundary, then pushed out to the finger.
-        local oc = has(p.set, vc, vr) and vc or (has(p.set, vc, vr - 1) and vc or (vc - 1))
-        local or_ = has(p.set, oc, vr) and vr or (vr - 1)
-        local outC, outR = (oc == vc) and -1 or 1, (or_ == vr) and -1 or 1
-        local pullC, pullR = dc * outC > 0, dr * outR > 0
-        if pullC then
-            local r = or_
-            while has(p.set, oc, r) and not has(p.set, oc + outC, r) do
-                _shapeCells.setRect(set, vc, r, fc, r + 1, true)
-                r = r - outR
-            end
-        end
-        if pullR then
-            local c = oc
-            while has(p.set, c, or_) and not has(p.set, c, or_ + outR) do
-                _shapeCells.setRect(set, c, vr, c + 1, fr, true)
-                c = c - outC
-            end
-        end
-        if pullC and pullR then _shapeCells.setRect(set, vc, vr, fc, fr, true) end
-    end
-    return set
+-- Which way c,r turns relative to the line from a to b: the sign is the side, 0 is on it.
+function _shapePoly.turn(ac, ar, bc, br, c, r)
+    return (bc - ac) * (r - ar) - (br - ar) * (c - ac)
 end
 
--- A cell set as trimmed shapeRows plus its box's min corner, or nil if it's
--- empty or split into more than one piece.
-function _shapeCells.encode(set)
-    local minC, maxC, minR, maxR, startC, startR
-    local total = 0
-    for r, row in pairs(set) do
-        for c in pairs(row) do
-            total = total + 1
-            startC, startR = c, r
-            minC, maxC = math.min(minC or c, c), math.max(maxC or c, c)
-            minR, maxR = math.min(minR or r, r), math.max(maxR or r, r)
+-- Whether two segments share any point at all, a mere touch included.
+function _shapePoly.segmentsTouch(a, b)
+    local function within(s, c, r)
+        return c >= math.min(s[1], s[3]) and c <= math.max(s[1], s[3]) and r >= math.min(s[2], s[4]) and r <= math.max(s[2], s[4])
+    end
+    local turn = _shapePoly.turn
+    local t1, t2 = turn(b[1], b[2], b[3], b[4], a[1], a[2]), turn(b[1], b[2], b[3], b[4], a[3], a[4])
+    local t3, t4 = turn(a[1], a[2], a[3], a[4], b[1], b[2]), turn(a[1], a[2], a[3], a[4], b[3], b[4])
+    if ((t1 > 0) ~= (t2 > 0)) and ((t3 > 0) ~= (t4 > 0)) and t1 ~= 0 and t2 ~= 0 and t3 ~= 0 and t4 ~= 0 then return true end
+    return (t1 == 0 and within(b, a[1], a[2])) or (t2 == 0 and within(b, a[3], a[4])) or
+           (t3 == 0 and within(a, b[1], b[2])) or (t4 == 0 and within(a, b[3], b[4]))
+end
+
+-- A corner list as finished shapePoints plus its box's min corner, or nil if
+-- it isn't a real polygon: a corner dragged flat onto the line between its
+-- neighbors (or onto a neighbor) simply stops being a corner, while an outline
+-- left with no area, or crossing or touching itself, is rejected.
+function _shapePoly.encode(points)
+    local corners = {}
+    for i = 1, #points, 2 do table.insert(corners, { points[i], points[i + 1] }) end
+    local i = 1
+    while i <= #corners and #corners >= 3 do
+        local a, b, c = corners[(i - 2) % #corners + 1], corners[i], corners[i % #corners + 1]
+        if _shapePoly.turn(a[1], a[2], b[1], b[2], c[1], c[2]) == 0 then
+            table.remove(corners, i)
+            i = 1
+        else
+            i = i + 1
         end
     end
-    if total == 0 then return nil end
-    local seen, stack, reached = {}, { { startC, startR } }, 0
-    while #stack > 0 do
-        local cell = table.remove(stack)
-        local c, r = cell[1], cell[2]
-        seen[r] = seen[r] or {}
-        if _shapeCells.has(set, c, r) and not seen[r][c] then
-            seen[r][c] = true
-            reached = reached + 1
-            table.insert(stack, { c + 1, r })
-            table.insert(stack, { c - 1, r })
-            table.insert(stack, { c, r + 1 })
-            table.insert(stack, { c, r - 1 })
+    local n = #corners
+    if n < 3 then return nil end
+    local minC, minR = corners[1][1], corners[1][2]
+    local segments = {}
+    for j, corner in ipairs(corners) do
+        minC, minR = math.min(minC, corner[1]), math.min(minR, corner[2])
+        local nextCorner = corners[j % n + 1]
+        segments[j] = { corner[1], corner[2], nextCorner[1], nextCorner[2] }
+    end
+    for j = 1, n do
+        for k = j + 2, n do
+            -- Neighboring sides share their corner by definition.
+            if not (j == 1 and k == n) and _shapePoly.segmentsTouch(segments[j], segments[k]) then return nil end
         end
     end
-    if reached ~= total then return nil end
-    local rows = {}
-    for r = minR, maxR do
-        local chars = {}
-        for c = minC, maxC do chars[#chars + 1] = _shapeCells.has(set, c, r) and "#" or "." end
-        rows[#rows + 1] = table.concat(chars)
+    local result = {}
+    for _, corner in ipairs(corners) do
+        table.insert(result, corner[1] - minC)
+        table.insert(result, corner[2] - minR)
     end
-    return rows, minC, minR
+    return result, minC, minR
 end
 
 -- True if a candidate footprint (cx,cy = pixel-space center, halfX,halfY =
@@ -1233,11 +1296,11 @@ end
 local function _footprintOverlapsAnother(canvas, cx, cy, halfX, halfY, excludeId)
     local bufferPx = 1 * _GRID_SPACING_PX * canvas.zoom -- 1 grid unit of required gap
     for _, e in ipairs(canvas.elements) do
-        if e.id ~= excludeId and e.shapeRows then
-            -- A shaped element only blocks where it's actually filled, so
+        if e.id ~= excludeId and e.shapePoints then
+            -- A shaped element only blocks where its outline actually reaches, so
             -- something can sit in a notch cut out of it.
-            local ecx, ecy, cw, ch, p = _shapeCells.frame(canvas, e)
-            local hit = _shapeCells.eachSpanBox(p, ecx, ecy, cw, ch, e.rotation, function(sx, sy, sHalfX, sHalfY)
+            local ecx, ecy, cw, ch, p = _shapePoly.frame(canvas, e)
+            local hit = _shapePoly.eachSpanBox(p, ecx, ecy, cw, ch, e.rotation, function(sx, sy, sHalfX, sHalfY)
                 return math.abs(cx - sx) < halfX + sHalfX + bufferPx and math.abs(cy - sy) < halfY + sHalfY + bufferPx
             end)
             if hit then return true, e end
@@ -1261,39 +1324,48 @@ local function _footprintOverlapsAnother(canvas, cx, cy, halfX, halfY, excludeId
     return false
 end
 
--- The same check for a shaped element about to sit at center cx,cy with cells
--- cw x ch pixels: each of its filled spans is its own candidate footprint.
-function _shapeCells.blockedAt(canvas, elem, p, cx, cy, cw, ch, rotationDeg)
-    return _shapeCells.eachSpanBox(p, cx, cy, cw, ch, rotationDeg, function(sx, sy, sHalfX, sHalfY)
+-- The same check for a shaped element about to sit at center cx,cy with grid units
+-- cw x ch pixels: each of its row spans is its own candidate footprint.
+function _shapePoly.blockedAt(canvas, elem, p, cx, cy, cw, ch, rotationDeg)
+    return _shapePoly.eachSpanBox(p, cx, cy, cw, ch, rotationDeg, function(sx, sy, sHalfX, sHalfY)
         return _footprintOverlapsAnother(canvas, sx, sy, sHalfX, sHalfY, elem.id)
     end)
 end
 
--- Applies the current finger position to an in-progress corner drag. Always
--- recomputed from the shape the press started on (canvas._shapeDrag), so
--- dragging back undoes the change live; a result that's split in two, off the
+-- Applies the current finger position to an in-progress corner/side drag.
+-- Always recomputed from the shape the press started on (canvas._shapeDrag), so
+-- dragging back undoes the change live; a result that crosses itself, off the
 -- canvas, or on top of a neighbor simply isn't applied — same "stops at the
--- obstacle" feel as a move drag. Returns true once e differs from that start.
-function _shapeCells.updateDrag(canvas, e, x, y)
+-- obstacle" feel as a move drag. Nothing applies until the press has become a
+-- real drag, so a tap's finger jitter can't nudge a corner or sprout a new one.
+-- Returns true once e differs from that start.
+function _shapePoly.updateDrag(canvas, e, x, y)
     local drag = canvas._shapeDrag
-    local p = _shapeCells.parse(drag.rows)
+    if not drag.started then
+        if math.abs(x - canvas.dragStartX) <= _ELEMENT_TAP_SLOP_PX and math.abs(y - canvas.dragStartY) <= _ELEMENT_TAP_SLOP_PX then
+            return false
+        end
+        drag.started = true
+    end
+    local p = _shapePoly.parse(drag.points)
     local bx, by = _toPixel(canvas, drag.x, drag.y)
     local bw, bh = drag.w * canvas.contentW * canvas.zoom, drag.h * canvas.contentH * canvas.zoom
     local bcx, bcy, cw, ch = bx + bw / 2, by + bh / 2, bw / p.cols, bh / p.rows
-    local lx, ly = _shapeCells.toLocal(bcx, bcy, cw, ch, p, e.rotation, x, y)
-    local fc, fr = math.floor(lx + 0.5), math.floor(ly + 0.5)
-    local rows, minC, minR = _shapeCells.encode(_shapeCells.candidateSet(p, drag, fc, fr))
+    local lx, ly = _shapePoly.toLocal(bcx, bcy, cw, ch, p, e.rotation, x, y)
+    local startX, startY = _shapePoly.toLocal(bcx, bcy, cw, ch, p, e.rotation, canvas.dragStartX, canvas.dragStartY)
+    local dc, dr = math.floor(lx - startX + 0.5), math.floor(ly - startY + 0.5)
+    local points, minC, minR = _shapePoly.encode(_shapePoly.candidatePoints(p, drag, dc, dr))
     canvas.collidingObstacleId = nil
-    if not rows then return false end
-    if table.concat(rows, "\n") == table.concat(drag.rows, "\n") then
-        e.shapeRows, e.x, e.y, e.w, e.h = drag.originalRows, drag.x, drag.y, drag.w, drag.h
+    if not points then return false end
+    if table.concat(points, ",") == table.concat(drag.points, ",") then
+        e.shapePoints, e.x, e.y, e.w, e.h = drag.originalPoints, drag.x, drag.y, drag.w, drag.h
         return false
     end
-    local np = _shapeCells.parse(rows)
-    -- Where the new box's center lands, keeping every surviving cell exactly
+    local np = _shapePoly.parse(points)
+    -- Where the new box's center lands, keeping every surviving corner exactly
     -- where it already was on screen.
-    local ncx, ncy = _shapeCells.toWorld(bcx, bcy, cw, ch, p, e.rotation, minC + np.cols / 2, minR + np.rows / 2)
-    local cosR, sinR = _shapeCells.cosSin(e.rotation)
+    local ncx, ncy = _shapePoly.toWorld(bcx, bcy, cw, ch, p, e.rotation, minC + np.cols / 2, minR + np.rows / 2)
+    local cosR, sinR = _shapePoly.cosSin(e.rotation)
     cosR, sinR = math.abs(cosR), math.abs(sinR)
     local newW, newH = np.cols * cw, np.rows * ch
     local halfX, halfY = (newW * cosR + newH * sinR) / 2, (newW * sinR + newH * cosR) / 2
@@ -1306,16 +1378,93 @@ function _shapeCells.updateDrag(canvas, e, x, y)
        ncy - halfY < math.min(originY, bcy - baseHalfY) - 0.001 or ncy + halfY > math.max(maxY, bcy + baseHalfY) + 0.001 then
         return false
     end
-    local blocked, obstacle = _shapeCells.blockedAt(canvas, e, np, ncx, ncy, cw, ch, e.rotation)
+    local blocked, obstacle = _shapePoly.blockedAt(canvas, e, np, ncx, ncy, cw, ch, e.rotation)
     if blocked then
         canvas.collidingObstacleId = obstacle and obstacle.id or nil
         return false
     end
     local fracW, fracH = np.cols * drag.w / p.cols, np.rows * drag.h / p.rows
     local cfx, cfy = _toFraction(canvas, ncx, ncy)
-    e.shapeRows, e.w, e.h = rows, fracW, fracH
+    e.shapePoints, e.w, e.h = points, fracW, fracH
     e.x, e.y = cfx - fracW / 2, cfy - fracH / 2
     return true
+end
+
+-- The bounding-box-relative corners of e's left-right mirror image. Paired with
+-- the opposite rotation (see openMirror), that's the true mirror of e as it
+-- actually sits on the canvas.
+function _shapePoly.mirroredPoints(canvas, e)
+    local points = _shapePoly.pointsOf(canvas, e)
+    local p = _shapePoly.parse(points)
+    local mirrored = {}
+    for i = 1, #points, 2 do
+        mirrored[i], mirrored[i + 1] = p.cols - points[i], points[i + 1]
+    end
+    return mirrored
+end
+
+-- The nearest clear on-canvas spot (top-left fractions) for a shape of size
+-- wFrac x hFrac, searching outward one grid unit at a time from centerX,centerY,
+-- along the row first. Only X snaps to the grid: a reshaped tank's center can sit
+-- off it, and its twin should still line up level with it. nil if there's no room.
+function _shapePoly.findClearSpot(canvas, p, rotationDeg, centerX, centerY, wFrac, hFrac)
+    local startX = _snapElementToGrid(canvas, centerX - wFrac / 2, centerY - hFrac / 2, wFrac, hFrac)
+    local startY = centerY - hFrac / 2
+    local stepX, stepY = _GRID_SPACING_PX / canvas.contentW, _GRID_SPACING_PX / canvas.contentH
+    local cosR, sinR = _shapePoly.cosSin(rotationDeg)
+    cosR, sinR = math.abs(cosR), math.abs(sinR)
+    local bw, bh = wFrac * canvas.contentW * canvas.zoom, hFrac * canvas.contentH * canvas.zoom
+    local halfX, halfY = (bw * cosR + bh * sinR) / 2, (bw * sinR + bh * cosR) / 2
+    local originX, originY = _toPixel(canvas, 0, 0)
+    local maxX, maxY = _toPixel(canvas, 1, 1)
+    local function isClear(dx, dy)
+        local px, py = _toPixel(canvas, startX + dx * stepX, startY + dy * stepY)
+        local cx, cy = px + bw / 2, py + bh / 2
+        return cx - halfX >= originX - 0.001 and cx + halfX <= maxX + 0.001 and
+               cy - halfY >= originY - 0.001 and cy + halfY <= maxY + 0.001 and
+               not _shapePoly.blockedAt(canvas, {}, p, cx, cy, bw / p.cols, bh / p.rows, rotationDeg)
+    end
+    local maxRing = math.ceil(math.max(1 / stepX, 1 / stepY))
+    for ring = 0, maxRing do
+        for i = 0, 2 * ring do
+            local dy = (i % 2 == 1) and (i + 1) / 2 or -i / 2
+            -- The ring's outline only: every column on its top and bottom
+            -- rows, just the two end columns on the rows between.
+            local stride = (math.abs(dy) == ring) and 1 or 2 * ring
+            for dx = -ring, ring, stride do
+                if isClear(dx, dy) then return startX + dx * stepX, startY + dy * stepY end
+            end
+        end
+    end
+    return nil
+end
+
+-- The edit menu's MIRROR option: asks for the new tank's NAME and properties
+-- through the same grid placing one from the catalog does, then creates it with
+-- e's outline flipped left-right. It lands across the canvas's vertical
+-- centerline from e, which is the matching wing on a symmetric aircraft, or the
+-- nearest clear spot to that if something's already there.
+function _shapePoly.openMirror(canvasName, canvas, e)
+    local points = _shapePoly.mirroredPoints(canvas, e)
+    local rotation = -(e.rotation or 0) % 360
+    local fracX, fracY = _shapePoly.findClearSpot(canvas, _shapePoly.parse(points), rotation,
+        1 - (e.x + e.w / 2), e.y + e.h / 2, e.w, e.h)
+    if not fracX then
+        gdsGui_schematic_openMenu(canvasName, "NO ROOM ON THE CANVAS FOR A MIRRORED TANK.", {"OK"},
+            "gdsGui_schematic_internal_onPlacementOverlapDismissed", nil)
+        return
+    end
+    local propertyKeys = {}
+    for _, property in ipairs(e.properties or {}) do table.insert(propertyKeys, property.key) end
+    canvas._placementCounter = canvas._placementCounter + 1
+    _openElementPlacementGrid(canvasName, {
+        canvasName = canvasName, kind = "element", shapeType = e.shapeType, componentType = e.componentType,
+        newId = (e.id:gsub("_%d+$", "")) .. "_" .. canvas._placementCounter,
+        label = ((e.label or e.id):gsub("_%d+$", "")),
+        title = "MIRROR OF " .. (e.label or e.id),
+        fracX = fracX, fracY = fracY, wFrac = e.w, hFrac = e.h, rotation = rotation, shapePoints = points,
+        defaultColor = _deepCopy(e.defaultColor), defaultPropertyKeys = propertyKeys,
+    })
 end
 
 -- Wire-terminal helpers for a control with its own `terminals` list (see
@@ -1354,7 +1503,7 @@ local function _hitElement(canvas, px, py)
         local e = canvas.elements[i]
         local ex, ey, ew, eh = _elementFootprintRect(canvas, e)
         if px >= ex and px <= ex + ew and py >= ey and py <= ey + eh
-           and (not e.shapeRows or _shapeCells.containsPoint(canvas, e, px, py)) then
+           and (not e.shapePoints or _shapePoly.containsPoint(canvas, e, px, py)) then
             return e
         end
     end
@@ -1561,7 +1710,7 @@ function gdsGui_schematic_create(name, page, x, y, anchorPoint, wFrac, hFrac)
     -- selectionMoveModeActive everywhere above/below it clears.
     canvas.rotateModeActive = false
     -- The third stop on that same tap cycle, for a reshapable element only
-    -- (see _shapeCells): move -> rotate -> reshape -> move.
+    -- (see _shapePoly): move -> rotate -> reshape -> move.
     canvas.reshapeModeActive = false
     canvas.reshapableKind    = nil   -- see gdsGui_schematic_setReshapableKind
     canvas._shapeDrag        = nil   -- start-of-gesture state while dragKind is "reshape"
@@ -3084,10 +3233,12 @@ end
 -- row.value — no keyboard involved); omitted, it's a free-text box.
 -- numericOnly (text rows only): same digit/one-decimal-point filter
 -- gdsGui_textPrompt_open's own numericOnly uses, applied per keystroke by
--- gdsGui_schematic_propertyGridTextInput below. slider = {min, max, unit}
--- (optional): a horizontal scrollbar in place of the value box, dragged or
--- tapped in whole steps, with row.value as the number in string form and the
--- current value shown after the row's label. requireAll (optional): true
+-- gdsGui_schematic_propertyGridTextInput below. slider = {min, max, unit,
+-- format} (optional): a horizontal scrollbar in place of the value box, dragged
+-- or tapped in whole steps, with row.value as the number in string form and the
+-- current value shown after the row's label (through string.format, if format
+-- is given). onChange (optional): called with no arguments after the user edits
+-- this row, by typing or by slider, so linked rows can follow it live. requireAll (optional): true
 -- gates SAVE on every row having a non-empty value (same "remaining" gate
 -- _choiceGrid.remaining enforces); false/omitted lets SAVE commit as-is,
 -- blank rows included. validateFunc (optional, a plain Lua function, NOT a
@@ -3188,6 +3339,7 @@ function _propertyGrid.setSliderFromX(owner, menu, rowIndex, px)
     local travel = bw - _propertyGrid.SLIDER_THUMB_W
     local t = math.max(0, math.min(1, (px - bx - _propertyGrid.SLIDER_THUMB_W / 2) / travel))
     row.value = tostring(math.floor(row.slider.min + t * (row.slider.max - row.slider.min) + 0.5))
+    if row.onChange then row.onChange() end
 end
 
 -- {kind = "row", row} | {kind = "choice", row, choice} | {kind = "slider", row} |
@@ -3342,6 +3494,7 @@ function gdsGui_schematic_propertyGridTextInput(t)
     if row.numericOnly and combined:find("%..*%.") then return end
     if #combined > _propertyGrid.MAX_CHARS then return end
     row.value = combined
+    if row.onChange then row.onChange() end
 end
 
 -- Called from love.keypressed when _propertyGridIsActive(). RETURN just
@@ -3355,6 +3508,7 @@ function gdsGui_schematic_propertyGridKeypressed(key)
     if not row then return end
     if key == "backspace" then
         row.value = (row.value or ""):sub(1, -2)
+        if row.onChange then row.onChange() end
     elseif key == "return" or key == "kpenter" then
         menu.activeRow = nil
         love.keyboard.setTextInput(false)
@@ -3398,7 +3552,11 @@ function _propertyGrid.draw(owner, menu)
                 love.graphics.rectangle("fill", g.x + 2, rowY + 1, g.w - 4, g.rowH - 2)
             end
             love.graphics.setColor(1, 1, 1, 1)
-            local labelText = row.slider and (row.label .. ": " .. (row.value or "") .. " " .. (row.slider.unit or "")) or row.label
+            local labelText = row.label
+            if row.slider then
+                local shown = row.slider.format and string.format(row.slider.format, tonumber(row.value) or 0) or (row.value or "")
+                labelText = row.label .. ": " .. shown .. " " .. (row.slider.unit or "")
+            end
             love.graphics.print(labelText, g.x + 8, rowY + (g.rowH - font:getHeight()) / 2)
 
             if row.slider then
@@ -4318,7 +4476,8 @@ end
 -- replaces this and its wire/control siblings' embedded color pickers.
 -- DELETE is this menu's own confirmIndex row (passed to openMenu below) —
 -- holding IT down for _CONFIRM_HOLD_SECONDS is the whole confirmation, no
--- separate "DELETE \"X\"?" popup. ADD WIRE/RENAME/PROPERTIES stay plain-tap.
+-- separate "DELETE \"X\"?" popup. ADD WIRE/RENAME/PROPERTIES stay plain-tap,
+-- as does MIRROR, offered only on a reshapable element (see _shapePoly.openMirror).
 --------------------------------------------------------------------------------
 
 function gdsGui_schematic_openElementEditMenu(canvasName, elementId)
@@ -4328,6 +4487,7 @@ function gdsGui_schematic_openElementEditMenu(canvasName, elementId)
     if not el then return end
     canvas._elementEditTargetId = elementId
     local options = {_pipes.addLabel(canvas), "RENAME", "PROPERTIES", "DELETE"}
+    if _shapePoly.allowed(canvas, el) then table.insert(options, 3, "MIRROR") end
     local title = el.label or elementId
     -- canvas.elementMenuTitleSuffix (optional, by-name like every other
     -- string-registered hook): called as fn(canvasName, elementId) just
@@ -4370,6 +4530,12 @@ function gdsGui_schematic_internal_onElementEditChosen(canvasName, index, option
         -- selected while that flow is in progress.
         canvas._elementEditTargetId = nil
         _openElementRenamePrompt(canvasName, elementId)
+        return
+    elseif optionText == "MIRROR" then
+        canvas._elementEditTargetId = nil
+        canvas.selectedElementId = nil
+        local el = _findElement(canvas, elementId)
+        if el then _shapePoly.openMirror(canvasName, canvas, el) end
         return
     elseif optionText == "PROPERTIES" then
         -- PROPERTIES tapped: hand off to the properties submenu, keeping the
@@ -5615,11 +5781,11 @@ local function _drawElement(canvas, e, signature)
         if e.spritePath then
             _drawElementSprite(e.spritePath, ex, ey, ew, eh, r, g, b, a, e.rotation)
             love.graphics.setColor(1, 1, 1, 1)
-        elseif e.shapeRows then
+        elseif e.shapePoints then
             love.graphics.push()
             love.graphics.translate(ex + ew / 2, ey + eh / 2)
             love.graphics.rotate(math.rad(e.rotation or 0))
-            _shapeCells.drawLocal(e, ew, eh, r, g, b, a, outline)
+            _shapePoly.drawLocal(e, ew, eh, r, g, b, a, outline)
             love.graphics.pop()
         elseif e.shapeType == "circle" then
             -- Every shapeType is rotatable now (move/rotate mode applies
@@ -5646,6 +5812,15 @@ local function _drawElement(canvas, e, signature)
             love.graphics.setColor(1, 1, 1, outline)
             love.graphics.rectangle("line", -ew / 2, -eh / 2, ew, eh)
             love.graphics.pop()
+        end
+    end
+
+    -- A tank showing its level; its powered-glow halo stays the whole body.
+    if e.fillPercent then
+        local drawWhole = drawShapeWithColor
+        drawShapeWithColor = function(r, g, b, a, isHalo)
+            if isHalo then return drawWhole(r, g, b, a, true) end
+            _shapePoly.drawLevel(canvas, e, drawWhole, r, g, b, a)
         end
     end
 
@@ -5680,8 +5855,8 @@ local function _drawElement(canvas, e, signature)
     -- once) the normal selection outline below.
     if canvas.collidingObstacleId == e.id then
         love.graphics.setColor(1, 0, 0, 1)
-        if e.shapeRows then
-            _shapeCells.strokeOutline(canvas, e)
+        if e.shapePoints then
+            _shapePoly.strokeOutline(canvas, e)
         else
             love.graphics.rectangle("line", fex, fey, few, feh)
         end
@@ -5708,9 +5883,9 @@ local function _drawElement(canvas, e, signature)
         -- Square, same as a control's own selection box (see _drawControl's
         -- matching "rectangle" line) — one consistent "this is selected"
         -- shape for every anchor kind. A reshaped element traces its real
-        -- outline instead, which is what it collides against (see _shapeCells).
-        if e.shapeRows then
-            _shapeCells.strokeOutline(canvas, e)
+        -- outline instead, which is what it collides against (see _shapePoly).
+        if e.shapePoints then
+            _shapePoly.strokeOutline(canvas, e)
         else
             love.graphics.rectangle("line", fex, fey, few, feh)
         end
@@ -5720,8 +5895,8 @@ local function _drawElement(canvas, e, signature)
             -- gdsGui_schematic_pressed's isActiveMoveTarget branch) rather
             -- than opening the edit menu. Every element is rotatable now,
             -- same as every control.
-            if canvas.reshapeModeActive and _shapeCells.allowed(canvas, e) then
-                _shapeCells.drawHandles(canvas, e)
+            if canvas.reshapeModeActive and _shapePoly.allowed(canvas, e) then
+                _shapePoly.drawHandles(canvas, e)
             elseif canvas.rotateModeActive then
                 -- Half-diagonal, not half-width/height — the smallest
                 -- circle that still fully encloses the (now exact, not
@@ -5895,15 +6070,15 @@ local function _anchorHalfExtent(canvas, anchor, axis)
     if anchor.shapeType == "diode" then return 0 end
     if anchor.w then
         local _, _, ew, eh = _elementPixelRect(canvas, anchor)
-        if anchor.shapeRows then _, _, ew, eh = _elementFootprintRect(canvas, anchor) end
+        if anchor.shapePoints then _, _, ew, eh = _elementFootprintRect(canvas, anchor) end
         return (axis == "x") and (ew / 2) or (eh / 2)
     end
     return canvas.controlRadius * canvas.zoom * (anchor.radiusScale or 1)
 end
 
 local function _anchorEdgePoint(canvas, anchor, cx, cy, axis, sign)
-    if anchor and anchor.shapeRows then
-        return _shapeCells.edgePoint(canvas, anchor, cx, cy, axis, sign)
+    if anchor and anchor.shapePoints then
+        return _shapePoly.edgePoint(canvas, anchor, cx, cy, axis, sign)
     end
     if anchor then
         -- Per-side, not symmetric: art that sits off-center in its image
@@ -6323,7 +6498,7 @@ function gdsGui_schematic_setPipeConnectors(canvasName, noun)
 end
 
 -- Names the one kind of element on this canvas whose outline can be redrawn
--- (see _shapeCells), or nil for none. Matched by kind rather than stored on
+-- (see _shapePoly), or nil for none. Matched by kind rather than stored on
 -- each element, so items placed before this existed qualify too.
 function gdsGui_schematic_setReshapableKind(canvasName, shapeType, componentType)
     local canvas = _findCanvas(canvasName)
@@ -6412,7 +6587,14 @@ function _pipes.cycleGravityDirection(w)
     end
 end
 
-_pipes.GRAVITY_CHEVRON_SPACING = _GRID_SPACING_PX * 2  -- world units between chevrons
+_pipes.GRAVITY_CHEVRON_GAP = _GRID_SPACING_PX * 2  -- world units of clear pipe from one chevron to the next (2 grid units)
+
+-- A chevron's length along the pipe, in pixels, and the distance from one
+-- chevron's center to the next, which is that length plus the gap.
+function _pipes.chevronSizeAndSpacing(canvas)
+    local size = _WIRE_WIDTH_PX * _pipes.WIDTH_MULT * canvas.zoom * 0.9
+    return size, size + _pipes.GRAVITY_CHEVRON_GAP * canvas.zoom
+end
 
 -- One open ">"-shaped chevron centered at (cx,cy), pointing in unit direction
 -- (dx,dy) — a 3-point polyline (never filled), so it reads as a notch across
@@ -6431,22 +6613,34 @@ end
 -- (the running "carry" phase below keeps the interval continuous across a
 -- bend from one segment into the next) — nothing drawn at all for "none".
 -- Drawn in the wall's own gray (_pipes.setWallColor) so it reads consistently
--- regardless of the fluid's own (per-source) color.
+-- regardless of the fluid's own (per-source) color. Layered in front of the
+-- fluid but behind the walls: this pass runs after the fluid, so a scissor on
+-- each segment's fluid channel (segments are always axis-aligned) is what stops
+-- a chevron's arms at the inner edge of the walls.
 function _pipes.drawGravityChevrons(canvas, w, plan)
     local dir = w.gravityDirection
     if not dir then return end
     local pointBackward = (dir == "reverse")
     local pipeWidth = _WIRE_WIDTH_PX * _pipes.WIDTH_MULT * canvas.zoom
-    local size = pipeWidth * 0.9
-    local spacing = math.max(size * 2.2, _pipes.GRAVITY_CHEVRON_SPACING * canvas.zoom)
+    local size, spacing = _pipes.chevronSizeAndSpacing(canvas)
     _pipes.setWallColor()
     love.graphics.setLineWidth(math.max(1, pipeWidth * 0.35))
     local carry = spacing / 2
+    local halfFluid = _WIRE_WIDTH_PX * canvas.zoom / 2
+    local prevScX, prevScY, prevScW, prevScH = love.graphics.getScissor()
+    local function restoreScissor()
+        if prevScX then love.graphics.setScissor(prevScX, prevScY, prevScW, prevScH) else love.graphics.setScissor() end
+    end
     for _, seg in ipairs(plan.segments) do
         local x1, y1, x2, y2 = seg[1], seg[2], seg[3], seg[4]
         local dx, dy = x2 - x1, y2 - y1
         local len = math.sqrt(dx * dx + dy * dy)
         if len > 0.001 then
+            local left = math.floor(math.min(x1, x2) - halfFluid + 0.5)
+            local top = math.floor(math.min(y1, y2) - halfFluid + 0.5)
+            restoreScissor()
+            love.graphics.intersectScissor(left, top,
+                math.floor(math.max(x1, x2) + halfFluid + 0.5) - left, math.floor(math.max(y1, y2) + halfFluid + 0.5) - top)
             local ux, uy = dx / len, dy / len
             local pointX = pointBackward and -ux or ux
             local pointY = pointBackward and -uy or uy
@@ -6456,6 +6650,38 @@ function _pipes.drawGravityChevrons(canvas, w, plan)
                 d = d + spacing
             end
             carry = d - len
+        end
+    end
+    restoreScissor()
+    love.graphics.setLineWidth(1)
+end
+
+-- The emptied stretch of a draining pipe (w.fluidPercent, set by the app; nil is
+-- full), laid over its fluid in canvas.emptyPipeColor from whichever end gravity
+-- is pulling away from, so the fluid visibly runs out toward the far end.
+function _pipes.drawEmptiedRun(canvas, w, plan)
+    if not w.fluidPercent or w.fluidPercent >= 100 or not canvas.emptyPipeColor then return end
+    local segments, total = {}, 0
+    for i, seg in ipairs(plan.segments) do
+        total = total + math.abs(seg[3] - seg[1]) + math.abs(seg[4] - seg[2])
+        if w.gravityDirection == "reverse" then
+            segments[#plan.segments + 1 - i] = { seg[3], seg[4], seg[1], seg[2] }
+        else
+            segments[i] = seg
+        end
+    end
+    local c = canvas.emptyPipeColor
+    love.graphics.setColor(_themedPaletteColor(c[1], c[2], c[3], c[4] or 1))
+    love.graphics.setLineWidth(_WIRE_WIDTH_PX * canvas.zoom)
+    local remaining = total * (1 - w.fluidPercent / 100)
+    for _, seg in ipairs(segments) do
+        local len = math.abs(seg[3] - seg[1]) + math.abs(seg[4] - seg[2])
+        if remaining <= 0 or len <= 0 then
+            if remaining <= 0 then break end
+        else
+            local t = math.min(1, remaining / len)
+            love.graphics.line(seg[1], seg[2], seg[1] + (seg[3] - seg[1]) * t, seg[2] + (seg[4] - seg[2]) * t)
+            remaining = remaining - len
         end
     end
     love.graphics.setLineWidth(1)
@@ -6536,11 +6762,11 @@ local function _wirePlansChanged(canvas)
     for i, e in ipairs(canvas.elements) do
         local se = elems[i]
         if not se then se = {}; elems[i] = se end
-        -- shapeRows: a reshaped element's wires stop at its real outline (see
-        -- _shapeCells.edgePoint), and each edit stores a brand-new table.
-        if se.id ~= e.id or se.x ~= e.x or se.y ~= e.y or se.rotation ~= e.rotation or se.shapeRows ~= e.shapeRows then
+        -- shapePoints: a reshaped element's wires stop at its real outline (see
+        -- _shapePoly.edgePoint), and each edit stores a brand-new table.
+        if se.id ~= e.id or se.x ~= e.x or se.y ~= e.y or se.rotation ~= e.rotation or se.shapePoints ~= e.shapePoints then
             changed = true
-            se.id, se.x, se.y, se.rotation, se.shapeRows = e.id, e.x, e.y, e.rotation, e.shapeRows
+            se.id, se.x, se.y, se.rotation, se.shapePoints = e.id, e.x, e.y, e.rotation, e.shapePoints
         end
     end
     for i = #canvas.elements + 1, #elems do elems[i] = nil end
@@ -7343,7 +7569,10 @@ function gdsGui_schematic_draw(pageName)
             if _pipes.isLiquid(canvas) then
                 for _, w in ipairs(canvas.wires) do
                     local plan = wirePlans[w.id]
-                    if plan and wireVisible(plan) then _pipes.drawGravityChevrons(canvas, w, plan) end
+                    if plan and wireVisible(plan) then
+                        _pipes.drawEmptiedRun(canvas, w, plan)
+                        _pipes.drawGravityChevrons(canvas, w, plan)
+                    end
                 end
             end
             for _, e in ipairs(canvas.elements) do
@@ -7838,19 +8067,19 @@ function gdsGui_schematic_pressed(touchId, x, y)
             goto continue
         end
 
-        -- Reshape mode's corner handles straddle the shape's outline, and an
-        -- outward pull starts on them, so they're checked ahead of any hit-test.
-        local reshapeTarget = _shapeCells.activeTarget(canvas)
+        -- Reshape mode's corner handles and sides straddle the shape's outline,
+        -- and an outward pull starts on them, so they're checked ahead of any hit-test.
+        local reshapeTarget = _shapePoly.activeTarget(canvas)
         if reshapeTarget and not (canvas.wireToolActive or canvas.pendingConnectorColor) then
-            local corner = _shapeCells.cornerAt(canvas, reshapeTarget, x, y)
-            if corner then
+            local handleIndex, isSide = _shapePoly.handleAt(canvas, reshapeTarget, x, y)
+            if handleIndex then
                 canvas.focusTouchId = touchId
                 canvas.dragKind     = "reshape"
                 canvas.dragStartX   = x
                 canvas.dragStartY   = y
                 canvas.dragMoved    = false
                 canvas._pendingDragUndoSnapshot = _snapshotState(canvas)
-                _shapeCells.beginDrag(canvas, reshapeTarget, corner)
+                _shapePoly.beginDrag(canvas, reshapeTarget, handleIndex, isSide)
                 goto continue
             end
         end
@@ -7905,10 +8134,11 @@ function gdsGui_schematic_pressed(touchId, x, y)
                 -- the overlay already matches for the whole gesture if this
                 -- press goes straight into a real drag.
                 -- A reshapable element has a third stop: from rotate, the
-                -- next tap enters reshape (dragging nothing until a corner
-                -- handle is pressed), and a tap on its body, off every handle
-                -- (see the check above), comes back around to move.
-                if canvas.rotateModeActive and _shapeCells.allowed(canvas, hitElem) then
+                -- next tap enters reshape (dragging nothing until a corner or
+                -- side is pressed), and a tap on its body, or a side without
+                -- dragging it (see gdsGui_schematic_released), comes back
+                -- around to move.
+                if canvas.rotateModeActive and _shapePoly.allowed(canvas, hitElem) then
                     canvas.dragKind = "reshapeEnter"
                     canvas.rotateModeActive = false
                     canvas.reshapeModeActive = true
@@ -8158,7 +8388,7 @@ function gdsGui_schematic_moved(touchId, x, y)
             end
         elseif canvas.dragKind == "reshape" and canvas.selectedElementId then
             local elem = _findElement(canvas, canvas.selectedElementId)
-            if elem and canvas._shapeDrag and _shapeCells.updateDrag(canvas, elem, x, y) and not canvas.dragMoved then
+            if elem and canvas._shapeDrag and _shapePoly.updateDrag(canvas, elem, x, y) and not canvas.dragMoved then
                 canvas.dragMoved = true
                 if canvas._pendingDragUndoSnapshot then
                     _commitUndoSnapshot(canvas, canvas._pendingDragUndoSnapshot)
@@ -8179,10 +8409,10 @@ function gdsGui_schematic_moved(touchId, x, y)
                 local pw, ph = elem.w * canvas.contentW * canvas.zoom, elem.h * canvas.contentH * canvas.zoom
                 if _isQuarterTurnRotation(elem.rotation) then pw, ph = ph, pw end
                 local blocked, obstacle
-                if elem.shapeRows then
-                    local p = _shapeCells.parse(elem.shapeRows)
+                if elem.shapePoints then
+                    local p = _shapePoly.parse(elem.shapePoints)
                     local bw, bh = elem.w * canvas.contentW * canvas.zoom, elem.h * canvas.contentH * canvas.zoom
-                    blocked, obstacle = _shapeCells.blockedAt(canvas, elem, p, px + bw / 2, py + bh / 2,
+                    blocked, obstacle = _shapePoly.blockedAt(canvas, elem, p, px + bw / 2, py + bh / 2,
                         bw / p.cols, bh / p.rows, elem.rotation)
                 else
                     blocked, obstacle = _footprintOverlapsAnother(canvas, px + pw / 2, py + ph / 2, pw / 2, ph / 2, elem.id)
@@ -8208,20 +8438,20 @@ function gdsGui_schematic_moved(touchId, x, y)
             end
         elseif canvas.dragKind == "rotate" and canvas.selectedElementId then
             local elem = _findElement(canvas, canvas.selectedElementId)
-            if elem and _shapeCells.allowed(canvas, elem) then
+            if elem and _shapePoly.allowed(canvas, elem) then
                 -- Any angle, not just the 4 cardinals — which also means a
                 -- tap's own finger jitter would turn it, so nothing applies
                 -- until the press has become a real drag. Off-cardinal angles
-                -- rely on the cell-based hit/collision/wire paths, so its
+                -- rely on the polygon hit/collision/wire paths, so its
                 -- shape is made explicit here (it looks the same either way).
                 if canvas.dragMoved or math.abs(x - canvas.dragStartX) > _ELEMENT_TAP_SLOP_PX or
                    math.abs(y - canvas.dragStartY) > _ELEMENT_TAP_SLOP_PX then
                     local cx, cy = _elementCenter(canvas, elem)
                     local rawAngle = math.atan2(y - cy, x - cx) - canvas.rotateGrabAngleOffset
-                    local candRotation = _shapeCells.freeRotationDegrees(rawAngle)
-                    elem.shapeRows = _shapeCells.rowsOf(canvas, elem)
-                    local _, _, cw, ch, p = _shapeCells.frame(canvas, elem)
-                    if not _shapeCells.blockedAt(canvas, elem, p, cx, cy, cw, ch, candRotation) then
+                    local candRotation = _shapePoly.freeRotationDegrees(rawAngle)
+                    elem.shapePoints = _shapePoly.pointsOf(canvas, elem)
+                    local _, _, cw, ch, p = _shapePoly.frame(canvas, elem)
+                    if not _shapePoly.blockedAt(canvas, elem, p, cx, cy, cw, ch, candRotation) then
                         elem.rotation = candRotation
                     end
                 end
@@ -8644,6 +8874,12 @@ function gdsGui_schematic_released(touchId, x, y)
                 canvas.dragKind == "controlRotate" or canvas.dragKind == "reshape") then
                 _notifyChanged(canvas)
             end
+            -- A side tapped rather than dragged counts as a tap on the body,
+            -- which is all that's left of a tank small on screen once its
+            -- sides' reach covers it (see gdsGui_schematic_pressed's cycle).
+            if canvas.dragKind == "reshape" and canvas._shapeDrag and canvas._shapeDrag.isSide and not canvas.dragMoved then
+                canvas.reshapeModeActive = false
+            end
             canvas.focusTouchId       = nil
             canvas.dragKind           = nil
             canvas._shapeDrag         = nil
@@ -8711,7 +8947,7 @@ function gdsGui_schematic_update(dt)
         canvas.longPressElapsed = (canvas.longPressElapsed or 0) + dt
         local holdElem = canvas.longPressTargetKind == "element" and canvas.selectedElementId
             and _findElement(canvas, canvas.selectedElementId)
-        local holdSeconds = (holdElem and _shapeCells.allowed(canvas, holdElem)) and _shapeCells.HOLD_SECONDS or _LONG_PRESS_SECONDS
+        local holdSeconds = (holdElem and _shapePoly.allowed(canvas, holdElem)) and _shapePoly.HOLD_SECONDS or _LONG_PRESS_SECONDS
         if canvas.longPressElapsed < holdSeconds then goto continue end
 
         -- Held long enough — unlock move/rotate mode for whatever's
@@ -8992,11 +9228,11 @@ local function _drawMiniDiagram(elements, wires, controls, tx, ty, tw, th)
         local c = e.defaultColor or _DEFAULT_COLOR
         if e.spritePath then
             _drawElementSprite(e.spritePath, ex, ey, ew, eh, c[1], c[2], c[3], c[4], e.rotation)
-        elseif e.shapeRows then
+        elseif e.shapePoints then
             love.graphics.push()
             love.graphics.translate(ex + ew / 2, ey + eh / 2)
             love.graphics.rotate(math.rad(e.rotation or 0))
-            _shapeCells.drawLocal(e, ew, eh, c[1], c[2], c[3], c[4], 0)
+            _shapePoly.drawLocal(e, ew, eh, c[1], c[2], c[3], c[4], 0)
             love.graphics.pop()
         elseif e.shapeType == "circle" then
             love.graphics.setColor(c[1], c[2], c[3], c[4])
