@@ -40,7 +40,7 @@ APP_VERSION = "1.0.33"
 -- v3: a system gained an optional rules field ({gateId -> ruleTable} learned
 -- by model/learner.lua's findSimplestRule, or user-locked — see
 -- _recomputeGateRules) — nil-safe (sys.rules or {}) on any record saved
--- before this existed, same convention as v2, no migration step needed.
+--  before this existed, same convention as v2, no migration step needed.
 SCHEMATIC_SCHEMA_VERSION = 3
 
 -- Original orientation the app was designed for; used by the GUI library to
@@ -370,6 +370,13 @@ local _SWITCH_SPRITE_PATHS = {"Sprites/control_switchOpen.png", "Sprites/control
 -- overlaySpritePath) is what shows it's live, not a change of base icon.
 local _GENERATOR_SPRITE_PATHS = {"Sprites/control_generatorHousing.png", "Sprites/control_generatorHousing.png"}
 local _GENERATOR_OVERLAY_SPRITE_PATH = "Sprites/control_generatorGear.png"
+-- Every fluid pump's two ports: inlet on the left, outlet on the right at
+-- rotation 0, so rotating the pump turns its flow direction with it. The
+-- flow marks are what model/graph.lua reads to make its pipes one-way.
+_FLUID_PUMP_TERMINALS = {
+    { x = -0.5, y = 0, exitX = -1, exitY = 0, flow = "in" },
+    { x =  0.5, y = 0, exitX =  1, exitY = 0, flow = "out" },
+}
 
 -- BATTERY's one wire terminal, the top of the cap in its artwork. Globals, not
 -- locals: this file sits at Lua's 200-local ceiling. Also read by
@@ -387,7 +394,7 @@ function _busLoadText(entity)
     return string.format("%g %s", amps, amps == 1 and "amp" or "amps")
 end
 
--- abbrev: the short (up to 4-letter) name the "NAME THIS ..." prompt
+-- abbrev: the short (up to 4-letter) name the ELEMENT PROPERTIES grid
 -- suggests for a newly placed item, as ABBREV_N (e.g. BATT_1) — see
 -- schematicCatalogItemChosen/_suggestedPlacementName.
 -- pipeConnectors: this system's connectors draw as pipes with fluid inside
@@ -505,7 +512,7 @@ local SCHEMATIC_CATALOG = {
           gridW = 2, gridH = 3, componentType = "source" },
         { label = "PUMP", abbrev = "PUMP", kind = "control", presets = { {"OFF", "ON"} },
           spritePaths = _GENERATOR_SPRITE_PATHS, overlaySpritePath = _GENERATOR_OVERLAY_SPRITE_PATH,
-          gridSize = 2, componentType = "source" },
+          gridSize = 2, componentType = "source", terminals = _FLUID_PUMP_TERMINALS },
         -- No defaultProperties — PRESSURE is SENSED (schematic
         -- ElementSensedValues' read-only PROPERTIES-menu header), not
         -- authored, same as BUS above.
@@ -540,7 +547,7 @@ local SCHEMATIC_CATALOG = {
         -- always-present FUEL TANK itself.
         { label = "FUEL PUMP", abbrev = "FPMP", kind = "control", presets = { {"OFF", "ON"} },
           spritePaths = _GENERATOR_SPRITE_PATHS, overlaySpritePath = _GENERATOR_OVERLAY_SPRITE_PATH,
-          gridSize = 2, componentType = "source" },
+          gridSize = 2, componentType = "source", terminals = _FLUID_PUMP_TERMINALS },
         -- No defaultProperties — PRESSURE is sensed, not authored (same
         -- reasoning MANIFOLD's own comment, above in the HYDRAULIC catalog,
         -- gives).
@@ -611,6 +618,15 @@ local SCHEMATIC_CATALOG = {
 -- created yet (see _systemGalleryItems) — SCHEMATIC_CATALOG is the single
 -- source of truth for which types exist and what each one's ADD ELEMENT/
 -- CONTROL catalog offers.
+-- A pump saved before pumps had ports: the generator-artwork source control
+-- in a piped liquid system. Its wires settle onto the nearer port when loaded
+-- (see gdsGui_schematic_addWire).
+function _isUnportedFluidPump(sys, control)
+    if control.terminals or control.componentType ~= "source" then return false end
+    if control.overlaySpritePath ~= _GENERATOR_OVERLAY_SPRITE_PATH then return false end
+    return sys.systemType == "HYDRAULIC" or sys.systemType == "FUEL"
+end
+
 local function _findCatalogEntryForType(systemType)
     for _, sys in ipairs(SCHEMATIC_CATALOG) do
         if sys.system == systemType then return sys end
@@ -1726,8 +1742,8 @@ function _relays.openLogicGrid(canvas, relay, fromGateRules)
     for _, row in ipairs(rows) do row.mirror = rowByKey[_relays.model.mirrorKey(row.key)] end
     _relays.editing = { relayId = relay.id, rows = rows, fromGateRules = fromGateRules }
     gdsGui_schematic_openChoiceGrid(canvas.name,
-        (relay.label or relay.id) .. (fromGateRules and ": BUS TIE LOGIC\nTap OPEN or CLOSED to change a row"
-            or ": SET BUS TIE LOGIC\nPick OPEN or CLOSED for every row"),
+        gdsGui_schematic_elementPropertiesTitle((relay.label or relay.id) .. (fromGateRules and ": BUS TIE LOGIC\nTap OPEN or CLOSED to change a row"
+            or ": SET BUS TIE LOGIC\nPick OPEN or CLOSED for every row")),
         "GEAR / SW / T1 | T2", rows, { "OPEN", "CLOSED" }, "schematicRelayLogicChanged", "schematicRelayLogicSaved",
         "schematicRelayLogicCancelled")
 end
@@ -3504,7 +3520,8 @@ local function _openSystemIntoCanvas(systemId, mode)
     for _, c in ipairs(sys.controls or {}) do
         gdsGui_schematic_addControl("mainCanvas", c.id, c.x, c.y, _deepCopyTable(c.positions), c.detentIndex,
             c.label, c.callbackFunc, c.radiusScale, c.spritePaths, c.rotation, c.overlaySpritePath,
-            _deepCopyTable(c.defaultColor), c.colorDarkenMul, c.componentType, _deepCopyTable(c.terminals))
+            _deepCopyTable(c.defaultColor), c.colorDarkenMul, c.componentType,
+            _deepCopyTable(c.terminals or (_isUnportedFluidPump(sys, c) and _FLUID_PUMP_TERMINALS or nil)))
         if canvas then
             local ctrl = canvas.controls[#canvas.controls]
             ctrl.voltage = c.voltage
@@ -3764,7 +3781,7 @@ local function _openGateRuleDetailMenu(canvasName, gateId)
     table.insert(options, "RETURN")
 
     _relays.pendingRuleGateId = gateId
-    gdsGui_schematic_openMenu(canvasName, text, options, "schematicGateRuleDetailChosen", "schematicGateRuleDetailCancelled", nil, 0.8)
+    gdsGui_schematic_openMenu(canvasName, gdsGui_schematic_elementPropertiesTitle(text), options, "schematicGateRuleDetailChosen", "schematicGateRuleDetailCancelled", nil, 0.8)
 end
 
 -------------------------------------------------------------------------------
@@ -3813,7 +3830,7 @@ local function _openAttributionRuleDetailMenu(canvasName, nodeId)
     table.insert(options, "RETURN")
 
     _pendingAttributionRuleNodeId = nodeId
-    gdsGui_schematic_openMenu(canvasName, text, options, "schematicAttributionRuleDetailChosen",
+    gdsGui_schematic_openMenu(canvasName, gdsGui_schematic_elementPropertiesTitle(text), options, "schematicAttributionRuleDetailChosen",
         "schematicAttributionRuleDetailCancelled", nil, 0.8)
 end
 
@@ -3903,7 +3920,7 @@ local function _openPerSourceSettingDetailMenu(canvasName, sourceId)
     _pendingPerSourceTargetId = sourceId
     local canvas = _findSchematicCanvas()
     local labelsById = canvas and _labelsByIdForCanvas(canvas) or {}
-    gdsGui_schematic_openMenu(canvasName, labelsById[sourceId] or sourceId,
+    gdsGui_schematic_openMenu(canvasName, gdsGui_schematic_elementPropertiesTitle(labelsById[sourceId] or sourceId),
         { _currentMedium().magnitudeLabel or "VOLTAGE", "RETURN" },
         "schematicPerSourceSettingDetailChosen", "schematicPerSourceSettingDetailCancelled")
 end
@@ -4263,7 +4280,7 @@ local function _schematicToolStillActive(tool)
         return gdsGui_schematic_isAnnunciatorPanelOpen("mainCanvas")
     elseif tool == "add" then
         -- Any step of the ADD flow: a catalog menu, an armed tap-to-place,
-        -- or the NAME THIS ... prompt that follows the tap.
+        -- or the ELEMENT PROPERTIES grid that follows the tap.
         return gdsGui_schematic_isMenuOpen("mainCanvas") or gdsGui_schematic_isPlacementArmed("mainCanvas")
             or gdsGui_textPrompt_isOpen()
     end
@@ -6017,8 +6034,8 @@ function love.load()
     selectedTime = 0
 end
 
--- Runs the gravity drain (model/fluid.lua) on the open liquid system, a few
--- times a second, while it's being operated rather than edited. Valve positions
+-- Runs the gravity drain and pumps (model/fluid.lua) on the open liquid system, a
+-- few times a second, while it's being operated rather than edited. Valve positions
 -- are read literally here: a valve labeled CLOSED holds fluid back, whatever
 -- _isActivePosition's electrical convention says for coloring.
 function _fluidTick(dt)
@@ -6051,7 +6068,14 @@ function _fluidTick(dt)
         if a and b then pipeUnits[w.id] = (math.abs(a.x - b.x) * canvas.contentW + math.abs(a.y - b.y) * canvas.contentH) / 2 end
     end
     local before = _currentSourceStates(canvas, componentTypes)
-    local flow = ModelFluid.computeFlow(graph, canvas.wires, conducting)
+    local offSources, pressures = {}, {}
+    for _, c in ipairs(canvas.controls) do
+        if componentTypes[c.id] == "source" then
+            pressures[c.id] = c.voltage
+            if not _isActivePosition(c) then offSources[c.id] = true end
+        end
+    end
+    local flow = ModelFluid.computeFlow(graph, canvas.wires, conducting, offSources, pressures)
     local changed, stillFeeding = ModelFluid.step(flow, stores, pipeUnits, elapsed)
     canvas._fluidStillFeeding = stillFeeding
     canvas.emptyPipeColor = _currentMedium().style.unpowered
@@ -8684,6 +8708,44 @@ function schematicFluidPathsTest()
     return 1
 end
 
+-- A pipe reads as moving only while fluid runs through it: not with a valve shut
+-- or a pump off, and not once it has run dry, and never when nothing's marked.
+function schematicFluidMovingTest()
+    local function run(types, wires, conducting, offSources, tank)
+        local elements, controls = {}, {}
+        for id in pairs(types) do table.insert(elements, { id = id }) end
+        local graph = ModelGraph.buildGraph(elements, controls, wires, types)
+        ModelFluid.step(ModelFluid.computeFlow(graph, wires, conducting or {}, offSources), { T = tank }, { p = 10, q = 10 }, 0.25)
+        return wires[1].fluidMoving
+    end
+    local pipe = function() return { { id = "p", fromElementId = "T", toElementId = "E", gravityDirection = "forward" } } end
+    local throughValve = function() return {
+        { id = "p", fromElementId = "T", toElementId = "V", gravityDirection = "forward" },
+        { id = "q", fromElementId = "V", toElementId = "E", gravityDirection = "forward" },
+    } end
+    local types = { T = "source", E = "sink" }
+    local valved = { T = "source", V = "gate", E = "sink" }
+    if run(types, pipe(), nil, nil, { tankMaxCapacity = 10 }) ~= true then return -1 end
+    if run(valved, throughValve(), { V = true }, nil, { tankMaxCapacity = 10 }) ~= true then return -2 end
+    if run(valved, throughValve(), {}, nil, { tankMaxCapacity = 10 }) ~= false then return -3 end
+    if run(types, pipe(), nil, { T = true }, nil) ~= false then return -4 end
+
+    -- A dry tank's pipe keeps moving while it empties, then stops.
+    local wires = pipe()
+    wires[1].fluidPercent = 1
+    if run(types, wires, nil, nil, { tankMaxCapacity = 10, fillPercent = 0 }) ~= false then return -5 end
+    wires = pipe()
+    wires[1].fluidPercent = 100
+    if run(types, wires, nil, nil, { tankMaxCapacity = 10, fillPercent = 0 }) ~= true then return -6 end
+
+    -- A marking taken off a pipe that was moving clears it.
+    wires = pipe()
+    wires[1].fluidMoving = true
+    wires[1].gravityDirection = nil
+    if run(types, wires, nil, nil, { tankMaxCapacity = 10 }) ~= false then return -7 end
+    return 1
+end
+
 -- A tank's fluid runs out at a constant rate, its pipe empties after it, the
 -- source stays on until that's done, and refilling the tank fills the pipe.
 function schematicFluidEmptiesTest()
@@ -8711,6 +8773,82 @@ function schematicFluidEmptiesTest()
     local unknown = {}
     ModelFluid.step(flow, { T = unknown }, units, 10)
     if unknown.fillPercent ~= nil or wires[1].fluidPercent ~= nil then return -7 end
+    return 1
+end
+
+-- A running pump moves fluid from the tank on its inlet to the tank on its outlet,
+-- whichever way the pipes' gravity markings point, and stops when it can't.
+function schematicFluidPumpTransferTest()
+    local PORTS = { { flow = "in" }, { flow = "out" } }
+    local types = { A = "source", B = "source", P = "source", V = "gate" }
+    local function build(wires, open, off, psi)
+        local graph = ModelGraph.buildGraph({ { id = "A" }, { id = "B" } },
+            { { id = "P", terminals = PORTS }, { id = "V" } }, wires, types)
+        return ModelFluid.computeFlow(graph, wires, open or {}, off, { P = psi or 30 })
+    end
+    local function direct(aMark, bMark) return {
+        { id = "p", fromElementId = "A", toElementId = "P", toTerminal = 1, gravityDirection = aMark },
+        { id = "q", fromElementId = "B", toElementId = "P", toTerminal = 2, gravityDirection = bMark },
+    } end
+    local function tanks(a, b)
+        return { tankMaxCapacity = 1000, fillPercent = a }, { tankMaxCapacity = 1000, fillPercent = b }
+    end
+    local gallons = 30 * ModelFluid.PUMP_RATE_PER_PSI * 3
+    local percent = gallons / 1000 * 100
+
+    -- Every combination of markings, none included: gravity doesn't enter into it.
+    for _, marks in ipairs({ { nil, nil }, { "forward", "reverse" }, { "reverse", "forward" }, { "forward", "forward" } }) do
+        local wires = direct(marks[1], marks[2])
+        local a, b = tanks(50, 0)
+        ModelFluid.step(build(wires), { A = a, B = b }, {}, 3)
+        if math.abs(a.fillPercent - (50 - percent)) > 0.0001 or math.abs(b.fillPercent - percent) > 0.0001 then return -1 end
+        if not wires[1].fluidMoving or not wires[2].fluidMoving then return -2 end
+        -- The way the fluid goes, not the way each wire happens to be drawn.
+        if wires[1].pumpedDirection ~= "forward" or wires[2].pumpedDirection ~= "reverse" then return -3 end
+    end
+
+    -- Off, or no pressure: nothing moves and nothing animates.
+    for _, flowArgs in ipairs({ { nil, { P = true }, 30 }, { nil, nil, 0 } }) do
+        local wires = direct("forward", "reverse")
+        local a, b = tanks(50, 0)
+        ModelFluid.step(build(wires, flowArgs[1], flowArgs[2], flowArgs[3]), { A = a, B = b }, {}, 3)
+        if a.fillPercent ~= 50 or b.fillPercent ~= 0 then return -4 end
+        if wires[1].fluidMoving or wires[1].pumpedDirection then return -5 end
+    end
+
+    -- Stops exactly at the supplier running dry, and at the receiver filling up.
+    local wires = direct()
+    local a, b = tanks(0.5, 0)
+    local flow = build(wires)
+    ModelFluid.step(flow, { A = a, B = b }, {}, 100)
+    if a.fillPercent ~= 0 or math.abs(b.fillPercent - 0.5) > 0.0001 then return -6 end
+    ModelFluid.step(flow, { A = a, B = b }, {}, 1)
+    if wires[1].fluidMoving then return -7 end
+    a, b = tanks(50, 99.5)
+    ModelFluid.step(flow, { A = a, B = b }, {}, 100)
+    if b.fillPercent ~= 100 or math.abs(a.fillPercent - 49.5) > 0.0001 then return -8 end
+    ModelFluid.step(flow, { A = a, B = b }, {}, 1)
+    if wires[1].fluidMoving then return -9 end
+
+    -- A shut valve on the outlet side dead-heads it; open, it passes.
+    local function valved() return {
+        { id = "p", fromElementId = "A", toElementId = "P", toTerminal = 1 },
+        { id = "q", fromElementId = "P", fromTerminal = 2, toElementId = "V" },
+        { id = "r", fromElementId = "V", toElementId = "B" },
+    } end
+    wires = valved()
+    a, b = tanks(50, 0)
+    ModelFluid.step(build(wires), { A = a, B = b }, {}, 3)
+    if a.fillPercent ~= 50 or wires[3].fluidMoving then return -10 end
+    wires = valved()
+    ModelFluid.step(build(wires, { V = true }), { A = a, B = b }, {}, 3)
+    if math.abs(b.fillPercent - percent) > 0.0001 or not wires[3].fluidMoving then return -11 end
+
+    -- Nothing on its inlet: nothing to draw, whatever's on the outlet.
+    wires = { { id = "q", fromElementId = "P", fromTerminal = 2, toElementId = "B" } }
+    a, b = tanks(50, 0)
+    ModelFluid.step(build(wires), { A = a, B = b }, {}, 3)
+    if b.fillPercent ~= 0 or wires[1].fluidMoving then return -12 end
     return 1
 end
 
@@ -9306,6 +9444,132 @@ function modelGraphDiodeDirectionFromTerminalsTest()
         { id = "w2", fromElementId = "d1", fromTerminal = 1, toElementId = "sink1" },
     }, componentTypes)
     return ModelSolver.solve(forward, { s1 = true }, {}).sink1, ModelSolver.solve(reversed, { s1 = true }, {}).sink1
+end
+
+-- A pump pushes out of its outlet only: on, it reaches what's on the outlet and
+-- never what's on the inlet, whose pipe it doesn't pressurize. Pressure from
+-- elsewhere can't back into the outlet, and can't pass through a pump that's off.
+function schematicPumpPortsTest()
+    local function graphOf(wires, extra)
+        local types = { P = "source", S = "source", U = "path", D = "path", P2 = "source", V = "directionalGate" }
+        local controls = { { id = "P", terminals = _FLUID_PUMP_TERMINALS }, { id = "P2", terminals = _FLUID_PUMP_TERMINALS } }
+        local elements = { { id = "S" }, { id = "U" }, { id = "D" }, { id = "V" } }
+        return ModelGraph.buildGraph(elements, controls, wires, types, extra)
+    end
+    local wires = {
+        { id = "in", fromElementId = "U", toElementId = "P", toTerminal = 1 },
+        { id = "out", fromElementId = "P", fromTerminal = 2, toElementId = "D" },
+    }
+    local g = graphOf(wires)
+    local on = { P = true }
+    local states = ModelSolver.solve(g, on, {})
+    if states.D ~= "powered" then return -1 end
+    if states.U ~= "unpowered" then return -2 end
+    if ModelSolver.wireFeed(g, "out", states, {}, on) ~= "P" then return -3 end
+    if ModelSolver.wireFeed(g, "in", states, {}, on) ~= false then return -4 end
+
+    -- The same pipes drawn from the other end, and wired to the opposite ports.
+    local drawnBackward = graphOf({
+        { id = "in", fromElementId = "P", fromTerminal = 1, toElementId = "U" },
+        { id = "out", fromElementId = "D", toElementId = "P", toTerminal = 2 },
+    })
+    states = ModelSolver.solve(drawnBackward, on, {})
+    if states.D ~= "powered" or states.U ~= "unpowered" then return -5 end
+    local swapped = graphOf({
+        { id = "in", fromElementId = "U", toElementId = "P", toTerminal = 2 },
+        { id = "out", fromElementId = "P", fromTerminal = 1, toElementId = "D" },
+    })
+    states = ModelSolver.solve(swapped, on, {})
+    if states.D ~= "unpowered" or states.U ~= "powered" then return -6 end
+
+    -- An off pump: inlet pressure stops at it, outlet pressure never enters it.
+    local upstreamFed = graphOf({ { id = "s", fromElementId = "S", toElementId = "U" }, wires[1], wires[2] })
+    states = ModelSolver.solve(upstreamFed, { S = true }, {})
+    if states.U ~= "powered" or states.D ~= "unpowered" then return -7 end
+    if ModelSolver.wireFeed(upstreamFed, "in", states, {}, { S = true }) ~= "U" then return -8 end
+    local downstreamFed = graphOf({ { id = "s", fromElementId = "S", toElementId = "D" }, wires[1], wires[2] })
+    states = ModelSolver.solve(downstreamFed, { S = true }, {})
+    if states.P ~= "unpowered" or states.U ~= "unpowered" then return -9 end
+
+    -- Two outlets piped straight together conduct nothing either way.
+    local headToHead = graphOf({ { id = "w", fromElementId = "P", fromTerminal = 2, toElementId = "P2", toTerminal = 2 } })
+    states = ModelSolver.solve(headToHead, on, {})
+    if states.P2 ~= "unpowered" then return -10 end
+    if ModelSolver.wireFeed(headToHead, "w", states, {}, on) ~= false then return -11 end
+
+    -- An outlet into a check valve only passes the way the valve faces.
+    local function throughValve(rotation)
+        local positions = { P = { x = 0, y = 0 }, V = { x = 1, y = 0, rotation = rotation }, D = { x = 2, y = 0 } }
+        local graph = graphOf({
+            { id = "a", fromElementId = "P", fromTerminal = 2, toElementId = "V" },
+            { id = "b", fromElementId = "V", toElementId = "D" },
+        }, positions)
+        return ModelSolver.solve(graph, on, {}).D
+    end
+    if throughValve(0) ~= "powered" then return -12 end
+    if throughValve(180) ~= "unpowered" then return -13 end
+
+    -- A bus fed only through a pump's outlet still counts as fed some other way.
+    if not ModelGraph.hasAltPath(g, "D", "nonexistent") then return -14 end
+    return 1
+end
+
+-- Every pump in every liquid system has an inlet and an outlet; a pump saved
+-- without them gets them on load, and a generator doesn't.
+function schematicPumpCatalogPortsTest()
+    local pumps = 0
+    for _, system in ipairs(SCHEMATIC_CATALOG) do
+        for _, item in ipairs(system.items) do
+            if item.label:find("PUMP") then
+                pumps = pumps + 1
+                local t = item.terminals
+                if not (t and t[1].flow == "in" and t[2].flow == "out") then return -1 end
+            end
+        end
+    end
+    if pumps ~= 2 then return -2 end
+    local savedPump = { componentType = "source", overlaySpritePath = _GENERATOR_OVERLAY_SPRITE_PATH }
+    if not _isUnportedFluidPump({ systemType = "FUEL" }, savedPump) then return -3 end
+    if not _isUnportedFluidPump({ systemType = "HYDRAULIC" }, savedPump) then return -4 end
+    if _isUnportedFluidPump({ systemType = "ELECTRICAL" }, savedPump) then return -5 end
+    return 1
+end
+
+-- Every properties and rules window carries the one title: a new item's
+-- placement grid and an existing one's properties grid and edit menus,
+-- whatever kind of item it is.
+function schematicElementPropertiesTitleTest()
+    local name = "unitTestCanvasElementTitle"
+    gdsGui_schematic_delete(name)
+    gdsGui_schematic_create(name, "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_addElement(name, "e1", "rect", 0.2, 0.2, 0.1, 0.1, "E1", {1, 1, 1, 1})
+    gdsGui_schematic_addControl(name, "c1", 0.6, 0.6, {"OFF", "ON"}, 0, "C1")
+    gdsGui_schematic_addAnnunciator(name, "a1", "A1", {1, 1, 1, 1}, true)
+    gdsGui_schematic_addWire(name, "w1", "e1", "c1", {1, 1, 1, 1})
+    local canvas
+    for _, c in ipairs(globApp.objects.schematics) do
+        if c.name == name then canvas = c end
+    end
+    local function firstLine()
+        local title = canvas.menu and canvas.menu.title or ""
+        canvas.menu = nil
+        return (title:match("^[^\n]*"))
+    end
+    local expected = "ELEMENT PROPERTIES"
+    gdsGui_schematic_openElementEditMenu(name, "e1")
+    if firstLine() ~= expected then return -1 end
+    gdsGui_schematic_openControlEditMenu(name, "c1")
+    if firstLine() ~= expected then return -2 end
+    gdsGui_schematic_openWireEditMenu(name, "w1")
+    if firstLine() ~= expected then return -3 end
+    gdsGui_schematic_openAnnunciatorEditMenu(name, "a1")
+    if firstLine() ~= expected then return -4 end
+    gdsGui_schematic_openPropertiesMenu(name, "e1")
+    if firstLine() ~= expected then return -5 end
+    gdsGui_schematic_openPropertiesMenu(name, "c1")
+    if firstLine() ~= expected then return -6 end
+    gdsGui_schematic_delete(name)
+    return 1
 end
 
 -- s1 (on) feeds bus1 directly; s2 (off, e.g. an off generator) also sits on
@@ -10250,6 +10514,26 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcParameters"]={0},
         ["funcExpctOutput"]={true}}
 
+    gdsGui_dev_testExecute {["id"]="schematicFluid_pipeMovingOnlyWhileFluidRuns",
+        ["funcName"]={"schematicFluidMovingTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+
+    gdsGui_dev_testExecute {["id"]="schematicPump_portsAreDirectional",
+        ["funcName"]={"schematicPumpPortsTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+
+    gdsGui_dev_testExecute {["id"]="schematicPump_everyPumpHasPorts",
+        ["funcName"]={"schematicPumpCatalogPortsTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+
+    gdsGui_dev_testExecute {["id"]="schematic_elementPropertiesTitle_everyWindow",
+        ["funcName"]={"schematicElementPropertiesTitleTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+
     gdsGui_dev_testExecute {["id"]="modelGraph_diodeDirection_fromTerminals",
         ["funcName"]={"modelGraphDiodeDirectionFromTerminalsTest"},
         ["funcParameters"]={0},
@@ -10539,6 +10823,10 @@ gdsGui_unitTests_registerSuite("app", function()
 
     gdsGui_dev_testExecute {["id"]="modelFluid_drainsOnlyWithOpenGravityPath",
         ["funcName"]={"schematicFluidPathsTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+    gdsGui_dev_testExecute {["id"]="modelFluid_pumpTransfersIgnoringGravity",
+        ["funcName"]={"schematicFluidPumpTransferTest"},
         ["funcParameters"]={0},
         ["funcExpctOutput"]={1}}
     gdsGui_dev_testExecute {["id"]="modelFluid_tankThenPipeEmptyAtConstantRate",

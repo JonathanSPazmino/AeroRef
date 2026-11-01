@@ -196,9 +196,18 @@ end
 local function buildGraph(elements, controls, wires, componentTypes, positions)
     componentTypes = componentTypes or {}
     local nodes = {}
-    -- A directionalGate's own terminals can say outright which lead is
-    -- which: flow = "in" (anode) or "out" (cathode). nodeId -> {terminalIndex -> flow}
+    -- A terminal can say outright which way it conducts: flow = "in" or "out"
+    -- (a diode's anode/cathode, a pump's inlet/outlet). anchorId ->
+    -- {terminalIndex -> flow}
     local flowsByNode = {}
+    local function noteFlowTerminals(anchor)
+        for i, t in ipairs(anchor.terminals or {}) do
+            if t.flow then
+                flowsByNode[anchor.id] = flowsByNode[anchor.id] or {}
+                flowsByNode[anchor.id][i] = t.flow
+            end
+        end
+    end
     -- A terminal marked `signal` (a relay's command input -- see
     -- model/relay.lua) carries a control signal, not power: a wire on one is
     -- left out of the graph entirely. anchorId -> {terminalIndex -> true}
@@ -217,11 +226,7 @@ local function buildGraph(elements, controls, wires, componentTypes, positions)
         local role = componentTypes[e.id]
         if role then
             nodes[e.id] = { id = e.id, role = role }
-            if role == "directionalGate" and e.terminals then
-                local flows = {}
-                for i, t in ipairs(e.terminals) do flows[i] = t.flow end
-                flowsByNode[e.id] = flows
-            end
+            noteFlowTerminals(e)
         end
     end
     local polesByControl = {} -- controlId -> {terminalIndex -> pole}
@@ -229,6 +234,7 @@ local function buildGraph(elements, controls, wires, componentTypes, positions)
         local role = componentTypes[c.id]
         if role then
             nodes[c.id] = { id = c.id, role = role }
+            noteFlowTerminals(c)
             if role == "gate" and c.terminals then
                 local byTerminal, poleIds = {}, {}
                 for i, t in ipairs(c.terminals) do
@@ -287,18 +293,34 @@ local function buildGraph(elements, controls, wires, componentTypes, positions)
         local fromNode, toNode = nodes[w.fromElementId], nodes[w.toElementId]
         if fromNode and toNode then
             local directional = (fromNode.role == "directionalGate") or (toNode.role == "directionalGate")
+                or w.fromFlow ~= nil or w.toFlow ~= nil
             local r = resolvedDirections[i]
             local fromId = (r and r.fromId) or w.fromElementId
             local toId   = (r and r.toId) or w.toElementId
-            -- A wire on a directionalGate's own anode/cathode terminal is
-            -- exact, so it wins over the geometric guess above: current
-            -- leaves through "out", enters through "in".
+            -- A wire on an in/out terminal is exact, so it wins over the
+            -- geometric guess above: flow leaves through "out", enters
+            -- through "in".
+            local exactFromId
             if w.fromFlow == "out" or w.toFlow == "in" then
+                exactFromId = w.fromElementId
                 fromId, toId = w.fromElementId, w.toElementId
             elseif w.fromFlow == "in" or w.toFlow == "out" then
+                exactFromId = w.toElementId
                 fromId, toId = w.toElementId, w.fromElementId
             end
-            table.insert(edges, { id = w.id, fromId = fromId, toId = toId, directional = directional })
+            -- Nothing conducts between two like ports, or from a pump's port
+            -- into the wrong side of a check valve that has no terminals of
+            -- its own to overrule its rotation.
+            local gateFlow = (fromNode.role == "directionalGate" and w.fromFlow)
+                or (toNode.role == "directionalGate" and w.toFlow)
+            local blocked = (w.fromFlow ~= nil and w.fromFlow == w.toFlow)
+                or (exactFromId ~= nil and r ~= nil and r.fromId ~= exactFromId and not gateFlow)
+            -- The source this wire feeds through its inlet port, if any: it
+            -- draws from that wire, so it never pressurizes it.
+            local inletOf = (fromNode.role == "source" and w.fromFlow == "in" and fromNode.id)
+                or (toNode.role == "source" and w.toFlow == "in" and toNode.id) or nil
+            table.insert(edges, { id = w.id, fromId = fromId, toId = toId, directional = directional,
+                blocked = blocked, inletOf = inletOf })
         end
     end
 
@@ -319,16 +341,17 @@ end
 -- whose id is excludeGateId -- i.e. an alternate route exists that doesn't
 -- depend on that one gate. Used by the learner (model/learner.lua) to tell
 -- "this gate must be closed" apart from "downstream is powered some other
--- way". Edges are walked the same direction rule buildGraph assigned them.
+-- way". Walks upstream from nodeId, so a directional edge is only followed
+-- back toward whatever feeds it.
 local function hasAltPath(graph, nodeId, excludeGateId)
     local adjacency = {}
     for _, e in ipairs(graph.edges) do
-        if e.id ~= excludeGateId then
-            adjacency[e.fromId] = adjacency[e.fromId] or {}
-            table.insert(adjacency[e.fromId], e.toId)
+        if e.id ~= excludeGateId and not e.blocked then
+            adjacency[e.toId] = adjacency[e.toId] or {}
+            table.insert(adjacency[e.toId], e.fromId)
             if not e.directional then
-                adjacency[e.toId] = adjacency[e.toId] or {}
-                table.insert(adjacency[e.toId], e.fromId)
+                adjacency[e.fromId] = adjacency[e.fromId] or {}
+                table.insert(adjacency[e.fromId], e.toId)
             end
         end
     end

@@ -33,8 +33,10 @@ local function solve(graph, sourceStates, gateStates)
         table.insert(adjacency[a], b)
     end
     for _, e in ipairs(graph.edges) do
-        link(e.fromId, e.toId)
-        if not e.directional then link(e.toId, e.fromId) end
+        if not e.blocked then
+            link(e.fromId, e.toId)
+            if not e.directional then link(e.toId, e.fromId) end
+        end
     end
 
     local powered = {}
@@ -252,7 +254,7 @@ local function _feedsWire(graph, nodeId, edge, nodeStates, gateStates, sourceSta
     if not node or nodeStates[nodeId] ~= POWERED then return false end
     if node.role == "gate" then return gateStates[nodeId] == "closed" end
     if node.role == "gatePole" then return gateStates[node.gateOf] == "closed" end
-    if node.role == "source" then return sourceStates[nodeId] and true or false end
+    if node.role == "source" then return (sourceStates[nodeId] and edge.inletOf ~= nodeId) and true or false end
     if node.role == "directionalGate" then return edge.directional and edge.fromId == nodeId end
     return true
 end
@@ -271,6 +273,7 @@ local function wireFeed(graph, wireId, nodeStates, gateStates, sourceStates)
         if e.id == wireId then edge = e; break end
     end
     if not edge or nodeStates[edge.fromId] == nil or nodeStates[edge.toId] == nil then return nil end
+    if edge.blocked then return false end
     local ends = { edge.fromId, edge.toId }
     if graph.nodes[edge.fromId].role == "directionalGate" then ends = { edge.toId, edge.fromId } end
     for _, nodeId in ipairs(ends) do

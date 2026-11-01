@@ -555,7 +555,7 @@ function _openElementPlacementGrid(canvasName, pending)
     end
     _pendingNamedPlacement = pending
     _pendingPlacementRows = rows
-    gdsGui_schematic_openPropertyGrid(canvasName, pending.title or ("NAME THIS " .. pending.kind:upper()), nil, rows, true,
+    gdsGui_schematic_openPropertyGrid(canvasName, gdsGui_schematic_elementPropertiesTitle(), pending.header, rows, true,
         "gdsGui_schematic_internal_onElementPlacementSaved", "gdsGui_schematic_internal_onElementPlacementCancelled",
         function(gridRows)
             local trimmed = (gridRows[1].value or ""):gsub("^%s*(.-)%s*$", "%1")
@@ -652,7 +652,7 @@ function gdsGui_schematic_armAnnunciatorCreation(canvasName)
     if not canvas then return end
     gdsGui_schematic_cancelPlacement(canvasName)
     _pendingNamedPlacement = { canvasName = canvasName, kind = "annunciator" }
-    _openPlacementNamePrompt("NAME THIS ANNUNCIATOR", _suggestedPlacementName(canvas, "ANNC"))
+    _openPlacementNamePrompt(gdsGui_schematic_elementPropertiesTitle(), _suggestedPlacementName(canvas, "ANNC"))
 end
 
 -- Shared onSelect/onCancel for the snapshot-wipe confirm menu above: both
@@ -1461,7 +1461,7 @@ function _shapePoly.openMirror(canvasName, canvas, e)
         canvasName = canvasName, kind = "element", shapeType = e.shapeType, componentType = e.componentType,
         newId = (e.id:gsub("_%d+$", "")) .. "_" .. canvas._placementCounter,
         label = ((e.label or e.id):gsub("_%d+$", "")),
-        title = "MIRROR OF " .. (e.label or e.id),
+        header = "MIRROR OF " .. (e.label or e.id),
         fracX = fracX, fracY = fracY, wFrac = e.w, hFrac = e.h, rotation = rotation, shapePoints = points,
         defaultColor = _deepCopy(e.defaultColor), defaultPropertyKeys = propertyKeys,
     })
@@ -3267,6 +3267,13 @@ _propertyGrid.SLIDER_THUMB_W = 16
 -- values (VOLTAGE/CURRENT, ...), which aren't part of `rows` since they're
 -- never editable. While validateFunc has flagged an error (menu.errorText),
 -- that takes over this same slot instead — see _propertyGrid.draw.
+-- The one title every element/control/connector properties or rules window
+-- carries. detail (optional) goes on the line below it, for a window whose
+-- rows don't already say which item it's for.
+function gdsGui_schematic_elementPropertiesTitle(detail)
+    return detail and ("ELEMENT PROPERTIES\n" .. detail) or "ELEMENT PROPERTIES"
+end
+
 function gdsGui_schematic_openPropertyGrid(canvasName, title, header, rows, requireAll, onSaveFunc, onCancelFunc, validateFunc)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
@@ -4173,7 +4180,7 @@ function gdsGui_schematic_openAnnunciatorEditMenu(canvasName, annunciatorId)
     local a = _findAnnunciator(canvas, annunciatorId)
     if not a then return end
     canvas._annunciatorEditTargetId = annunciatorId
-    gdsGui_schematic_openMenu(canvasName, a.label or annunciatorId, {"RENAME", "PROPERTIES", "DELETE"},
+    gdsGui_schematic_openMenu(canvasName, gdsGui_schematic_elementPropertiesTitle(a.label or annunciatorId), {"RENAME", "PROPERTIES", "DELETE"},
         "gdsGui_schematic_internal_onAnnunciatorEditChosen", "gdsGui_schematic_internal_onAnnunciatorEditCancelled", 3)
 end
 
@@ -4279,7 +4286,7 @@ function _openAnnunciatorPropertiesMenu(canvasName, annunciatorId)
             value = _annunciatorColorName(a.color) or "" },
     }
     _pendingAnnunciatorPropertyEdit = { canvasName = canvasName, annunciatorId = annunciatorId, rows = rows }
-    gdsGui_schematic_openPropertyGrid(canvasName, "PROPERTIES: " .. (a.label or annunciatorId), nil, rows, false,
+    gdsGui_schematic_openPropertyGrid(canvasName, gdsGui_schematic_elementPropertiesTitle(), a.label or annunciatorId, rows, false,
         "gdsGui_schematic_internal_onAnnunciatorPropertiesSaved", "gdsGui_schematic_internal_onAnnunciatorPropertiesCancelled")
 end
 
@@ -4502,7 +4509,7 @@ function gdsGui_schematic_openElementEditMenu(canvasName, elementId)
         local suffix = fn and fn(canvasName, elementId)
         if suffix and suffix ~= "" then title = title .. "  (" .. suffix .. ")" end
     end
-    gdsGui_schematic_openMenu(canvasName, title, options,
+    gdsGui_schematic_openMenu(canvasName, gdsGui_schematic_elementPropertiesTitle(title), options,
         "gdsGui_schematic_internal_onElementEditChosen", "gdsGui_schematic_internal_onElementEditCancelled", #options)
 end
 
@@ -4652,11 +4659,11 @@ function gdsGui_schematic_openWireEditMenu(canvasName, wireId)
     -- noDelete: an app-set flag for an item that only goes away along with
     -- whatever owns it (e.g. a relay's command wire and switch).
     if w.noDelete then
-        gdsGui_schematic_openMenu(canvasName, _pipes.noun(canvas) .. ": " .. wireId .. "\nCan't be deleted on its own — delete the item it belongs to.",
+        gdsGui_schematic_openMenu(canvasName, gdsGui_schematic_elementPropertiesTitle(_pipes.noun(canvas) .. ": " .. wireId .. "\nCan't be deleted on its own — delete the item it belongs to."),
             {"OK"}, "gdsGui_schematic_internal_onWireEditCancelled", "gdsGui_schematic_internal_onWireEditCancelled")
         return
     end
-    gdsGui_schematic_openMenu(canvasName, _pipes.noun(canvas) .. ": " .. wireId, {"DELETE"},
+    gdsGui_schematic_openMenu(canvasName, gdsGui_schematic_elementPropertiesTitle(_pipes.noun(canvas) .. ": " .. wireId), {"DELETE"},
         "gdsGui_schematic_internal_onWireEditChosen", "gdsGui_schematic_internal_onWireEditCancelled", 1)
 end
 
@@ -4724,7 +4731,7 @@ function gdsGui_schematic_openControlEditMenu(canvasName, controlId)
     for _, p in ipairs(ctrl.positions) do table.insert(options, p) end
     -- No DELETE for a noDelete control (see openWireEditMenu).
     if not ctrl.noDelete then table.insert(options, "DELETE") end
-    gdsGui_schematic_openMenu(canvasName, ctrl.label or controlId, options,
+    gdsGui_schematic_openMenu(canvasName, gdsGui_schematic_elementPropertiesTitle(ctrl.label or controlId), options,
         "gdsGui_schematic_internal_onControlEditChosen", "gdsGui_schematic_internal_onControlEditCancelled",
         (not ctrl.noDelete) and #options or nil)
 end
@@ -4896,7 +4903,7 @@ function _openPropertiesMenu(canvasName, elementId)
     -- already cleared canvas.menu (same "closes first, callback after"
     -- order _choiceGrid's own save/cancel release use).
     canvas._pendingPropertyRows = rows
-    gdsGui_schematic_openPropertyGrid(canvasName, "PROPERTIES: " .. (el.label or elementId),
+    gdsGui_schematic_openPropertyGrid(canvasName, gdsGui_schematic_elementPropertiesTitle(),
         (#headerLines > 0) and table.concat(headerLines, "\n") or nil, rows, false,
         "gdsGui_schematic_internal_onPropertiesSaved", "gdsGui_schematic_internal_onPropertiesCancelled",
         function(gridRows)
@@ -6561,10 +6568,11 @@ end
 -- not a gas DUCT) can mark which way gravity drives the fluid through that
 -- particular run, shown as a row of open chevrons (>) along its own center
 -- pointing that way — or no chevrons at all for "none" (e.g. a run that sits
--- level, so gravity alone doesn't move anything through it). Purely a visual
--- annotation, not fed into the solver: the same "nil means automatic/unset"
--- convention as w.directionOverride, just for flow direction instead of bend
--- shape. Cycled by a plain tap once rebending/direction mode has already
+-- level, so gravity alone doesn't move anything through it). The chevrons travel
+-- that way while fluid is running through the pipe (w.fluidMoving, set by the
+-- app) and sit still otherwise. Not fed into the solver: the same "nil means
+-- automatic/unset" convention as w.directionOverride, just for flow direction
+-- instead of bend shape. Cycled by a plain tap once rebending/direction mode has already
 -- unlocked on the wire (gdsGui_schematic_released's own "wireDirection"
 -- branch), not a menu row — meant to be as quick and repeatable as the
 -- direction-drag itself while routing a run of pipe.
@@ -6588,6 +6596,7 @@ function _pipes.cycleGravityDirection(w)
 end
 
 _pipes.GRAVITY_CHEVRON_GAP = _GRID_SPACING_PX * 2  -- world units of clear pipe from one chevron to the next (2 grid units)
+_pipes.CHEVRON_SPEED = _GRID_SPACING_PX * 3  -- world units a second that chevrons travel along a pipe with fluid moving
 
 -- A chevron's length along the pipe, in pixels, and the distance from one
 -- chevron's center to the next, which is that length plus the gap.
@@ -6617,8 +6626,11 @@ end
 -- fluid but behind the walls: this pass runs after the fluid, so a scissor on
 -- each segment's fluid channel (segments are always axis-aligned) is what stops
 -- a chevron's arms at the inner edge of the walls.
+-- A pump driving the pipe (w.pumpedDirection, set by the app) overrides the
+-- marking while the system is being operated: its chevrons show the way the fluid
+-- is really going, on an unmarked pipe too.
 function _pipes.drawGravityChevrons(canvas, w, plan)
-    local dir = w.gravityDirection
+    local dir = (canvas.mode == "control" and w.pumpedDirection) or w.gravityDirection
     if not dir then return end
     local pointBackward = (dir == "reverse")
     local pipeWidth = _WIRE_WIDTH_PX * _pipes.WIDTH_MULT * canvas.zoom
@@ -6626,6 +6638,10 @@ function _pipes.drawGravityChevrons(canvas, w, plan)
     _pipes.setWallColor()
     love.graphics.setLineWidth(math.max(1, pipeWidth * 0.35))
     local carry = spacing / 2
+    if w.fluidMoving and canvas.mode == "control" then
+        local travel = (canvas._chevronTravel or 0) * canvas.zoom
+        carry = (carry + (pointBackward and -travel or travel)) % spacing
+    end
     local halfFluid = _WIRE_WIDTH_PX * canvas.zoom / 2
     local prevScX, prevScY, prevScW, prevScH = love.graphics.getScissor()
     local function restoreScissor()
@@ -7352,6 +7368,38 @@ local function _drawControl(canvas, c, signature)
         _drawElementSprite(c.overlaySpritePath, cx - rad, cy - rad, rad * 2, rad * 2, r, g, b, a,
             spinDeg + (c.rotation or 0))
     end
+    -- A port with a flow direction (a pump's inlet/outlet) gets a labelled
+    -- arrow pointing the way fluid moves through it.
+    local labelAlpha = _labelAlphaForZoom(canvas.zoom)
+    for i, t in ipairs(c.terminals or {}) do
+        if t.flow then
+            local tx, ty = _terminals.point(canvas, c, i)
+            local rot = math.rad(c.rotation or 0)
+            local ex, ey = t.exitX or 0, t.exitY or 0
+            local exitX = ex * math.cos(rot) - ey * math.sin(rot)
+            local exitY = ex * math.sin(rot) + ey * math.cos(rot)
+            local sign = (t.flow == "out") and 1 or -1
+            local dx, dy = exitX * sign, exitY * sign
+            local size = rad * 0.32
+            love.graphics.setColor(r, g, b, a)
+            love.graphics.polygon("fill", tx + dx * size, ty + dy * size,
+                tx - dx * size - dy * size, ty - dy * size + dx * size,
+                tx - dx * size + dy * size, ty - dy * size - dx * size)
+            -- Clear of both the icon and the pipe leaving the port: above a
+            -- port on the side, beside one on the top or bottom.
+            local tc = globApp.themeTextColor or {1, 1, 1, 1}
+            love.graphics.setColor(tc[1], tc[2], tc[3], labelAlpha)
+            love.graphics.setFont(globApp.appFont or love.graphics.getFont())
+            local text = (t.flow == "out") and "OUT" or "IN"
+            local font = love.graphics.getFont()
+            local textW, textH = font:getWidth(text), font:getHeight()
+            if math.abs(exitX) > math.abs(exitY) then
+                love.graphics.print(text, tx + exitX * textW / 2 - textW / 2, ty - size - textH)
+            else
+                love.graphics.print(text, tx + size, ty + exitY * textH / 2 - textH / 2)
+            end
+        end
+    end
     local posName = (c.positions and c.positions[c.detentIndex + 1]) or tostring(c.detentIndex)
     -- Row 1: the label (name). Row 2: the control's current status (ON/OFF,
     -- OPEN/CLOSED, STBY, ...).
@@ -7896,7 +7944,7 @@ function gdsGui_schematic_pressed(touchId, x, y)
             -- Same "can't overlap an existing element/control" rule the
             -- drag handlers enforce (see _footprintOverlapsAnother) —
             -- checked here at the tap itself so an invalid spot never
-            -- even reaches the "NAME THIS..." prompt. pendingPlacement
+            -- even reaches the ELEMENT PROPERTIES grid. pendingPlacement
             -- stays armed either way — a rejected tap is simply ignored,
             -- same as missing the canvas entirely, so the user can just
             -- try a different spot right away.
@@ -8907,6 +8955,7 @@ function gdsGui_schematic_update(dt)
     for _, canvas in ipairs(globApp.objects.schematics) do
         if canvas.page == activePageName and canvas.mode == "control" then
             canvas._overlayAnimAngle = (canvas._overlayAnimAngle or 0) + dt * _OVERLAY_SPIN_RADPS
+            canvas._chevronTravel = (canvas._chevronTravel or 0) + dt * _pipes.CHEVRON_SPEED
         end
         if canvas.page ~= activePageName then goto continue end
         _pollMenuHoldToConfirm(canvas, dt)
