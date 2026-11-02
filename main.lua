@@ -9317,6 +9317,75 @@ function schematicWirePortPickTest()
     return result
 end
 
+-- MOVE PORT: a tap on a port, then a tap on the tank's edge, moves it there with
+-- its pipes still on it. A tap off every port, or onto another port, changes
+-- nothing; undo puts it back; a tank with no ports isn't offered it.
+function schematicTankMovePortTest()
+    local canvas, tank, restore = _reshapeTestSetup("unitTestCanvasMovePort")
+    local result = 1
+    local cell = 16 -- 2 world units per grid unit at zoom 8
+    local x0, y0 = canvas.x + canvas.panX, canvas.y + canvas.panY
+    local function arm(option)
+        gdsGui_schematic_openElementEditMenu(canvas.name, "tank")
+        local offered = false
+        for _, text in ipairs(canvas.menu.options) do offered = offered or text == option end
+        canvas.menu = nil
+        canvas._elementEditTargetId = "tank"
+        gdsGui_schematic_internal_onElementEditChosen(canvas.name, nil, option)
+        return offered
+    end
+    local function tap(x, y)
+        gdsGui_schematic_pressed("t", x, y)
+        gdsGui_schematic_released("t", x, y)
+    end
+    local function near(a, b) return math.abs(a - b) < 0.0001 end
+    local function onRight(t) return t and near(t.x, 0.5) and near(t.y, 0) and near(t.exitX, 1) and near(t.exitY, 0) end
+
+    if arm("MOVE PORT") then result = -1 end
+    gdsGui_schematic_cancelPlacement(canvas.name)
+
+    -- One port on the right side, with a pipe on it.
+    gdsGui_schematic_addElement(canvas.name, "other", "rect", 0.5, 0.5, 6 / canvas.contentW, 6 / canvas.contentH, "O")
+    gdsGui_schematic_addWire(canvas.name, "w1", "tank", "other")
+    arm("ADD PORT")
+    tap(x0 + 3 * cell + 5, y0 + 1.5 * cell)
+    if not tank.terminals or not onRight(tank.terminals[1]) or canvas.wires[1].fromTerminal ~= 1 then
+        restore()
+        return -2
+    end
+
+    -- A first tap off every port cancels.
+    if not arm("MOVE PORT") then result = -3 end
+    tap(x0 + 18 * cell, y0 + 18 * cell)
+    if canvas.pendingPort or not onRight(tank.terminals[1]) then result = -4 end
+
+    -- The port, then the top edge: it moves there, facing up, and keeps its pipe.
+    arm("MOVE PORT")
+    tap(x0 + 3 * cell, y0 + 1.5 * cell)
+    if not canvas.pendingPort or canvas.pendingPort.moving ~= 1 then result = -5 end
+    tap(x0 + 1.5 * cell, y0)
+    local t = tank.terminals[1]
+    if #tank.terminals ~= 1 or not near(t.x, 0) or not near(t.y, -0.5) or not near(t.exitY, -1) then result = -6 end
+    if canvas.wires[1].fromTerminal ~= 1 or canvas.pendingPort then result = -7 end
+
+    -- Undo puts it back.
+    gdsGui_schematic_undo(canvas.name)
+    tank = canvas.elements[1]
+    if not onRight(tank.terminals[1]) then result = -8 end
+
+    -- Onto another port's spot: nothing moves, and it disarms.
+    arm("ADD PORT")
+    tap(x0 + 1.5 * cell, y0)
+    arm("MOVE PORT")
+    tap(x0 + 3 * cell, y0 + 1.5 * cell)
+    tap(x0 + 1.5 * cell, y0)
+    if #tank.terminals ~= 2 or not onRight(tank.terminals[1]) or canvas.pendingPort then result = -9 end
+
+    gdsGui_schematic_cancelPlacement(canvas.name)
+    restore()
+    return result
+end
+
 -- A tank's ports: placed by tap on its outline at any rotation, they hold its pipes,
 -- follow a reshape, flip with a mirror, and undo and remove cleanly.
 function schematicTankPortsTest()
@@ -11263,6 +11332,10 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcExpctOutput"]={1}}
     gdsGui_dev_testExecute {["id"]="schematic_tank_ports",
         ["funcName"]={"schematicTankPortsTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+    gdsGui_dev_testExecute {["id"]="schematic_tank_movePort",
+        ["funcName"]={"schematicTankMovePortTest"},
         ["funcParameters"]={0},
         ["funcExpctOutput"]={1}}
     gdsGui_dev_testExecute {["id"]="schematic_wire_portPick",

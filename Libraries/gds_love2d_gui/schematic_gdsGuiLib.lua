@@ -1757,18 +1757,27 @@ function _shapePoly.settleWiresOnPorts(canvas, e)
     end
 end
 
--- Adds a port where a tap at x,y lands on e's outline. False if the tap's too far
--- from the outline, or on a port that's already there.
-function _shapePoly.addPortAt(canvas, e, x, y)
+-- The port a tap at x,y would put on e's outline, snapped as nearestOutlinePoint
+-- does. nil if the tap's too far from the outline, or lands where one of e's
+-- ports (other than port `except`, if given) already is.
+function _shapePoly.outlinePortAt(canvas, e, x, y, except)
     local cx, cy, cw, ch, p = _shapePoly.frame(canvas, e)
     local c, r, outC, outR = _shapePoly.nearestOutlinePoint(p, _shapePoly.toLocal(cx, cy, cw, ch, p, e.rotation, x, y))
     local wx, wy = _shapePoly.toWorld(cx, cy, cw, ch, p, e.rotation, c, r)
     local slop = _shapePoly.PORT_TAP_SLOP_PX
-    if (wx - x) * (wx - x) + (wy - y) * (wy - y) > slop * slop then return false end
+    if (wx - x) * (wx - x) + (wy - y) * (wy - y) > slop * slop then return nil end
     local port = _shapePoly.portAt(p, c, r, outC, outR)
-    for _, t in ipairs(e.terminals or {}) do
-        if math.abs(t.x - port.x) < 1e-6 and math.abs(t.y - port.y) < 1e-6 then return false end
+    for i, t in ipairs(e.terminals or {}) do
+        if i ~= except and math.abs(t.x - port.x) < 1e-6 and math.abs(t.y - port.y) < 1e-6 then return nil end
     end
+    return port
+end
+
+-- Adds a port where a tap at x,y lands on e's outline. False if the tap's too far
+-- from the outline, or on a port that's already there.
+function _shapePoly.addPortAt(canvas, e, x, y)
+    local port = _shapePoly.outlinePortAt(canvas, e, x, y)
+    if not port then return false end
     _pushUndo(canvas)
     e.terminals = e.terminals or {}
     table.insert(e.terminals, port)
@@ -1806,23 +1815,56 @@ function _shapePoly.removePortAt(canvas, e, x, y)
     return true
 end
 
--- e's ports, and what to do next while ADD PORT or REMOVE PORT waits on a tap.
+-- Moves port `index` of e to where a tap at x,y lands on its outline. It keeps
+-- its index, so the pipes on it go with it. False if the tap's off the outline
+-- or on another port, or lands on the port's own spot (nothing to move).
+function _shapePoly.movePortTo(canvas, e, index, x, y)
+    local old = e.terminals and e.terminals[index]
+    if not old then return false end
+    local port = _shapePoly.outlinePortAt(canvas, e, x, y, index)
+    if not port or (math.abs(old.x - port.x) < 1e-6 and math.abs(old.y - port.y) < 1e-6) then return false end
+    _pushUndo(canvas)
+    -- A new table, so the cached wire routes see the change (_wirePlansChanged).
+    local moved = {}
+    for i, t in ipairs(e.terminals) do moved[i] = t end
+    moved[index] = port
+    e.terminals = moved
+    _notifyChanged(canvas)
+    return true
+end
+
+-- e's ports, and what to do next while ADD PORT, REMOVE PORT or MOVE PORT waits
+-- on a tap. MOVE PORT's picked port is drawn in the snap color.
 function _shapePoly.drawPorts(canvas, e)
     if not _shapePoly.allowed(canvas, e) then return end
     local radius = math.max(2.5, math.min(6, canvas.zoom))
+    local pending = canvas.pendingPort
+    if pending and pending.elementId ~= e.id then pending = nil end
     for i in ipairs(e.terminals or {}) do
         local tx, ty = _terminals.point(canvas, e, i)
         love.graphics.setColor(0, 0, 0, 1)
         love.graphics.circle("fill", tx, ty, radius + 1)
-        love.graphics.setColor(1, 1, 1, 1)
+        if pending and pending.moving == i then
+            love.graphics.setColor(_CONNECTOR_SNAP_COLOR[1], _CONNECTOR_SNAP_COLOR[2], _CONNECTOR_SNAP_COLOR[3], 1)
+        else
+            love.graphics.setColor(1, 1, 1, 1)
+        end
         love.graphics.circle("fill", tx, ty, radius)
     end
-    local pending = canvas.pendingPort
-    if pending and pending.elementId == e.id then
+    if pending then
+        local prompt
+        if pending.removing then
+            prompt = "TAP A PORT TO REMOVE IT"
+        elseif pending.moving == true then
+            prompt = "TAP THE PORT TO MOVE"
+        elseif pending.moving then
+            prompt = "TAP THE TANK'S EDGE TO MOVE THE PORT THERE"
+        else
+            prompt = "TAP THE TANK'S EDGE TO ADD A PORT"
+        end
         love.graphics.setFont(globApp.appFont or love.graphics.getFont())
         love.graphics.setColor(1, 1, 1, 1)
-        love.graphics.printf(pending.removing and "TAP A PORT TO REMOVE IT" or "TAP THE TANK'S EDGE TO ADD A PORT",
-            canvas.x, canvas.y + 4, canvas.w, "center")
+        love.graphics.printf(prompt, canvas.x, canvas.y + 4, canvas.w, "center")
     end
 end
 
@@ -1985,7 +2027,7 @@ function gdsGui_schematic_create(name, page, x, y, anchorPoint, wFrac, hFrac)
     canvas.pendingConnectorColor = nil  -- armed "draw next wire" from the catalog, independent of wireToolActive/the dock toggle; disarms after one connector
     canvas.pendingColorAssignPick = false  -- armed "tap an element or wire to assign its snapshot color"; disarms after one pick
     canvas.pendingWireFromId = nil  -- armed via ADD WIRE in the element edit menu: elementId the next press-drag-release starts a wire from, with no need to land that press on an anchor; disarms after one drag
-    canvas.pendingPort       = nil  -- armed via ADD PORT/REMOVE PORT in the element edit menu: {elementId, removing}, what the next tap does; disarms after one tap
+    canvas.pendingPort       = nil  -- armed via ADD PORT/REMOVE PORT/MOVE PORT in the element edit menu: {elementId, removing, moving}, what the next tap does; moving is true until a port is picked, then that port's index. Disarms after one tap (MOVE PORT: after two)
     canvas.pendingWirePortPick = nil  -- armed via ADD WIRE on an element with two or more terminals: its id, waiting on a tap on the port the wire leaves from; disarms after one tap
     canvas.pendingWireFromTerminal = nil  -- the port picked for pendingWireFromId, so its wire leaves from there rather than whichever port ends up nearest the far end
     canvas.paintMode = nil  -- { color = {r,g,b,a} | nil } while the PAINT brush is armed; see gdsGui_schematic_armPaintMode. Unlike the pending* one-shot fields above, stays armed across any number of taps.
@@ -4746,7 +4788,10 @@ function gdsGui_schematic_openElementEditMenu(canvasName, elementId)
     if _shapePoly.allowed(canvas, el) then
         table.insert(options, 3, "MIRROR")
         table.insert(options, 4, "ADD PORT")
-        if el.terminals then table.insert(options, 5, "REMOVE PORT") end
+        if el.terminals then
+            table.insert(options, 5, "REMOVE PORT")
+            table.insert(options, 6, "MOVE PORT")
+        end
     end
     local title = el.label or elementId
     -- canvas.elementMenuTitleSuffix (optional, by-name like every other
@@ -4805,11 +4850,13 @@ function gdsGui_schematic_internal_onElementEditChosen(canvasName, index, option
         local el = _findElement(canvas, elementId)
         if el then _shapePoly.openMirror(canvasName, canvas, el) end
         return
-    elseif optionText == "ADD PORT" or optionText == "REMOVE PORT" then
+    elseif optionText == "ADD PORT" or optionText == "REMOVE PORT" or optionText == "MOVE PORT" then
         -- Waits on the next tap, keeping the tank selected, same as ADD WIRE above.
+        -- MOVE PORT waits on two: the port, then where on the edge it goes.
         canvas._elementEditTargetId = nil
         gdsGui_schematic_cancelPlacement(canvasName)
-        canvas.pendingPort = { elementId = elementId, removing = optionText == "REMOVE PORT" }
+        canvas.pendingPort = { elementId = elementId, removing = optionText == "REMOVE PORT",
+            moving = optionText == "MOVE PORT" or nil }
         return
     elseif optionText == "PROPERTIES" then
         -- PROPERTIES tapped: hand off to the properties submenu, keeping the
@@ -7129,9 +7176,12 @@ local function _wirePlansChanged(canvas)
         if not se then se = {}; elems[i] = se end
         -- shapePoints: a reshaped element's wires stop at its real outline (see
         -- _shapePoly.edgePoint), and each edit stores a brand-new table.
-        if se.id ~= e.id or se.x ~= e.x or se.y ~= e.y or se.rotation ~= e.rotation or se.shapePoints ~= e.shapePoints then
+        -- terminals: likewise, a moved port (_shapePoly.movePortTo) is a new
+        -- terminals table, since its pipes keep the same terminal index.
+        if se.id ~= e.id or se.x ~= e.x or se.y ~= e.y or se.rotation ~= e.rotation or se.shapePoints ~= e.shapePoints
+           or se.terminals ~= e.terminals then
             changed = true
-            se.id, se.x, se.y, se.rotation, se.shapePoints = e.id, e.x, e.y, e.rotation, e.shapePoints
+            se.id, se.x, se.y, se.rotation, se.shapePoints, se.terminals = e.id, e.x, e.y, e.rotation, e.shapePoints, e.terminals
         end
     end
     for i = #canvas.elements + 1, #elems do elems[i] = nil end
@@ -8506,6 +8556,12 @@ function gdsGui_schematic_pressed(touchId, x, y)
             if tank then
                 if pending.removing then
                     _shapePoly.removePortAt(canvas, tank, x, y)
+                elseif pending.moving == true then
+                    -- MOVE PORT's first tap picks the port; off every port cancels.
+                    local index = _terminals.pickAt(canvas, tank, x, y)
+                    if index then canvas.pendingPort = { elementId = tank.id, moving = index } end
+                elseif pending.moving then
+                    _shapePoly.movePortTo(canvas, tank, pending.moving, x, y)
                 else
                     _shapePoly.addPortAt(canvas, tank, x, y)
                 end
