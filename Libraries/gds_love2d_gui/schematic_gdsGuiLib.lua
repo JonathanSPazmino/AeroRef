@@ -442,6 +442,7 @@ local function _pendingElementSizeFrac(canvas, pending)
 end
 
 local function _commitNamedPlacement(canvas, pending, trimmed)
+    gdsGui_haptics_feedback("light")
     if pending.kind == "element" then
         _pushUndo(canvas)
         local properties = {}
@@ -1452,6 +1453,7 @@ function _shapePoly.openMirror(canvasName, canvas, e)
     local fracX, fracY = _shapePoly.findClearSpot(canvas, _shapePoly.parse(points), rotation,
         1 - (e.x + e.w / 2), e.y + e.h / 2, e.w, e.h)
     if not fracX then
+        gdsGui_haptics_feedback("error")
         gdsGui_schematic_openMenu(canvasName, "NO ROOM ON THE CANVAS FOR A MIRRORED TANK.", {"OK"},
             "gdsGui_schematic_internal_onPlacementOverlapDismissed", nil)
         return
@@ -2029,6 +2031,7 @@ function gdsGui_schematic_create(name, page, x, y, anchorPoint, wFrac, hFrac)
     canvas.pendingWireFromId = nil  -- armed via ADD WIRE in the element edit menu: elementId the next press-drag-release starts a wire from, with no need to land that press on an anchor; disarms after one drag
     canvas.pendingPort       = nil  -- armed via ADD PORT/REMOVE PORT/MOVE PORT in the element edit menu: {elementId, removing, moving}, what the next tap does; moving is true until a port is picked, then that port's index. Disarms after one tap (MOVE PORT: after two)
     canvas.pendingWirePortPick = nil  -- armed via ADD WIRE on an element with two or more terminals: its id, waiting on a tap on the port the wire leaves from; disarms after one tap
+    canvas.pathEdit = nil  -- {wireId, index, inserted, grabX, grabY} while EDIT PATH is on for a connector (see _wirePath)
     canvas.pendingWireFromTerminal = nil  -- the port picked for pendingWireFromId, so its wire leaves from there rather than whichever port ends up nearest the far end
     canvas.paintMode = nil  -- { color = {r,g,b,a} | nil } while the PAINT brush is armed; see gdsGui_schematic_armPaintMode. Unlike the pending* one-shot fields above, stays armed across any number of taps.
     canvas._paintTarget = nil  -- {kind, id} of whatever a "paint" drag's press landed on, between press and release
@@ -2234,6 +2237,7 @@ function gdsGui_schematic_setMode(canvasName, mode)
     canvas.pendingWireFromId = nil
     canvas.pendingWirePortPick = nil
     canvas.pendingWireFromTerminal = nil
+    canvas.pathEdit = nil
     canvas.paintMode = nil
     canvas._paintTarget = nil
     canvas.annunciatorPanelOpen = false
@@ -2788,6 +2792,7 @@ function gdsGui_schematic_cancelPlacement(canvasName)
         canvas.pendingWirePortPick = nil
         canvas.pendingWireFromTerminal = nil
         canvas.pendingPort = nil
+        canvas.pathEdit = nil
         canvas.paintMode = nil
         canvas.annunciatorPanelOpen = false
     end
@@ -2841,7 +2846,7 @@ function gdsGui_schematic_isPlacementArmed(canvasName)
     local canvas = _findCanvas(canvasName)
     return canvas ~= nil and (canvas.pendingPlacement ~= nil or canvas.pendingConnectorColor ~= nil or
         canvas.pendingColorAssignPick or canvas.pendingWireFromId ~= nil or canvas.pendingPort ~= nil or
-        canvas.pendingWirePortPick ~= nil)
+        canvas.pendingWirePortPick ~= nil or canvas.pathEdit ~= nil)
 end
 
 --------------------------------------------------------------------------------
@@ -3019,6 +3024,49 @@ local function _titleHeight(mw, title)
     return math.max(_MENU_ROW_H, numLines * font:getHeight() + titleVPad)
 end
 
+-- Menus are drawn the way iOS draws an action sheet: a rounded group of options
+-- (title on top in gray, hairlines between rows) docked at the bottom of the
+-- canvas/gallery, with the way out on a separate CANCEL button below it, and a
+-- short slide up when one opens. A menu pinned to a dock button (see
+-- gdsGui_schematic_setMenuAnchorButton) and the swatch picker keep their own
+-- spots and just share the look. A global table, like _shapePoly, since this
+-- file is at Lua's 200-local ceiling.
+_actionSheet = {}
+_actionSheet.MARGIN_PX = 8        -- clear space between the sheet and the owner's edges
+_actionSheet.GAP_PX = 8           -- between the options group and its CANCEL button
+_actionSheet.MAX_W_PX = 420       -- a sheet's widest, so it doesn't stretch across a tablet
+_actionSheet.RADIUS_PX = 12
+_actionSheet.ROW_H_PX = 44        -- preferred row height (iOS's touch target); falls back to _MENU_ROW_H when a long menu wouldn't fit
+_actionSheet.SLIDE_SECONDS = 0.22
+_actionSheet.CANCEL_TEXT = "CANCEL"
+-- Opaque, so a pressed row's fill can overlap the group's rounded corners cleanly.
+_actionSheet.DARK = { bg = {0.17, 0.17, 0.18, 1}, pressed = {0.26, 0.26, 0.28, 1}, separator = {0.33, 0.33, 0.35, 1},
+    title = {0.60, 0.60, 0.63, 1}, action = {0.04, 0.52, 1, 1}, destructive = {1, 0.27, 0.23, 1} }
+_actionSheet.LIGHT = { bg = {0.97, 0.97, 0.97, 1}, pressed = {0.84, 0.84, 0.86, 1}, separator = {0.78, 0.78, 0.80, 1},
+    title = {0.43, 0.43, 0.45, 1}, action = {0, 0.48, 1, 1}, destructive = {1, 0.23, 0.19, 1} }
+
+-- An option that reads as the way out of its menu, shown as the sheet's CANCEL button.
+function _actionSheet.isExitOption(opt)
+    return opt == "CANCEL" or opt == "RETURN"
+end
+
+-- An option that deletes or clears something, drawn in red as iOS draws destructive actions.
+function _actionSheet.isDestructive(opt)
+    return type(opt) == "string" and (opt:find("^DELETE") or opt:find("^REMOVE") or opt:find("^CLEAR")) ~= nil
+end
+
+-- Fills a rectangle, rounding only its top corners, its bottom ones, both or neither.
+function _actionSheet.fill(x, y, w, h, roundTop, roundBottom)
+    local r = math.min(_actionSheet.RADIUS_PX, h / 2)
+    if not roundTop and not roundBottom then
+        love.graphics.rectangle("fill", x, y, w, h)
+        return
+    end
+    love.graphics.rectangle("fill", x, y, w, h, r, r)
+    if not roundTop then love.graphics.rectangle("fill", x, y, w, r) end
+    if not roundBottom then love.graphics.rectangle("fill", x, y + h - r, w, r) end
+end
+
 -- Generalized over any owner with .x/.y/.w/.h (schematic canvas or gallery)
 -- so both widget types can share one modal-menu implementation below.
 -- A menu is normally a plain vertical list of text rows (menu.options). When
@@ -3027,23 +3075,49 @@ end
 -- still render as ordinary text rows below it) — the swatch count plus the
 -- extra-option count must equal #menu.options, since hit-testing/selection
 -- still indexes into that one combined list.
+-- Returns the layout: x, w; y, h and titleH of the options group; swatchY (swatch
+-- picker only); rows, each {index into menu.options, y, h}; cancel, {hit, text, y, h}
+-- or nil, where hit is the option index of a trailing CANCEL/RETURN or "cancel" for
+-- the plain one (which closes the menu as a tap outside it does); and reveal, 0-1
+-- through the opening slide (see _drawMenuBox, which starts it).
 local function _menuGeometry(owner, menu)
-    local w = owner.w * (menu.widthFrac or _MENU_WIDTH_FRAC)
-    local titleH = _titleHeight(w, menu.title)
-    local bodyH
-    if menu.isSwatchPicker then
-        bodyH = _SWATCH_ROW_H_PX + #menu.extraOptions * _MENU_ROW_H
-    else
-        bodyH = #menu.options * _MENU_ROW_H
+    local M = _actionSheet.MARGIN_PX
+    local anchorBtn = menu.anchorButtonName and _findButton(menu.anchorButtonName)
+    local sheet = not menu.isSwatchPicker and not anchorBtn
+    local n = #menu.options
+    local firstRow, lastRow = 1, n
+    if menu.isSwatchPicker then firstRow = #menu.swatchColors + 1 end
+    local cancel
+    if sheet and n >= 2 then
+        if _actionSheet.isExitOption(menu.options[n]) and not (menu.confirmRows and menu.confirmRows[n]) then
+            cancel = { hit = n, text = menu.options[n] }
+            lastRow = n - 1
+        else
+            cancel = { hit = "cancel", text = _actionSheet.CANCEL_TEXT }
+        end
     end
-    local h = titleH + bodyH + 10
+
+    local w = sheet and math.min(owner.w - 2 * M, _actionSheet.MAX_W_PX) or owner.w * (menu.widthFrac or _MENU_WIDTH_FRAC)
+    local titleH = _titleHeight(w, menu.title)
+    local swatchH = menu.isSwatchPicker and _SWATCH_ROW_H_PX or 0
+    local rowCount = lastRow - firstRow + 1
+    local rowH = sheet and _actionSheet.ROW_H_PX or _MENU_ROW_H
+    local function totalFor(h) return titleH + swatchH + rowCount * h + (cancel and (_actionSheet.GAP_PX + h) or 0) end
+    if sheet and totalFor(rowH) > owner.h - 2 * M then rowH = _MENU_ROW_H end
+    -- Still too tall: the separate CANCEL button goes (a tap outside still
+    -- cancels, and a trailing CANCEL/RETURN goes back to being its last row).
+    if sheet and cancel and totalFor(rowH) > owner.h - 2 * M then
+        cancel = nil
+        lastRow = n
+        rowCount = lastRow - firstRow + 1
+    end
+    local groupH = titleH + swatchH + rowCount * rowH
+
     local x = owner.x + (owner.w - w) / 2
     local y
-    local anchorBtn = menu.anchorButtonName and _findButton(menu.anchorButtonName)
     if anchorBtn then
         -- Opened by a dock tool (see gdsGui_schematic_setMenuAnchorButton):
-        -- pinned just left of that tool's button at the canvas's top edge
-        -- instead of centered.
+        -- pinned just left of that tool's button at the canvas's top edge.
         x, y = _toolPopupOrigin(owner, anchorBtn, w)
     elseif menu.isSwatchPicker then
         -- The selected-item color picker is anchored in the bottom third of
@@ -3052,12 +3126,36 @@ local function _menuGeometry(owner, menu)
         -- owner bounds in case the band is shorter than the menu itself.
         local bandY = owner.y + owner.h * 2 / 3
         local bandH = owner.h / 3
-        y = bandY + (bandH - h) / 2
-        y = math.max(owner.y, math.min(y, owner.y + owner.h - h))
+        y = bandY + (bandH - groupH) / 2
+        y = math.max(owner.y, math.min(y, owner.y + owner.h - groupH))
     else
-        y = owner.y + math.max(0, (owner.h - h) / 2)
+        -- Docked at the bottom, but never above the owner's top edge, so the
+        -- title and first rows of a long menu stay on screen and tappable.
+        y = math.max(owner.y, owner.y + owner.h - M - totalFor(rowH))
     end
-    return x, y, w, h, titleH
+
+    -- The opening slide, eased out: from just below the owner's bottom edge.
+    local reveal = 1
+    if sheet and menu._openedAt then
+        local t = (love.timer.getTime() - menu._openedAt) / _actionSheet.SLIDE_SECONDS
+        if t < 1 then
+            reveal = 1 - (1 - math.max(0, t)) ^ 3
+            y = y + (1 - reveal) * (owner.y + owner.h - y)
+        end
+    end
+
+    local layout = { x = x, w = w, y = y, h = groupH, titleH = titleH, rows = {}, cancel = cancel, reveal = reveal }
+    local rowY = y + titleH
+    if menu.isSwatchPicker then
+        layout.swatchY = rowY
+        rowY = rowY + swatchH
+    end
+    for i = firstRow, lastRow do
+        table.insert(layout.rows, { index = i, y = rowY, h = rowH })
+        rowY = rowY + rowH
+    end
+    if cancel then cancel.y, cancel.h = y + groupH + _actionSheet.GAP_PX, rowH end
+    return layout
 end
 
 -- Geometry of one swatch square in a swatch-picker row, by 1-based index.
@@ -3068,34 +3166,26 @@ local function _swatchRect(mx, mw, count, index)
     return sx, size
 end
 
--- Returns the 1-based index (into menu.options) tapped, "outside" if the tap
--- missed the menu box entirely (treated as cancel), or nil if inside the box
--- but not on a row/swatch.
+-- Returns the 1-based index (into menu.options) tapped, "cancel" for the sheet's
+-- own CANCEL button, "outside" if the tap missed the menu entirely (both close
+-- it), or nil if inside the options group but not on a row/swatch.
 local function _menuRowAt(owner, menu, px, py)
-    local mx, my, mw, mh, titleH = _menuGeometry(owner, menu)
-    if px < mx or px > mx + mw or py < my or py > my + mh then return "outside" end
-    local rowY = my + titleH
-
-    if menu.isSwatchPicker then
+    local layout = _menuGeometry(owner, menu)
+    local function within(y, h)
+        return px >= layout.x and px <= layout.x + layout.w and py >= y and py < y + h
+    end
+    if layout.cancel and within(layout.cancel.y, layout.cancel.h) then return layout.cancel.hit end
+    if not within(layout.y, layout.h) then return "outside" end
+    if menu.isSwatchPicker and py >= layout.swatchY and py < layout.swatchY + _SWATCH_ROW_H_PX then
         local n = #menu.swatchColors
-        if py >= rowY and py < rowY + _SWATCH_ROW_H_PX then
-            for i = 1, n do
-                local sx, size = _swatchRect(mx, mw, n, i)
-                if px >= sx and px <= sx + size then return i end
-            end
-            return nil
-        end
-        rowY = rowY + _SWATCH_ROW_H_PX
-        for j = 1, #menu.extraOptions do
-            if py >= rowY and py < rowY + _MENU_ROW_H then return n + j end
-            rowY = rowY + _MENU_ROW_H
+        for i = 1, n do
+            local sx, size = _swatchRect(layout.x, layout.w, n, i)
+            if px >= sx and px <= sx + size then return i end
         end
         return nil
     end
-
-    for i = 1, #menu.options do
-        if py >= rowY and py < rowY + _MENU_ROW_H then return i end
-        rowY = rowY + _MENU_ROW_H
+    for _, row in ipairs(layout.rows) do
+        if py >= row.y and py < row.y + row.h then return row.index end
     end
     return nil
 end
@@ -3114,6 +3204,11 @@ local function _handleMenuPress(owner, touchId, px, py)
     -- the menu while the first is still held must not hijack (overwrite)
     -- or silently discard the first finger's in-progress press/release pair.
     if owner.menu._pressedTouchId ~= nil and owner.menu._pressedTouchId ~= touchId then return end
+    -- A press while the menu is still sliding in finishes the slide first, so
+    -- the press and its release are hit-tested against the same, settled layout.
+    if owner.menu._openedAt then
+        owner.menu._openedAt = math.min(owner.menu._openedAt, love.timer.getTime() - _actionSheet.SLIDE_SECONDS)
+    end
     owner.menu._pressedHit     = _menuRowAt(owner, owner.menu, px, py)
     owner.menu._pressedTouchId = touchId
     -- Fresh press, fresh hold timer — see _pollMenuHoldToConfirm, which is
@@ -3135,7 +3230,7 @@ local function _handleMenuRelease(owner, touchId, px, py)
     if pressedHit == nil then return end
     local releasedHit = _menuRowAt(owner, menu, px, py)
     if releasedHit ~= pressedHit then return end
-    if pressedHit == "outside" then
+    if pressedHit == "outside" or pressedHit == "cancel" then
         local cb = menu.onCancel
         owner.menu = nil
         if cb and _G[cb] then _G[cb](owner.name) end
@@ -3173,124 +3268,125 @@ local function _pollMenuHoldToConfirm(owner, dt)
     end
     menu._holdElapsed = (menu._holdElapsed or 0) + math.min(dt, _CONFIRM_HOLD_MAX_DT)
     if menu._holdElapsed < _CONFIRM_HOLD_SECONDS then return end
+    gdsGui_haptics_feedback("warning")
     local opt = menu.options[pressedIndex]
     local cb = menu.onSelect
     owner.menu = nil
     if cb and _G[cb] then _G[cb](owner.name, pressedIndex, opt) end
 end
 
--- One text menu row, filled with confirmColor whenever it's a confirm-gated
--- action (menu.confirmRows[idx] — see _markConfirmMenu) — EVERY row
--- requiring a sustained hold to fire, whatever its label actually says
--- ("DELETE", "DELETE PROPERTY", "CLEAR PAGE", "CONTINUE", "OVERWRITE", ...),
--- not just rows whose text happens to literally read "DELETE". Previously
--- keyed off an exact opt == "DELETE" text match, so every other
--- confirm-gated row (RESET, SNAPSHOT RESET's CONTINUE, a snapshot-conflict
--- OVERWRITE, ...) looked like an ordinary plain-tap row even though it
--- already required the same hold to actually fire — inconsistent styling
--- for identical behavior. holdFrac (optional, 0-1): while this row is a
--- confirm-gated action AND is currently being held down (see
--- _pollMenuHoldToConfirm), draws a left-to-right loading-bar overlay across
--- it so the user can see how much longer the hold needs to last instead of
--- just waiting blind — reaching the row's full width exactly when the hold
--- is about to fire.
-local function _drawMenuTextRow(mx, mw, rowY, opt, confirmColor, holdFrac)
+-- One text row's label, in the iOS action color: red for a destructive one, or
+-- for a confirm-gated row (menu.confirmRows[idx] — see _markConfirmMenu) its own
+-- confirm color, the default red reading as iOS red. holdFrac (optional, 0-1):
+-- while a confirm-gated row is being held down (see _pollMenuHoldToConfirm),
+-- a left-to-right fill in that color shows how much longer the hold needs,
+-- reaching the row's full width just as it fires.
+local function _drawMenuTextRow(x, w, y, h, opt, confirmColor, holdFrac, palette)
+    local color = palette.action
     if confirmColor then
-        love.graphics.setColor(confirmColor[1], confirmColor[2], confirmColor[3], confirmColor[4] or 1)
-        love.graphics.rectangle("fill", mx + 4, rowY + 2, mw - 8, _MENU_ROW_H - 4)
-        love.graphics.setColor(1, 1, 1, 1)
-        love.graphics.rectangle("line", mx + 4, rowY + 2, mw - 8, _MENU_ROW_H - 4)
-        -- Black for a light confirm color (yellow and up), white otherwise
-        -- — keeps the row's own label readable regardless of which color
-        -- it was given (the historical red default always resolved to
-        -- white text; yellow needs the opposite). Plain luminance
-        -- threshold, not a true perceptual formula — this only ever has
-        -- to pick between two colors wildly far apart in brightness,
-        -- never a close call. Nested here (its only caller) to stay under
-        -- this file's 200-local ceiling.
-        local luminance = 0.299 * confirmColor[1] + 0.587 * confirmColor[2] + 0.114 * confirmColor[3]
-        if luminance > 0.6 then love.graphics.setColor(0, 0, 0, 1) else love.graphics.setColor(1, 1, 1, 1) end
-    elseif opt == "RETURN" then
-        -- Every RETURN row, on every schematic menu (this function is the
-        -- one shared draw path _drawMenuBox/gdsGui_schematicGallery_
-        -- drawMenuOverlay both call) — a footer matching _drawMenuBox's
-        -- own title-bar treatment exactly (full-bleed fill, no inset
-        -- margin, no outline), not another row styled like the
-        -- confirmColor ones above. Still an ordinary single-tap row —
-        -- only its background changes, no hold-to-confirm behavior.
-        love.graphics.setColor(0.25, 0.25, 0.25, _MENU_OPACITY)
-        love.graphics.rectangle("fill", mx, rowY, mw, _MENU_ROW_H)
-        love.graphics.setColor(1, 1, 1, 1)
-    else
-        love.graphics.setColor(1, 1, 1, 0.15)
-        love.graphics.rectangle("line", mx + 4, rowY + 2, mw - 8, _MENU_ROW_H - 4)
-        love.graphics.setColor(1, 1, 1, 1)
+        local isDefaultRed = confirmColor[1] > 0.6 and confirmColor[2] < 0.3 and confirmColor[3] < 0.3
+        if not isDefaultRed then
+            local k = (globApp.themeIsDark == false) and _LIGHT_MODE_COLOR_DARKEN or 1
+            color = { confirmColor[1] * k, confirmColor[2] * k, confirmColor[3] * k, 1 }
+        else
+            color = palette.destructive
+        end
+    elseif _actionSheet.isDestructive(opt) then
+        color = palette.destructive
     end
-    love.graphics.printf(opt, mx, rowY + 8, mw, "center")
     if holdFrac and holdFrac > 0 then
-        love.graphics.setColor(0.2, 0.5, 1, 0.5)
-        love.graphics.rectangle("fill", mx + 4, rowY + 2, (mw - 8) * math.min(1, holdFrac), _MENU_ROW_H - 4)
-        love.graphics.setColor(1, 1, 1, 1)
-        love.graphics.rectangle("line", mx + 4, rowY + 2, mw - 8, _MENU_ROW_H - 4)
-        love.graphics.printf(opt, mx, rowY + 8, mw, "center")
+        love.graphics.setColor(color[1], color[2], color[3], 0.3)
+        love.graphics.rectangle("fill", x + 4, y + 3, (w - 8) * math.min(1, holdFrac), h - 6, 6, 6)
     end
+    love.graphics.setColor(color)
+    love.graphics.printf(opt, x, y + (h - love.graphics.getFont():getHeight()) / 2, w, "center")
 end
 
--- Shared modal-menu box drawing for any owner with a .menu.
+-- Shared modal-menu drawing for any owner with a .menu (see _menuGeometry for the layout).
 local function _drawMenuBox(owner, menu)
     if menu.choiceGrid then return _choiceGrid.draw(owner, menu) end
     if menu.propertyGrid then return _propertyGrid.draw(owner, menu) end
-    love.graphics.setColor(0, 0, 0, 0.6)
+    local now = love.timer.getTime()
+    if not menu._openedAt then
+        -- One menu straight after another (a cascade, or a menu reopening
+        -- itself after a pick) is already up, so it doesn't slide in again.
+        local alreadyUp = owner._menuLastDrawnAt and now - owner._menuLastDrawnAt < 0.1
+        menu._openedAt = alreadyUp and (now - _actionSheet.SLIDE_SECONDS) or now
+    end
+    owner._menuLastDrawnAt = now
+    local layout = _menuGeometry(owner, menu)
+    local palette = (globApp.themeIsDark == false) and _actionSheet.LIGHT or _actionSheet.DARK
+    local x, w = layout.x, layout.w
+    local pressed = menu._pressedTouchId ~= nil and menu._pressedHit or nil
+
+    love.graphics.setColor(0, 0, 0, 0.4 * layout.reveal)
     love.graphics.rectangle("fill", owner.x, owner.y, owner.w, owner.h)
+    -- Mid-slide the sheet starts below the owner's bottom edge; keep it from
+    -- drawing over whatever sits there (the dock, the page footer).
+    local sx, sy, sw, sh = love.graphics.getScissor()
+    local sliding = layout.reveal < 1
+    if sliding then love.graphics.intersectScissor(owner.x, owner.y, owner.w, owner.h) end
 
-    local mx, my, mw, mh, titleH = _menuGeometry(owner, menu)
-    love.graphics.setColor(0.15, 0.15, 0.18, _MENU_OPACITY)
-    love.graphics.rectangle("fill", mx, my, mw, mh)
-    love.graphics.setColor(1, 1, 0, 1)
-    love.graphics.rectangle("line", mx, my, mw, mh)
-
-    local rowY = my
+    love.graphics.setColor(palette.bg)
+    love.graphics.rectangle("fill", x, layout.y, w, layout.h, _actionSheet.RADIUS_PX, _actionSheet.RADIUS_PX)
     if menu.title then
-        love.graphics.setColor(0.25, 0.25, 0.25, _MENU_OPACITY)
-        love.graphics.rectangle("fill", mx, rowY, mw, titleH)
-        love.graphics.setColor(1, 1, 1, 1)
-        love.graphics.printf(menu.title, mx, rowY + 8, mw, "center")
-        rowY = rowY + titleH
+        love.graphics.setColor(palette.title)
+        love.graphics.printf(menu.title, x, layout.y + 8, w, "center")
     end
 
     -- Which row (by combined options index — same indexing menu.confirmRows
     -- itself uses, swatches included) is a confirm action currently being
-    -- held down, and how far through _CONFIRM_HOLD_SECONDS that hold is —
-    -- see _drawMenuTextRow's own comment for why.
+    -- held down, and how far through _CONFIRM_HOLD_SECONDS that hold is.
     local holdIndex, holdFrac
-    if menu.confirmRows and menu._pressedTouchId ~= nil and menu.confirmRows[menu._pressedHit] then
-        holdIndex = menu._pressedHit
+    if menu.confirmRows and pressed and menu.confirmRows[pressed] then
+        holdIndex = pressed
         holdFrac = (menu._holdElapsed or 0) / _CONFIRM_HOLD_SECONDS
     end
 
     if menu.isSwatchPicker then
+        if menu.title then
+            love.graphics.setColor(palette.separator)
+            local hairline = gdsGui_general_hairline()
+            love.graphics.rectangle("fill", x, gdsGui_general_pixelCenter(layout.swatchY) - hairline / 2, w, hairline)
+        end
         local n = #menu.swatchColors
-        local _, firstSize = _swatchRect(mx, mw, n, 1)
-        local sy = rowY + (_SWATCH_ROW_H_PX - firstSize) / 2
+        local _, firstSize = _swatchRect(x, w, n, 1)
+        local sy = layout.swatchY + (_SWATCH_ROW_H_PX - firstSize) / 2
         for i, c in ipairs(menu.swatchColors) do
-            local sx, size = _swatchRect(mx, mw, n, i)
+            local sx, size = _swatchRect(x, w, n, i)
             love.graphics.setColor(_themedPaletteColor(c[1], c[2], c[3], c[4] or 1))
-            love.graphics.rectangle("fill", sx, sy, size, size)
-            love.graphics.setColor(1, 1, 1, 1)
-            love.graphics.rectangle("line", sx, sy, size, size)
-        end
-        rowY = rowY + _SWATCH_ROW_H_PX
-        for j, opt in ipairs(menu.extraOptions) do
-            local idx = n + j
-            _drawMenuTextRow(mx, mw, rowY, opt, menu.confirmRows and menu.confirmRows[idx], (idx == holdIndex) and holdFrac or nil)
-            rowY = rowY + _MENU_ROW_H
-        end
-    else
-        for i, opt in ipairs(menu.options) do
-            _drawMenuTextRow(mx, mw, rowY, opt, menu.confirmRows and menu.confirmRows[i], (i == holdIndex) and holdFrac or nil)
-            rowY = rowY + _MENU_ROW_H
+            love.graphics.rectangle("fill", sx, sy, size, size, 4, 4)
+            love.graphics.setColor(palette.separator)
+            local prevLineWidth = love.graphics.getLineWidth()
+            love.graphics.setLineWidth(gdsGui_general_hairline())
+            love.graphics.rectangle("line", sx, sy, size, size, 4, 4)
+            love.graphics.setLineWidth(prevLineWidth)
         end
     end
+
+    for k, row in ipairs(layout.rows) do
+        local atTop = row.y <= layout.y + 0.5
+        if pressed == row.index then
+            love.graphics.setColor(palette.pressed)
+            _actionSheet.fill(x, row.y, w, row.h, atTop, k == #layout.rows)
+        end
+        if not atTop then
+            love.graphics.setColor(palette.separator)
+            local hairline = gdsGui_general_hairline()
+            love.graphics.rectangle("fill", x, gdsGui_general_pixelCenter(row.y) - hairline / 2, w, hairline)
+        end
+        _drawMenuTextRow(x, w, row.y, row.h, menu.options[row.index], menu.confirmRows and menu.confirmRows[row.index],
+            (row.index == holdIndex) and holdFrac or nil, palette)
+    end
+
+    local cancel = layout.cancel
+    if cancel then
+        love.graphics.setColor(pressed == cancel.hit and palette.pressed or palette.bg)
+        love.graphics.rectangle("fill", x, cancel.y, w, cancel.h, _actionSheet.RADIUS_PX, _actionSheet.RADIUS_PX)
+        love.graphics.setColor(palette.action)
+        love.graphics.printf(cancel.text, x, cancel.y + (cancel.h - love.graphics.getFont():getHeight()) / 2, w, "center")
+    end
+    if sliding then love.graphics.setScissor(sx, sy, sw, sh) end
     love.graphics.setColor(1, 1, 1, 1)
 end
 
@@ -4977,8 +5073,13 @@ function gdsGui_schematic_openWireEditMenu(canvasName, wireId)
             {"OK"}, "gdsGui_schematic_internal_onWireEditCancelled", "gdsGui_schematic_internal_onWireEditCancelled")
         return
     end
-    gdsGui_schematic_openMenu(canvasName, gdsGui_schematic_elementPropertiesTitle(_pipes.noun(canvas) .. ": " .. wireId), {"DELETE"},
-        "gdsGui_schematic_internal_onWireEditChosen", "gdsGui_schematic_internal_onWireEditCancelled", 1)
+    -- EDIT PATH draws the connector's own route (see _wirePath); RESET PATH,
+    -- once it has one, goes back to the automatic route.
+    local options = { "EDIT PATH" }
+    if w.waypoints then table.insert(options, "RESET PATH") end
+    table.insert(options, "DELETE")
+    gdsGui_schematic_openMenu(canvasName, gdsGui_schematic_elementPropertiesTitle(_pipes.noun(canvas) .. ": " .. wireId), options,
+        "gdsGui_schematic_internal_onWireEditChosen", "gdsGui_schematic_internal_onWireEditCancelled", #options)
 end
 
 function gdsGui_schematic_internal_onWireEditChosen(canvasName, index, optionText)
@@ -4997,6 +5098,17 @@ function gdsGui_schematic_internal_onWireEditChosen(canvasName, index, optionTex
         canvas.snapshots = {}
         _notifyChanged(canvas)
         return
+    elseif optionText == "EDIT PATH" then
+        canvas._wireEditTargetId = nil
+        _wirePath.start(canvasName, wireId)
+        return
+    elseif optionText == "RESET PATH" then
+        local w = _findWire(canvas, wireId)
+        if w and w.waypoints then
+            _pushUndo(canvas)
+            w.waypoints = nil
+            _notifyChanged(canvas)
+        end
     end
     canvas._wireEditTargetId = nil
     canvas.selectedWireId = nil
@@ -5832,7 +5944,13 @@ local function _drawGrid(canvas)
     -- either canvas backdrop; a plain GUI-library consumer that never sets
     -- it still gets the original faint-white-on-dark look.
     local g = globApp.themeCanvasGridColor or {1, 1, 1, 0.06}
-    love.graphics.setColor(g[1], g[2], g[3], g[4])
+    -- True one-device-pixel lines, each on a pixel center, so the grid is
+    -- crisp on a Retina screen; alpha scaled up to match, so it reads as
+    -- strongly as the old wider line did.
+    local hairline = gdsGui_general_hairline()
+    love.graphics.setColor(g[1], g[2], g[3], math.min(1, g[4] / hairline))
+    local prevLineWidth = love.graphics.getLineWidth()
+    love.graphics.setLineWidth(hairline)
     local spacing = _GRID_SPACING_PX
     local x0, y0, x1, y1 = canvas.x, canvas.y, canvas.x + canvas.w, canvas.y + canvas.h
 
@@ -5840,7 +5958,7 @@ local function _drawGrid(canvas)
     local worldRight = (x1 - canvas.x - canvas.panX) / canvas.zoom
     local gx = math.floor(worldLeft / spacing) * spacing
     while gx <= worldRight do
-        local sx = canvas.x + canvas.panX + gx * canvas.zoom
+        local sx = gdsGui_general_pixelCenter(canvas.x + canvas.panX + gx * canvas.zoom)
         love.graphics.line(sx, y0, sx, y1)
         gx = gx + spacing
     end
@@ -5849,20 +5967,33 @@ local function _drawGrid(canvas)
     local worldBottom = (y1 - canvas.y - canvas.panY) / canvas.zoom
     local gy = math.floor(worldTop / spacing) * spacing
     while gy <= worldBottom do
-        local sy = canvas.y + canvas.panY + gy * canvas.zoom
+        local sy = gdsGui_general_pixelCenter(canvas.y + canvas.panY + gy * canvas.zoom)
         love.graphics.line(x0, sy, x1, sy)
         gy = gy + spacing
     end
+    love.graphics.setLineWidth(prevLineWidth)
 end
 
 -- Caches an element's sprite image by path, same lazy-load-once pattern as
 -- _loadGalleryImage further below (kept separate since that one is defined
 -- after this point in the file and elements are drawn far more often per
 -- frame than gallery tiles are rebuilt).
+-- Element art is drawn far smaller than its source (1080 px squares down to a
+-- few dozen pixels), so it's mipmapped and linearly filtered: smooth edges, and
+-- no shimmer as the canvas pans and zooms. Falls back to a plain image where
+-- mipmaps aren't supported.
+gdsGui_schematic_internal_loadSmoothImage = function(path)
+    local ok, img = pcall(love.graphics.newImage, path, { mipmaps = true })
+    if not ok then img = love.graphics.newImage(path) end
+    img:setFilter("linear", "linear")
+    if ok then pcall(img.setMipmapFilter, img, "linear") end
+    return img
+end
+
 local _elementSpriteCache = {}
 local function _loadElementSprite(path)
     if not _elementSpriteCache[path] then
-        _elementSpriteCache[path] = love.graphics.newImage(path)
+        _elementSpriteCache[path] = gdsGui_schematic_internal_loadSmoothImage(path)
     end
     return _elementSpriteCache[path]
 end
@@ -6272,26 +6403,32 @@ local function _drawElement(canvas, e, signature)
         -- opacity (both the outline and the move/rotate overlay below,
         -- which inherits this same setColor) so it reads as an active
         -- affordance without visually competing with the element itself.
-        if canvas.selectionMoveModeActive then
-            love.graphics.setColor(1, 0, 1, 0.5)
-        else
-            love.graphics.setColor(1, 1, 0, 1)
+        -- The rounded selection frame sits just outside the footprint (see
+        -- _selection); a reshaped element's follows its real outline. The
+        -- exact footprint, the box drags and placements collide against
+        -- (_elementFootprintRect), shows as a thin line only while it's dragged.
+        local key = "e:" .. e.id
+        local lift = _selection.lift(canvas)
+        local function drawSelected(alpha)
+            if e.shapePoints then
+                _selection.drawOutline(canvas, e, alpha, lift)
+            else
+                _selection.drawFrame(fex, fey, few, feh, alpha, lift)
+            end
         end
-        -- Hugs the element's own true pixel footprint (fex,fey,few,feh) with
-        -- no padding — the exact same box _footprintOverlapsAnother checks
-        -- placement/drag collisions against (see _elementFootprintRect), so
-        -- the visible selection square IS the collision boundary — rotated
-        -- right along with the element for a non-square (gridW ~= gridH)
-        -- one, not a separate shared size that only approximated it.
-        -- Square, same as a control's own selection box (see _drawControl's
-        -- matching "rectangle" line) — one consistent "this is selected"
-        -- shape for every anchor kind. A reshaped element traces its real
-        -- outline instead, which is what it collides against (see _shapePoly).
-        if e.shapePoints then
-            _shapePoly.strokeOutline(canvas, e)
-        else
+        drawSelected(_selection.mark(canvas, key))
+        _selection.remember(canvas, key, drawSelected)
+        if canvas.dragKind == "element" and canvas.dragMoved then
+            love.graphics.setLineWidth(gdsGui_general_hairline())
+            _selection.setAccent(0.6)
             love.graphics.rectangle("line", fex, fey, few, feh)
+            love.graphics.setLineWidth(1)
         end
+        local holdFraction = _selection.holdFraction(canvas, "element")
+        if holdFraction then _selection.drawHoldTrace(fex, fey, few, feh, holdFraction) end
+        -- The move/rotate overlay below draws in this color, translucent so it
+        -- doesn't compete with the item itself.
+        _selection.setAccent(0.5)
         if canvas.selectionMoveModeActive then
             -- Mutually exclusive, not both at once: every further tap on
             -- the active target toggles between them (see
@@ -6700,8 +6837,10 @@ end
 -- that's enough now that overlapping wires draw as one shared bundle
 -- instead of being nudged apart into separate parallel lines. lineFn
 -- (optional): called as lineFn(ax, ay, bx, by) to draw each straight stretch,
--- in place of a plain love.graphics.line.
-local function _drawSegmentWithHopsAndGaps(x1, y1, x2, y2, hopDistances, bundledRanges, zoom, lineFn)
+-- in place of a plain love.graphics.line. trimLo/trimHi (optional): how far
+-- in from the start/end to stop drawing, where a pipe's rounded bend (see
+-- _pipes.corners) takes over.
+local function _drawSegmentWithHopsAndGaps(x1, y1, x2, y2, hopDistances, bundledRanges, zoom, lineFn, trimLo, trimHi)
     zoom = zoom or 1
     local hopRadiusPx = _WIRE_CROSS_HOP_RADIUS_PX * zoom
     local horiz = (y1 == y2)
@@ -6733,8 +6872,12 @@ local function _drawSegmentWithHopsAndGaps(x1, y1, x2, y2, hopDistances, bundled
     end
     cuts = dedup
 
+    local drawLo, drawHi = trimLo or 0, length - (trimHi or 0)
     for i = 1, #cuts - 1 do
         local a, b = cuts[i], cuts[i + 1]
+        local whole = a >= drawLo - 0.01 and b <= drawHi + 0.01
+        a, b = math.max(a, drawLo), math.min(b, drawHi)
+        if b - a <= 0.01 then goto nextPiece end
         local mid = (a + b) / 2
         local inBundle = false
         for _, r in ipairs(bundledRanges) do
@@ -6745,7 +6888,9 @@ local function _drawSegmentWithHopsAndGaps(x1, y1, x2, y2, hopDistances, bundled
             for _, hr in ipairs(hopRanges) do
                 if mid >= hr.lo and mid <= hr.hi then inHop = hr end
             end
-            if inHop then
+            if inHop and not whole then
+                -- A hop cut into by a bend: leave it out rather than draw half an arc.
+            elseif inHop then
                 local cxp, cyp = pointAt(inHop.center)
                 local startAngle, endAngle
                 if horiz then startAngle, endAngle = math.pi, math.pi * 2
@@ -6757,6 +6902,7 @@ local function _drawSegmentWithHopsAndGaps(x1, y1, x2, y2, hopDistances, bundled
                 if lineFn then lineFn(ax, ay, bx, by) else love.graphics.line(ax, ay, bx, by) end
             end
         end
+        ::nextPiece::
     end
 
     -- This segment's true start/end, for _drawWirePlanSegments/
@@ -6796,7 +6942,7 @@ local function _drawWireBundleSegment(canvas, x1, y1, x2, y2, colors, isHalo)
         if not seen then table.insert(distinct, c) end
     end
 
-    local thickness = _WIRE_WIDTH_PX * canvas.zoom * (isHalo and _glow.WIRE_WIDTH or 1)
+    local thickness = _pipes.fluidWidth(canvas) * (isHalo and _glow.WIRE_WIDTH or 1)
     local stripeLen = _WIRE_BUNDLE_STRIPE_LEN_PX * canvas.zoom
     local halfT = thickness / 2
     local capLo, capHi = -halfT, length + halfT
@@ -6867,13 +7013,20 @@ end
 -- applying that wire's own hop points and bundle gaps per segment (see
 -- _drawSegmentWithHopsAndGaps) — the bundle zones themselves are drawn
 -- separately, once per bundle, by _drawWireBundleSegment.
-local function _drawWirePlanSegments(plan, zoom)
+-- radius (optional): a pipe's bend radius (see _pipes.corners), rounding each
+-- bend instead of squaring it off.
+local function _drawWirePlanSegments(plan, zoom, radius)
     local halfW = love.graphics.getLineWidth() / 2
+    local corners = radius and _pipes.corners(plan, radius)
     local prevEndX, prevEndY, prevVertical
     for idx, seg in ipairs(plan.segments) do
+        local before, after = corners and corners[idx - 1], corners and corners[idx]
         local startX, startY, endX, endY = _drawSegmentWithHopsAndGaps(
-            seg[1], seg[2], seg[3], seg[4], plan.hopDistances[idx], plan.bundledRanges[idx], zoom)
-        if idx > 1 then
+            seg[1], seg[2], seg[3], seg[4], plan.hopDistances[idx], plan.bundledRanges[idx], zoom, nil,
+            before and before.r, after and after.r)
+        if before then
+            _pipes.drawBend(before)
+        elseif idx > 1 then
             _bridgeSegmentJoint(prevEndX, prevEndY, prevVertical, startX, startY, halfW)
         end
         prevEndX, prevEndY = endX, endY
@@ -6890,6 +7043,123 @@ end
 _pipes.WIDTH_MULT = 3                -- full pipe width, as a multiple of a wire's width
 _pipes.WALL_GRAY_DARK = 90 / 255     -- wall shade per theme: distinct from an empty pipe's
 _pipes.WALL_GRAY_LIGHT = 170 / 255   -- gray fluid (see _themedPaletteColor) against either backdrop
+_pipes.BEND_RADIUS_MULT = 1          -- a bend's centerline radius, as a multiple of the full pipe width
+_pipes.BEND_PX_PER_SEGMENT = 3     -- device pixels of outer wall per straight piece of a bend
+_pipes.EDGE_FRACTION = 0.12        -- dark outer edge, as a fraction of the full pipe width
+_pipes.LIGHT_FRACTION = 0.55       -- lit inner band, as a fraction of each wall
+_pipes.STREAK_FRACTION = 0.35      -- shine down the fluid, as a fraction of its width
+_pipes.STREAK_ALPHA = 0.22
+
+-- A pipe's widths on this canvas, each a whole, odd number of device pixels so
+-- that, centered on a device pixel (see _pipes.snapPlans), both edges land on
+-- pixel boundaries: crisp, and the two walls always equal. Layers, outermost
+-- first: pipe (dark edge), body (wall), light (lit inner band of each wall),
+-- fluid, streak (shine; nil when the fluid is too thin for one). nil for plain
+-- wires, which keep their own widths.
+function _pipes.widths(canvas)
+    if not canvas.pipeConnectors then return nil end
+    local dpi = love.graphics.getDPIScale()
+    local cached = canvas._pipeWidths
+    if cached and cached.zoom == canvas.zoom and cached.dpi == dpi then return cached end
+    local function odd(px) return math.max(1, 2 * math.floor(px / 2) + 1) end
+    local wirePx = _WIRE_WIDTH_PX * canvas.zoom * dpi
+    local fluidPx = odd(wirePx)
+    local wallPx = math.max(1, math.floor(wirePx * (_pipes.WIDTH_MULT - 1) / 2 + 0.5))
+    local pipePx = fluidPx + 2 * wallPx
+    local edgePx = math.max(1, math.floor(pipePx * _pipes.EDGE_FRACTION + 0.5))
+    local bodyPx = pipePx - 2 * edgePx
+    local lightPx = fluidPx + 2 * math.max(1, math.floor(wallPx * _pipes.LIGHT_FRACTION + 0.5))
+    if lightPx >= bodyPx then lightPx = nil end
+    local streakPx = fluidPx >= 3 and odd(fluidPx * _pipes.STREAK_FRACTION) or nil
+    cached = { zoom = canvas.zoom, dpi = dpi, pipe = pipePx / dpi, body = bodyPx / dpi,
+        light = lightPx and lightPx / dpi, fluid = fluidPx / dpi, streak = streakPx and streakPx / dpi }
+    canvas._pipeWidths = cached
+    return cached
+end
+
+-- The width a connector's fluid (or a plain wire) draws at.
+function _pipes.fluidWidth(canvas)
+    local widths = _pipes.widths(canvas)
+    return widths and widths.fluid or _WIRE_WIDTH_PX * canvas.zoom
+end
+
+-- The radius a pipe's bends are drawn at on this canvas, or nil for plain wires,
+-- which keep their square schematic corners.
+function _pipes.bendRadius(canvas)
+    local widths = _pipes.widths(canvas)
+    return widths and widths.pipe * _pipes.BEND_RADIUS_MULT
+end
+
+-- How many straight pieces a bend of radius r sweeping `sweep` radians needs at
+-- the current line width, so its outer wall stays smooth at any zoom.
+function _pipes.bendSegments(r, sweep)
+    local outer = r + love.graphics.getLineWidth() / 2
+    local px = outer * math.abs(sweep) * love.graphics.getDPIScale()
+    return math.max(6, math.min(96, math.ceil(px / _pipes.BEND_PX_PER_SEGMENT)))
+end
+
+-- Moves every pipe path of plans and bundles onto device-pixel centers (see
+-- _pipes.widths), in place. Idempotent, and every shared corner moves the same
+-- way, so runs stay joined and square to the grid.
+function _pipes.snapPlans(plans, bundles)
+    local snap = gdsGui_general_pixelCenter
+    for _, plan in pairs(plans) do
+        for _, seg in ipairs(plan.segments) do
+            seg[1], seg[2], seg[3], seg[4] = snap(seg[1]), snap(seg[2]), snap(seg[3]), snap(seg[4])
+        end
+        plan._corners = nil
+    end
+    for _, bundle in ipairs(bundles) do
+        bundle.x1, bundle.y1, bundle.x2, bundle.y2 = snap(bundle.x1), snap(bundle.y1), snap(bundle.x2), snap(bundle.y2)
+    end
+end
+
+-- The rounded bend at each corner of plan, keyed by the index of the segment
+-- coming into it: {r, cx, cy, a1, a2, x1, y1, x2, y2}, an arc of radius r about
+-- cx,cy from angle a1 to a2, leaving that segment at x1,y1 and joining the next
+-- at x2,y2 (r back from the corner along each). Each r is the full radius when
+-- both segments have room for it, else as much as half the shorter one allows.
+-- A corner inside a bundle (whose square walls are drawn whole, see
+-- _pipes.drawAllWalls) or with no real turn gets none, and keeps the square
+-- join. Kept on the plan, which only changes when the wiring does.
+function _pipes.corners(plan, radius)
+    if plan._corners and plan._cornersRadius == radius then return plan._corners end
+    local corners = {}
+    local segs = plan.segments
+    local function lengthOf(seg) return math.abs(seg[3] - seg[1]) + math.abs(seg[4] - seg[2]) end
+    local function bundledAt(idx, d)
+        for _, range in ipairs(plan.bundledRanges[idx] or {}) do
+            if d >= range.lo - 0.01 and d <= range.hi + 0.01 then return true end
+        end
+        return false
+    end
+    for k = 1, #segs - 1 do
+        local a, b = segs[k], segs[k + 1]
+        local lenA, lenB = lengthOf(a), lengthOf(b)
+        local r = math.min(radius, lenA / 2, lenB / 2)
+        if r > 0.5 and not bundledAt(k, lenA) and not bundledAt(k + 1, 0) then
+            local d1x, d1y = (a[3] - a[1]) / lenA, (a[4] - a[2]) / lenA
+            local d2x, d2y = (b[3] - b[1]) / lenB, (b[4] - b[2]) / lenB
+            if math.abs(d1x * d2y - d1y * d2x) > 0.5 then
+                local px, py = a[3], a[4]
+                local x1, y1 = px - d1x * r, py - d1y * r
+                local cx, cy = x1 + d2x * r, y1 + d2y * r
+                local a1 = math.atan2(-d2y, -d2x)
+                local sweep = math.atan2(d1y, d1x) - a1
+                if sweep > math.pi then sweep = sweep - 2 * math.pi elseif sweep < -math.pi then sweep = sweep + 2 * math.pi end
+                corners[k] = { r = r, cx = cx, cy = cy, a1 = a1, a2 = a1 + sweep,
+                    x1 = x1, y1 = y1, x2 = px + d2x * r, y2 = py + d2y * r }
+            end
+        end
+    end
+    plan._corners, plan._cornersRadius = corners, radius
+    return corners
+end
+
+-- One bend (see _pipes.corners), in the current color and line width.
+function _pipes.drawBend(bend)
+    love.graphics.arc("line", "open", bend.cx, bend.cy, bend.r, bend.a1, bend.a2, _pipes.bendSegments(bend.r, bend.a2 - bend.a1))
+end
 
 -- noun: what the menus call a connector on this canvas ("PIPE", "DUCT"), or nil
 -- for plain wires.
@@ -6924,39 +7194,78 @@ end
 -- see gdsGui_schematic_released's "wireDirection" branch — it cycles
 -- w.gravityDirection instead, same spot a drag there changes the bend.
 function _pipes.drawSelection(canvas, plan, width)
-    if canvas.selectionMoveModeActive then
-        love.graphics.setColor(1, 0, 1, 1)
-    else
-        love.graphics.setColor(1, 1, 0, 1)
-    end
-    love.graphics.setLineWidth(width)
-    _drawWirePlanSegments(plan, canvas.zoom)
+    _selection.drawConnector(canvas, plan, width)
 end
 
-function _pipes.setWallColor()
+function _pipes.setWallColor(shade)
     local gray = globApp.themeIsDark == false and _pipes.WALL_GRAY_LIGHT or _pipes.WALL_GRAY_DARK
+    gray = math.min(1, gray * (shade or 1))
     love.graphics.setColor(gray, gray, gray, 1)
 end
 
--- One wire's walls, with its selection emphasis (if any) around them.
-function _pipes.drawWireWalls(canvas, w, plan)
-    local pipeWidth = _WIRE_WIDTH_PX * _pipes.WIDTH_MULT * canvas.zoom
-    if canvas.selectedWireId == w.id then
-        _pipes.drawSelection(canvas, plan, pipeWidth + 1.6 * canvas.zoom)
+-- The wall layers that give a pipe its rounded, tube-like look, outermost first:
+-- {width key in _pipes.widths, shade of the wall gray}. Each covers the middle
+-- of the one before, leaving a dark rim at the outer edge and a lit band beside
+-- the fluid.
+_pipes.WALL_LAYERS = { { "pipe", 0.55 }, { "body", 1 }, { "light", 1.35 } }
+
+-- Every pipe's walls, one layer at a time across all of them (see
+-- _pipes.WALL_LAYERS), so where pipes meet, one's dark rim never paints over
+-- another's wall. A selected pipe's emphasis goes underneath all of it.
+-- isVisible(plan) and isRectVisible(x, y, w, h) cull what's off-screen.
+function _pipes.drawAllWalls(canvas, plans, bundles, isVisible, isRectVisible)
+    local widths = _pipes.widths(canvas)
+    local radius = _pipes.bendRadius(canvas)
+    local selected = canvas.selectedWireId and plans[canvas.selectedWireId]
+    if selected and isVisible(selected) then
+        _pipes.drawSelection(canvas, selected, widths.pipe)
     end
-    _pipes.setWallColor()
-    love.graphics.setLineWidth(pipeWidth)
-    _drawWirePlanSegments(plan, canvas.zoom)
+    for _, layer in ipairs(_pipes.WALL_LAYERS) do
+        local width = widths[layer[1]]
+        if width then
+            _pipes.setWallColor(layer[2])
+            love.graphics.setLineWidth(width)
+            for _, w in ipairs(canvas.wires) do
+                local plan = plans[w.id]
+                if plan and isVisible(plan) then _drawWirePlanSegments(plan, canvas.zoom, radius) end
+            end
+            -- A bundle zone's walls are cut square half a pipe past each end, so
+            -- bends in a bundle meet with a full corner.
+            local half = width / 2
+            for _, bundle in ipairs(bundles) do
+                local loX, hiX = math.min(bundle.x1, bundle.x2), math.max(bundle.x1, bundle.x2)
+                local loY, hiY = math.min(bundle.y1, bundle.y2), math.max(bundle.y1, bundle.y2)
+                if isRectVisible(loX, loY, hiX - loX, hiY - loY) then
+                    love.graphics.rectangle("fill", loX - half, loY - half, hiX - loX + half * 2, hiY - loY + half * 2)
+                end
+            end
+        end
+    end
+    love.graphics.setLineWidth(1)
 end
 
--- One bundle zone's walls, cut square half a pipe past each end so bends in a
--- bundle meet with a full corner (the walls' version of _drawWireBundleSegment).
-function _pipes.drawBundleWalls(canvas, bundle)
-    local half = _WIRE_WIDTH_PX * _pipes.WIDTH_MULT * canvas.zoom / 2
-    local loX, hiX = math.min(bundle.x1, bundle.x2), math.max(bundle.x1, bundle.x2)
-    local loY, hiY = math.min(bundle.y1, bundle.y2), math.max(bundle.y1, bundle.y2)
-    _pipes.setWallColor()
-    love.graphics.rectangle("fill", loX - half, loY - half, hiX - loX + half * 2, hiY - loY + half * 2)
+-- A thin shine down the middle of every pipe's fluid, bundles included, so the
+-- fluid reads as filling a round pipe. Drawn after the fluid and before the
+-- drained stretch (_pipes.drawEmptiedRun), which covers it where the pipe is empty.
+function _pipes.drawAllStreaks(canvas, plans, bundles, isVisible, isRectVisible)
+    local widths = _pipes.widths(canvas)
+    if not widths or not widths.streak then return end
+    local radius = _pipes.bendRadius(canvas)
+    love.graphics.setColor(1, 1, 1, _pipes.STREAK_ALPHA)
+    love.graphics.setLineWidth(widths.streak)
+    for _, w in ipairs(canvas.wires) do
+        local plan = plans[w.id]
+        if plan and isVisible(plan) then _drawWirePlanSegments(plan, canvas.zoom, radius) end
+    end
+    for _, bundle in ipairs(bundles) do
+        local loX, hiX = math.min(bundle.x1, bundle.x2), math.max(bundle.x1, bundle.x2)
+        local loY, hiY = math.min(bundle.y1, bundle.y2), math.max(bundle.y1, bundle.y2)
+        if isRectVisible(loX, loY, hiX - loX, hiY - loY) then
+            love.graphics.line(bundle.x1, bundle.y1, bundle.x2, bundle.y2)
+        end
+    end
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.setLineWidth(1)
 end
 
 --------------------------------------------------------------------------------
@@ -7001,71 +7310,151 @@ function _pipes.chevronSizeAndSpacing(canvas)
     return size, size + _pipes.GRAVITY_CHEVRON_GAP * canvas.zoom
 end
 
--- One open ">"-shaped chevron centered at (cx,cy), pointing in unit direction
--- (dx,dy) — a 3-point polyline (never filled), so it reads as a notch across
--- the fluid rather than a solid arrowhead.
-function _pipes.drawChevron(cx, cy, dx, dy, size)
-    local perpX, perpY = -dy, dx
-    local tipX,  tipY  = cx + dx * size * 0.5, cy + dy * size * 0.5
-    local backX, backY = cx - dx * size * 0.5, cy - dy * size * 0.5
-    love.graphics.line(
-        backX + perpX * size * 0.45, backY + perpY * size * 0.45,
-        tipX, tipY,
-        backX - perpX * size * 0.45, backY - perpY * size * 0.45)
+-- plan's path as it's drawn, rounded bends included (see _pipes.corners), in
+-- order from its first segment to its last: straight runs {x1, y1, x2, y2,
+-- seg, segOffset} and bends {bend}, each with len and d0 (distance along the
+-- path where it starts). seg and segOffset place a run within its segment, for
+-- the segment's own hop and bundle distances. Returns pieces, total length.
+-- Kept on the plan, which only changes when the wiring or view does.
+function _pipes.pathPieces(canvas, plan)
+    local radius = _pipes.bendRadius(canvas) or 0
+    if plan._pieces and plan._piecesRadius == radius then return plan._pieces, plan._piecesTotal end
+    local corners = _pipes.corners(plan, radius)
+    local pieces, total = {}, 0
+    for i, seg in ipairs(plan.segments) do
+        local before, after = corners[i - 1], corners[i]
+        local x1, y1 = before and before.x2 or seg[1], before and before.y2 or seg[2]
+        local x2, y2 = after and after.x1 or seg[3], after and after.y1 or seg[4]
+        local len = math.abs(x2 - x1) + math.abs(y2 - y1)
+        table.insert(pieces, { x1 = x1, y1 = y1, x2 = x2, y2 = y2, seg = i, segOffset = before and before.r or 0,
+            len = len, d0 = total })
+        total = total + len
+        if after then
+            local bendLen = after.r * math.abs(after.a2 - after.a1)
+            table.insert(pieces, { bend = after, len = bendLen, d0 = total })
+            total = total + bendLen
+        end
+    end
+    plan._pieces, plan._piecesRadius, plan._piecesTotal = pieces, radius, total
+    return pieces, total
 end
 
--- Every chevron along one wire's plan, evenly spaced along its WHOLE path
--- (the running "carry" phase below keeps the interval continuous across a
--- bend from one segment into the next) — nothing drawn at all for "none".
--- Drawn in the wall's own gray (_pipes.setWallColor) so it reads consistently
--- regardless of the fluid's own (per-source) color. Layered in front of the
--- fluid but behind the walls: this pass runs after the fluid, so a scissor on
--- each segment's fluid channel (segments are always axis-aligned) is what stops
--- a chevron's arms at the inner edge of the walls.
--- A pump driving the pipe (w.pumpedDirection, set by the app) overrides the
--- marking while the system is being operated: its chevrons show the way the fluid
--- is really going, on an unmarked pipe too.
+-- The point t along piece (0 to piece.len), and the unit direction the path
+-- runs there.
+function _pipes.pointOnPiece(piece, t)
+    local bend = piece.bend
+    if bend then
+        local sweep = bend.a2 - bend.a1
+        local angle = bend.a1 + sweep * (piece.len > 0 and t / piece.len or 0)
+        local turn = sweep >= 0 and 1 or -1
+        return bend.cx + math.cos(angle) * bend.r, bend.cy + math.sin(angle) * bend.r,
+            -math.sin(angle) * turn, math.cos(angle) * turn
+    end
+    local dx, dy = piece.x2 - piece.x1, piece.y2 - piece.y1
+    local f = piece.len > 0 and t / piece.len or 0
+    local ux, uy = 0, 0
+    if piece.len > 0 then ux, uy = dx / piece.len, dy / piece.len end
+    return piece.x1 + dx * f, piece.y1 + dy * f, ux, uy
+end
+
+-- Draws the part of piece from t0 to t1 as one stroke, at the current line width.
+function _pipes.strokePiece(piece, t0, t1)
+    local bend = piece.bend
+    if bend then
+        local sweep = bend.a2 - bend.a1
+        local a0 = bend.a1 + sweep * t0 / piece.len
+        local a1 = bend.a1 + sweep * t1 / piece.len
+        love.graphics.arc("line", "open", bend.cx, bend.cy, bend.r, a0, a1, _pipes.bendSegments(bend.r, a1 - a0))
+    else
+        local ax, ay = _pipes.pointOnPiece(piece, t0)
+        local bx, by = _pipes.pointOnPiece(piece, t1)
+        love.graphics.line(ax, ay, bx, by)
+    end
+end
+
+--------------------------------------------------------------------------------
+-- CHEVRONS: solid, round-tipped ">" marks that fit inside the fluid (so no
+-- clipping is needed), placed by distance along the path so they turn with
+-- each bend, fading in and out near the pipe's ends. A light mark on a dark
+-- rim reads on any fluid color.
+--------------------------------------------------------------------------------
+_pipes.CHEVRON_THICKNESS = 0.28   -- stroke, as a fraction of the fluid's width
+_pipes.CHEVRON_FADE = 0.75        -- fade-in/out length at each end of the pipe, in chevron spacings
+
+-- One chevron centered at x,y pointing along unit tx,ty: two arms of stroke
+-- `thick` meeting at a rounded tip, reaching halfSpan either side of the path
+-- and `depth` along it.
+function _pipes.drawChevron(x, y, tx, ty, halfSpan, depth, thick)
+    local px, py = -ty, tx
+    local tipX, tipY = x + tx * depth / 2, y + ty * depth / 2
+    local backX, backY = x - tx * depth / 2, y - ty * depth / 2
+    local h = thick / 2
+    for side = -1, 1, 2 do
+        local endX, endY = backX + px * halfSpan * side, backY + py * halfSpan * side
+        local ax, ay = tipX - endX, tipY - endY
+        local alen = math.sqrt(ax * ax + ay * ay)
+        if alen > 0 then
+            local nx, ny = -ay / alen * h, ax / alen * h
+            love.graphics.polygon("fill", endX + nx, endY + ny, tipX + nx, tipY + ny, tipX - nx, tipY - ny, endX - nx, endY - ny)
+        end
+        love.graphics.circle("fill", endX, endY, h, 10)
+    end
+    love.graphics.circle("fill", tipX, tipY, h, 10)
+end
+
+-- Every chevron along one pipe (see the section header). A pump driving the
+-- pipe (w.pumpedDirection, set by the app) overrides the marking while the
+-- system is being operated: its chevrons show the way the fluid is really
+-- going, on an unmarked pipe too. They travel that way while fluid is running
+-- (w.fluidMoving, set by the app) and sit still otherwise.
 function _pipes.drawGravityChevrons(canvas, w, plan)
     local dir = (canvas.mode == "control" and w.pumpedDirection) or w.gravityDirection
     if not dir then return end
-    local pointBackward = (dir == "reverse")
-    local pipeWidth = _WIRE_WIDTH_PX * _pipes.WIDTH_MULT * canvas.zoom
-    local size, spacing = _pipes.chevronSizeAndSpacing(canvas)
-    _pipes.setWallColor()
-    love.graphics.setLineWidth(math.max(1, pipeWidth * 0.35))
-    local carry = spacing / 2
+    local widths = _pipes.widths(canvas)
+    local pieces, total = _pipes.pathPieces(canvas, plan)
+    if total <= 0 then return end
+    local dpi = love.graphics.getDPIScale()
+    local onePx = 1 / dpi
+    local thick = math.max(onePx, math.floor(widths.fluid * _pipes.CHEVRON_THICKNESS * dpi + 0.5) / dpi)
+    -- A dark rim one device pixel wide, when the fluid is wide enough to hold it.
+    local rim = onePx
+    local halfSpan = widths.fluid / 2 - thick / 2 - rim
+    if halfSpan < thick then
+        rim = 0
+        halfSpan = widths.fluid / 2 - thick / 2
+    end
+    if halfSpan <= 0 then return end
+    local depth = halfSpan * 1.1
+    local _, spacing = _pipes.chevronSizeAndSpacing(canvas)
+    local backward = (dir == "reverse")
+    local offset = spacing / 2
     if w.fluidMoving and canvas.mode == "control" then
         local travel = (canvas._chevronTravel or 0) * canvas.zoom
-        carry = (carry + (pointBackward and -travel or travel)) % spacing
+        offset = (offset + (backward and -travel or travel)) % spacing
     end
-    local halfFluid = _WIRE_WIDTH_PX * canvas.zoom / 2
-    local prevScX, prevScY, prevScW, prevScH = love.graphics.getScissor()
-    local function restoreScissor()
-        if prevScX then love.graphics.setScissor(prevScX, prevScY, prevScW, prevScH) else love.graphics.setScissor() end
-    end
-    for _, seg in ipairs(plan.segments) do
-        local x1, y1, x2, y2 = seg[1], seg[2], seg[3], seg[4]
-        local dx, dy = x2 - x1, y2 - y1
-        local len = math.sqrt(dx * dx + dy * dy)
-        if len > 0.001 then
-            local left = math.floor(math.min(x1, x2) - halfFluid + 0.5)
-            local top = math.floor(math.min(y1, y2) - halfFluid + 0.5)
-            restoreScissor()
-            love.graphics.intersectScissor(left, top,
-                math.floor(math.max(x1, x2) + halfFluid + 0.5) - left, math.floor(math.max(y1, y2) + halfFluid + 0.5) - top)
-            local ux, uy = dx / len, dy / len
-            local pointX = pointBackward and -ux or ux
-            local pointY = pointBackward and -uy or uy
-            local d = carry
-            while d < len do
-                _pipes.drawChevron(x1 + ux * d, y1 + uy * d, pointX, pointY, size)
-                d = d + spacing
+    local fade = spacing * _pipes.CHEVRON_FADE
+    local dark = globApp.themeIsDark == false and 0.25 or 0.08
+    local light = globApp.themeIsDark == false and 0.97 or 0.9
+
+    local index = 1
+    local d = offset
+    while d < total do
+        while pieces[index + 1] and pieces[index + 1].d0 <= d do index = index + 1 end
+        local piece = pieces[index]
+        local x, y, tx, ty = _pipes.pointOnPiece(piece, d - piece.d0)
+        if backward then tx, ty = -tx, -ty end
+        local alpha = math.max(0, math.min(1, d / fade, (total - d) / fade))
+        if alpha > 0 and (tx ~= 0 or ty ~= 0) then
+            if rim > 0 then
+                love.graphics.setColor(dark, dark, dark, 0.6 * alpha)
+                _pipes.drawChevron(x, y, tx, ty, halfSpan, depth, thick + rim * 2)
             end
-            carry = d - len
+            love.graphics.setColor(light, light, light, alpha)
+            _pipes.drawChevron(x, y, tx, ty, halfSpan, depth, thick)
         end
+        d = d + spacing
     end
-    restoreScissor()
-    love.graphics.setLineWidth(1)
+    love.graphics.setColor(1, 1, 1, 1)
 end
 
 -- The emptied stretch of a draining pipe (w.fluidPercent, set by the app; nil is
@@ -7073,30 +7462,217 @@ end
 -- is pulling away from, so the fluid visibly runs out toward the far end.
 function _pipes.drawEmptiedRun(canvas, w, plan)
     if not w.fluidPercent or w.fluidPercent >= 100 or not canvas.emptyPipeColor then return end
-    local segments, total = {}, 0
-    for i, seg in ipairs(plan.segments) do
-        total = total + math.abs(seg[3] - seg[1]) + math.abs(seg[4] - seg[2])
-        if w.gravityDirection == "reverse" then
-            segments[#plan.segments + 1 - i] = { seg[3], seg[4], seg[1], seg[2] }
-        else
-            segments[i] = seg
-        end
-    end
+    local pieces, total = _pipes.pathPieces(canvas, plan)
     local c = canvas.emptyPipeColor
     love.graphics.setColor(_themedPaletteColor(c[1], c[2], c[3], c[4] or 1))
-    love.graphics.setLineWidth(_WIRE_WIDTH_PX * canvas.zoom)
-    local remaining = total * (1 - w.fluidPercent / 100)
-    for _, seg in ipairs(segments) do
-        local len = math.abs(seg[3] - seg[1]) + math.abs(seg[4] - seg[2])
-        if remaining <= 0 or len <= 0 then
-            if remaining <= 0 then break end
-        else
-            local t = math.min(1, remaining / len)
-            love.graphics.line(seg[1], seg[2], seg[1] + (seg[3] - seg[1]) * t, seg[2] + (seg[4] - seg[2]) * t)
-            remaining = remaining - len
-        end
+    love.graphics.setLineWidth(_pipes.fluidWidth(canvas))
+    local empty = total * (1 - w.fluidPercent / 100)
+    -- Measured from the end gravity pulls away from: the path's start, or its
+    -- end for a reversed run.
+    local lo, hi = 0, empty
+    if w.gravityDirection == "reverse" then lo, hi = total - empty, total end
+    for _, piece in ipairs(pieces) do
+        local t0 = math.max(0, lo - piece.d0)
+        local t1 = math.min(piece.len, hi - piece.d0)
+        if t1 - t0 > 0.01 then _pipes.strokePiece(piece, t0, t1) end
     end
     love.graphics.setLineWidth(1)
+end
+
+--------------------------------------------------------------------------------
+-- FLOWING FLUID: while fluid runs through a liquid pipe (w.fluidMoving, set by
+-- the app, in control mode), soft lighter and darker streaks drift along its
+-- fluid the way it's flowing, at the chevrons' speed. A strip mesh over the
+-- fluid carries each point's distance along the path (u, in world units, so
+-- the streaks keep their length at any zoom) and its place across it (v, -1
+-- to 1), and a small shader turns those into the moving pattern.
+--------------------------------------------------------------------------------
+_pipes.FLOW_STRENGTH = 0.22        -- the streaks' strongest light/dark, as alpha
+_pipes.FLOW_PERIOD = 24            -- world units after which the streak pattern repeats exactly
+
+-- The shader, built on first use. nil (and no streaks) if it won't compile.
+function _pipes.flowShader()
+    if _pipes._flowShaderFailed then return nil end
+    if _pipes._flowShader then return _pipes._flowShader end
+    -- Each wave is a whole number of cycles per FLOW_PERIOD (k = 2*pi/24), so
+    -- the phase can wrap at FLOW_PERIOD without a visible jump.
+    local ok, shader = pcall(love.graphics.newShader, [[
+        extern number phase;
+        extern number strength;
+        vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc)
+        {
+            float k = 0.2617993878;
+            float u = tc.x - phase;
+            float v = tc.y;
+            float s = 0.55 * sin(u * 4.0 * k) + 0.30 * sin(u * 10.0 * k + v * 1.9) + 0.15 * sin(u * 2.0 * k - v * 1.3);
+            float a = s * strength * (1.0 - 0.5 * v * v) * color.a;
+            return mix(vec4(0.0, 0.0, 0.0, -a), vec4(1.0, 1.0, 1.0, a), step(0.0, a));
+        }
+    ]])
+    if not ok then
+        _pipes._flowShaderFailed = true
+        return nil
+    end
+    _pipes._flowShader = shader
+    return shader
+end
+
+-- Whether plan has the same shape as the one a cached mesh was built from,
+-- measured from the canvas origin ox,oy (so a pan alone is no change). Allows a
+-- pixel of give for the per-pan snap to device pixels (see _pipes.snapPlans).
+function _pipes.flowShapeMatches(cached, plan, ox, oy)
+    local segs = plan.segments
+    if #segs ~= #cached.shape then return false end
+    for i, seg in ipairs(segs) do
+        local c = cached.shape[i]
+        if math.abs(seg[1] - ox - c[1]) > 1 or math.abs(seg[2] - oy - c[2]) > 1
+           or math.abs(seg[3] - ox - c[3]) > 1 or math.abs(seg[4] - oy - c[4]) > 1 then return false end
+        local hops, cHops = plan.hopDistances[i] or {}, c.hops
+        if #hops ~= #cHops then return false end
+        for j, d in ipairs(hops) do if math.abs(d - cHops[j]) > 1 then return false end end
+        local ranges, cRanges = plan.bundledRanges[i] or {}, c.ranges
+        if #ranges ~= #cRanges then return false end
+        for j, r in ipairs(ranges) do
+            if math.abs(r.lo - cRanges[j][1]) > 1 or math.abs(r.hi - cRanges[j][2]) > 1 then return false end
+        end
+    end
+    return true
+end
+
+-- The strip mesh over w's fluid (see the section header), skipping stretches
+-- drawn by a bundle or a crossing hop, built relative to the canvas origin and
+-- drawn translated to the current one. Returns the mesh.
+-- Rebuilt only when the pipe's shape or width changes, not on a pan; the one
+-- it replaces is released.
+function _pipes.flowMesh(canvas, w, plan)
+    local widths = _pipes.widths(canvas)
+    canvas._flowMeshes = canvas._flowMeshes or {}
+    local ox, oy = canvas.x + canvas.panX, canvas.y + canvas.panY
+    local cached = canvas._flowMeshes[w.id]
+    if cached and cached.width == widths.fluid and (cached.plan == plan or _pipes.flowShapeMatches(cached, plan, ox, oy)) then
+        cached.plan = plan
+        return cached.mesh
+    end
+    if cached and cached.mesh then cached.mesh:release() end
+
+    local pieces = _pipes.pathPieces(canvas, plan)
+    local half, zoom = widths.fluid / 2, canvas.zoom
+    local hopRadius = _WIRE_CROSS_HOP_RADIUS_PX * zoom
+    local verts = {}
+    local function edge(x, y, nx, ny, d)
+        return { x + nx * half, y + ny * half, d / zoom, -1, 1, 1, 1, 1 },
+            { x - nx * half, y - ny * half, d / zoom, 1, 1, 1, 1, 1 }
+    end
+    local function quad(a1, a2, b1, b2)
+        verts[#verts + 1] = a1; verts[#verts + 1] = a2; verts[#verts + 1] = b1
+        verts[#verts + 1] = b1; verts[#verts + 1] = a2; verts[#verts + 1] = b2
+    end
+    for _, piece in ipairs(pieces) do
+        if piece.bend then
+            local bend = piece.bend
+            local sweep = bend.a2 - bend.a1
+            local steps = math.max(6, math.min(96, math.ceil((bend.r + half) * math.abs(sweep) * love.graphics.getDPIScale() / _pipes.BEND_PX_PER_SEGMENT)))
+            local turn = sweep >= 0 and 1 or -1
+            local prev1, prev2
+            for k = 0, steps do
+                local angle = bend.a1 + sweep * k / steps
+                local nx, ny = math.cos(angle) * turn, math.sin(angle) * turn
+                local x, y = bend.cx + math.cos(angle) * bend.r, bend.cy + math.sin(angle) * bend.r
+                -- Across the path, matching a straight run's side: its normal is
+                -- the path direction turned a quarter.
+                local e1, e2 = edge(x, y, -nx, -ny, piece.d0 + piece.len * k / steps)
+                if prev1 then quad(prev1, prev2, e1, e2) end
+                prev1, prev2 = e1, e2
+            end
+        elseif piece.len > 0.01 then
+            -- The run's own stretches, around its segment's bundles and hops.
+            local skips = {}
+            for _, range in ipairs(plan.bundledRanges[piece.seg] or {}) do table.insert(skips, { range.lo, range.hi }) end
+            for _, hop in ipairs(plan.hopDistances[piece.seg] or {}) do table.insert(skips, { hop - hopRadius, hop + hopRadius }) end
+            local cuts = { 0, piece.len }
+            for _, skip in ipairs(skips) do
+                for _, at in ipairs(skip) do
+                    local t = at - piece.segOffset
+                    if t > 0 and t < piece.len then table.insert(cuts, t) end
+                end
+            end
+            table.sort(cuts)
+            local _, _, ux, uy = _pipes.pointOnPiece(piece, 0)
+            local nx, ny = -uy, ux
+            for i = 1, #cuts - 1 do
+                local t0, t1 = cuts[i], cuts[i + 1]
+                local mid = piece.segOffset + (t0 + t1) / 2
+                local skipped = false
+                for _, skip in ipairs(skips) do
+                    if mid >= skip[1] and mid <= skip[2] then skipped = true end
+                end
+                if not skipped and t1 - t0 > 0.01 then
+                    local ax, ay = _pipes.pointOnPiece(piece, t0)
+                    local bx, by = _pipes.pointOnPiece(piece, t1)
+                    local a1, a2 = edge(ax, ay, nx, ny, piece.d0 + t0)
+                    local b1, b2 = edge(bx, by, nx, ny, piece.d0 + t1)
+                    quad(a1, a2, b1, b2)
+                end
+            end
+        end
+    end
+    for _, v in ipairs(verts) do v[1], v[2] = v[1] - ox, v[2] - oy end
+    local mesh = #verts >= 3 and love.graphics.newMesh(verts, "triangles", "static") or nil
+    local shape = {}
+    for i, seg in ipairs(plan.segments) do
+        local hops, ranges = {}, {}
+        for j, d in ipairs(plan.hopDistances[i] or {}) do hops[j] = d end
+        for j, r in ipairs(plan.bundledRanges[i] or {}) do ranges[j] = { r.lo, r.hi } end
+        shape[i] = { seg[1] - ox, seg[2] - oy, seg[3] - ox, seg[4] - oy, hops = hops, ranges = ranges }
+    end
+    canvas._flowMeshes[w.id] = { plan = plan, width = widths.fluid, mesh = mesh, shape = shape }
+    return mesh
+end
+
+-- Releases the cached flow meshes of connectors that no longer exist.
+function _pipes.pruneFlowMeshes(canvas)
+    local cache = canvas._flowMeshes
+    if not cache then return end
+    local count = 0
+    for _ in pairs(cache) do count = count + 1 end
+    if count <= #canvas.wires then return end
+    local live = {}
+    for _, w in ipairs(canvas.wires) do live[w.id] = true end
+    for id, entry in pairs(cache) do
+        if not live[id] then
+            if entry.mesh then entry.mesh:release() end
+            cache[id] = nil
+        end
+    end
+end
+
+-- The moving streaks over every liquid pipe with fluid running through it.
+-- Drawn over the fluid, before its shine and the drained stretch, which covers
+-- the streaks where the pipe is empty.
+function _pipes.drawAllFlow(canvas, plans, isVisible)
+    if not _pipes.isLiquid(canvas) or canvas.mode ~= "control" then return end
+    _pipes.pruneFlowMeshes(canvas)
+    local shader
+    for _, w in ipairs(canvas.wires) do
+        local dir = w.pumpedDirection or w.gravityDirection
+        local plan = plans[w.id]
+        if w.fluidMoving and dir and plan and isVisible(plan) then
+            shader = shader or _pipes.flowShader()
+            if not shader then return end
+            local mesh = _pipes.flowMesh(canvas, w, plan)
+            if mesh then
+                local travel = canvas._chevronTravel or 0
+                local phase = ((dir == "reverse") and -travel or travel) % _pipes.FLOW_PERIOD
+                local prevShader = love.graphics.getShader()
+                love.graphics.setShader(shader)
+                shader:send("phase", phase)
+                shader:send("strength", _pipes.FLOW_STRENGTH)
+                love.graphics.setColor(1, 1, 1, 1)
+                love.graphics.draw(mesh, canvas.x + canvas.panX, canvas.y + canvas.panY)
+                love.graphics.setShader(prevShader)
+            end
+        end
+    end
 end
 
 -- Draws an orthogonal connector line between two anchors' centers, clamped
@@ -7206,11 +7782,11 @@ local function _wirePlansChanged(canvas)
         local sw = wires[i]
         if not sw then sw = {}; wires[i] = sw end
         if sw.id ~= w.id or sw.fromElementId ~= w.fromElementId or sw.toElementId ~= w.toElementId
-           or sw.directionOverride ~= w.directionOverride
+           or sw.directionOverride ~= w.directionOverride or sw.waypoints ~= w.waypoints
            or sw.fromTerminal ~= w.fromTerminal or sw.toTerminal ~= w.toTerminal then
             changed = true
-            sw.id, sw.fromElementId, sw.toElementId, sw.directionOverride =
-                w.id, w.fromElementId, w.toElementId, w.directionOverride
+            sw.id, sw.fromElementId, sw.toElementId, sw.directionOverride, sw.waypoints =
+                w.id, w.fromElementId, w.toElementId, w.directionOverride, w.waypoints
             sw.fromTerminal, sw.toTerminal = w.fromTerminal, w.toTerminal
         end
     end
@@ -7234,10 +7810,263 @@ end
 
 -- A finished wire's own routed segments between its two (already looked
 -- up) anchors, attaching at its fromTerminal/toTerminal where it has them.
+-- With a user-drawn path (w.waypoints, see _wirePath) it runs through each
+-- of its points in turn, each a corner: the leg out of a point starts square
+-- to the way the path came in, and goes straight on when the next stop lies
+-- dead ahead. Also returns the legs, {first, last} segment indices of each
+-- stretch between stops (start, each point, end), for EDIT PATH's handles.
 function _terminals.wireSegments(canvas, w, fromE, toE)
     local x1, y1, fromA, fromAxis = _terminals.wireEnd(canvas, fromE, w.fromTerminal)
     local x2, y2, toA, toAxis = _terminals.wireEnd(canvas, toE, w.toTerminal)
-    return _terminals.segments(canvas, x1, y1, fromA, fromAxis, x2, y2, toA, toAxis, _wireForceAxis(w))
+    if not w.waypoints or #w.waypoints == 0 then
+        local segments = _terminals.segments(canvas, x1, y1, fromA, fromAxis, x2, y2, toA, toAxis, _wireForceAxis(w))
+        return segments, { { first = 1, last = #segments } }
+    end
+    local stops = { { x1, y1, fromA, fromAxis } }
+    for _, point in ipairs(w.waypoints) do
+        local px, py = _toPixel(canvas, point.x, point.y)
+        table.insert(stops, { px, py })
+    end
+    table.insert(stops, { x2, y2, toA, toAxis })
+    local segments, legs = {}, {}
+    for k = 1, #stops - 1 do
+        local a, b = stops[k], stops[k + 1]
+        local prev = segments[#segments]
+        local forceAxis = prev and ((prev[2] == prev[4]) and "v" or "h") or nil
+        -- A bend point leaves on that axis as if it were a port's exit, so the
+        -- leg can't start back along the stretch it arrived on, even into a
+        -- port or element that would otherwise pick the first axis itself.
+        local fromAxis = a[4] or forceAxis
+        local first = #segments + 1
+        for _, seg in ipairs(_terminals.segments(canvas, a[1], a[2], a[3], fromAxis, b[1], b[2], b[3], b[4], forceAxis)) do
+            table.insert(segments, seg)
+        end
+        legs[k] = { first = first, last = #segments }
+    end
+    return segments, legs
+end
+
+--------------------------------------------------------------------------------
+-- USER-DRAWN CONNECTOR PATHS (EDIT PATH on a connector's edit menu, any
+-- system). A connector's path is its list of bend points, w.waypoints, each
+-- {x, y} in canvas fractions snapped to the grid like an element's position;
+-- nil for the automatic route. While canvas.pathEdit = {wireId} is set:
+-- drag a point to move it, drag a "+" at the middle of any stretch to put a
+-- new point there, tap a point to remove it, tap anywhere else to finish.
+-- A global table, like _shapePoly, since this file is at Lua's 200-local
+-- ceiling.
+--------------------------------------------------------------------------------
+_wirePath = {}
+_wirePath.POINT_RADIUS_PX = 7     -- a bend point's handle
+_wirePath.INSERT_RADIUS_PX = 6    -- a "+" handle
+_wirePath.HIT_PX = 24             -- how far off a handle a touch still takes it
+_wirePath.MIN_LEG_PX = 36         -- stretches shorter than this on screen get no "+"
+
+-- A copy of w's points, to change and then store as a new table (the wire
+-- route cache spots an edit by the table changing, see _wirePlansChanged).
+function _wirePath.copy(w)
+    local points = {}
+    for i, p in ipairs(w.waypoints or {}) do points[i] = { x = p.x, y = p.y } end
+    return points
+end
+
+-- The handles EDIT PATH shows for w, routed as plan: {kind = "point", index}
+-- at each bend point, then {kind = "insert", index} at the middle of each
+-- stretch long enough for one, index being where a new point goes in w.waypoints.
+function _wirePath.handles(canvas, w, plan)
+    local handles = {}
+    for i, p in ipairs(w.waypoints or {}) do
+        local px, py = _toPixel(canvas, p.x, p.y)
+        table.insert(handles, { kind = "point", index = i, x = px, y = py })
+    end
+    for k, leg in ipairs(plan.legs or {}) do
+        local total = 0
+        for s = leg.first, leg.last do
+            local seg = plan.segments[s]
+            total = total + math.abs(seg[3] - seg[1]) + math.abs(seg[4] - seg[2])
+        end
+        if total >= _wirePath.MIN_LEG_PX then
+            local remaining = total / 2
+            for s = leg.first, leg.last do
+                local seg = plan.segments[s]
+                local len = math.abs(seg[3] - seg[1]) + math.abs(seg[4] - seg[2])
+                if remaining <= len and len > 0 then
+                    local t = remaining / len
+                    table.insert(handles, { kind = "insert", index = k,
+                        x = seg[1] + (seg[3] - seg[1]) * t, y = seg[2] + (seg[4] - seg[2]) * t })
+                    break
+                end
+                remaining = remaining - len
+            end
+        end
+    end
+    return handles
+end
+
+-- w's route as it stands now, {segments, legs}, worked out fresh. nil if an end is missing.
+function _wirePath.plan(canvas, w)
+    local fromE, toE = _findAnchor(canvas, w.fromElementId), _findAnchor(canvas, w.toElementId)
+    if not (fromE and toE) then return nil end
+    local segments, legs = _terminals.wireSegments(canvas, w, fromE, toE)
+    return { segments = segments, legs = legs }
+end
+
+-- The handle of the wire being edited nearest x,y, within reach; bend points
+-- win over "+" handles. nil if none.
+function _wirePath.hitHandle(canvas, w, x, y)
+    local plan = _wirePath.plan(canvas, w)
+    if not plan then return nil end
+    local best, bestDistSq
+    local reach = _wirePath.HIT_PX * _wirePath.HIT_PX
+    for _, handle in ipairs(_wirePath.handles(canvas, w, plan)) do
+        local distSq = (handle.x - x) ^ 2 + (handle.y - y) ^ 2
+        if distSq <= reach then
+            local better = not best or (handle.kind == "point" and best.kind ~= "point")
+                or (handle.kind == best.kind and distSq < bestDistSq)
+            if better then best, bestDistSq = handle, distSq end
+        end
+    end
+    return best
+end
+
+-- Puts w's point `index` at the grid point nearest pixel x,y. True if it moved.
+function _wirePath.movePoint(canvas, w, index, x, y)
+    local fx, fy = _snapToGrid(canvas, _toFraction(canvas, x, y))
+    local current = w.waypoints and w.waypoints[index]
+    if not current or (math.abs(current.x - fx) < 1e-9 and math.abs(current.y - fy) < 1e-9) then return false end
+    local points = _wirePath.copy(w)
+    points[index] = { x = fx, y = fy }
+    w.waypoints = points
+    return true
+end
+
+function _wirePath.start(canvasName, wireId)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return end
+    gdsGui_schematic_cancelPlacement(canvasName)
+    canvas.pathEdit = { wireId = wireId }
+    canvas.selectedWireId = wireId
+end
+
+function _wirePath.finish(canvas)
+    canvas.pathEdit = nil
+    canvas.selectedWireId = nil
+end
+
+-- A press while EDIT PATH is on (see gdsGui_schematic_pressed): takes a
+-- handle, or finishes editing. A "+" puts its new point in straight away
+-- (one undo step); a bend point's undo step is only kept once it's dragged
+-- or removed.
+function _wirePath.press(canvas, touchId, x, y)
+    local w = _findWire(canvas, canvas.pathEdit.wireId)
+    local handle = w and _wirePath.hitHandle(canvas, w, x, y)
+    if not handle then
+        _wirePath.finish(canvas)
+        return
+    end
+    if handle.kind == "insert" then
+        _pushUndo(canvas)
+        local fx, fy = _snapToGrid(canvas, _toFraction(canvas, handle.x, handle.y))
+        local points = _wirePath.copy(w)
+        table.insert(points, handle.index, { x = fx, y = fy })
+        w.waypoints = points
+        gdsGui_haptics_feedback("light")
+    else
+        canvas._pendingDragUndoSnapshot = _snapshotState(canvas)
+        gdsGui_haptics_feedback("selection")
+    end
+    canvas.pathEdit.index = handle.index
+    canvas.pathEdit.inserted = handle.kind == "insert"
+    canvas.pathEdit.grabX, canvas.pathEdit.grabY = handle.x - x, handle.y - y
+    canvas.focusTouchId = touchId
+    canvas.dragKind = "pathPoint"
+    canvas.dragMoved = false
+    canvas.dragStartX, canvas.dragStartY = x, y
+end
+
+-- The drag of a bend point, snapping to the grid with a tick at each step.
+function _wirePath.move(canvas, x, y)
+    local edit = canvas.pathEdit
+    if not canvas.dragMoved and (math.abs(x - canvas.dragStartX) > _ELEMENT_TAP_SLOP_PX or
+                                 math.abs(y - canvas.dragStartY) > _ELEMENT_TAP_SLOP_PX) then
+        canvas.dragMoved = true
+        if canvas._pendingDragUndoSnapshot then
+            _commitUndoSnapshot(canvas, canvas._pendingDragUndoSnapshot)
+            canvas._pendingDragUndoSnapshot = nil
+        end
+    end
+    if not canvas.dragMoved then return end
+    local w = _findWire(canvas, edit.wireId)
+    if w and _wirePath.movePoint(canvas, w, edit.index, x + edit.grabX, y + edit.grabY) then
+        gdsGui_haptics_feedback("selection")
+    end
+end
+
+-- The end of a handle's press: a bend point tapped (not dragged) is removed.
+function _wirePath.release(canvas)
+    local edit = canvas.pathEdit
+    local w = _findWire(canvas, edit.wireId)
+    if w and not canvas.dragMoved and not edit.inserted then
+        if canvas._pendingDragUndoSnapshot then
+            _commitUndoSnapshot(canvas, canvas._pendingDragUndoSnapshot)
+            canvas._pendingDragUndoSnapshot = nil
+        end
+        local points = _wirePath.copy(w)
+        table.remove(points, edit.index)
+        w.waypoints = #points > 0 and points or nil
+        gdsGui_haptics_feedback("light")
+    end
+    edit.index, edit.inserted = nil, nil
+    _notifyChanged(canvas)
+end
+
+-- The handles over the wire being edited, and what to do next.
+function _wirePath.draw(canvas)
+    local edit = canvas.pathEdit
+    if not edit then return end
+    local w = _findWire(canvas, edit.wireId)
+    local plan = w and canvas._wirePlansCache and canvas._wirePlansCache[w.id]
+    if not plan then return end
+    local accent = { 0.04, 0.52, 1, 1 }
+    for _, handle in ipairs(_wirePath.handles(canvas, w, plan)) do
+        if handle.kind == "insert" then
+            local r = _wirePath.INSERT_RADIUS_PX
+            love.graphics.setColor(0, 0, 0, 0.55)
+            love.graphics.circle("fill", handle.x, handle.y, r + 1.5)
+            love.graphics.setColor(1, 1, 1, 0.92)
+            love.graphics.circle("fill", handle.x, handle.y, r)
+            love.graphics.setColor(accent)
+            love.graphics.setLineWidth(2)
+            love.graphics.line(handle.x - r * 0.55, handle.y, handle.x + r * 0.55, handle.y)
+            love.graphics.line(handle.x, handle.y - r * 0.55, handle.x, handle.y + r * 0.55)
+        end
+    end
+    for _, handle in ipairs(_wirePath.handles(canvas, w, plan)) do
+        if handle.kind == "point" then
+            local r = _wirePath.POINT_RADIUS_PX * ((edit.index == handle.index and canvas.dragKind == "pathPoint") and 1.3 or 1)
+            love.graphics.setColor(0, 0, 0, 0.55)
+            love.graphics.circle("fill", handle.x, handle.y, r + 2.5)
+            love.graphics.setColor(1, 1, 1, 1)
+            love.graphics.circle("fill", handle.x, handle.y, r + 1.5)
+            love.graphics.setColor(accent)
+            love.graphics.circle("fill", handle.x, handle.y, r)
+        end
+    end
+    love.graphics.setLineWidth(1)
+    love.graphics.setFont(globApp.appFont or love.graphics.getFont())
+    love.graphics.setColor(1, 1, 1, 1)
+    local hint = (w.waypoints and #w.waypoints > 0) and "DRAG + TO ADD A BEND\nTAP A BEND TO REMOVE IT\nTAP AWAY WHEN DONE"
+        or "DRAG A + TO ADD A BEND\nTAP AWAY WHEN DONE"
+    local font = love.graphics.getFont()
+    local width = canvas.w - 16
+    local _, lines = font:getWrap(hint, width)
+    local textW = 0
+    for _, line in ipairs(lines) do textW = math.max(textW, font:getWidth(line)) end
+    local plateH = #lines * font:getHeight() + 8
+    love.graphics.setColor(0, 0, 0, 0.6)
+    love.graphics.rectangle("fill", canvas.x + (canvas.w - textW) / 2 - 8, canvas.y + 2, textW + 16, plateH, 6, 6)
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.printf(hint, canvas.x + 8, canvas.y + 6, width, "center")
 end
 
 
@@ -7289,8 +8118,8 @@ local function _computeWirePlans(canvas)
         for _, w in ipairs(canvas.wires) do
             local fromE, toE = _findAnchor(canvas, w.fromElementId), _findAnchor(canvas, w.toElementId)
             if fromE and toE then
-                local segments = _terminals.wireSegments(canvas, w, fromE, toE)
-                plans[w.id] = { segments = segments, hopDistances = {}, bundledRanges = {} }
+                local segments, legs = _terminals.wireSegments(canvas, w, fromE, toE)
+                plans[w.id] = { segments = segments, legs = legs, hopDistances = {}, bundledRanges = {} }
             end
         end
         return plans, {}
@@ -7309,8 +8138,8 @@ local function _computeWirePlans(canvas)
     for order, w in ipairs(canvas.wires) do
         local fromE, toE = _findAnchor(canvas, w.fromElementId), _findAnchor(canvas, w.toElementId)
         if fromE and toE then
-            local segments = _terminals.wireSegments(canvas, w, fromE, toE)
-            plans[w.id] = { segments = segments, hopDistances = {}, bundledRanges = {} }
+            local segments, legs = _terminals.wireSegments(canvas, w, fromE, toE)
+            plans[w.id] = { segments = segments, legs = legs, hopDistances = {}, bundledRanges = {} }
             for segIdx, seg in ipairs(segments) do
                 local horiz = (seg[2] == seg[4])
                 local loAbs, hiAbs
@@ -7398,6 +8227,7 @@ local function _computeWirePlans(canvas)
         end
     end
 
+    if canvas.pipeConnectors then _pipes.snapPlans(plans, bundles) end
     canvas._wirePlansCache = plans
     canvas._wireBundlesCache = bundles
     return plans, bundles
@@ -7498,6 +8328,9 @@ function _glow.ensureResources()
     if not _glow.canvasA or _glow.canvasA:getWidth() ~= w or _glow.canvasA:getHeight() ~= h then
         _glow.canvasA = love.graphics.newCanvas(w, h)
         _glow.canvasB = love.graphics.newCanvas(w, h)
+        -- Drawn back at full size: linear, so the glow scales up soft rather than blocky.
+        _glow.canvasA:setFilter("linear", "linear")
+        _glow.canvasB:setFilter("linear", "linear")
     end
     return true
 end
@@ -7594,11 +8427,11 @@ function _glow.finish(canvas)
 end
 
 -- Glow source for a wire: its own path, a little wider than the wire.
-function _glow.wire(plan, zoom, wireWidth, r, g, b)
+function _glow.wire(plan, zoom, wireWidth, r, g, b, bendRadius)
     _glow.capture(function()
         love.graphics.setColor(r, g, b, 1)
         love.graphics.setLineWidth(wireWidth * _glow.WIRE_WIDTH)
-        _drawWirePlanSegments(plan, zoom)
+        _drawWirePlanSegments(plan, zoom, bendRadius)
     end)
 end
 
@@ -7621,15 +8454,315 @@ function _glow.haloStriped(canvas, x, y, w, h, colors, drawFn)
     end)
 end
 
+--------------------------------------------------------------------------------
+-- SELECTION: one look for a selected element, control or connector in the
+-- editor. A rounded frame in the accent color just outside an element's or
+-- control's footprint (or along a reshaped tank's own outline), with a faint
+-- fill, a soft halo and corner handles; a connector gets the halo along its
+-- own path, a dot at each end and a light frame on the two things it joins.
+-- Selecting fades it in and deselecting fades it out. Holding to unlock move
+-- mode traces the frame (or the connector) as the hold fills. Once unlocked,
+-- the item lifts: a little larger, with a shadow, its frame slowly pulsing,
+-- and a connector's halo marching along it. A global table, like _shapePoly,
+-- since this file is at Lua's 200-local ceiling.
+--------------------------------------------------------------------------------
+_selection = {}
+_selection.ACCENT = { 0.04, 0.52, 1 }
+_selection.PAD_PX = 4             -- frame's clearance outside the footprint
+_selection.RADIUS_PX = 6          -- frame corner radius
+_selection.HANDLE_PX = 3.5        -- corner handle half-size
+_selection.FADE_SECONDS = 0.12
+_selection.LIFT_SECONDS = 0.15
+_selection.LIFT_SCALE = 0.04      -- how much larger a lifted item draws
+_selection.PULSE_SECONDS = 1.2
+_selection.HOLD_SHOW_AFTER = 0.2  -- a hold shows its progress only once it's clearly not a tap
+_selection.DASH_PX = 6
+_selection.DASH_SPEED = 24        -- pixels a second the marching dashes travel
+-- Halo layers, widest and faintest first: {extra width in pixels, strength}.
+_selection.HALO = { { 14, 0.16 }, { 8, 0.28 }, { 4, 0.42 } }
+
+function _selection.now() return love.timer.getTime() end
+
+function _selection.setAccent(alpha)
+    local a = _selection.ACCENT
+    love.graphics.setColor(a[1], a[2], a[3], alpha)
+end
+
+-- Notes that `key` is drawn selected this frame; returns its fade-in, 0 to 1.
+function _selection.mark(canvas, key)
+    local now = _selection.now()
+    if canvas._selKey ~= key then
+        canvas._selKey, canvas._selSince = key, now
+    end
+    canvas._selDrawn = key
+    return math.min(1, (now - canvas._selSince) / _selection.FADE_SECONDS)
+end
+
+-- Keeps drawFn(alpha), how `key` is drawn selected, so it can fade out once
+-- deselected (see _selection.endFrame).
+function _selection.remember(canvas, key, drawFn)
+    canvas._selGhost = { key = key, fn = drawFn }
+end
+
+-- After everything else on the canvas: fades out a selection that's just gone.
+function _selection.endFrame(canvas)
+    local ghost = canvas._selGhost
+    if ghost and ghost.key ~= canvas._selDrawn then
+        local now = _selection.now()
+        ghost.endedAt = ghost.endedAt or now
+        local alpha = 1 - (now - ghost.endedAt) / _selection.FADE_SECONDS
+        if alpha <= 0 then canvas._selGhost = nil else ghost.fn(alpha) end
+    end
+    if not canvas._selDrawn then canvas._selKey = nil end
+    canvas._selDrawn = nil
+end
+
+-- How far the selected item is lifted (move mode unlocked), 0 to 1, eased.
+function _selection.lift(canvas)
+    if not canvas.selectionMoveModeActive then return 0 end
+    local t = (_selection.now() - (canvas._liftStartedAt or 0)) / _selection.LIFT_SECONDS
+    t = math.min(1, math.max(0, t))
+    return 1 - (1 - t) ^ 3
+end
+
+-- The frame's slow pulse while lifted: a multiplier on its stroke, 0.7 to 1.
+function _selection.pulse(lift)
+    if lift <= 0 then return 1 end
+    local phase = (_selection.now() % _selection.PULSE_SECONDS) / _selection.PULSE_SECONDS
+    return 1 - lift * 0.15 * (1 - math.cos(phase * 2 * math.pi))
+end
+
+-- A soft accent glow: strokeFn(extra) strokes the shape `extra` pixels wider
+-- than its own line, once per layer. Lighten (dark theme) or darken (light)
+-- blending, so where strokes overlap (a connector's joints) the glow doesn't
+-- build up; plain alpha if the device can't blend that way.
+function _selection.halo(strokeFn, alpha)
+    local dark = globApp.themeIsDark ~= false
+    local prevMode, prevAlphaMode = love.graphics.getBlendMode()
+    local blended = pcall(love.graphics.setBlendMode, dark and "lighten" or "darken", "premultiplied")
+    local accent = _selection.ACCENT
+    for _, layer in ipairs(_selection.HALO) do
+        local a = layer[2] * alpha
+        if not blended then
+            love.graphics.setColor(accent[1], accent[2], accent[3], a * 0.6)
+        elseif dark then
+            love.graphics.setColor(accent[1] * a, accent[2] * a, accent[3] * a, a)
+        else
+            love.graphics.setColor(1 - (1 - accent[1]) * a, 1 - (1 - accent[2]) * a, 1 - (1 - accent[3]) * a, 1)
+        end
+        strokeFn(layer[1])
+    end
+    love.graphics.setBlendMode(prevMode, prevAlphaMode)
+end
+
+-- The rounded frame around a footprint x,y,w,h (see the section header).
+function _selection.drawFrame(x, y, w, h, alpha, lift)
+    local pad, r = _selection.PAD_PX, _selection.RADIUS_PX
+    local fx, fy, fw, fh = x - pad, y - pad, w + pad * 2, h + pad * 2
+    local stroke = 2 * gdsGui_general_hairline()
+    local prevWidth = love.graphics.getLineWidth()
+    _selection.halo(function(extra)
+        love.graphics.setLineWidth(stroke + extra)
+        love.graphics.rectangle("line", fx, fy, fw, fh, r, r)
+    end, alpha)
+    _selection.setAccent(0.08 * alpha)
+    love.graphics.rectangle("fill", fx, fy, fw, fh, r, r)
+    love.graphics.setLineWidth(stroke)
+    _selection.setAccent(alpha * _selection.pulse(lift or 0))
+    love.graphics.rectangle("line", fx, fy, fw, fh, r, r)
+    local hs = _selection.HANDLE_PX
+    for _, corner in ipairs({ { fx, fy }, { fx + fw, fy }, { fx + fw, fy + fh }, { fx, fy + fh } }) do
+        love.graphics.setColor(1, 1, 1, alpha)
+        love.graphics.rectangle("fill", corner[1] - hs, corner[2] - hs, hs * 2, hs * 2, 1.5, 1.5)
+        _selection.setAccent(alpha)
+        love.graphics.rectangle("line", corner[1] - hs, corner[2] - hs, hs * 2, hs * 2, 1.5, 1.5)
+    end
+    love.graphics.setLineWidth(prevWidth)
+end
+
+-- The same treatment along a reshaped tank's own outline (no corner handles:
+-- its reshape mode has its own).
+function _selection.drawOutline(canvas, e, alpha, lift)
+    local stroke = 2 * gdsGui_general_hairline()
+    local prevWidth = love.graphics.getLineWidth()
+    _selection.halo(function(extra)
+        love.graphics.setLineWidth(stroke + extra)
+        _shapePoly.strokeOutline(canvas, e)
+    end, alpha)
+    love.graphics.setLineWidth(stroke)
+    _selection.setAccent(alpha * _selection.pulse(lift or 0))
+    _shapePoly.strokeOutline(canvas, e)
+    love.graphics.setLineWidth(prevWidth)
+end
+
+-- How far through the hold that unlocks move mode a press on `kind` is, 0 to
+-- 1, shown only once it's clearly a hold. nil when there's no such hold.
+function _selection.holdFraction(canvas, kind)
+    if canvas.dragKind ~= "pendingLongPress" or canvas.longPressTargetKind ~= kind then return nil end
+    if not canvas.focusTouchId or canvas.dragMoved then return nil end
+    local holdSeconds = _LONG_PRESS_SECONDS
+    if kind == "element" then
+        local e = canvas.selectedElementId and _findElement(canvas, canvas.selectedElementId)
+        if e and _shapePoly.allowed(canvas, e) then holdSeconds = _shapePoly.HOLD_SECONDS end
+    end
+    local show = _selection.HOLD_SHOW_AFTER
+    local elapsed = canvas.longPressElapsed or 0
+    if elapsed < show then return nil end
+    return math.min(1, (elapsed - show) / (holdSeconds - show))
+end
+
+-- The frame around x,y,w,h traced clockwise from its top middle, `fraction` of
+-- the way round, over a faint track: a hold's progress.
+function _selection.drawHoldTrace(x, y, w, h, fraction)
+    local pad, r = _selection.PAD_PX, _selection.RADIUS_PX
+    local fx, fy, fw, fh = x - pad, y - pad, w + pad * 2, h + pad * 2
+    r = math.min(r, fw / 2, fh / 2)
+    local points = { fx + fw / 2, fy }
+    local corners = { { fx + fw - r, fy + r, -math.pi / 2 }, { fx + fw - r, fy + fh - r, 0 },
+        { fx + r, fy + fh - r, math.pi / 2 }, { fx + r, fy + r, math.pi } }
+    for _, corner in ipairs(corners) do
+        for k = 0, 6 do
+            local angle = corner[3] + (math.pi / 2) * k / 6
+            points[#points + 1] = corner[1] + math.cos(angle) * r
+            points[#points + 1] = corner[2] + math.sin(angle) * r
+        end
+    end
+    points[#points + 1], points[#points + 2] = fx + fw / 2, fy
+    local total = 0
+    for i = 3, #points, 2 do
+        total = total + math.sqrt((points[i] - points[i - 2]) ^ 2 + (points[i + 1] - points[i - 1]) ^ 2)
+    end
+    local prevWidth = love.graphics.getLineWidth()
+    local width = 4 * gdsGui_general_hairline() + 1
+    love.graphics.setLineWidth(width)
+    love.graphics.setColor(1, 1, 1, 0.25)
+    love.graphics.line(points)
+    local remaining = total * fraction
+    local traced = { points[1], points[2] }
+    for i = 3, #points, 2 do
+        if remaining <= 0 then break end
+        local len = math.sqrt((points[i] - points[i - 2]) ^ 2 + (points[i + 1] - points[i - 1]) ^ 2)
+        local t = len > 0 and math.min(1, remaining / len) or 1
+        traced[#traced + 1] = points[i - 2] + (points[i] - points[i - 2]) * t
+        traced[#traced + 1] = points[i - 1] + (points[i + 1] - points[i - 1]) * t
+        remaining = remaining - len
+    end
+    if #traced >= 4 then
+        _selection.setAccent(1)
+        love.graphics.line(traced)
+    end
+    love.graphics.setLineWidth(prevWidth)
+end
+
+-- Starts drawing a lifted item centered at cx,cy (footprint w by h): its shadow,
+-- then a transform that draws it a little larger. Pair with love.graphics.pop().
+function _selection.beginLift(cx, cy, w, h, lift)
+    local r = _selection.RADIUS_PX
+    for i = 3, 1, -1 do
+        local spread = i * 2 * lift
+        love.graphics.setColor(0, 0, 0, 0.12 * lift)
+        love.graphics.rectangle("fill", cx - w / 2 - spread, cy - h / 2 - spread + 3 * lift,
+            w + spread * 2, h + spread * 2, r + spread, r + spread)
+    end
+    love.graphics.push()
+    love.graphics.translate(cx, cy)
+    local scale = 1 + _selection.LIFT_SCALE * lift
+    love.graphics.scale(scale, scale)
+    love.graphics.translate(-cx, -cy)
+end
+
+-- The footprint of an element or control, for framing it: x, y, w, h.
+function _selection.anchorRect(canvas, anchor)
+    if _findElement(canvas, anchor.id) then return _elementFootprintRect(canvas, anchor) end
+    local cx, cy = _toPixel(canvas, anchor.x, anchor.y)
+    local half = canvas.controlRadius * canvas.zoom * (anchor.radiusScale or 1) + 4
+    return cx - half, cy - half, half * 2, half * 2
+end
+
+-- A selected connector's halo (and, once unlocked, its marching dashes), drawn
+-- under it. width: its own drawn width (the full pipe, for a pipe).
+function _selection.drawConnector(canvas, plan, width)
+    local key = "w:" .. tostring(canvas.selectedWireId)
+    local fade = _selection.mark(canvas, key)
+    local radius = _pipes.bendRadius(canvas)
+    local function draw(alpha)
+        local prevWidth = love.graphics.getLineWidth()
+        _selection.halo(function(extra)
+            love.graphics.setLineWidth(width + extra)
+            _drawWirePlanSegments(plan, canvas.zoom, radius)
+        end, alpha)
+        love.graphics.setLineWidth(prevWidth)
+    end
+    draw(fade)
+    _selection.remember(canvas, key, draw)
+    if canvas.selectionMoveModeActive then
+        local pieces, total = _pipes.pathPieces(canvas, plan)
+        local dash = _selection.DASH_PX
+        local offset = (_selection.now() * _selection.DASH_SPEED) % (dash * 2)
+        love.graphics.setLineWidth(width + 4)
+        _selection.setAccent(0.9 * _selection.lift(canvas))
+        local start = offset - dash * 2
+        while start < total do
+            local lo, hi = math.max(0, start), math.min(total, start + dash)
+            for _, piece in ipairs(pieces) do
+                local t0, t1 = math.max(0, lo - piece.d0), math.min(piece.len, hi - piece.d0)
+                if t1 - t0 > 0.01 then _pipes.strokePiece(piece, t0, t1) end
+            end
+            start = start + dash * 2
+        end
+        love.graphics.setLineWidth(1)
+    end
+end
+
+-- Over everything: the selected connector's end dots, a light frame on the two
+-- things it joins, and a hold's progress along it.
+function _selection.drawConnectorExtras(canvas, plans)
+    local w = canvas.selectedWireId and _findWire(canvas, canvas.selectedWireId)
+    local plan = w and plans[w.id]
+    if not plan or #plan.segments == 0 then return end
+    local alpha = canvas._selKey == "w:" .. w.id and math.min(1, (_selection.now() - (canvas._selSince or 0)) / _selection.FADE_SECONDS) or 1
+    for _, id in ipairs({ w.fromElementId, w.toElementId }) do
+        local anchor = _findAnchor(canvas, id)
+        if anchor then
+            local x, y, fw, fh = _selection.anchorRect(canvas, anchor)
+            local pad, r = _selection.PAD_PX, _selection.RADIUS_PX
+            love.graphics.setLineWidth(gdsGui_general_hairline() * 2)
+            _selection.setAccent(0.35 * alpha)
+            love.graphics.rectangle("line", x - pad, y - pad, fw + pad * 2, fh + pad * 2, r, r)
+        end
+    end
+    local first, last = plan.segments[1], plan.segments[#plan.segments]
+    for _, p in ipairs({ { first[1], first[2] }, { last[3], last[4] } }) do
+        love.graphics.setColor(1, 1, 1, alpha)
+        love.graphics.circle("fill", p[1], p[2], 5)
+        _selection.setAccent(alpha)
+        love.graphics.circle("fill", p[1], p[2], 3.5)
+    end
+    local fraction = _selection.holdFraction(canvas, "wire")
+    if fraction then
+        local pieces, total = _pipes.pathPieces(canvas, plan)
+        local widths = _pipes.widths(canvas)
+        love.graphics.setLineWidth((widths and widths.pipe or _WIRE_WIDTH_PX * canvas.zoom) + 4)
+        _selection.setAccent(0.9)
+        local reach = total * fraction
+        for _, piece in ipairs(pieces) do
+            local t1 = math.min(piece.len, reach - piece.d0)
+            if t1 > 0.01 then _pipes.strokePiece(piece, 0, t1) end
+        end
+    end
+    love.graphics.setLineWidth(1)
+    love.graphics.setColor(1, 1, 1, 1)
+end
+
 local function _drawWire(canvas, w, plan, signature)
     if not plan then return end
-    local wireWidth = _WIRE_WIDTH_PX * canvas.zoom
+    local wireWidth = _pipes.fluidWidth(canvas)
     if canvas.selectedWireId == w.id and not canvas.pipeConnectors then
         -- Same yellow/magenta selection emphasis as an element's outline
         -- (see its comment on gdsGui_schematic_update's long-press timer),
         -- drawn as a wider line underneath so it reads as a highlight
         -- around the wire. A pipe draws its own with its walls instead.
-        _pipes.drawSelection(canvas, plan, wireWidth + 2.4 * canvas.zoom)
+        _pipes.drawSelection(canvas, plan, wireWidth)
     end
 
     -- A wire fed by more than one source at once (see
@@ -7644,13 +8777,18 @@ local function _drawWire(canvas, w, plan, signature)
             local function setArcColor() love.graphics.setColor(arcColor[1], arcColor[2], arcColor[3], arcColor[4] or 1) end
             setArcColor()
             love.graphics.setLineWidth(arcWidth)
+            local bendRadius = _pipes.bendRadius(canvas)
+            local corners = bendRadius and _pipes.corners(plan, bendRadius)
             for idx, seg in ipairs(plan.segments) do
+                local before, after = corners and corners[idx - 1], corners and corners[idx]
                 _drawSegmentWithHopsAndGaps(seg[1], seg[2], seg[3], seg[4], plan.hopDistances[idx], plan.bundledRanges[idx], canvas.zoom,
                     function(ax, ay, bx, by)
                         if ax > bx or ay > by then ax, ay, bx, by = bx, by, ax, ay end
                         _drawWireBundleSegment(canvas, ax, ay, bx, by, colors, isHalo)
                         setArcColor()
-                    end)
+                    end, before and before.r, after and after.r)
+                -- A bend carries the run's first color, as a hop arc does.
+                if before then _pipes.drawBend(before) end
             end
         end
         for _, c in ipairs(colors) do
@@ -7662,10 +8800,11 @@ local function _drawWire(canvas, w, plan, signature)
         drawBands(colors[1], wireWidth)
     else
         local r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "wire", w.id, signature)
-        if _glow.applies(canvas, r, g, b) then _glow.wire(plan, canvas.zoom, wireWidth, r, g, b) end
+        local bendRadius = _pipes.bendRadius(canvas)
+        if _glow.applies(canvas, r, g, b) then _glow.wire(plan, canvas.zoom, wireWidth, r, g, b, bendRadius) end
         love.graphics.setColor(r, g, b, a)
         love.graphics.setLineWidth(wireWidth)
-        _drawWirePlanSegments(plan, canvas.zoom)
+        _drawWirePlanSegments(plan, canvas.zoom, bendRadius)
     end
     love.graphics.setLineWidth(1)
 end
@@ -7690,18 +8829,20 @@ local function _drawControl(canvas, c, signature)
         love.graphics.rectangle("line", cx - drawHalf, cy - drawHalf, drawHalf * 2, drawHalf * 2)
     end
     if canvas.selectedControlId == c.id then
-        -- Same yellow/magenta selection emphasis as an element's outline —
-        -- see its comment (including the half-opacity magenta).
-        if canvas.selectionMoveModeActive then
-            love.graphics.setColor(1, 0, 1, 0.5)
-        else
-            love.graphics.setColor(1, 1, 0, 1)
+        -- The same selection frame as an element's (see _selection), around
+        -- the control's square footprint.
+        local key = "c:" .. c.id
+        local lift = _selection.lift(canvas)
+        local function drawSelected(alpha)
+            _selection.drawFrame(cx - drawHalf, cy - drawHalf, drawHalf * 2, drawHalf * 2, alpha, lift)
         end
-        -- Square, not round — controls are sized in square grid units (see
-        -- gdsGui_schematic_armControlPlacement's gridSize), so a square
-        -- selection box reads as "this many grid squares" the same way an
-        -- element's own rectangular footprint does.
-        love.graphics.rectangle("line", cx - drawHalf, cy - drawHalf, drawHalf * 2, drawHalf * 2)
+        drawSelected(_selection.mark(canvas, key))
+        _selection.remember(canvas, key, drawSelected)
+        local holdFraction = _selection.holdFraction(canvas, "control")
+        if holdFraction then _selection.drawHoldTrace(cx - drawHalf, cy - drawHalf, drawHalf * 2, drawHalf * 2, holdFraction) end
+        -- The move/rotate overlay below draws in this color, translucent so it
+        -- doesn't compete with the item itself.
+        _selection.setAccent(0.5)
         if canvas.selectionMoveModeActive then
             -- Mutually exclusive, not both at once — see the matching
             -- comment in _drawElement.
@@ -7965,15 +9106,7 @@ function gdsGui_schematic_draw(pageName)
                 return visible
             end
             if canvas.pipeConnectors then
-                for _, w in ipairs(canvas.wires) do
-                    local plan = wirePlans[w.id]
-                    if plan and wireVisible(plan) then _pipes.drawWireWalls(canvas, w, plan) end
-                end
-                for _, bundle in ipairs(wireBundles) do
-                    local loX, hiX = math.min(bundle.x1, bundle.x2), math.max(bundle.x1, bundle.x2)
-                    local loY, hiY = math.min(bundle.y1, bundle.y2), math.max(bundle.y1, bundle.y2)
-                    if rectVisible(loX, loY, hiX - loX, hiY - loY) then _pipes.drawBundleWalls(canvas, bundle) end
-                end
+                _pipes.drawAllWalls(canvas, wirePlans, wireBundles, wireVisible, rectVisible)
             end
             for _, w in ipairs(canvas.wires) do
                 local plan = wirePlans[w.id]
@@ -8008,6 +9141,10 @@ function gdsGui_schematic_draw(pageName)
                     _drawWireBundleSegment(canvas, bundle.x1, bundle.y1, bundle.x2, bundle.y2, colors)
                 end
             end
+            if canvas.pipeConnectors then
+                _pipes.drawAllFlow(canvas, wirePlans, wireVisible)
+                _pipes.drawAllStreaks(canvas, wirePlans, wireBundles, wireVisible, rectVisible)
+            end
             -- Gravity-direction chevrons (see _pipes.drawGravityChevrons):
             -- drawn in their own pass, after both the per-wire fluid lines
             -- AND the bundle color bands above, so a chevron on a stretch
@@ -8024,17 +9161,31 @@ function gdsGui_schematic_draw(pageName)
             end
             for _, e in ipairs(canvas.elements) do
                 local ex, ey, ew, eh = _elementFootprintRect(canvas, e)
-                if rectVisible(ex, ey, ew, eh) then _drawElement(canvas, e, signature) end
+                if rectVisible(ex, ey, ew, eh) then
+                    -- A selected element with move mode unlocked draws lifted (see _selection).
+                    local lift = canvas.selectedElementId == e.id and _selection.lift(canvas) or 0
+                    if lift > 0 then _selection.beginLift(ex + ew / 2, ey + eh / 2, ew, eh, lift) end
+                    _drawElement(canvas, e, signature)
+                    if lift > 0 then love.graphics.pop() end
+                end
             end
             for _, c in ipairs(canvas.controls) do
                 local ccx, ccy = _toPixel(canvas, c.x, c.y)
                 local crad = canvas.controlRadius * canvas.zoom * (c.radiusScale or 1)
-                if not c.hidden and rectVisible(ccx - crad, ccy - crad, crad * 2, crad * 2) then _drawControl(canvas, c, signature) end
+                if not c.hidden and rectVisible(ccx - crad, ccy - crad, crad * 2, crad * 2) then
+                    local lift = canvas.selectedControlId == c.id and _selection.lift(canvas) or 0
+                    if lift > 0 then _selection.beginLift(ccx, ccy, crad * 2, crad * 2, lift) end
+                    _drawControl(canvas, c, signature)
+                    if lift > 0 then love.graphics.pop() end
+                end
             end
             _glow.finish(canvas)
             _drawAnnunciators(canvas)
             drawAiCulpritHighlight(canvas)
             _terminals.drawPick(canvas)
+            _selection.drawConnectorExtras(canvas, wirePlans)
+            _wirePath.draw(canvas)
+            _selection.endFrame(canvas)
 
             if canvas.wireTool.fromId then
                 local fromE = _findAnchor(canvas, canvas.wireTool.fromId)
@@ -8316,6 +9467,11 @@ function gdsGui_schematic_pressed(touchId, x, y)
 
         if canvas.focusTouchId ~= nil then goto continue end
 
+        if canvas.pathEdit and canvas.mode == "design" then
+            _wirePath.press(canvas, touchId, x, y)
+            goto continue
+        end
+
         if canvas.mode == "control" then
             -- Pure "operate" mode: the only thing a tap can do is cycle a
             -- control. Color assignment and snapshot capture are design-mode
@@ -8365,6 +9521,7 @@ function gdsGui_schematic_pressed(touchId, x, y)
                 candHalfY = candHalfX
             end
             if _footprintOverlapsAnother(canvas, candCx, candCy, candHalfX, candHalfY, nil) then
+                gdsGui_haptics_feedback("error")
                 gdsGui_schematic_openMenu(canvas.name, "CAN'T PLACE HERE — IT OVERLAPS ANOTHER ELEMENT.", {"OK"},
                     "gdsGui_schematic_internal_onPlacementOverlapDismissed", nil)
                 goto continue
@@ -8504,6 +9661,7 @@ function gdsGui_schematic_pressed(touchId, x, y)
             canvas.pendingWirePortPick = nil
             local index = anchor and _terminals.pickAt(canvas, anchor, x, y)
             if index then
+                gdsGui_haptics_feedback("selection")
                 canvas.focusTouchId          = touchId
                 canvas.wireTool.fromId       = anchor.id
                 canvas.wireTool.fromTerminal = index
@@ -8554,17 +9712,22 @@ function gdsGui_schematic_pressed(touchId, x, y)
             canvas.pendingPort = nil
             local tank = _findElement(canvas, pending.elementId)
             if tank then
+                local done
                 if pending.removing then
-                    _shapePoly.removePortAt(canvas, tank, x, y)
+                    done = _shapePoly.removePortAt(canvas, tank, x, y)
                 elseif pending.moving == true then
                     -- MOVE PORT's first tap picks the port; off every port cancels.
                     local index = _terminals.pickAt(canvas, tank, x, y)
-                    if index then canvas.pendingPort = { elementId = tank.id, moving = index } end
+                    if index then
+                        canvas.pendingPort = { elementId = tank.id, moving = index }
+                        gdsGui_haptics_feedback("selection")
+                    end
                 elseif pending.moving then
-                    _shapePoly.movePortTo(canvas, tank, pending.moving, x, y)
+                    done = _shapePoly.movePortTo(canvas, tank, pending.moving, x, y)
                 else
-                    _shapePoly.addPortAt(canvas, tank, x, y)
+                    done = _shapePoly.addPortAt(canvas, tank, x, y)
                 end
+                if done then gdsGui_haptics_feedback("light") end
             end
             goto continue
         end
@@ -8863,9 +10026,19 @@ function gdsGui_schematic_moved(touchId, x, y)
 
         if canvas.focusTouchId ~= touchId then goto continue end
 
-        if canvas.wireTool.fromId then
+        if canvas.dragKind == "pathPoint" and canvas.pathEdit then
+            _wirePath.move(canvas, x, y)
+        elseif canvas.wireTool.fromId then
             canvas.wireTool.curX = x
             canvas.wireTool.curY = y
+            -- A tick each time the loose end locks onto a new element or
+            -- port, as the drag preview does (see _connectorSnapTarget).
+            local snapTarget, snapTerminal = _connectorSnapTarget(canvas)
+            local snapKey = snapTarget and (snapTarget.id .. "#" .. tostring(snapTerminal)) or nil
+            if snapKey ~= canvas.wireTool.snapKey then
+                canvas.wireTool.snapKey = snapKey
+                if snapKey then gdsGui_haptics_feedback("selection") end
+            end
         elseif canvas.dragKind == "paint" then
             -- Moved too far to count as a tap — cancels the pending paint
             -- outright (gdsGui_schematic_released below only applies it when
@@ -8971,6 +10144,7 @@ function gdsGui_schematic_moved(touchId, x, y)
                 local pw, ph = elem.w * canvas.contentW * canvas.zoom, elem.h * canvas.contentH * canvas.zoom
                 if _isQuarterTurnRotation(candRotation) then pw, ph = ph, pw end
                 if not _footprintOverlapsAnother(canvas, cx, cy, pw / 2, ph / 2, elem.id) then
+                    if elem.rotation ~= candRotation then gdsGui_haptics_feedback("selection") end
                     elem.rotation = candRotation
                 end
             end
@@ -9031,7 +10205,9 @@ function gdsGui_schematic_moved(touchId, x, y)
             if ctrl then
                 local cx, cy = _toPixel(canvas, ctrl.x, ctrl.y)
                 local rawAngle = math.atan2(y - cy, x - cx) - canvas.rotateGrabAngleOffset
-                ctrl.rotation = _snapRotationDegrees(rawAngle)
+                local snapped = _snapRotationDegrees(rawAngle)
+                if ctrl.rotation ~= snapped then gdsGui_haptics_feedback("selection") end
+                ctrl.rotation = snapped
             end
             if not canvas.dragMoved and
                (math.abs(x - canvas.dragStartX) > _ELEMENT_TAP_SLOP_PX or
@@ -9213,7 +10389,9 @@ function gdsGui_schematic_released(touchId, x, y)
             goto continue
         end
         if canvas.focusTouchId == touchId then
-            if canvas.dragKind == "paint" then
+            if canvas.dragKind == "pathPoint" and canvas.pathEdit then
+                _wirePath.release(canvas)
+            elseif canvas.dragKind == "paint" then
                 -- Only a clean tap (never crossed the slop threshold —
                 -- gdsGui_schematic_moved) actually paints; a tap that turned
                 -- into a drag/pan gesture applies nothing, matching every
@@ -9234,6 +10412,7 @@ function gdsGui_schematic_released(touchId, x, y)
                     fromTerminal = _terminals.nearest(canvas, fromElem, ox, oy)
                 end
                 canvas.wireTool.fromTerminal = nil
+                canvas.wireTool.snapKey = nil
                 -- A port picked by pendingWirePortPick and then only tapped:
                 -- stay armed from that port, so the next drag can start
                 -- anywhere and still leave from it. A drag that ends on
@@ -9251,6 +10430,7 @@ function gdsGui_schematic_released(touchId, x, y)
                     or twoTerminalAnchorAtWireLimit(canvas, toElem.id, toTerminal))
                 if toElem then
                     if limitNotice then
+                        gdsGui_haptics_feedback("error")
                         gdsGui_schematic_openMenu(canvas.name, limitNotice, {"OK"},
                             "gdsGui_schematic_internal_onTwoTerminalWireLimitDismissed", nil)
                     else
@@ -9280,6 +10460,7 @@ function gdsGui_schematic_released(touchId, x, y)
                             local baseId = canvas.wireTool.fromId .. "_to_" .. toElem.id
                             gdsGui_schematic_addWire(canvas.name, _uniqueWireId(canvas, baseId),
                                 canvas.wireTool.fromId, toElem.id, pendingColor, nil, fromTerminal, toTerminal)
+                            gdsGui_haptics_feedback("medium")
                             canvas.snapshots = {}
                             _notifyChanged(canvas)
                         end
@@ -9445,7 +10626,7 @@ function gdsGui_schematic_update(dt)
                 canvas._annunciatorPanelPressedHit = nil
                 canvas._annunciatorPanelLongPressElapsed = 0
                 if a then
-                    gdsGui_haptics_vibrate()
+                    gdsGui_haptics_feedback("medium")
                     gdsGui_schematic_openAnnunciatorEditMenu(canvas.name, a.id)
                 end
             end
@@ -9476,7 +10657,8 @@ function gdsGui_schematic_update(dt)
         canvas.selectionMoveModeActive = true
         canvas.rotateModeActive = false
         canvas.reshapeModeActive = false
-        gdsGui_haptics_vibrate()
+        canvas._liftStartedAt = love.timer.getTime()
+        gdsGui_haptics_feedback("medium")
         local touch = canvas.touches[canvas.focusTouchId]
         local x = touch and touch.x or canvas.dragStartX
         local y = touch and touch.y or canvas.dragStartY
@@ -9664,7 +10846,7 @@ end
 local _galleryImageCache = {}
 local function _loadGalleryImage(path)
     if not _galleryImageCache[path] then
-        _galleryImageCache[path] = love.graphics.newImage(path)
+        _galleryImageCache[path] = gdsGui_schematic_internal_loadSmoothImage(path)
     end
     return _galleryImageCache[path]
 end
@@ -9734,7 +10916,14 @@ local function _drawMiniDiagram(elements, wires, controls, tx, ty, tw, th)
             local c = w.defaultColor or _DEFAULT_COLOR
             love.graphics.setColor(c[1], c[2], c[3], c[4])
             love.graphics.setLineWidth(2)
-            _drawOrthogonalLine(x1, y1, x2, y2)
+            -- Through a user-drawn path's points (see _wirePath), if it has one.
+            local px, py = x1, y1
+            for _, p in ipairs(w.waypoints or {}) do
+                local qx, qy = toPixel(p.x, p.y)
+                _drawOrthogonalLine(px, py, qx, qy)
+                px, py = qx, qy
+            end
+            _drawOrthogonalLine(px, py, x2, y2)
             love.graphics.setLineWidth(1)
         end
     end

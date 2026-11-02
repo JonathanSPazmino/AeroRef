@@ -10,6 +10,32 @@ MAIN_GDSGUI_VERSION = "0.8.0"
 -- prevents bilinear blur when sprites are drawn at non-1:1 scale on PC.
 love.graphics.setDefaultFilter("nearest", "nearest")
 
+-- Text drawn at a fractional position lands between device pixels, so its
+-- glyphs come out blurred or unevenly spaced. Every print/printf has its
+-- position snapped to the nearest device pixel (DPI-aware), as long as only a
+-- translation is in effect; scaled or rotated drawing is left exactly as asked.
+do
+	local rawPrint, rawPrintf = love.graphics.print, love.graphics.printf
+	local function snapped(x, y)
+		if type(x) ~= "number" or type(y) ~= "number" or not love.graphics.transformPoint then return x, y end
+		local ax, ay = love.graphics.transformPoint(0, 0)
+		local bx, by = love.graphics.transformPoint(1, 1)
+		-- With a tolerance: LÖVE's transform is single precision, so under a
+		-- fractional translation the unit step rarely comes back as exactly 1.
+		if math.abs(bx - ax - 1) > 1e-4 or math.abs(by - ay - 1) > 1e-4 then return x, y end
+		local dpi = love.graphics.getDPIScale()
+		return math.floor((ax + x) * dpi + 0.5) / dpi - ax, math.floor((ay + y) * dpi + 0.5) / dpi - ay
+	end
+	love.graphics.print = function(text, x, y, ...)
+		x, y = snapped(x, y)
+		return rawPrint(text, x, y, ...)
+	end
+	love.graphics.printf = function(text, x, y, ...)
+		x, y = snapped(x, y)
+		return rawPrintf(text, x, y, ...)
+	end
+end
+
 local function requireGUILibraries ()
 
 	--when calling files, no need for .lua externsions

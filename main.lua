@@ -341,8 +341,12 @@ end
 
 -- Writes appSettings, first copying the current file (if it still parses) to
 -- appSettings.lua.bak, so a write cut short by the app being killed leaves a
--- good copy for _loadAppSettings to fall back to.
+-- good copy for _loadAppSettings to fall back to. Does nothing while the unit
+-- tests run (_appSettingsSaveSuspended, set by the "app" suite): they call
+-- settings handlers like fontSizeChanged directly, and at startup they run
+-- before love.load has even read the real settings in.
 local function _saveAppSettings()
+    if _appSettingsSaveSuspended then return end
     if love.filesystem.getInfo("appSettings.lua") and _compilesAsLua("appSettings.lua") then
         local prevContents = love.filesystem.read("appSettings.lua")
         if prevContents then love.filesystem.write("appSettings.lua.bak", prevContents) end
@@ -406,7 +410,7 @@ _FLUID_PUMP_TERMINALS = {
 
 -- BATTERY's one wire terminal, the top of the cap in its artwork. Globals, not
 -- locals: this file sits at Lua's 200-local ceiling. Also read by
--- _openSystemIntoCanvas, which gives it to batteries saved before they had one.
+-- _convertLegacySchematicSystem, which gives it to batteries saved before they had one.
 _BATTERY_SPRITE_PATH = "Sprites/element_battery.png"
 _BATTERY_TERMINALS = { { x = -0.011, y = -0.476, exitX = 0, exitY = -1 } }
 
@@ -414,8 +418,8 @@ _BATTERY_TERMINALS = { { x = -0.011, y = -0.476, exitX = 0, exitY = -1 } }
 -- suction at the very center of its artwork. The suction port leaves on the
 -- vertical axis with no side of its own, so its pipe runs straight up or
 -- straight down, whichever way the far end lies, without turning the ejector.
--- Also read by _openSystemIntoCanvas, which gives every saved ejector these,
--- so one placed before a change here picks it up.
+-- Also read by _convertLegacySchematicSystem, which gives every saved ejector
+-- these on load, so one placed before a change here picks it up.
 _EJECTOR_SPRITE_PATH = "Sprites/element_ejector.png"
 _EJECTOR_TERMINALS = {
     { x = -0.5, y = 0, exitX = -1, exitY = 0, flow = "in" },
@@ -666,8 +670,8 @@ local SCHEMATIC_CATALOG = {
 -- source of truth for which types exist and what each one's ADD ELEMENT/
 -- CONTROL catalog offers.
 -- A pump saved before pumps had ports: the generator-artwork source control
--- in a piped liquid system. Its wires settle onto the nearer port when loaded
--- (see gdsGui_schematic_addWire).
+-- in a piped liquid system. _convertLegacySchematicSystem gives it ports on
+-- load; its wires then settle onto the nearer port (see gdsGui_schematic_addWire).
 function _isUnportedFluidPump(sys, control)
     if control.terminals or control.componentType ~= "source" then return false end
     if control.overlaySpritePath ~= _GENERATOR_OVERLAY_SPRITE_PATH then return false end
@@ -1140,14 +1144,116 @@ local function _dedupeIds(list, idField, describe, notes)
     end
 end
 
+-- Converts one saved system, in place, from any shape an earlier version of
+-- the app wrote into the shape this version reads, so an old project opens
+-- exactly like one made today instead of relying on scattered fix-ups at open
+-- time. Every step is idempotent (a system already in the current shape
+-- passes through untouched) and keyed off the data itself rather than
+-- schemaVersion, since several of these shape changes shipped without a
+-- schema bump. report(what) is called once per kind of change made, for the
+-- compat notice. Global, not local: main.lua is at Lua's 200-local ceiling.
+function _convertLegacySchematicSystem(sys, report)
+    local counts = {}
+    local function bump(what) counts[what] = (counts[what] or 0) + 1 end
+    -- Port layouts are flat arrays of flat records, so a one-level copy and
+    -- compare is enough (_deepCopyTable is a local declared further down).
+    local function copyPorts(ports)
+        local out = {}
+        for i, p in ipairs(ports) do
+            out[i] = {}
+            for k, v in pairs(p) do out[i][k] = v end
+        end
+        return out
+    end
+    local function samePorts(a, b)
+        if type(a) ~= "table" or #a ~= #b then return false end
+        for i, p in ipairs(b) do
+            if type(a[i]) ~= "table" then return false end
+            for k, v in pairs(p) do if a[i][k] ~= v then return false end end
+            for k, v in pairs(a[i]) do if p[k] ~= v then return false end end
+        end
+        return true
+    end
+
+    -- The LOAD element was removed along with its sprite: any saved one goes,
+    -- with its wires, since its image no longer exists to draw.
+    local retired = {}
+    for i = #sys.elements, 1, -1 do
+        if sys.elements[i].spritePath == "Sprites/element_load.png" then
+            retired[sys.elements[i].id] = true
+            table.remove(sys.elements, i)
+            bump("removed retired LOAD element(s)")
+        end
+    end
+    for i = #sys.wires, 1, -1 do
+        local w = sys.wires[i]
+        if retired[w.fromElementId] or retired[w.toElementId] then table.remove(sys.wires, i) end
+    end
+
+    local catalogEntry = sys.systemType and _findCatalogEntryForType(sys.systemType)
+    local reshapableItem
+    for _, item in ipairs(catalogEntry and catalogEntry.items or {}) do
+        if item.reshapable then reshapableItem = item end
+    end
+
+    for _, e in ipairs(sys.elements) do
+        -- Reshaped tanks saved back when their outline was rows of grid squares.
+        if e.shapeRows then
+            e.shapePoints = _shapePoly.pointsFromRows(e.shapeRows)
+            e.shapeRows = nil
+            bump("converted grid-square tank outline(s) to polygons")
+        end
+        -- Ejectors always carry the current port layout, so one placed before
+        -- a change to _EJECTOR_TERMINALS picks it up.
+        if e.spritePath == _EJECTOR_SPRITE_PATH and not samePorts(e.terminals, _EJECTOR_TERMINALS) then
+            e.terminals = copyPorts(_EJECTOR_TERMINALS)
+            bump("updated ejector port(s)")
+        end
+        -- Batteries saved before they had a wire terminal.
+        if e.spritePath == _BATTERY_SPRITE_PATH and not e.terminals then
+            e.terminals = copyPorts(_BATTERY_TERMINALS)
+            bump("added battery terminal(s)")
+        end
+        if reshapableItem and e.componentType == reshapableItem.componentType then
+            -- Tanks saved back when the catalog placed them as circles.
+            if e.shapeType == "circle" then
+                e.shapeType = reshapableItem.shapeType
+                bump("converted round tank(s) to reshapable tanks")
+            end
+            -- Tanks placed with a plain QUANTITY property, superseded by
+            -- MAX CAPACITY + LEVEL (see schematicDropOldTankQuantity).
+            if e.shapeType == reshapableItem.shapeType then
+                local before = #(e.properties or {})
+                schematicDropOldTankQuantity(e)
+                if #(e.properties or {}) ~= before then bump("dropped old tank QUANTITY field(s)") end
+            end
+        end
+    end
+
+    -- Pumps saved before pumps had ports. Their wires are left without a
+    -- terminal index; gdsGui_schematic_addWire settles each onto the nearer
+    -- port the first time the system is opened.
+    for _, c in ipairs(sys.controls) do
+        if _isUnportedFluidPump(sys, c) then
+            c.terminals = copyPorts(_FLUID_PUMP_TERMINALS)
+            bump("added inlet/outlet ports to pump(s)")
+        end
+    end
+
+    for what, n in pairs(counts) do report(what .. " (" .. n .. ")") end
+end
+
 -- Runs on every load (not just once per APP_VERSION — a duplicate-id issue
 -- isn't tied to app updates) and mutates store in place: nil-guards every
 -- expected array field per aircraft/system instead of ever discarding a
 -- record for a missing one, and de-duplicates aircraft/system/element/wire/
--- control/annunciator ids via _dedupeIds. Returns {notes, aircraftCount,
--- systemCount} for the one-time compat notice to summarize.
+-- control/annunciator ids via _dedupeIds. Also converts every system saved
+-- by an earlier app version into the current shape (see
+-- _convertLegacySchematicSystem) and drops wires left pointing at nothing.
+-- Returns {notes, conversions, failures, aircraftCount, systemCount} for the one-time
+-- compat notice to summarize.
 local function _verifyAndRepairSchematicStore(store)
-    local notes = {}
+    local notes, conversions, failures = {}, {}, {}
     local aircraftList = (store and store.aircraft) or {}
     _dedupeIds(aircraftList, "id", function(old, new)
         return "aircraft id '" .. old .. "' was duplicated — second instance renamed to '" .. new .. "'"
@@ -1169,12 +1275,14 @@ local function _verifyAndRepairSchematicStore(store)
             sys.annunciators = sys.annunciators or {}
             sys.snapshots    = sys.snapshots    or {}
             local sysLabel = sys.name or sys.id or "?"
-            -- Reshaped tanks saved back when their outline was rows of grid squares.
-            for _, e in ipairs(sys.elements) do
-                if e.shapeRows then
-                    e.shapePoints = _shapePoly.pointsFromRows(e.shapeRows)
-                    e.shapeRows = nil
-                end
+            -- Guarded: a malformed record in one system must not stop the app
+            -- from starting; it's left as saved and reported instead.
+            local converted, convertErr = pcall(_convertLegacySchematicSystem, sys, function(what)
+                table.insert(conversions, "system '" .. sysLabel .. "': " .. what)
+            end)
+            if not converted then
+                table.insert(failures, "system '" .. sysLabel .. "': couldn't convert from an earlier version (" ..
+                    tostring(convertErr) .. ") — left as saved")
             end
             _dedupeIds(sys.elements, "id", function(old, new)
                 return "system '" .. sysLabel .. "': duplicate element id '" .. old .. "' renamed to '" .. new .. "'"
@@ -1188,10 +1296,28 @@ local function _verifyAndRepairSchematicStore(store)
             _dedupeIds(sys.annunciators, "id", function(old, new)
                 return "system '" .. sysLabel .. "': duplicate annunciator id '" .. old .. "' renamed to '" .. new .. "'"
             end, notes)
+            -- After the dedupe, so a wire to a renamed duplicate still
+            -- resolves to the first instance rather than counting as dangling.
+            local anchors = {}
+            for _, e in ipairs(sys.elements) do if e.id ~= nil then anchors[e.id] = true end end
+            for _, c in ipairs(sys.controls) do if c.id ~= nil then anchors[c.id] = true end end
+            local dangling = 0
+            for i = #sys.wires, 1, -1 do
+                local w = sys.wires[i]
+                if not (anchors[w.fromElementId] and anchors[w.toElementId]) then
+                    table.remove(sys.wires, i)
+                    dangling = dangling + 1
+                end
+            end
+            if dangling > 0 then
+                table.insert(conversions, "system '" .. sysLabel .. "': removed " .. dangling ..
+                    " wire(s) whose element or control no longer exists")
+            end
         end
     end
 
-    return { notes = notes, aircraftCount = aircraftCount, systemCount = systemCount }
+    return { notes = notes, conversions = conversions, failures = failures, aircraftCount = aircraftCount,
+        systemCount = systemCount }
 end
 
 -- Builds the one-time-per-APP_VERSION info-popup message (see love.load()'s
@@ -1210,6 +1336,15 @@ local function _buildSchematicCompatNotice(loadStatus, repair)
     end
     if #repair.notes > 0 then
         summary = summary .. " Repaired " .. #repair.notes .. " duplicate ID issue(s) automatically — nothing was lost."
+    end
+    local conversions = repair.conversions or {}
+    if #conversions > 0 then
+        summary = summary .. " Converted " .. #conversions .. " item(s) saved by an earlier version to the current format: " ..
+            table.concat(conversions, "; ") .. "."
+    end
+    local failures = repair.failures or {}
+    if #failures > 0 then
+        summary = summary .. " " .. table.concat(failures, "; ") .. "."
     end
     return summary
 end
@@ -3453,7 +3588,7 @@ function drawSchematicAiPanel()
     love.graphics.setColor(1, 1, 0, 1)
     love.graphics.rectangle("line", px, py, pw, ph)
 
-    if not _aiPanelFont then _aiPanelFont = love.graphics.newFont(13) end
+    if not _aiPanelFont then _aiPanelFont = gdsGui_general_newFont(13) end
     love.graphics.setFont(_aiPanelFont)
 
     local lines = {
@@ -3520,19 +3655,9 @@ end
 local function _openSystemIntoCanvas(systemId, mode)
     local sys = _findSystem(systemId)
     if not sys then return end
-    -- The LOAD element was removed along with its sprite: any saved one goes,
-    -- with its wires, since its image no longer exists to draw.
-    local retired = {}
-    for i = #(sys.elements or {}), 1, -1 do
-        if sys.elements[i].spritePath == "Sprites/element_load.png" then
-            retired[sys.elements[i].id] = true
-            table.remove(sys.elements, i)
-        end
-    end
-    for i = #(sys.wires or {}), 1, -1 do
-        local w = sys.wires[i]
-        if retired[w.fromElementId] or retired[w.toElementId] then table.remove(sys.wires, i) end
-    end
+    -- Older-version data shapes (retired elements, unported pumps, round
+    -- tanks, ...) were already converted when the store was loaded — see
+    -- _convertLegacySchematicSystem.
     -- A leftover undo snapshot could otherwise splice a DIFFERENT system's
     -- elements/wires/controls back in if "undo" were used right after this.
     gdsGui_schematic_clearUndo("mainCanvas")
@@ -3545,8 +3670,7 @@ local function _openSystemIntoCanvas(systemId, mode)
     for _, e in ipairs(sys.elements or {}) do
         gdsGui_schematic_addElement("mainCanvas", e.id, e.shapeType, e.x, e.y, e.w, e.h, e.label,
             _deepCopyTable(e.defaultColor), _deepCopyTable(e.properties), e.rotation or 0, e.spritePath,
-            e.componentType, _deepCopyTable((e.spritePath == _EJECTOR_SPRITE_PATH and _EJECTOR_TERMINALS)
-                or e.terminals or (e.spritePath == _BATTERY_SPRITE_PATH and _BATTERY_TERMINALS or nil)))
+            e.componentType, _deepCopyTable(e.terminals))
         -- voltage (per-source display setting — see
         -- _openPerSourceSettingsMenu) isn't among addElement's own
         -- parameters, so it doesn't round-trip through it like
@@ -3569,7 +3693,7 @@ local function _openSystemIntoCanvas(systemId, mode)
         gdsGui_schematic_addControl("mainCanvas", c.id, c.x, c.y, _deepCopyTable(c.positions), c.detentIndex,
             c.label, c.callbackFunc, c.radiusScale, c.spritePaths, c.rotation, c.overlaySpritePath,
             _deepCopyTable(c.defaultColor), c.colorDarkenMul, c.componentType,
-            _deepCopyTable(c.terminals or (_isUnportedFluidPump(sys, c) and _FLUID_PUMP_TERMINALS or nil)))
+            _deepCopyTable(c.terminals))
         if canvas then
             local ctrl = canvas.controls[#canvas.controls]
             ctrl.voltage = c.voltage
@@ -3588,6 +3712,7 @@ local function _openSystemIntoCanvas(systemId, mode)
         if canvas then
             canvas.wires[#canvas.wires].gravityDirection = w.gravityDirection
             canvas.wires[#canvas.wires].fluidPercent = w.fluidPercent
+            canvas.wires[#canvas.wires].waypoints = _deepCopyTable(w.waypoints)
         end
     end
     for _, a in ipairs(sys.annunciators or {}) do
@@ -3619,15 +3744,6 @@ local function _openSystemIntoCanvas(systemId, mode)
     end
     gdsGui_schematic_setReshapableKind("mainCanvas", reshapableItem and reshapableItem.shapeType,
         reshapableItem and reshapableItem.componentType)
-    -- Tanks saved back when the catalog placed them as circles start square too.
-    for _, e in ipairs(canvas and canvas.elements or {}) do
-        if reshapableItem and e.componentType == reshapableItem.componentType and e.shapeType == "circle" then
-            e.shapeType = reshapableItem.shapeType
-        end
-        if reshapableItem and e.componentType == reshapableItem.componentType and e.shapeType == reshapableItem.shapeType then
-            schematicDropOldTankQuantity(e)
-        end
-    end
     local designing = (mode == "design")
     -- Every initial open (design or control) lands at a fixed 1.4x zoom,
     -- vertically centered (see gdsGui_schematic_resetView) rather than the
@@ -4798,7 +4914,7 @@ local function _applyTheme(isDark)
 end
 
 local function _applyFontSize(fontSize)
-    globApp.appFont = love.graphics.newFont(fontSize)
+    globApp.appFont = gdsGui_general_newFont(fontSize)
     love.graphics.setFont(globApp.appFont)
     local names = {
         -- main menu data panels
@@ -4858,7 +4974,7 @@ local function _applyFontSize(fontSize)
 
     -- Recompute each textbox height at the new font size, update containerFrac,
     -- and relayout so containers shrink/grow to fit — no empty space left behind.
-    local font = love.graphics.newFont(fontSize)
+    local font = gdsGui_general_newFont(fontSize)
     local cW   = globApp.safeScreenArea.w
     local function wS(px) return math.floor(px / 320 * cW) end
     local function mH(maxText, fw)
@@ -4922,7 +5038,7 @@ local function _applyFontSize(fontSize)
     setCF(tx, "requiredDistance", "y", calcResCY)
 
     -- Duty panel (positions depend on heights above, mirroring the _d1.._d8 logic)
-    local warnFont = love.graphics.newFont(math.max(8, fontSize - 2))
+    local warnFont = gdsGui_general_newFont(math.max(8, fontSize - 2))
     local function mHW(maxText, fw)
         local textW = (fw - 10) * 0.8
         local lines = 0
@@ -5116,7 +5232,7 @@ function love.load()
         appSettings.schematicCompatCheckedVersion = APP_VERSION
         _saveAppSettings()
     end
-    if #_schematicRepair.notes > 0 then
+    if #_schematicRepair.notes > 0 or #_schematicRepair.conversions > 0 then
         _saveSchematicStore()
     end
 
@@ -5129,7 +5245,7 @@ function love.load()
     -- Measure each textbox height from the actual fs=16 font (worst case) so no
     -- textbox ever requires internal scrolling at any user-selectable font size.
     local _sbH    = 30   -- scrollbar height, fixed
-    local _font16 = love.graphics.newFont(16)
+    local _font16 = gdsGui_general_newFont(16)
     local function _measuredH(maxText, frameWidth)
         local textW = (frameWidth - 10) * 0.8
         local lines = 0
@@ -5496,8 +5612,8 @@ function love.load()
     -- textbox shows all content without any internal scroll.  Mirrors _buildLines:
     -- frame.width = learnTxtW - 10 (SB_WIDTH), text.width = frame.width * 0.8.
     -- Use fs=16 for worst-case wrapping/height since _applyFontSize can set 16pt.
-    local _learnFont   = love.graphics.newFont(learnFontSize)
-    local _learnFont16 = love.graphics.newFont(16)
+    local _learnFont   = gdsGui_general_newFont(learnFontSize)
+    local _learnFont16 = gdsGui_general_newFont(16)
     local _learnTxtW   = (learnTxtW - 10) * 0.8
     local _learnLineH  = _learnFont16:getHeight()
     local function learnH(rawSegs)
@@ -6593,7 +6709,7 @@ function drawSchematicZoomFullScreenLabel()
     local w, h = 70, 20
     local pos = gdsGui_general_relativePosition("RB", 0.98, 0.98, w, h, sa.x, sa.y, sa.w, sa.h)
     if not _schematicZoomFullScreenFont then
-        _schematicZoomFullScreenFont = love.graphics.newFont(10)
+        _schematicZoomFullScreenFont = gdsGui_general_newFont(10)
     end
     love.graphics.setFont(_schematicZoomFullScreenFont)
     love.graphics.setColor(1, 1, 1, 0.3)
@@ -7746,7 +7862,8 @@ end
 -- capacity to be a fraction of, so its value can't carry over to the level.
 function schematicDropOldTankQuantity(entity)
     for i = #(entity.properties or {}), 1, -1 do
-        if entity.properties[i].key:upper() == "QUANTITY" then table.remove(entity.properties, i) end
+        local prop = entity.properties[i]
+        if type(prop) == "table" and type(prop.key) == "string" and prop.key:upper() == "QUANTITY" then table.remove(entity.properties, i) end
     end
 end
 
@@ -9082,6 +9199,95 @@ local function _reshapeTestSetup(canvasName)
     end
 end
 
+-- EDIT PATH: dragging a "+" puts a bend point where it's dropped, snapped to the
+-- grid, and the route runs through it; tapping a point removes it, undo puts it
+-- back, tapping away finishes, and RESET PATH goes back to the automatic route.
+function schematicWirePathTest()
+    local canvas, _, restore = _reshapeTestSetup("unitTestCanvasWirePath")
+    local result = 1
+    local zoom = canvas.zoom
+    local x0, y0 = canvas.x + canvas.panX, canvas.y + canvas.panY
+    local function px(wx, wy) return x0 + wx * zoom, y0 + wy * zoom end
+    gdsGui_schematic_addElement(canvas.name, "other", "rect", 24 / canvas.contentW, 24 / canvas.contentH,
+        6 / canvas.contentW, 6 / canvas.contentH, "O")
+    gdsGui_schematic_addWire(canvas.name, "w", "tank", "other")
+    local function wire() return canvas.wires[1] end
+    local function choose(option)
+        canvas._wireEditTargetId = "w"
+        gdsGui_schematic_internal_onWireEditChosen(canvas.name, nil, option)
+    end
+    local function offered(option)
+        gdsGui_schematic_openWireEditMenu(canvas.name, "w")
+        local found = false
+        for _, text in ipairs(canvas.menu.options) do found = found or text == option end
+        canvas.menu = nil
+        return found
+    end
+    local function tap(x, y)
+        gdsGui_schematic_pressed("t", x, y)
+        gdsGui_schematic_released("t", x, y)
+    end
+    local function drag(x1, y1, x2, y2)
+        gdsGui_schematic_pressed("t", x1, y1)
+        gdsGui_schematic_moved("t", (x1 + x2) / 2, (y1 + y2) / 2)
+        gdsGui_schematic_moved("t", x2, y2)
+        gdsGui_schematic_released("t", x2, y2)
+    end
+    local function handle(kind, index)
+        for _, h in ipairs(_wirePath.handles(canvas, wire(), _wirePath.plan(canvas, wire()))) do
+            if h.kind == kind and h.index == index then return h end
+        end
+    end
+    local function passesThrough(wx, wy)
+        local tx, ty = px(wx, wy)
+        for _, seg in ipairs(_wirePath.plan(canvas, wire()).segments) do
+            if math.abs(seg[3] - tx) < 0.01 and math.abs(seg[4] - ty) < 0.01 then return true end
+        end
+        return false
+    end
+
+    if not offered("EDIT PATH") or offered("RESET PATH") then result = -1 end
+    choose("EDIT PATH")
+    if not canvas.pathEdit or canvas.pathEdit.wireId ~= "w" then restore() return -2 end
+
+    -- Dropped a little off the grid, it snaps to the nearest grid point.
+    local plus = handle("insert", 1)
+    if not plus then restore() return -3 end
+    local tx, ty = px(30, 4)
+    drag(plus.x, plus.y, tx + 3, ty - 2)
+    local points = wire().waypoints
+    if not points or #points ~= 1 then
+        result = -4
+    elseif not passesThrough(30, 4) then
+        result = -5
+    end
+
+    -- A tap on the point removes it; undo puts it back.
+    local point = handle("point", 1)
+    if point then tap(point.x, point.y) end
+    if wire().waypoints then result = -6 end
+    gdsGui_schematic_undo(canvas.name)
+    if not wire().waypoints or #wire().waypoints ~= 1 then result = -7 end
+
+    -- A second bend off the next stretch's "+", after the first.
+    local plus2 = handle("insert", 2)
+    if plus2 then
+        local bx, by = px(40, 16)
+        drag(plus2.x, plus2.y, bx, by)
+    end
+    points = wire().waypoints
+    if not points or #points ~= 2 or not passesThrough(30, 4) or not passesThrough(40, 16) then result = -8 end
+
+    -- Tapping away finishes; RESET PATH is offered and clears the path.
+    tap(px(2, 40))
+    if canvas.pathEdit then result = -9 end
+    if not offered("RESET PATH") then result = -10 end
+    choose("RESET PATH")
+    if wire().waypoints then result = -11 end
+    restore()
+    return result
+end
+
 -- A center label fits what it can inside the outline: every line on a big tank,
 -- only its first on a tank too short for more, and nothing on one too small to read.
 function schematicCenterTextFitTest()
@@ -9696,6 +9902,53 @@ function schematicRepair_dedupesElementIdsTest()
     local els = store.aircraft[1].systems[1].elements
     if #els == 2 and els[1].id ~= els[2].id and #repair.notes >= 1 then return 1 end
     return 0
+end
+
+-- A system saved by an older version (retired LOAD element, round tank with a
+-- plain QUANTITY property, pump and battery without ports, grid-square tank
+-- outline, a wire to a deleted element) comes out of the repair pass in the
+-- current shape, with each kind of change reported for the compat notice —
+-- and a second pass over the result changes nothing.
+function schematicRepair_convertsLegacySystemTest()
+    local store = { aircraft = {
+        { id = "ac1", name = "Old Aircraft", systems = {
+            { id = "sys1", name = "Fuel", systemType = "FUEL",
+              elements = {
+                  { id = "tank1", shapeType = "circle", componentType = "source",
+                    properties = { { key = "QUANTITY", value = "50" }, { key = "NOTE", value = "x" } } },
+                  { id = "tank2", shapeType = "rect", componentType = "source", shapeRows = { "##", "##" } },
+                  { id = "load1", spritePath = "Sprites/element_load.png" },
+                  { id = "batt1", spritePath = _BATTERY_SPRITE_PATH },
+                  { id = "ej1", spritePath = _EJECTOR_SPRITE_PATH, terminals = { { x = 0, y = 0 } } },
+              },
+              wires = {
+                  { id = "w1", fromElementId = "tank1", toElementId = "pump1" },
+                  { id = "w2", fromElementId = "tank1", toElementId = "load1" },
+                  { id = "w3", fromElementId = "tank1", toElementId = "ghost" },
+              },
+              controls = {
+                  { id = "pump1", componentType = "source", overlaySpritePath = _GENERATOR_OVERLAY_SPRITE_PATH },
+              } },
+        } },
+    } }
+    local repair = _verifyAndRepairSchematicStore(store)
+    local sys = store.aircraft[1].systems[1]
+    local byId = {}
+    for _, e in ipairs(sys.elements) do byId[e.id] = e end
+    if byId.load1 then return -1 end
+    if #sys.wires ~= 1 or sys.wires[1].id ~= "w1" then return -2 end
+    if byId.tank1.shapeType ~= "rect" then return -3 end
+    if #byId.tank1.properties ~= 1 or byId.tank1.properties[1].key ~= "NOTE" then return -4 end
+    if byId.tank2.shapeRows or not byId.tank2.shapePoints then return -5 end
+    if not (byId.batt1.terminals and #byId.batt1.terminals == #_BATTERY_TERMINALS) then return -6 end
+    if #byId.ej1.terminals ~= #_EJECTOR_TERMINALS or byId.ej1.terminals[2].suction ~= true then return -7 end
+    if byId.ej1.terminals == _EJECTOR_TERMINALS then return -8 end -- a copy, never the shared table
+    local pump = sys.controls[1]
+    if not (pump.terminals and pump.terminals[1].flow == "in" and pump.terminals[2].flow == "out") then return -9 end
+    if #repair.conversions < 7 then return -10 end
+    if not _buildSchematicCompatNotice("ok", repair):find("earlier version") then return -11 end
+    if #_verifyAndRepairSchematicStore(store).conversions ~= 0 then return -12 end
+    return 1
 end
 
 -- The compat notice is built from a load status, but whether it's actually
@@ -10677,6 +10930,11 @@ end
 -- builds the devUnitTest table below.
 -------------------------------------------------------------------------------
 gdsGui_unitTests_registerSuite("app", function()
+    -- Tests change settings through the app's own handlers: keep them in
+    -- memory only, and put the user's settings back afterwards.
+    _appSettingsSaveSuspended = true
+    local settingsBeforeTests = {}
+    for k, v in pairs(appSettings) do settingsBeforeTests[k] = v end
 
     --------------------------------------------------------------------------
     --  format_time
@@ -11334,6 +11592,10 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcName"]={"schematicTankPortsTest"},
         ["funcParameters"]={0},
         ["funcExpctOutput"]={1}}
+    gdsGui_dev_testExecute {["id"]="schematic_wire_userPath",
+        ["funcName"]={"schematicWirePathTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
     gdsGui_dev_testExecute {["id"]="schematic_tank_movePort",
         ["funcName"]={"schematicTankMovePortTest"},
         ["funcParameters"]={0},
@@ -11421,11 +11683,19 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcParameters"]={0},
         ["funcExpctOutput"]={1}}
 
+    gdsGui_dev_testExecute {["id"]="schematicStore_repair_convertsLegacySystem",
+        ["funcName"]={"schematicRepair_convertsLegacySystemTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
     gdsGui_dev_testExecute {["id"]="schematicStore_compatNotice_gatesOncePerVersion",
         ["funcName"]={"schematicCompatNotice_gatesOncePerVersionTest"},
         ["funcParameters"]={0},
         ["funcExpctOutput"]={1}}
 
+
+    appSettings = settingsBeforeTests
+    _appSettingsSaveSuspended = false
+    if appSettings.fontSize then _applyFontSize(appSettings.fontSize) end
 end)
 
 -- Build the unit-test table widget now that both "gui" and "app" suites are registered.

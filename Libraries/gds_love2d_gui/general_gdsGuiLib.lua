@@ -450,6 +450,35 @@ end
 
 
 
+-- A UI font at the given size: light hinting (glyph shapes closer to iOS's,
+-- less squeezed onto the pixel grid) and linear filtering, so text drawn at a
+-- scale stays smooth instead of blocky under the library's "nearest" default.
+-- Uses the TrueType file at globApp.uiFontPath when the app sets one (e.g. a
+-- bundled Inter); LÖVE's built-in font otherwise.
+function gdsGui_general_newFont (size)
+	local font
+	if globApp and globApp.uiFontPath and love.filesystem.getInfo(globApp.uiFontPath) then
+		font = love.graphics.newFont(globApp.uiFontPath, size, "light")
+	else
+		font = love.graphics.newFont(size, "light")
+	end
+	font:setFilter("linear", "linear")
+	return font
+end
+
+-- The width of one device pixel in drawing units: a true hairline on a
+-- Retina screen (1/3 on most iPhones), 1 on a plain desktop display.
+function gdsGui_general_hairline ()
+	return 1 / love.graphics.getDPIScale()
+end
+
+-- v moved to the center of the device pixel it falls in, so a hairline drawn
+-- there covers exactly one pixel row/column instead of blurring across two.
+function gdsGui_general_pixelCenter (v)
+	local dpi = love.graphics.getDPIScale()
+	return (math.floor(v * dpi) + 0.5) / dpi
+end
+
 function gdsGui_general_smartFontScaling (minFontPercentSize, maxFontPercentSize)
 
 	--[[window dimensions]]

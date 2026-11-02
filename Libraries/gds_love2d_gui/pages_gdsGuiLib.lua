@@ -69,8 +69,8 @@ function gdsGui_page_loadingCreate (myName, myToPg, myMinTime_secs, myFromPg, te
 	NewLoadingObject.progress = 0
 	NewLoadingObject.minEndingProgress = myMinTime_secs
 	NewLoadingObject.progressBarColor = myProgressBarColor
-	NewLoadingObject.coreFontSize = love.graphics.newFont(math.floor(gdsGui_general_smartFontScaling (0.025, 0.044)))
-	NewLoadingObject.devMsgFontSize = love.graphics.newFont(math.floor(gdsGui_general_smartFontScaling (0.022, 0.041)))
+	NewLoadingObject.coreFontSize = gdsGui_general_newFont(math.floor(gdsGui_general_smartFontScaling (0.025, 0.044)))
+	NewLoadingObject.devMsgFontSize = gdsGui_general_newFont(math.floor(gdsGui_general_smartFontScaling (0.022, 0.041)))
 
 	for i, pg in ipairs (pages) do
 		if pg.index == NewLoadingObject.fromPg then
@@ -203,8 +203,8 @@ function gdsGui_page_loadingUpdate (dt)
 
 			if globApp.resizeDetected == true then
 
-				lp.coreFontSize = love.graphics.newFont(math.floor(gdsGui_general_smartFontScaling (0.025, 0.044)))
-				lp.devMsgFontSize = love.graphics.newFont(math.floor(gdsGui_general_smartFontScaling (0.022, 0.041)))
+				lp.coreFontSize = gdsGui_general_newFont(math.floor(gdsGui_general_smartFontScaling (0.025, 0.044)))
+				lp.devMsgFontSize = gdsGui_general_newFont(math.floor(gdsGui_general_smartFontScaling (0.022, 0.041)))
 
 				----------------------------
 				--TITLE TEXT

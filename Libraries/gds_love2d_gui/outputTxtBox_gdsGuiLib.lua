@@ -207,7 +207,7 @@ function gdsGui_outputTxtBox_create (id, page, bgSprite, x, y, anchorPoint, widt
 			end
 
 		tb.text = {}
-			tb.text.font = love.graphics.newFont(fontSize)
+			tb.text.font = gdsGui_general_newFont(fontSize)
 			if tb.state == 1 then
 				tb.text.color    = txtColor
 				tb.text.text     = text
@@ -738,7 +738,7 @@ end
 function gdsGui_outputTxtBox_setFontSize(name, newSize)
 	for _, box in ipairs(globApp.objects.outputTextBox) do
 		if box.name == name then
-			box.text.font     = love.graphics.newFont(newSize)
+			box.text.font     = gdsGui_general_newFont(newSize)
 			box.text.height   = gdsGui_general_returnFontInfo(box.text.font, "height")
 			box.text.lastText = nil
 			break
@@ -754,7 +754,7 @@ end
 local _fitFontCache = {}
 local function _loadFitFont(size)
 	if not _fitFontCache[size] then
-		_fitFontCache[size] = love.graphics.newFont(size)
+		_fitFontCache[size] = gdsGui_general_newFont(size)
 	end
 	return _fitFontCache[size]
 end
