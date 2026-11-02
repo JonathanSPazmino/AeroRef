@@ -332,14 +332,24 @@ function gdsGui_saveLoad_saveProject (fileName, Data, SavingTag)
   love.filesystem.write(fileName, table.show(Data, SavingTag))
 end
 
+-- Runs a saved Lua data file. A missing file is skipped; a damaged one (a
+-- truncated write, say) is reported and skipped rather than crashing the app.
+-- love.filesystem.load throws on a syntax error in some LÖVE versions and
+-- returns nil, err in others, so both are caught. Returns true only if the
+-- file existed and ran cleanly.
 function gdsGui_saveLoad_loadFileContents (strFileName)
-   --[[checks if file exists]]
-	if love.filesystem.getInfo (strFileName) then 
-      --[[assigns function that loads data contained in file to variable]]
-		local loadData = love.filesystem.load(strFileName) 
-      --[[calls the function which loads it data back to the globApp.projects table]]
-		loadData() 
+	if not love.filesystem.getInfo (strFileName) then return false end
+	local okLoad, loadData, loadErr = pcall(love.filesystem.load, strFileName)
+	if not okLoad or not loadData then
+		gdsGui_generateConsoleMessage ("error", "could not parse " .. strFileName .. ": " .. tostring(okLoad and loadErr or loadData))
+		return false
 	end
+	local okRun, runErr = pcall(loadData)
+	if not okRun then
+		gdsGui_generateConsoleMessage ("error", "could not run " .. strFileName .. ": " .. tostring(runErr))
+		return false
+	end
+	return true
 end
 
 function gdsGui_saveLoad_updateProjectAvailability ()

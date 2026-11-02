@@ -1589,6 +1589,93 @@ function _terminals.wireEnd(canvas, anchor, terminalIndex)
     return x, y, anchor, nil
 end
 
+-- What to call terminal `index` on screen while picking a port: its own `name`,
+-- else what its role says. Beside a suction port (an ejector's), an inlet is the
+-- motive port and an outlet the discharge; a port with no direction (a tank's)
+-- is numbered.
+function _terminals.label(anchor, index)
+    local t = anchor.terminals[index]
+    if t.name then return t.name end
+    if t.suction then return "SUCTION" end
+    local hasSuction = false
+    for _, other in ipairs(anchor.terminals) do
+        if other.suction then hasSuction = true end
+    end
+    if t.flow == "in" then return hasSuction and "MOTIVE" or "IN" end
+    if t.flow == "out" then return hasSuction and "DISCHARGE" or "OUT" end
+    return "PORT " .. index
+end
+
+-- The terminal of anchor a tap at the pixel point picks: the nearest, if the
+-- tap is within PORT_TAP_SLOP_PX of it. nil otherwise.
+function _terminals.pickAt(canvas, anchor, px, py)
+    local index = _terminals.nearest(canvas, anchor, px, py)
+    if not index then return nil end
+    local tx, ty = _terminals.point(canvas, anchor, index)
+    local slop = _shapePoly.PORT_TAP_SLOP_PX
+    if (tx - px) * (tx - px) + (ty - py) * (ty - py) <= slop * slop then return index end
+    return nil
+end
+
+-- Terminal `index`'s label (see _terminals.label) on a dark plate, just off the
+-- terminal in the direction a wire leaves it.
+function _terminals.drawLabel(canvas, anchor, index)
+    local t = anchor.terminals[index]
+    local tx, ty = _terminals.point(canvas, anchor, index)
+    local rot = math.rad(anchor.rotation or 0)
+    local ex, ey = t.exitX or 0, t.exitY or 0
+    local dx, dy = ex * math.cos(rot) - ey * math.sin(rot), ex * math.sin(rot) + ey * math.cos(rot)
+    local len = math.sqrt(dx * dx + dy * dy)
+    if len > 0 then dx, dy = dx / len, dy / len else dx, dy = 0, -1 end
+    love.graphics.setFont(globApp.appFont or love.graphics.getFont())
+    local font = love.graphics.getFont()
+    local text = _terminals.label(anchor, index)
+    local w, h = font:getWidth(text), font:getHeight()
+    local gap = 12
+    local cx, cy = tx + dx * (gap + w / 2), ty + dy * (gap + h / 2)
+    love.graphics.setColor(0, 0, 0, 0.75)
+    love.graphics.rectangle("fill", cx - w / 2 - 3, cy - h / 2 - 1, w + 6, h + 2, 3, 3)
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.print(text, math.floor(cx - w / 2 + 0.5), math.floor(cy - h / 2 + 0.5))
+end
+
+-- The ports of an element whose wire is waiting on a port (pendingWirePortPick),
+-- each labeled; then, once picked, just that one, until the wire is drawn.
+function _terminals.drawPick(canvas)
+    local id, chosen = canvas.pendingWirePortPick, nil
+    local noun = _pipes.noun(canvas)
+    local prompt = "TAP THE PORT TO RUN THE " .. noun .. " FROM"
+    if not id and canvas.pendingWireFromId and canvas.pendingWireFromTerminal then
+        id, chosen = canvas.pendingWireFromId, canvas.pendingWireFromTerminal
+    elseif not id and canvas.wireTool.fromId and canvas.wireTool.portPicked then
+        id, chosen, prompt = canvas.wireTool.fromId, canvas.wireTool.fromTerminal, nil
+    end
+    local anchor = id and _findAnchor(canvas, id)
+    if not anchor or not anchor.terminals then return end
+    local radius = math.max(4, math.min(8, canvas.zoom * 1.5))
+    for i in ipairs(anchor.terminals) do
+        if not chosen or i == chosen then
+            local tx, ty = _terminals.point(canvas, anchor, i)
+            love.graphics.setColor(0, 0, 0, 1)
+            love.graphics.circle("fill", tx, ty, radius + 1)
+            if chosen then
+                love.graphics.setColor(_CONNECTOR_SNAP_COLOR[1], _CONNECTOR_SNAP_COLOR[2], _CONNECTOR_SNAP_COLOR[3], 1)
+            else
+                love.graphics.setColor(1, 1, 1, 1)
+            end
+            love.graphics.circle("fill", tx, ty, radius)
+            _terminals.drawLabel(canvas, anchor, i)
+        end
+    end
+    if chosen and prompt then
+        prompt = "DRAG FROM " .. _terminals.label(anchor, chosen) .. " TO WHERE THE " .. noun .. " GOES"
+    end
+    if prompt then
+        love.graphics.setColor(1, 1, 1, 1)
+        love.graphics.printf(prompt, canvas.x, canvas.y + 4, canvas.w, "center")
+    end
+end
+
 -- A reshapable element's ports (ADD PORT on its edit menu): ordinary wire terminals
 -- the user places on its outline, so pipes meet the tank there. Each is a terminal
 -- with no flow direction, since a tank's pipes can run either way. Once a tank has
@@ -1899,6 +1986,8 @@ function gdsGui_schematic_create(name, page, x, y, anchorPoint, wFrac, hFrac)
     canvas.pendingColorAssignPick = false  -- armed "tap an element or wire to assign its snapshot color"; disarms after one pick
     canvas.pendingWireFromId = nil  -- armed via ADD WIRE in the element edit menu: elementId the next press-drag-release starts a wire from, with no need to land that press on an anchor; disarms after one drag
     canvas.pendingPort       = nil  -- armed via ADD PORT/REMOVE PORT in the element edit menu: {elementId, removing}, what the next tap does; disarms after one tap
+    canvas.pendingWirePortPick = nil  -- armed via ADD WIRE on an element with two or more terminals: its id, waiting on a tap on the port the wire leaves from; disarms after one tap
+    canvas.pendingWireFromTerminal = nil  -- the port picked for pendingWireFromId, so its wire leaves from there rather than whichever port ends up nearest the far end
     canvas.paintMode = nil  -- { color = {r,g,b,a} | nil } while the PAINT brush is armed; see gdsGui_schematic_armPaintMode. Unlike the pending* one-shot fields above, stays armed across any number of taps.
     canvas._paintTarget = nil  -- {kind, id} of whatever a "paint" drag's press landed on, between press and release
     canvas._paintButtonName = nil  -- name of the app's PAINT dock button, set via gdsGui_schematic_setPaintButtonName; the swatch palette cascades from it
@@ -2101,6 +2190,8 @@ function gdsGui_schematic_setMode(canvasName, mode)
     canvas.pendingConnectorColor = nil
     canvas.pendingColorAssignPick = false
     canvas.pendingWireFromId = nil
+    canvas.pendingWirePortPick = nil
+    canvas.pendingWireFromTerminal = nil
     canvas.paintMode = nil
     canvas._paintTarget = nil
     canvas.annunciatorPanelOpen = false
@@ -2652,6 +2743,8 @@ function gdsGui_schematic_cancelPlacement(canvasName)
         canvas.pendingConnectorColor = nil
         canvas.pendingColorAssignPick = false
         canvas.pendingWireFromId = nil
+        canvas.pendingWirePortPick = nil
+        canvas.pendingWireFromTerminal = nil
         canvas.pendingPort = nil
         canvas.paintMode = nil
         canvas.annunciatorPanelOpen = false
@@ -2705,7 +2798,8 @@ end
 function gdsGui_schematic_isPlacementArmed(canvasName)
     local canvas = _findCanvas(canvasName)
     return canvas ~= nil and (canvas.pendingPlacement ~= nil or canvas.pendingConnectorColor ~= nil or
-        canvas.pendingColorAssignPick or canvas.pendingWireFromId ~= nil or canvas.pendingPort ~= nil)
+        canvas.pendingColorAssignPick or canvas.pendingWireFromId ~= nil or canvas.pendingPort ~= nil or
+        canvas.pendingWirePortPick ~= nil)
 end
 
 --------------------------------------------------------------------------------
@@ -4689,7 +4783,15 @@ function gdsGui_schematic_internal_onElementEditChosen(canvasName, index, option
         -- arm this one, since cancelPlacement would otherwise immediately
         -- clear the very field being set on the next line.
         gdsGui_schematic_cancelPlacement(canvasName)
-        canvas.pendingWireFromId = elementId
+        -- More than one port (a tank's, an ejector's): ask which one first, so
+        -- the wire leaves from the port the user means (see pendingWirePortPick
+        -- in gdsGui_schematic_pressed).
+        local el = _findElement(canvas, elementId)
+        if el and el.terminals and #el.terminals >= 2 then
+            canvas.pendingWirePortPick = elementId
+        else
+            canvas.pendingWireFromId = elementId
+        end
         return
     elseif optionText == "RENAME" then
         -- RENAME tapped: hand off to the rename prompt, keeping the element
@@ -7882,12 +7984,19 @@ function gdsGui_schematic_draw(pageName)
             _glow.finish(canvas)
             _drawAnnunciators(canvas)
             drawAiCulpritHighlight(canvas)
+            _terminals.drawPick(canvas)
 
             if canvas.wireTool.fromId then
                 local fromE = _findAnchor(canvas, canvas.wireTool.fromId)
                 if fromE and canvas.wireTool.curX then
                     local snapTarget, snapTerminal = _connectorSnapTarget(canvas)
                     _drawConnectorTargets(canvas, snapTarget, snapTerminal)
+                    -- Name the port it would land on, so an ejector's suction
+                    -- port can be told from its motive port. Pipes and ducts
+                    -- only: a switch's lugs have nothing worth naming.
+                    if snapTerminal and #snapTarget.terminals >= 2 and _pipes.noun(canvas) ~= "WIRE" then
+                        _terminals.drawLabel(canvas, snapTarget, snapTerminal)
+                    end
                     -- Clamped to the snap target's center/terminal (if any)
                     -- rather than the raw cursor/finger position, so the line
                     -- visibly locks on once in range instead of just trailing
@@ -8334,6 +8443,29 @@ function gdsGui_schematic_pressed(touchId, x, y)
             goto continue
         end
 
+        if canvas.pendingWirePortPick then
+            -- ADD WIRE on an element with two or more ports: this press says
+            -- which port the wire leaves from, and starts dragging it from
+            -- there. A tap that lands on no port cancels, same as ADD PORT.
+            -- Just tapping the port keeps it armed from that port; see the
+            -- wireTool branch of the release. portPicked = "pick" marks this
+            -- press, and pressX/pressY tell that tap from a drag.
+            local anchor = _findAnchor(canvas, canvas.pendingWirePortPick)
+            canvas.pendingWirePortPick = nil
+            local index = anchor and _terminals.pickAt(canvas, anchor, x, y)
+            if index then
+                canvas.focusTouchId          = touchId
+                canvas.wireTool.fromId       = anchor.id
+                canvas.wireTool.fromTerminal = index
+                canvas.wireTool.portPicked   = "pick"
+                canvas.wireTool.pressX       = x
+                canvas.wireTool.pressY       = y
+                canvas.wireTool.curX         = x
+                canvas.wireTool.curY         = y
+            end
+            goto continue
+        end
+
         if canvas.pendingWireFromId then
             -- Armed via ADD WIRE in the element edit menu (see
             -- gdsGui_schematic_internal_onElementEditChosen): the source
@@ -8345,7 +8477,9 @@ function gdsGui_schematic_pressed(touchId, x, y)
             -- was still open, so only a bulk load/undo could do this),
             -- there's nothing to connect from, so just drop it.
             local fromId = canvas.pendingWireFromId
+            local pickedTerminal = canvas.pendingWireFromTerminal
             canvas.pendingWireFromId = nil
+            canvas.pendingWireFromTerminal = nil
             local fromAnchor = _findAnchor(canvas, fromId)
             if fromAnchor then
                 canvas.focusTouchId    = touchId
@@ -8356,8 +8490,10 @@ function gdsGui_schematic_pressed(touchId, x, y)
                 -- right here; starting anywhere else leaves it to follow
                 -- the loose end (see the wire-drag preview in
                 -- gdsGui_schematic_draw, and the release).
-                canvas.wireTool.fromTerminal = (_hitControl(canvas, x, y) == fromAnchor)
-                    and _terminals.nearest(canvas, fromAnchor, x, y) or nil
+                -- A port already picked (pendingWirePortPick) holds either way.
+                canvas.wireTool.fromTerminal = pickedTerminal or ((_hitControl(canvas, x, y) == fromAnchor)
+                    and _terminals.nearest(canvas, fromAnchor, x, y) or nil)
+                canvas.wireTool.portPicked = pickedTerminal ~= nil
             end
             goto continue
         end
@@ -8403,6 +8539,7 @@ function gdsGui_schematic_pressed(touchId, x, y)
                 canvas.focusTouchId    = touchId
                 canvas.wireTool.fromId = anchor.id
                 canvas.wireTool.fromTerminal = _terminals.nearest(canvas, anchor, x, y)
+                canvas.wireTool.portPicked = nil
                 canvas.wireTool.curX   = x
                 canvas.wireTool.curY   = y
                 if canvas.pendingConnectorColor then
@@ -9041,6 +9178,19 @@ function gdsGui_schematic_released(touchId, x, y)
                     fromTerminal = _terminals.nearest(canvas, fromElem, ox, oy)
                 end
                 canvas.wireTool.fromTerminal = nil
+                -- A port picked by pendingWirePortPick and then only tapped:
+                -- stay armed from that port, so the next drag can start
+                -- anywhere and still leave from it. A drag that ends on
+                -- nothing disarms instead, as does the next drag if it misses
+                -- too, the same way a tap off every port cancels the pick.
+                local tw = canvas.wireTool
+                if tw.portPicked == "pick" and not toElem and tw.pressX
+                   and math.abs(x - tw.pressX) <= _ELEMENT_TAP_SLOP_PX
+                   and math.abs(y - tw.pressY) <= _ELEMENT_TAP_SLOP_PX then
+                    canvas.pendingWireFromId = tw.fromId
+                    canvas.pendingWireFromTerminal = fromTerminal
+                end
+                tw.portPicked, tw.pressX, tw.pressY = nil, nil, nil
                 local limitNotice = toElem and (twoTerminalAnchorAtWireLimit(canvas, canvas.wireTool.fromId, fromTerminal)
                     or twoTerminalAnchorAtWireLimit(canvas, toElem.id, toTerminal))
                 if toElem then

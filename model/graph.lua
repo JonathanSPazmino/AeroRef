@@ -200,8 +200,9 @@ local function buildGraph(elements, controls, wires, componentTypes, positions)
     -- (a diode's anode/cathode, a pump's inlet/outlet). anchorId ->
     -- {terminalIndex -> flow}
     local flowsByNode = {}
-    -- A terminal marked `suction` (an ejector's -- see model/fluid.lua) only draws
-    -- while motive flow runs through its element. anchorId -> {terminalIndex -> true}
+    -- A terminal marked `suction` (an ejector's -- see model/fluid.lua) is where a
+    -- pump driving its element draws more fluid in; gravity treats it like any other
+    -- inlet. anchorId -> {terminalIndex -> true}
     local suctionTerminals = {}
     local function noteFlowTerminals(anchor)
         for i, t in ipairs(anchor.terminals or {}) do

@@ -207,6 +207,14 @@ end
 --------------------------------------------------------------------------------
 devTests = {}
 
+-- A test function's results as gdsGui_dev_testCreate compares them: a single
+-- value (a table included) as it is, several values packed into a table in
+-- order, so a test that returns a, b is checked against both.
+function gdsGui_dev_packTestReturns(...)
+	if select("#", ...) <= 1 then return (...) end
+	return { ... }
+end
+
 function gdsGui_dev_testCreate (myLable, myTestingUnit, myInput, myExpectedOutPut)
 
 	--[[GUIDE:
@@ -256,7 +264,7 @@ function gdsGui_dev_testCreate (myLable, myTestingUnit, myInput, myExpectedOutPu
 
 	--[[THIS PART RUNNS THE TEST PASSING PARAMETERS]]
 
-	local fullParameterString1 = "NewTest.output = getfenv()[NewTest.test]("
+	local fullParameterString1 = "NewTest.output = gdsGui_dev_packTestReturns(getfenv()[NewTest.test]("
 	local fullParameterString2 = ""
 	local fullParameterString3 = ""
 
@@ -272,7 +280,7 @@ function gdsGui_dev_testCreate (myLable, myTestingUnit, myInput, myExpectedOutPu
 		
 	end
 
-	fullParameterString3 = fullParameterString1 .. fullParameterString2 .. ",true)"
+	fullParameterString3 = fullParameterString1 .. fullParameterString2 .. ",true))"
 
 	
 	local executeStringTestFunction = loadstring(fullParameterString3)
@@ -287,7 +295,8 @@ function gdsGui_dev_testCreate (myLable, myTestingUnit, myInput, myExpectedOutPu
 	local testFailTrigger = false
 	NewTest.failingParameter = ""
 
-	if type (NewTest.output) ~= "table" and NewTest.output ~= nil then --converts single values to table format
+	if NewTest.output == nil then NewTest.output = {} end --a test that returns nothing fails every expected value instead of erroring
+	if type (NewTest.output) ~= "table" then --converts single values to table format
 
 		local tamporaryOutputHolder = NewTest.output
 		NewTest.output = {}
@@ -314,9 +323,9 @@ function gdsGui_dev_testCreate (myLable, myTestingUnit, myInput, myExpectedOutPu
 			if outputExists == true and expectedOutputExists == true then
 				NewTest.failingParameter = NewTest.failingParameter .. i .. ")_xpctd:" .. tostring(myExpectedOutPut[i]) .. "_butGot:" .. tostring(NewTest.output[i]) ..  ", "
 			elseif outputExists == false and expectedOutputExists == true then
-				NewTest.failingParameter = NewTest.failingParameter .. i .. ")_noXpctdVal: " .. "_butGot: " .. tostring(NewTest.output[i]) ..  ","
+				NewTest.failingParameter = NewTest.failingParameter .. i .. ")_xpctd:" .. tostring (myExpectedOutPut[i]) .. "_butGotNoOutput, "
 			elseif outputExists == true and expectedOutputExists == false then
-				NewTest.failingParameter = NewTest.failingParameter .. i .. ")_xpct:" .. tostring (myExpectedOutPut[i]) .. "butGotNoOutput,"
+				NewTest.failingParameter = NewTest.failingParameter .. i .. ")_noXpctdVal_butGot:" .. tostring(NewTest.output[i]) ..  ", "
 			end
 
 		end

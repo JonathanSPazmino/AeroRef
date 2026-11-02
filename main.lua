@@ -331,8 +331,34 @@ local function _learnSegsColored(rawSegs, isDark)
     return out
 end
 
+-- True if fileName parses as Lua (compiles only, doesn't run it).
+-- love.filesystem.load throws on a syntax error in some LÖVE versions and
+-- returns nil in others, so both count as "doesn't parse".
+local function _compilesAsLua(fileName)
+    local okLoad, chunk = pcall(love.filesystem.load, fileName)
+    return okLoad and chunk ~= nil
+end
+
+-- Writes appSettings, first copying the current file (if it still parses) to
+-- appSettings.lua.bak, so a write cut short by the app being killed leaves a
+-- good copy for _loadAppSettings to fall back to.
 local function _saveAppSettings()
+    if love.filesystem.getInfo("appSettings.lua") and _compilesAsLua("appSettings.lua") then
+        local prevContents = love.filesystem.read("appSettings.lua")
+        if prevContents then love.filesystem.write("appSettings.lua.bak", prevContents) end
+    end
     love.filesystem.write("appSettings.lua", table.show(appSettings, "appSettings"))
+end
+
+-- Loads appSettings from appSettings.lua, else from its backup, else leaves it
+-- empty for the nil-guard defaults in love.load to fill in. A damaged file
+-- never stops the app from starting.
+local function _loadAppSettings()
+    appSettings = {}
+    for _, fileName in ipairs({ "appSettings.lua", "appSettings.lua.bak" }) do
+        if gdsGui_saveLoad_loadFileContents(fileName) and type(appSettings) == "table" then return end
+        appSettings = {}
+    end
 end
 
 -------------------------------------------------------------------------------
@@ -383,6 +409,19 @@ _FLUID_PUMP_TERMINALS = {
 -- _openSystemIntoCanvas, which gives it to batteries saved before they had one.
 _BATTERY_SPRITE_PATH = "Sprites/element_battery.png"
 _BATTERY_TERMINALS = { { x = -0.011, y = -0.476, exitX = 0, exitY = -1 } }
+
+-- EJECTOR's ports: motive in on the left, discharge out on the right, and
+-- suction at the very center of its artwork. The suction port leaves on the
+-- vertical axis with no side of its own, so its pipe runs straight up or
+-- straight down, whichever way the far end lies, without turning the ejector.
+-- Also read by _openSystemIntoCanvas, which gives every saved ejector these,
+-- so one placed before a change here picks it up.
+_EJECTOR_SPRITE_PATH = "Sprites/element_ejector.png"
+_EJECTOR_TERMINALS = {
+    { x = -0.5, y = 0, exitX = -1, exitY = 0, flow = "in" },
+    { x =  0,   y = 0, exitX =  0, exitY = 1, flow = "in", suction = true },
+    { x =  0.5, y = 0, exitX =  1, exitY = 0, flow = "out" },
+}
 
 -- A BUS's load (entity.busLoadAmps, nil reads as 0), set on the slider in its
 -- PROPERTIES menu and shown in its diagram label.
@@ -562,13 +601,9 @@ local SCHEMATIC_CATALOG = {
         -- and both leave through its discharge (see model/fluid.lua). A one-way role
         -- like CHECK VALVE's, so its ports alone set the direction.
         { label = "EJECTOR", abbrev = "EJCT", kind = "element", shapeType = "diode",
-          spritePath = "Sprites/element_ejector.png",
+          spritePath = _EJECTOR_SPRITE_PATH,
           gridW = 3, gridH = 3, componentType = "directionalGate",
-          terminals = {
-              { x = -0.5,    y = 0,   exitX = -1, exitY = 0, flow = "in" },
-              { x = -1 / 6,  y = 0.5, exitX =  0, exitY = 1, flow = "in", suction = true },
-              { x =  0.5,    y = 0,   exitX =  1, exitY = 0, flow = "out" },
-          } },
+          terminals = _EJECTOR_TERMINALS },
         { label = "FUEL SHUTOFF VALVE", abbrev = "FSOV", kind = "control",
           presets = { {"CLOSED", "OPEN"}, {"CLOSED", "OPEN", "AUTO"} },
           spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate" },
@@ -1000,7 +1035,7 @@ local function _saveSchematicStore(fileName)
     -- doesn't run it) before it's ever allowed to touch the real file — a
     -- table.show() edge case that produced invalid Lua source must never get
     -- the chance to overwrite a good save with garbage.
-    if not love.filesystem.load(tmpName) then
+    if not _compilesAsLua(tmpName) then
         love.filesystem.remove(tmpName)
         print("WARNING: " .. fileName .. " save aborted -- serialized data failed to parse back. Previous save left untouched.")
         return
@@ -1026,8 +1061,8 @@ end
 -- Returns true only if the file existed AND executed without error.
 local function _tryLoadLuaDataFile(fileName)
     if not love.filesystem.getInfo(fileName) then return false end
-    local chunk = love.filesystem.load(fileName)
-    if not chunk then return false end
+    local okLoad, chunk = pcall(love.filesystem.load, fileName)
+    if not okLoad or not chunk then return false end
     return pcall(chunk)
 end
 
@@ -3510,7 +3545,8 @@ local function _openSystemIntoCanvas(systemId, mode)
     for _, e in ipairs(sys.elements or {}) do
         gdsGui_schematic_addElement("mainCanvas", e.id, e.shapeType, e.x, e.y, e.w, e.h, e.label,
             _deepCopyTable(e.defaultColor), _deepCopyTable(e.properties), e.rotation or 0, e.spritePath,
-            e.componentType, _deepCopyTable(e.terminals or (e.spritePath == _BATTERY_SPRITE_PATH and _BATTERY_TERMINALS or nil)))
+            e.componentType, _deepCopyTable((e.spritePath == _EJECTOR_SPRITE_PATH and _EJECTOR_TERMINALS)
+                or e.terminals or (e.spritePath == _BATTERY_SPRITE_PATH and _BATTERY_TERMINALS or nil)))
         -- voltage (per-source display setting — see
         -- _openPerSourceSettingsMenu) isn't among addElement's own
         -- parameters, so it doesn't round-trip through it like
@@ -4960,6 +4996,7 @@ end
 function gdsGui_dev_onDataErased()
     appSettings = {}
     love.filesystem.remove("appSettings.lua")
+    love.filesystem.remove("appSettings.lua.bak")
     _tcScrolledToBottom = false
     gdsGui_button_setState("tcAgreementToggle", "deactivated")
     gdsGui_button_setState("tcContinueButton",  "deactivated")
@@ -4988,7 +5025,7 @@ function love.load()
     ---------------------------------------------------------------------------
     -- LOAD SETTINGS EARLY (needed for layout variables below)
     ---------------------------------------------------------------------------
-    gdsGui_saveLoad_loadFileContents("appSettings.lua")
+    _loadAppSettings()
     if appSettings.darkMode         == nil then appSettings.darkMode         = true  end
     if appSettings.soundEnabled     == nil then appSettings.soundEnabled     = true  end
     if appSettings.hapticsEnabled   == nil then appSettings.hapticsEnabled   = true  end
@@ -6979,7 +7016,7 @@ end
 
 function tcContinuePressed()
     appSettings.tcAcceptedVersion = APP_VERSION
-    love.filesystem.write("appSettings.lua", table.show(appSettings, "appSettings"))
+    _saveAppSettings()
     _navSyncAll("MainMenu")
     gdsGui_page_switch("LoadingMainMenu", 3, 3, false)
 end
@@ -8058,10 +8095,13 @@ function colorForPoweredNode_singleSourceOwnColorTest()
     return color[1], color[2], color[3]
 end
 
-function colorForPoweredNode_singleSourceNoColorFallsBackTest()
+-- A source with no voltage set has no color of its own, so what it alone powers
+-- draws in the current medium's unpowered color, not the default.
+function colorForPoweredNode_singleSourceNoVoltageShowsUnpoweredTest()
     local canvas = { elements = { { id = "batt1" } }, controls = {}, voltageColors = {} } -- no voltage -> no registered color
     local color = _colorForPoweredNode("bus1", { bus1 = { batt1 = true } }, canvas, _TEST_DEFAULT)
-    return color[1], color[2], color[3]
+    local unpowered = _currentMedium().style.unpowered
+    return color[1] == unpowered[1] and color[2] == unpowered[2] and color[3] == unpowered[3]
 end
 
 function colorForPoweredNode_tieHigherVoltageWinsTest()
@@ -8896,7 +8936,8 @@ function schematicFluidPumpTransferTest()
 end
 
 -- A driven ejector scavenges its suction tank into its discharge, even when that's
--- the tank its pump draws from, and does nothing without motive flow.
+-- the tank its pump draws from. Without motive flow it pumps nothing, but gravity
+-- still drains through it like an open check valve.
 function schematicFluidEjectorTest()
     local item
     for _, system in ipairs(SCHEMATIC_CATALOG) do
@@ -8907,6 +8948,9 @@ function schematicFluidEjectorTest()
     if not item or not love.filesystem.getInfo(item.spritePath) then return -1 end
     local t = item.terminals
     if not (t[1].flow == "in" and not t[1].suction and t[2].flow == "in" and t[2].suction and t[3].flow == "out") then return -2 end
+    -- Suction sits at the center and leaves vertically, so a pipe can reach it
+    -- from above or below without turning the ejector.
+    if t[2].x ~= 0 or t[2].y ~= 0 or t[2].exitX ~= 0 or t[2].exitY == 0 then return -14 end
 
     local types = { C = "source", W = "source", E = "sink", P = "source", V = "gate", X = "directionalGate" }
     local function build(wires, open, off)
@@ -8982,6 +9026,14 @@ function schematicFluidEjectorTest()
     c, w = tank(50), tank(40)
     ModelFluid.step(build(wires), { C = c, W = w }, {}, 3)
     if w.fillPercent ~= 40 or wires[1].fluidMoving then return -12 end
+
+    -- No pump, but a gravity-marked run through the ejector to an engine: the wing
+    -- tank drains at the gravity rate.
+    wires = { { id = "suction", fromElementId = "W", toElementId = "X", toTerminal = 2, gravityDirection = "forward" },
+        { id = "discharge", fromElementId = "X", fromTerminal = 3, toElementId = "E", gravityDirection = "forward" } }
+    w = tank(40)
+    ModelFluid.step(build(wires, nil, { P = true }), { W = w }, {}, 3)
+    if not close(w.fillPercent, 40 - ModelFluid.DRAIN_RATE * 3 / 1000 * 100) or not wires[1].fluidMoving then return -13 end
     return 1
 end
 
@@ -9176,6 +9228,93 @@ function schematicReshapeMigratesRowsTest()
     if traced({ "###..", "#####", "#####", "#####" }) ~= "0,0,3,0,3,1,5,1,5,4,0,4" then return -3 end
     if traced({ ".##", "###" }) ~= "1,0,3,0,3,2,0,2,0,1,1,1" then return -4 end
     return 1
+end
+
+-- ADD WIRE on an element with two or more ports asks which one first: a tap off
+-- every port cancels, a tap on one keeps it for the next drag, and a drag from
+-- one runs straight from it. An ejector's suction port can be picked the same way.
+function schematicWirePortPickTest()
+    local canvas, tank, restore = _reshapeTestSetup("unitTestCanvasPortPick")
+    local result = 1
+    local cell = 16 -- 2 world units per grid unit at zoom 8
+    local x0, y0 = canvas.x + canvas.panX, canvas.y + canvas.panY
+    local function choose(id, option)
+        canvas._elementEditTargetId = id
+        gdsGui_schematic_internal_onElementEditChosen(canvas.name, nil, option)
+    end
+    local function tap(x, y)
+        gdsGui_schematic_pressed("t", x, y)
+        gdsGui_schematic_released("t", x, y)
+    end
+    local function drag(x1, y1, x2, y2)
+        gdsGui_schematic_pressed("t", x1, y1)
+        gdsGui_schematic_moved("t", x2, y2)
+        gdsGui_schematic_released("t", x2, y2)
+    end
+    local function lastWire() return canvas.wires[#canvas.wires] end
+
+    -- Port 1 on the tank's right side, port 2 on its top; a target off to the right.
+    choose("tank", "ADD PORT")
+    tap(x0 + 3 * cell + 5, y0 + 1.5 * cell)
+    choose("tank", "ADD PORT")
+    tap(x0 + 1.5 * cell, y0)
+    if not tank.terminals or #tank.terminals ~= 2 then restore() return -1 end
+    gdsGui_schematic_addElement(canvas.name, "other", "rect", 14 / canvas.contentW, 0, 6 / canvas.contentW, 6 / canvas.contentH, "O")
+    local otherX, otherY = x0 + 8.5 * cell, y0 + 1.5 * cell
+
+    -- Asks for a port rather than arming the drag outright.
+    choose("tank", "ADD WIRE")
+    if canvas.pendingWirePortPick ~= "tank" or canvas.pendingWireFromId then result = -2 end
+    -- A tap on no port cancels.
+    tap(x0 + 1.5 * cell, y0 + 12 * cell)
+    if canvas.pendingWirePortPick or canvas.pendingWireFromId or #canvas.wires ~= 0 then result = -3 end
+
+    -- A tap on the top port keeps it; a drag starting by the right port still
+    -- leaves from the top one.
+    choose("tank", "ADD WIRE")
+    tap(x0 + 1.5 * cell, y0 + 1)
+    if canvas.pendingWireFromId ~= "tank" or canvas.pendingWireFromTerminal ~= 2 or #canvas.wires ~= 0 then result = -4 end
+    drag(x0 + 3 * cell + 2, y0 + 1.5 * cell, otherX, otherY)
+    if #canvas.wires ~= 1 or lastWire().fromElementId ~= "tank" or lastWire().fromTerminal ~= 2 then result = -5 end
+    if canvas.pendingWireFromId or canvas.pendingWireFromTerminal then result = -6 end
+
+    -- A drag straight off the right port runs from it.
+    choose("tank", "ADD WIRE")
+    drag(x0 + 3 * cell, y0 + 1.5 * cell, otherX, otherY)
+    if #canvas.wires ~= 2 or lastWire().fromTerminal ~= 1 then result = -7 end
+
+    -- A drag off a port to nothing disarms, and so does a miss after a tap kept it.
+    choose("tank", "ADD WIRE")
+    drag(x0 + 1.5 * cell, y0 + 1, x0 + 1.5 * cell, y0 + 12 * cell)
+    if canvas.pendingWirePortPick or canvas.pendingWireFromId or #canvas.wires ~= 2 then result = -12 end
+    choose("tank", "ADD WIRE")
+    tap(x0 + 1.5 * cell, y0 + 1)
+    drag(x0 + 3 * cell + 2, y0 + 1.5 * cell, x0 + 1.5 * cell, y0 + 12 * cell)
+    if canvas.pendingWirePortPick or canvas.pendingWireFromId or #canvas.wires ~= 2 then result = -13 end
+
+    -- An ejector: its suction port, picked by tap, holds the pipe.
+    local item
+    for _, system in ipairs(SCHEMATIC_CATALOG) do
+        for _, candidate in ipairs(system.items) do
+            if candidate.label == "EJECTOR" then item = candidate end
+        end
+    end
+    gdsGui_schematic_addElement(canvas.name, "ej", "diode", 0, 20 / canvas.contentH, 6 / canvas.contentW, 6 / canvas.contentH,
+        "EJ", nil, nil, nil, nil, "directionalGate", item.terminals)
+    choose("ej", "ADD WIRE")
+    if canvas.pendingWirePortPick ~= "ej" then result = -8 end
+    tap(x0 + 1.5 * cell, y0 + 11.5 * cell) -- the suction port, dead center
+    if canvas.pendingWireFromTerminal ~= 2 then result = -9 end
+    drag(x0 + 1.5 * cell, y0 + 10.5 * cell, otherX, otherY)
+    if #canvas.wires ~= 3 or lastWire().fromElementId ~= "ej" or lastWire().fromTerminal ~= 2 then result = -10 end
+
+    -- An element with a single port (or none) skips the question.
+    gdsGui_schematic_addElement(canvas.name, "plain", "rect", 14 / canvas.contentW, 20 / canvas.contentH, 6 / canvas.contentW, 6 / canvas.contentH, "P")
+    choose("plain", "ADD WIRE")
+    if canvas.pendingWirePortPick or canvas.pendingWireFromId ~= "plain" then result = -11 end
+    gdsGui_schematic_cancelPlacement(canvas.name)
+    restore()
+    return result
 end
 
 -- A tank's ports: placed by tap on its outline at any rotation, they hold its pipes,
@@ -11010,10 +11149,10 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcParameters"]={0},
         ["funcExpctOutput"]={1, 0, 0}}
 
-    gdsGui_dev_testExecute {["id"]="colorForPoweredNode_singleSourceNoColorFallsBack",
-        ["funcName"]={"colorForPoweredNode_singleSourceNoColorFallsBackTest"},
+    gdsGui_dev_testExecute {["id"]="colorForPoweredNode_singleSourceNoVoltageShowsUnpowered",
+        ["funcName"]={"colorForPoweredNode_singleSourceNoVoltageShowsUnpoweredTest"},
         ["funcParameters"]={0},
-        ["funcExpctOutput"]={0.9, 0.9, 0.9}}
+        ["funcExpctOutput"]={true}}
 
     gdsGui_dev_testExecute {["id"]="colorForPoweredNode_tieHigherVoltageWins",
         ["funcName"]={"colorForPoweredNode_tieHigherVoltageWinsTest"},
@@ -11118,12 +11257,16 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcName"]={"schematicFluidPumpTransferTest"},
         ["funcParameters"]={0},
         ["funcExpctOutput"]={1}}
-    gdsGui_dev_testExecute {["id"]="modelFluid_ejectorScavengesOnlyWhenDriven",
+    gdsGui_dev_testExecute {["id"]="modelFluid_ejectorScavengesWhenDrivenDrainsByGravity",
         ["funcName"]={"schematicFluidEjectorTest"},
         ["funcParameters"]={0},
         ["funcExpctOutput"]={1}}
     gdsGui_dev_testExecute {["id"]="schematic_tank_ports",
         ["funcName"]={"schematicTankPortsTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+    gdsGui_dev_testExecute {["id"]="schematic_wire_portPick",
+        ["funcName"]={"schematicWirePortPickTest"},
         ["funcParameters"]={0},
         ["funcExpctOutput"]={1}}
     gdsGui_dev_testExecute {["id"]="schematic_tank_centerText",

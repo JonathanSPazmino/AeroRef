@@ -25,9 +25,11 @@
 --
 -- An ejector (a jet pump) has no moving parts and no power of its own. Fluid a
 -- running pump pushes in through its motive port draws more in through its suction
--- port, and both leave through its discharge. So its suction tank only drains while
--- a pump drives it, and its discharge can be the very tank that pump draws from: the
--- usual layout, scavenging a wing tank into the collector tank feeding the pump.
+-- port, and both leave through its discharge, which can be the very tank that pump
+-- draws from: the usual layout, scavenging a wing tank into the collector tank
+-- feeding the pump. Only a driven ejector moves fluid into another tank. To gravity
+-- it is an open check valve, suction port included, so a gravity-marked run through
+-- it still drains its suction tank to a sink or an open line end, pump or not.
 
 -- Gallons a second: about 6 gallons a minute, a half-inch line draining under
 -- gravity alone. One rate per store, however many routes lead away from it.
