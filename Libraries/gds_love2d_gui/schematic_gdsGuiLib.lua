@@ -1145,9 +1145,14 @@ function _shapePoly.drawLevel(canvas, e, drawBody, r, g, b, a)
     drawBody(r * shade, g * shade, b * shade, a)
     if e.fillPercent <= 0 then return end
     local lineY, maxY = _shapePoly.levelLineY(canvas, e)
-    local top = math.floor(lineY + 0.5)
+    -- The scissor is in screen space, which ignores the transform, so the line
+    -- and bottom go through it: a lifted tank (see _selection.beginLift) draws
+    -- scaled, and its level must scale with it.
+    local _, screenLineY = love.graphics.transformPoint(0, lineY)
+    local _, screenMaxY = love.graphics.transformPoint(0, maxY)
+    local top = math.floor(screenLineY + 0.5)
     local prevX, prevY, prevW, prevH = love.graphics.getScissor()
-    love.graphics.intersectScissor(0, top, love.graphics.getWidth(), math.ceil(maxY) + 1 - top)
+    love.graphics.intersectScissor(0, top, love.graphics.getWidth(), math.ceil(screenMaxY) + 1 - top)
     drawBody(r, g, b, a)
     if prevX then love.graphics.setScissor(prevX, prevY, prevW, prevH) else love.graphics.setScissor() end
 end
@@ -2031,7 +2036,7 @@ function gdsGui_schematic_create(name, page, x, y, anchorPoint, wFrac, hFrac)
     canvas.pendingWireFromId = nil  -- armed via ADD WIRE in the element edit menu: elementId the next press-drag-release starts a wire from, with no need to land that press on an anchor; disarms after one drag
     canvas.pendingPort       = nil  -- armed via ADD PORT/REMOVE PORT/MOVE PORT in the element edit menu: {elementId, removing, moving}, what the next tap does; moving is true until a port is picked, then that port's index. Disarms after one tap (MOVE PORT: after two)
     canvas.pendingWirePortPick = nil  -- armed via ADD WIRE on an element with two or more terminals: its id, waiting on a tap on the port the wire leaves from; disarms after one tap
-    canvas.pathEdit = nil  -- {wireId, index, inserted, grabX, grabY} while EDIT PATH is on for a connector (see _wirePath)
+    canvas.pathEdit = nil  -- {wireId, index, pendingInsert, grabX, grabY} while EDIT PATH is on for a connector (see _wirePath)
     canvas.pendingWireFromTerminal = nil  -- the port picked for pendingWireFromId, so its wire leaves from there rather than whichever port ends up nearest the far end
     canvas.paintMode = nil  -- { color = {r,g,b,a} | nil } while the PAINT brush is armed; see gdsGui_schematic_armPaintMode. Unlike the pending* one-shot fields above, stays armed across any number of taps.
     canvas._paintTarget = nil  -- {kind, id} of whatever a "paint" drag's press landed on, between press and release
@@ -2792,6 +2797,8 @@ function gdsGui_schematic_cancelPlacement(canvasName)
         canvas.pendingWirePortPick = nil
         canvas.pendingWireFromTerminal = nil
         canvas.pendingPort = nil
+        -- Ending EDIT PATH also lets go of the connector it selected.
+        if canvas.pathEdit then canvas.selectedWireId = nil end
         canvas.pathEdit = nil
         canvas.paintMode = nil
         canvas.annunciatorPanelOpen = false
@@ -2926,6 +2933,9 @@ function gdsGui_schematic_openMenu(canvasName, title, options, onSelectFunc, onC
     -- it's no longer receiving input for (e.g. the ADD "+" button opening
     -- the catalog cascade while the panel happens to be open).
     canvas.annunciatorPanelOpen = false
+    -- Likewise EDIT PATH: its handles would draw over the menu, and the tap
+    -- after it (placing an element from ADD, say) would only end the edit.
+    if canvas.pathEdit then _wirePath.finish(canvas) end
     canvas.menu = { title = title, options = options, onSelect = onSelectFunc, onCancel = onCancelFunc,
         anchorButtonName = canvas._menuAnchorButtonName, widthFrac = widthFrac }
     _markConfirmMenu(canvas.menu, confirmIndex)
@@ -7954,69 +7964,84 @@ function _wirePath.finish(canvas)
 end
 
 -- A press while EDIT PATH is on (see gdsGui_schematic_pressed): takes a
--- handle, or finishes editing. A "+" puts its new point in straight away
--- (one undo step); a bend point's undo step is only kept once it's dragged
--- or removed.
+-- handle, or finishes editing. Nothing changes until the press is known to be a
+-- drag or a tap, so one that becomes a pinch leaves the path alone: a "+"
+-- puts its new point in once dragged (or tapped), a bend point moves once
+-- dragged and goes when tapped. Each is one undo step.
 function _wirePath.press(canvas, touchId, x, y)
-    local w = _findWire(canvas, canvas.pathEdit.wireId)
+    local edit = canvas.pathEdit
+    local w = _findWire(canvas, edit.wireId)
     local handle = w and _wirePath.hitHandle(canvas, w, x, y)
     if not handle then
         _wirePath.finish(canvas)
         return
     end
+    canvas._pendingDragUndoSnapshot = _snapshotState(canvas)
+    gdsGui_haptics_feedback("selection")
     if handle.kind == "insert" then
-        _pushUndo(canvas)
-        local fx, fy = _snapToGrid(canvas, _toFraction(canvas, handle.x, handle.y))
-        local points = _wirePath.copy(w)
-        table.insert(points, handle.index, { x = fx, y = fy })
-        w.waypoints = points
-        gdsGui_haptics_feedback("light")
+        edit.index, edit.pendingInsert = nil, { index = handle.index, x = handle.x, y = handle.y }
     else
-        canvas._pendingDragUndoSnapshot = _snapshotState(canvas)
-        gdsGui_haptics_feedback("selection")
+        edit.index, edit.pendingInsert = handle.index, nil
     end
-    canvas.pathEdit.index = handle.index
-    canvas.pathEdit.inserted = handle.kind == "insert"
-    canvas.pathEdit.grabX, canvas.pathEdit.grabY = handle.x - x, handle.y - y
+    edit.grabX, edit.grabY = handle.x - x, handle.y - y
     canvas.focusTouchId = touchId
     canvas.dragKind = "pathPoint"
     canvas.dragMoved = false
     canvas.dragStartX, canvas.dragStartY = x, y
 end
 
+-- Commits the pressed handle's undo step and, for a "+", puts its new point
+-- in where the "+" sat; edit.index is then that point.
+function _wirePath.commitPress(canvas, w)
+    local edit = canvas.pathEdit
+    if canvas._pendingDragUndoSnapshot then
+        _commitUndoSnapshot(canvas, canvas._pendingDragUndoSnapshot)
+        canvas._pendingDragUndoSnapshot = nil
+    end
+    local insert = edit.pendingInsert
+    if insert then
+        local fx, fy = _snapToGrid(canvas, _toFraction(canvas, insert.x, insert.y))
+        local points = _wirePath.copy(w)
+        table.insert(points, insert.index, { x = fx, y = fy })
+        w.waypoints = points
+        edit.index, edit.pendingInsert = insert.index, nil
+        gdsGui_haptics_feedback("light")
+        return true
+    end
+    return false
+end
+
 -- The drag of a bend point, snapping to the grid with a tick at each step.
 function _wirePath.move(canvas, x, y)
     local edit = canvas.pathEdit
+    local w = _findWire(canvas, edit.wireId)
+    if not w then return end
     if not canvas.dragMoved and (math.abs(x - canvas.dragStartX) > _ELEMENT_TAP_SLOP_PX or
                                  math.abs(y - canvas.dragStartY) > _ELEMENT_TAP_SLOP_PX) then
         canvas.dragMoved = true
-        if canvas._pendingDragUndoSnapshot then
-            _commitUndoSnapshot(canvas, canvas._pendingDragUndoSnapshot)
-            canvas._pendingDragUndoSnapshot = nil
-        end
+        _wirePath.commitPress(canvas, w)
     end
-    if not canvas.dragMoved then return end
-    local w = _findWire(canvas, edit.wireId)
-    if w and _wirePath.movePoint(canvas, w, edit.index, x + edit.grabX, y + edit.grabY) then
+    if not canvas.dragMoved or not edit.index then return end
+    if _wirePath.movePoint(canvas, w, edit.index, x + edit.grabX, y + edit.grabY) then
         gdsGui_haptics_feedback("selection")
     end
 end
 
--- The end of a handle's press: a bend point tapped (not dragged) is removed.
+-- The end of a handle's press: a "+" tapped (not dragged) puts its point in;
+-- a bend point tapped is removed.
 function _wirePath.release(canvas)
     local edit = canvas.pathEdit
     local w = _findWire(canvas, edit.wireId)
-    if w and not canvas.dragMoved and not edit.inserted then
-        if canvas._pendingDragUndoSnapshot then
-            _commitUndoSnapshot(canvas, canvas._pendingDragUndoSnapshot)
-            canvas._pendingDragUndoSnapshot = nil
+    if w and not canvas.dragMoved then
+        if not _wirePath.commitPress(canvas, w) and edit.index then
+            local points = _wirePath.copy(w)
+            table.remove(points, edit.index)
+            w.waypoints = #points > 0 and points or nil
+            gdsGui_haptics_feedback("light")
         end
-        local points = _wirePath.copy(w)
-        table.remove(points, edit.index)
-        w.waypoints = #points > 0 and points or nil
-        gdsGui_haptics_feedback("light")
     end
-    edit.index, edit.inserted = nil, nil
+    canvas._pendingDragUndoSnapshot = nil
+    edit.index, edit.pendingInsert = nil, nil
     _notifyChanged(canvas)
 end
 

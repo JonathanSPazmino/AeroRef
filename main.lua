@@ -9250,8 +9250,19 @@ function schematicWirePathTest()
     choose("EDIT PATH")
     if not canvas.pathEdit or canvas.pathEdit.wireId ~= "w" then restore() return -2 end
 
-    -- Dropped a little off the grid, it snaps to the nearest grid point.
+    -- A press on a "+" that turns into a pinch adds nothing.
     local plus = handle("insert", 1)
+    if not plus then restore() return -3 end
+    local zoomBefore, panXBefore, panYBefore = canvas.zoom, canvas.panX, canvas.panY
+    gdsGui_schematic_pressed("t", plus.x, plus.y)
+    gdsGui_schematic_pressed("t2", px(2, 40))
+    gdsGui_schematic_released("t2", px(2, 40))
+    gdsGui_schematic_released("t", plus.x, plus.y)
+    canvas.zoom, canvas.panX, canvas.panY = zoomBefore, panXBefore, panYBefore
+    if wire().waypoints or not canvas.pathEdit then result = -12 end
+
+    -- Dropped a little off the grid, it snaps to the nearest grid point.
+    plus = handle("insert", 1)
     if not plus then restore() return -3 end
     local tx, ty = px(30, 4)
     drag(plus.x, plus.y, tx + 3, ty - 2)
@@ -10935,6 +10946,12 @@ gdsGui_unitTests_registerSuite("app", function()
     _appSettingsSaveSuspended = true
     local settingsBeforeTests = {}
     for k, v in pairs(appSettings) do settingsBeforeTests[k] = v end
+    -- Likewise the calculator's live selections, which the knob/slider
+    -- handler tests set: a re-run from the dev panel mustn't leave the
+    -- crosswind readout working from test values.
+    local liveSelections = { "selectedWindSpeed", "selectedWindGust", "selectedKnobPos", "selectedWindDirection" }
+    local selectionsBeforeTests = {}
+    for _, name in ipairs(liveSelections) do selectionsBeforeTests[name] = _G[name] end
 
     --------------------------------------------------------------------------
     --  format_time
@@ -11694,6 +11711,7 @@ gdsGui_unitTests_registerSuite("app", function()
 
 
     appSettings = settingsBeforeTests
+    for _, name in ipairs(liveSelections) do _G[name] = selectionsBeforeTests[name] end
     _appSettingsSaveSuspended = false
     if appSettings.fontSize then _applyFontSize(appSettings.fontSize) end
 end)
