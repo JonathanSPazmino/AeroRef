@@ -22,6 +22,12 @@
 -- moves fluid from whatever its inlet can draw on to whatever its outlet can
 -- deliver to, another tank included, along the same valves, manifolds and check
 -- valves. See _pumpRoutes.
+--
+-- An ejector (a jet pump) has no moving parts and no power of its own. Fluid a
+-- running pump pushes in through its motive port draws more in through its suction
+-- port, and both leave through its discharge. So its suction tank only drains while
+-- a pump drives it, and its discharge can be the very tank that pump draws from: the
+-- usual layout, scavenging a wing tank into the collector tank feeding the pump.
 
 -- Gallons a second: about 6 gallons a minute, a half-inch line draining under
 -- gravity alone. One rate per store, however many routes lead away from it.
@@ -30,6 +36,8 @@ local DRAIN_RATE = 0.1
 local PIPE_VOLUME_PER_UNIT = 0.01
 -- Gallons a second per PSI of pump pressure: 30 PSI moves 600 gallons a minute.
 local PUMP_RATE_PER_PSI = 1 / 3
+-- Gallons an ejector draws per gallon of the motive flow driving it.
+local EJECTOR_ENTRAINMENT = 1
 
 local function _conducts(node, conducting)
     if node.role == "path" or node.role == "directionalGate" then return true end
@@ -70,7 +78,7 @@ end
 -- feeding another pump counts once, as the first in line, so a series pair
 -- doesn't move twice the fluid. pressures: {pumpId -> PSI}.
 local function _pumpRoutes(graph, conducting, offSources, pressures)
-    local isPump, downstream, upstream = {}, {}, {}
+    local isPump, isEjector, downstream, upstream = {}, {}, {}, {}
     local function addLink(edge, from, to)
         local link = { edge = edge, from = from, to = to }
         downstream[from] = downstream[from] or {}
@@ -83,11 +91,26 @@ local function _pumpRoutes(graph, conducting, offSources, pressures)
             addLink(e, e.fromId, e.toId)
             if not e.directional then addLink(e, e.toId, e.fromId) end
             if e.inletOf and not (offSources and offSources[e.inletOf]) then isPump[e.inletOf] = true end
+            if e.suctionOf then isEjector[e.suctionOf] = true end
         end
     end
 
     local function passes(id)
         return isPump[id] or _conducts(graph.nodes[id], conducting)
+    end
+
+    -- What one ejector can draw on through its suction port (and not its motive
+    -- port), and what its discharge can reach.
+    local function ejectorRoute(id)
+        local suctionOnly = {}
+        for _, links in pairs(upstream) do
+            for _, link in ipairs(links) do
+                if link.to ~= id or link.edge.suctionOf == id then suctionOnly[link] = true end
+            end
+        end
+        local draws, suction = _walk({ id }, upstream, "from", passes, suctionOnly)
+        local serves, discharge = _walk({ id }, downstream, "to", passes)
+        return { id = id, draws = draws, suction = suction, serves = serves, discharge = discharge }
     end
 
     local pumps = {}
@@ -99,9 +122,19 @@ local function _pumpRoutes(graph, conducting, offSources, pressures)
         end
         if leads then
             local outlets, delivery = _walk({ id }, downstream, "to", passes)
+            -- Driven only by a pipe into the motive port: a pump on the suction
+            -- port is just feeding it, and draws nothing else along.
+            local ejectors, driven = {}, {}
+            for link in pairs(delivery) do
+                if isEjector[link.to] and link.edge.suctionOf ~= link.to and not driven[link.to] then
+                    driven[link.to] = true
+                    table.insert(ejectors, ejectorRoute(link.to))
+                end
+            end
             table.insert(pumps, {
                 id = id, psi = tonumber(pressures and pressures[id]) or 0,
                 inlets = inlets, suction = suction, outlets = outlets, delivery = delivery,
+                ejectors = ejectors,
             })
         end
     end
@@ -200,9 +233,10 @@ local function _stepPumps(flow, stores, dt)
         return store, capacity, gallons
     end
 
-    for _, pump in ipairs(flow.pumps) do
+    -- The stores among reached with anything to give.
+    local function suppliersIn(reached)
         local suppliers, supplierSet = {}, {}
-        for id in pairs(pump.inlets) do
+        for id in pairs(reached) do
             -- Only a store holds anything to draw: a pump upstream, on or off, doesn't.
             if stores[id] then
                 local store, _, gallons = storeState(id)
@@ -212,9 +246,13 @@ local function _stepPumps(flow, stores, dt)
                 end
             end
         end
+        return suppliers, supplierSet
+    end
 
+    -- Whatever among reached can take more, other than the suppliers themselves.
+    local function receiversIn(reached, supplierSet)
         local receivers = {}
-        for id in pairs(pump.outlets) do
+        for id in pairs(reached) do
             local node = graph.nodes[id]
             if not supplierSet[id] then
                 local accepts = node.role == "sink"
@@ -227,41 +265,70 @@ local function _stepPumps(flow, stores, dt)
                 if accepts then table.insert(receivers, id) end
             end
         end
+        return receivers
+    end
 
-        if #suppliers > 0 and #receivers > 0 and pump.psi > 0 then
-            -- Split evenly and capped by the emptiest supplier and the fullest
-            -- receiver, so what leaves always equals what arrives.
-            local amount = pump.psi * PUMP_RATE_PER_PSI * dt
-            for _, id in ipairs(suppliers) do
-                local store, _, gallons = storeState(id)
-                if store then amount = math.min(amount, gallons * #suppliers) end
+    -- Split evenly and capped by the emptiest supplier and the fullest receiver,
+    -- so what leaves always equals what arrives.
+    local function transfer(suppliers, receivers, amount)
+        for _, id in ipairs(suppliers) do
+            local store, _, gallons = storeState(id)
+            if store then amount = math.min(amount, gallons * #suppliers) end
+        end
+        for _, id in ipairs(receivers) do
+            local store, capacity, gallons = storeState(id)
+            if store then amount = math.min(amount, (capacity - gallons) * #receivers) end
+        end
+        for _, id in ipairs(suppliers) do
+            local store, capacity, gallons = storeState(id)
+            if store then
+                store.fillPercent = math.max(0, (gallons - amount / #suppliers) / capacity * 100)
+                changed = true
             end
-            for _, id in ipairs(receivers) do
-                local store, capacity, gallons = storeState(id)
-                if store then amount = math.min(amount, (capacity - gallons) * #receivers) end
+        end
+        for _, id in ipairs(receivers) do
+            local store, capacity, gallons = storeState(id)
+            if store then
+                store.fillPercent = math.min(100, (gallons + amount / #receivers) / capacity * 100)
+                changed = true
             end
-            for _, id in ipairs(suppliers) do
-                local store, capacity, gallons = storeState(id)
-                if store then
-                    store.fillPercent = math.max(0, (gallons - amount / #suppliers) / capacity * 100)
-                    changed = true
-                end
-            end
-            for _, id in ipairs(receivers) do
-                local store, capacity, gallons = storeState(id)
-                if store then
-                    store.fillPercent = math.min(100, (gallons + amount / #receivers) / capacity * 100)
-                    changed = true
-                end
-            end
+        end
+    end
 
+    local function markMoving(used)
+        for link in pairs(used) do
+            local ends = graph.wireEnds[link.edge.id]
+            pumped[link.edge.id] = (ends and ends.toId == link.from) and "reverse" or "forward"
+        end
+    end
+
+    for _, pump in ipairs(flow.pumps) do
+        local suppliers, supplierSet = suppliersIn(pump.inlets)
+        if #suppliers > 0 and pump.psi > 0 then
+            local gallons = pump.psi * PUMP_RATE_PER_PSI * dt
+            local receivers = receiversIn(pump.outlets, supplierSet)
             -- Only the pipes actually between a supplier and a receiver.
             local _, drawing = _walk(suppliers, flow.downstream, "to", flow.passes, pump.suction)
-            local _, delivering = _walk(receivers, flow.upstream, "from", flow.passes, pump.delivery)
-            for _, used in ipairs({ drawing, delivering }) do
-                for link in pairs(used) do
-                    local ends = graph.wireEnds[link.edge.id]
-                    pumped[link.edge.id] = (ends and ends.toId == link.from) and "reverse" or "forward"
+            if #receivers > 0 then
+                transfer(suppliers, receivers, gallons)
+                local _, delivering = _walk(receivers, flow.upstream, "from", flow.passes, pump.delivery)
+                markMoving(drawing)
+                markMoving(delivering)
+            end
+
+            for _, ejector in ipairs(pump.ejectors) do
+                local drawn, drawnSet = suppliersIn(ejector.draws)
+                local served = receiversIn(ejector.serves, drawnSet)
+                if #served > 0 then
+                    if #drawn > 0 then
+                        transfer(drawn, served, gallons * EJECTOR_ENTRAINMENT / #pump.ejectors)
+                        markMoving(select(2, _walk(drawn, flow.downstream, "to", flow.passes, ejector.suction)))
+                    end
+                    -- The motive flow runs whether or not there's anything left to
+                    -- draw, even when it only circles back to the pump's own tank.
+                    markMoving(drawing)
+                    markMoving(select(2, _walk({ ejector.id }, flow.upstream, "from", flow.passes, pump.delivery)))
+                    markMoving(select(2, _walk(served, flow.upstream, "from", flow.passes, ejector.discharge)))
                 end
             end
         end
@@ -340,4 +407,4 @@ local function step(flow, stores, pipeUnits, dt)
 end
 
 return { computeFlow = computeFlow, step = step, DRAIN_RATE = DRAIN_RATE, PIPE_VOLUME_PER_UNIT = PIPE_VOLUME_PER_UNIT,
-    PUMP_RATE_PER_PSI = PUMP_RATE_PER_PSI }
+    PUMP_RATE_PER_PSI = PUMP_RATE_PER_PSI, EJECTOR_ENTRAINMENT = EJECTOR_ENTRAINMENT }

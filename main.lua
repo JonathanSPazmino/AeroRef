@@ -43,7 +43,7 @@ APP_VERSION = "1.0.33"
 --  before this existed, same convention as v2, no migration step needed.
 SCHEMATIC_SCHEMA_VERSION = 3
 
--- Original orientation the app was designed for; used by the GUI library to
+-- Original orieBntation the app was designed for; used by the GUI library to
 -- establish the reference container width at first finalize (portrait = 1 col).
 globApp.appOriginalOrientation = "portrait"
 
@@ -557,6 +557,18 @@ local SCHEMATIC_CATALOG = {
         -- VALVE above (e.g. an anti-siphon or crossfeed check valve).
         { label = "CHECK VALVE", abbrev = "CKVL", kind = "element", shapeType = "diode",
           gridW = 2, gridH = 2, componentType = "directionalGate" },
+        -- A jet pump: no moving parts and nothing to switch, so an element. Fuel a
+        -- pump drives into its motive port draws more in through its suction port,
+        -- and both leave through its discharge (see model/fluid.lua). A one-way role
+        -- like CHECK VALVE's, so its ports alone set the direction.
+        { label = "EJECTOR", abbrev = "EJCT", kind = "element", shapeType = "diode",
+          spritePath = "Sprites/element_ejector.png",
+          gridW = 3, gridH = 3, componentType = "directionalGate",
+          terminals = {
+              { x = -0.5,    y = 0,   exitX = -1, exitY = 0, flow = "in" },
+              { x = -1 / 6,  y = 0.5, exitX =  0, exitY = 1, flow = "in", suction = true },
+              { x =  0.5,    y = 0,   exitX =  1, exitY = 0, flow = "out" },
+          } },
         { label = "FUEL SHUTOFF VALVE", abbrev = "FSOV", kind = "control",
           presets = { {"CLOSED", "OPEN"}, {"CLOSED", "OPEN", "AUTO"} },
           spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate" },
@@ -5842,6 +5854,7 @@ function love.load()
     -- e.g. "24V"; anything else (BUS, DIODE, no voltage taught yet, ...)
     -- shows no second row at all.
     _findSchematicCanvas().elementStatusText = "schematicElementStatusText"
+    _findSchematicCanvas().elementCenterText = "schematicElementCenterText"
     -- Starts empty: the canvas is only ever populated by an explicit NEW
     -- SYSTEM or OPEN action from the aircraft flow (see _openSystemIntoCanvas above).
     _schematicCanvasNormalLayout = { x = schCanvasXFrac, y = schCanvasYFrac, anchorPoint = "LT", wFrac = schCanvasWFrac, hFrac = schCanvasHFrac }
@@ -7575,6 +7588,36 @@ function schematicElementSensedValues(canvasName, elementId)
     return values
 end
 
+-- What a liquid tank's center label says, one reading a line: its quantity (left
+-- out with no MAX CAPACITY to work it out from, and in gallons like model/fluid.lua
+-- reads capacities), its level (nil reads as full, same as the schematic's fill)
+-- and pressure, the "30PSI" schematicElementSensedVoltage gives, or nil for none.
+-- A small tank drops lines from the end, so this order keeps the quantity longest:
+-- it shows nowhere else, while the fill shows the level and the status text pressure.
+function _tankCenterText(entity, sensedPressure, unit)
+    local percent = entity.fillPercent or 100
+    local lines = {}
+    local capacity = tonumber(entity.tankMaxCapacity)
+    if capacity and capacity > 0 then
+        local gallons = capacity * percent / 100
+        lines[#lines + 1] = string.format(gallons >= 100 and "%.0f GAL" or "%.1f GAL", gallons)
+    end
+    lines[#lines + 1] = string.format("%.0f%%", percent)
+    local value, suffix = (sensedPressure or ""):match("^(%-?[%d%.]+)(.*)$")
+    lines[#lines + 1] = (value or "0") .. " " .. ((value and suffix) or unit)
+    return table.concat(lines, "\n")
+end
+
+-- canvas.elementCenterText hook (schematic_gdsGuiLib.lua's _drawElement): the
+-- label over every tank that stores liquid (see _holdsFluid), nothing on the rest.
+function schematicElementCenterText(canvasName, elementId)
+    local canvas = _findSchematicCanvas()
+    local entity = canvas and _findSourceEntity(canvas, elementId)
+    if not entity or not _holdsFluid(canvas, entity) then return nil end
+    return _tankCenterText(entity, schematicElementSensedVoltage(canvasName, elementId),
+        _currentMedium().magnitudeUnit or "PSI")
+end
+
 -- canvas.elementStatusText hook (schematic_gdsGuiLib.lua's _drawElement):
 -- the on-canvas row-2 status text under an element's own label, same
 -- sensed-voltage reading schematicElementSensedValues shows in the
@@ -8852,6 +8895,112 @@ function schematicFluidPumpTransferTest()
     return 1
 end
 
+-- A driven ejector scavenges its suction tank into its discharge, even when that's
+-- the tank its pump draws from, and does nothing without motive flow.
+function schematicFluidEjectorTest()
+    local item
+    for _, system in ipairs(SCHEMATIC_CATALOG) do
+        for _, candidate in ipairs(system.items) do
+            if candidate.label == "EJECTOR" then item = candidate end
+        end
+    end
+    if not item or not love.filesystem.getInfo(item.spritePath) then return -1 end
+    local t = item.terminals
+    if not (t[1].flow == "in" and not t[1].suction and t[2].flow == "in" and t[2].suction and t[3].flow == "out") then return -2 end
+
+    local types = { C = "source", W = "source", E = "sink", P = "source", V = "gate", X = "directionalGate" }
+    local function build(wires, open, off)
+        local graph = ModelGraph.buildGraph({ { id = "C" }, { id = "W" }, { id = "E" }, { id = "X", terminals = item.terminals } },
+            { { id = "P", terminals = _FLUID_PUMP_TERMINALS }, { id = "V" } }, wires, types)
+        return ModelFluid.computeFlow(graph, wires, open or {}, off, { P = 30 })
+    end
+    -- C -> pump -> valve -> ejector motive, wing tank on suction, discharge to `into`.
+    local function layout(into) return {
+        { id = "inlet", fromElementId = "C", toElementId = "P", toTerminal = 1 },
+        { id = "out", fromElementId = "P", fromTerminal = 2, toElementId = "V" },
+        { id = "motive", fromElementId = "V", toElementId = "X", toTerminal = 1 },
+        { id = "suction", fromElementId = "W", toElementId = "X", toTerminal = 2 },
+        { id = "discharge", fromElementId = "X", fromTerminal = 3, toElementId = into },
+    } end
+    local function tank(percent) return { tankMaxCapacity = 1000, fillPercent = percent } end
+    local rate = 30 * ModelFluid.PUMP_RATE_PER_PSI * 3 * ModelFluid.EJECTOR_ENTRAINMENT
+    local percent = rate / 1000 * 100
+    local function close(a, b) return math.abs(a - b) < 0.0001 end
+
+    -- Discharging back into the pump's own tank: only the wing tank's fuel moves.
+    local wires = layout("C")
+    local c, w = tank(50), tank(40)
+    ModelFluid.step(build(wires, { V = true }), { C = c, W = w }, {}, 3)
+    if not close(w.fillPercent, 40 - percent) or not close(c.fillPercent, 50 + percent) then return -3 end
+    for _, wire in ipairs(wires) do
+        if not wire.fluidMoving then return -4 end
+    end
+    if wires[4].pumpedDirection ~= "forward" or wires[5].pumpedDirection ~= "forward" then return -5 end
+
+    -- Pump off, or the motive line shut: nothing moves.
+    for _, args in ipairs({ { { V = true }, { P = true } }, { {}, nil } }) do
+        wires = layout("C")
+        c, w = tank(50), tank(40)
+        ModelFluid.step(build(wires, args[1], args[2]), { C = c, W = w }, {}, 3)
+        if c.fillPercent ~= 50 or w.fillPercent ~= 40 or wires[4].fluidMoving then return -6 end
+    end
+
+    -- An empty wing tank: motive fuel still circulates, with nothing on the suction line.
+    wires = layout("C")
+    c, w = tank(50), tank(0)
+    ModelFluid.step(build(wires, { V = true }), { C = c, W = w }, {}, 3)
+    if c.fillPercent ~= 50 or w.fillPercent ~= 0 then return -7 end
+    if wires[4].fluidMoving or not wires[3].fluidMoving or not wires[5].fluidMoving then return -8 end
+
+    -- A full collector takes no more, so the wing tank stops there.
+    wires = layout("C")
+    c, w = tank(100), tank(40)
+    ModelFluid.step(build(wires, { V = true }), { C = c, W = w }, {}, 3)
+    if w.fillPercent ~= 40 or wires[4].fluidMoving then return -9 end
+
+    -- Discharging to an engine: the pump's own tank feeds it too.
+    wires = layout("E")
+    c, w = tank(50), tank(40)
+    ModelFluid.step(build(wires, { V = true }), { C = c, W = w }, {}, 3)
+    if not close(c.fillPercent, 50 - percent) or not close(w.fillPercent, 40 - percent) then return -10 end
+
+    -- The pump on the suction port and the wing tank on the motive port: nothing
+    -- draws that tank, and the pump's own fuel still reaches the engine.
+    wires = {
+        { id = "inlet", fromElementId = "C", toElementId = "P", toTerminal = 1 },
+        { id = "out", fromElementId = "P", fromTerminal = 2, toElementId = "X", toTerminal = 2 },
+        { id = "wing", fromElementId = "W", toElementId = "X", toTerminal = 1 },
+        { id = "discharge", fromElementId = "X", fromTerminal = 3, toElementId = "E" },
+    }
+    c, w = tank(50), tank(40)
+    ModelFluid.step(build(wires), { C = c, W = w }, {}, 3)
+    if w.fillPercent ~= 40 or not close(c.fillPercent, 50 - percent) or wires[3].fluidMoving then return -11 end
+
+    -- No pump at all: the suction line stays still.
+    wires = { { id = "suction", fromElementId = "W", toElementId = "X", toTerminal = 2 },
+        { id = "discharge", fromElementId = "X", fromTerminal = 3, toElementId = "C" } }
+    c, w = tank(50), tank(40)
+    ModelFluid.step(build(wires), { C = c, W = w }, {}, 3)
+    if w.fillPercent ~= 40 or wires[1].fluidMoving then return -12 end
+    return 1
+end
+
+-- A tank's center label: quantity when there's a capacity, level, then pressure,
+-- reading zero when nothing's pressurizing it.
+function schematicTankCenterTextTest()
+    if _tankCenterText({ tankMaxCapacity = 5000, fillPercent = 69 }, "30PSI", "PSI") ~= "3450 GAL\n69%\n30 PSI" then return -1 end
+    if _tankCenterText({ tankMaxCapacity = 50, fillPercent = 10 }, nil, "PSI") ~= "5.0 GAL\n10%\n0 PSI" then return -2 end
+    if _tankCenterText({ fillPercent = 25 }, "1500PSI", "PSI") ~= "25%\n1500 PSI" then return -3 end
+    if _tankCenterText({ tankMaxCapacity = 200 }, nil, "PSI") ~= "200 GAL\n100%\n0 PSI" then return -4 end
+    -- Only what stores liquid gets one: not a pump, a manifold or a dry-system source.
+    local piped = { connectorNoun = "PIPE" }
+    if not _holdsFluid(piped, { componentType = "source", shapeType = "rect" }) then return -5 end
+    if _holdsFluid(piped, { componentType = "source" }) then return -6 end
+    if _holdsFluid(piped, { componentType = "path", shapeType = "rect" }) then return -7 end
+    if _holdsFluid({ connectorNoun = "WIRE" }, { componentType = "source", shapeType = "rect" }) then return -8 end
+    return 1
+end
+
 -- Builds a lone reshapable 3x3 square at the top-left of a fresh test canvas,
 -- so the real press/move/release handlers can drive it. Returns the canvas,
 -- the element, and a function that undoes the setup.
@@ -8879,6 +9028,30 @@ local function _reshapeTestSetup(canvasName)
             if pages[i] == testPage then table.remove(pages, i) end
         end
     end
+end
+
+-- A center label fits what it can inside the outline: every line on a big tank,
+-- only its first on a tank too short for more, and nothing on one too small to read.
+function schematicCenterTextFitTest()
+    local canvas, e, undo = _reshapeTestSetup("centerTextFitTest")
+    local font = {
+        getWidth = function(_, line) return #line * 7 end,
+        getHeight = function() return 14 end,
+    }
+    local lines = { "1041 GAL", "21%", "0 PSI" }
+    e.w, e.h = 20 / canvas.contentW, 2 / canvas.contentH
+    local function fit(zoom)
+        canvas.zoom = zoom
+        return _shapePoly.fitCenterText(canvas, e, lines, font)
+    end
+    local big, bigScale, bigWidth = fit(40)
+    local short, shortScale = fit(10)
+    local tiny = fit(0.5)
+    undo()
+    if big ~= 3 or bigScale ~= 1 or bigWidth ~= 56 then return -1 end
+    if short ~= 1 or shortScale ~= 1 then return -2 end
+    if tiny ~= nil then return -3 end
+    return 1
 end
 
 local function _reshapeTestTap(x, y)
@@ -9003,6 +9176,122 @@ function schematicReshapeMigratesRowsTest()
     if traced({ "###..", "#####", "#####", "#####" }) ~= "0,0,3,0,3,1,5,1,5,4,0,4" then return -3 end
     if traced({ ".##", "###" }) ~= "1,0,3,0,3,2,0,2,0,1,1,1" then return -4 end
     return 1
+end
+
+-- A tank's ports: placed by tap on its outline at any rotation, they hold its pipes,
+-- follow a reshape, flip with a mirror, and undo and remove cleanly.
+function schematicTankPortsTest()
+    local canvas, tank, restore = _reshapeTestSetup("unitTestCanvasPorts")
+    local result = 1
+    local cell = 16 -- 2 world units per grid unit at zoom 8
+    local x0, y0 = canvas.x + canvas.panX, canvas.y + canvas.panY
+    local function arm(option)
+        gdsGui_schematic_openElementEditMenu(canvas.name, "tank")
+        local offered = false
+        for _, text in ipairs(canvas.menu.options) do offered = offered or text == option end
+        canvas.menu = nil
+        canvas._elementEditTargetId = "tank"
+        gdsGui_schematic_internal_onElementEditChosen(canvas.name, nil, option)
+        return offered
+    end
+    local function tap(x, y)
+        gdsGui_schematic_pressed("t", x, y)
+        gdsGui_schematic_released("t", x, y)
+    end
+    local function near(a, b) return math.abs(a - b) < 0.0001 end
+
+    -- Nothing to remove yet; a tap just off the right side lands on it, facing out.
+    if arm("REMOVE PORT") then result = -1 end
+    gdsGui_schematic_cancelPlacement(canvas.name)
+    gdsGui_schematic_addElement(canvas.name, "other", "rect", 0.5, 0.5, 6 / canvas.contentW, 6 / canvas.contentH, "O")
+    gdsGui_schematic_addWire(canvas.name, "w1", "tank", "other")
+    if not arm("ADD PORT") then result = -2 end
+    tap(x0 + 3 * cell + 5, y0 + 1.5 * cell)
+    local t = tank.terminals and tank.terminals[1]
+    if not t or not near(t.x, 0.5) or not near(t.y, 0) or not near(t.exitX, 1) or not near(t.exitY, 0) then
+        restore()
+        return -3
+    end
+    -- A pipe already on the tank moves to the port.
+    if canvas.wires[1].fromTerminal ~= 1 then result = -4 end
+    if canvas.pendingPort then result = -5 end
+
+    -- A tap well away from the tank cancels; one on the same spot adds nothing.
+    arm("ADD PORT")
+    tap(x0 + 18 * cell, y0 + 18 * cell)
+    if #tank.terminals ~= 1 or canvas.pendingPort then result = -6 end
+    arm("ADD PORT")
+    tap(x0 + 3 * cell, y0 + 1.5 * cell)
+    if #tank.terminals ~= 1 then result = -7 end
+
+    -- Undo takes a port back off, and the pipe it had settled.
+    arm("ADD PORT")
+    tap(x0 + 1.5 * cell, y0)
+    if #tank.terminals ~= 2 or not near(tank.terminals[2].y, -0.5) or not near(tank.terminals[2].exitY, -1) then result = -8 end
+    gdsGui_schematic_undo(canvas.name)
+    tank = canvas.elements[1]
+    if #tank.terminals ~= 1 then result = -9 end
+
+    -- At a turned angle the tap still means the point under the finger.
+    tank.rotation = 90
+    local cx, cy, cw, ch, p = _shapePoly.frame(canvas, tank)
+    local wx, wy = _shapePoly.toWorld(cx, cy, cw, ch, p, 90, 1.5, 0)
+    arm("ADD PORT")
+    tap(wx, wy)
+    if not tank.terminals[2] or not near(tank.terminals[2].y, -0.5) or not near(tank.terminals[2].exitY, -1) then
+        restore()
+        return -10
+    end
+    tank.rotation = 0
+
+    -- Removing a port renumbers the pipe on the port after it, and one on the
+    -- removed port goes to the one left.
+    gdsGui_schematic_addWire(canvas.name, "w2", "other", "tank", nil, nil, nil, 2)
+    canvas.wires[1].fromTerminal = 1
+    arm("REMOVE PORT")
+    tap(x0 + 3 * cell, y0 + 1.5 * cell)
+    if #tank.terminals ~= 1 or canvas.wires[1].fromTerminal ~= 1 or canvas.wires[2].toTerminal ~= 1 then result = -11 end
+    -- With none left, pipes go back to the tank's body and the option goes away.
+    arm("REMOVE PORT")
+    tap(x0 + 1.5 * cell, y0)
+    if tank.terminals ~= nil or canvas.wires[1].fromTerminal ~= nil or canvas.wires[2].toTerminal ~= nil then result = -12 end
+    if arm("REMOVE PORT") then result = -13 end
+    gdsGui_schematic_cancelPlacement(canvas.name)
+
+    -- A reshape pulling the corner by a port keeps it on the new, slanted side.
+    arm("ADD PORT")
+    tap(x0 + 3 * cell, y0 + 1.5 * cell)
+    canvas.selectedElementId = "tank"
+    canvas.selectionMoveModeActive, canvas.reshapeModeActive = true, true
+    gdsGui_schematic_pressed("t", x0 + 3 * cell, y0 + 3 * cell)
+    gdsGui_schematic_moved("t", x0 + 4 * cell, y0 + 4 * cell)
+    gdsGui_schematic_released("t", x0 + 4 * cell, y0 + 4 * cell)
+    canvas.selectionMoveModeActive, canvas.reshapeModeActive = false, false
+    if table.concat(tank.shapePoints or {}, ",") ~= "0,0,3,0,4,4,0,3" then result = -14 end
+    t = tank.terminals and tank.terminals[1]
+    if t then
+        -- Grid position within the 4x4 box, on the edge (3,0)-(4,4): 4 down per 1 across.
+        local c, r = (t.x + 0.5) * 4, (t.y + 0.5) * 4
+        if math.abs((c - 3) * 4 - r) > 0.0001 or t.exitX <= 0 then result = -15 end
+    else
+        result = -16
+    end
+
+    -- A mirror flips them; a tank without any stays without.
+    local flipped = _shapePoly.mirroredPorts({ { x = 0.5, y = -0.25, exitX = 1, exitY = 0 } })[1]
+    if not near(flipped.x, -0.5) or not near(flipped.y, -0.25) or not near(flipped.exitX, -1) then result = -17 end
+    if _shapePoly.mirroredPorts(nil) ~= nil then result = -18 end
+
+    -- Nothing in the fluid model changes: pipes on a port still drain the tank.
+    local types = { tank = "source", other = "sink" }
+    local wires = { { id = "w", fromElementId = "tank", fromTerminal = 1, toElementId = "other", gravityDirection = "forward" } }
+    local graph = ModelGraph.buildGraph({ { id = "tank", terminals = tank.terminals }, { id = "other" } }, {}, wires, types)
+    local store = { tankMaxCapacity = 100, fillPercent = 50 }
+    ModelFluid.step(ModelFluid.computeFlow(graph, wires, {}), { tank = store }, {}, 10)
+    if store.fillPercent >= 50 or not wires[1].fluidMoving then result = -19 end
+
+    restore()
+    return result
 end
 
 -- MIRROR sits right below RENAME, prompts through the placement grid, and makes
@@ -10827,6 +11116,22 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcExpctOutput"]={1}}
     gdsGui_dev_testExecute {["id"]="modelFluid_pumpTransfersIgnoringGravity",
         ["funcName"]={"schematicFluidPumpTransferTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+    gdsGui_dev_testExecute {["id"]="modelFluid_ejectorScavengesOnlyWhenDriven",
+        ["funcName"]={"schematicFluidEjectorTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+    gdsGui_dev_testExecute {["id"]="schematic_tank_ports",
+        ["funcName"]={"schematicTankPortsTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+    gdsGui_dev_testExecute {["id"]="schematic_tank_centerText",
+        ["funcName"]={"schematicTankCenterTextTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+    gdsGui_dev_testExecute {["id"]="schematic_centerText_fitsOutline",
+        ["funcName"]={"schematicCenterTextFitTest"},
         ["funcParameters"]={0},
         ["funcExpctOutput"]={1}}
     gdsGui_dev_testExecute {["id"]="modelFluid_tankThenPipeEmptyAtConstantRate",

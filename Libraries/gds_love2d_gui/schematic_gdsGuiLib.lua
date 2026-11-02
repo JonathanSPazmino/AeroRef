@@ -1189,7 +1189,7 @@ end
 function _shapePoly.beginDrag(canvas, e, index, isSide)
     canvas._shapeDrag = {
         index = index, isSide = isSide, points = _shapePoly.pointsOf(canvas, e), originalPoints = e.shapePoints,
-        x = e.x, y = e.y, w = e.w, h = e.h,
+        x = e.x, y = e.y, w = e.w, h = e.h, ports = e.terminals,
     }
 end
 
@@ -1359,6 +1359,7 @@ function _shapePoly.updateDrag(canvas, e, x, y)
     if not points then return false end
     if table.concat(points, ",") == table.concat(drag.points, ",") then
         e.shapePoints, e.x, e.y, e.w, e.h = drag.originalPoints, drag.x, drag.y, drag.w, drag.h
+        e.terminals = drag.ports
         return false
     end
     local np = _shapePoly.parse(points)
@@ -1387,6 +1388,7 @@ function _shapePoly.updateDrag(canvas, e, x, y)
     local cfx, cfy = _toFraction(canvas, ncx, ncy)
     e.shapePoints, e.w, e.h = points, fracW, fracH
     e.x, e.y = cfx - fracW / 2, cfy - fracH / 2
+    e.terminals = _shapePoly.reseatPorts(drag.ports, p, np, minC, minR)
     return true
 end
 
@@ -1463,6 +1465,7 @@ function _shapePoly.openMirror(canvasName, canvas, e)
         label = ((e.label or e.id):gsub("_%d+$", "")),
         header = "MIRROR OF " .. (e.label or e.id),
         fracX = fracX, fracY = fracY, wFrac = e.w, hFrac = e.h, rotation = rotation, shapePoints = points,
+        terminals = _shapePoly.mirroredPorts(e.terminals),
         defaultColor = _deepCopy(e.defaultColor), defaultPropertyKeys = propertyKeys,
     })
 end
@@ -1584,6 +1587,156 @@ function _terminals.wireEnd(canvas, anchor, terminalIndex)
     end
     local x, y = _anchorCenter(canvas, anchor)
     return x, y, anchor, nil
+end
+
+-- A reshapable element's ports (ADD PORT on its edit menu): ordinary wire terminals
+-- the user places on its outline, so pipes meet the tank there. Each is a terminal
+-- with no flow direction, since a tank's pipes can run either way. Once a tank has
+-- any, all its pipes sit on them, which is also what addWire settles them onto when
+-- a saved system loads.
+
+-- How far off an edge or a port a tap still counts, in screen pixels.
+_shapePoly.PORT_TAP_SLOP_PX = 24
+
+-- The point on p's outline nearest grid position lc,lr, at half-grid steps along
+-- its edge so ports on straight sides line up with pipes, and that edge's outward
+-- direction. Returns c, r, outwardC, outwardR.
+function _shapePoly.nearestOutlinePoint(p, lc, lr)
+    local bestC, bestR, bestOutC, bestOutR, bestDistSq
+    for _, edge in ipairs(p.edges) do
+        local ac, ar, bc, br = edge[1], edge[2], edge[3], edge[4]
+        local dc, dr = bc - ac, br - ar
+        local length = math.sqrt(dc * dc + dr * dr)
+        if length > 0 then
+            local along = math.max(0, math.min(length, ((lc - ac) * dc + (lr - ar) * dr) / length))
+            along = math.min(length, math.floor(along * 2 + 0.5) / 2)
+            local c, r = ac + dc * along / length, ar + dr * along / length
+            local distSq = (c - lc) * (c - lc) + (r - lr) * (r - lr)
+            if not bestDistSq or distSq < bestDistSq then
+                local outC, outR = dr / length, -dc / length
+                -- Tested off the edge's middle, clear of any other edge at a corner.
+                if _shapePoly.containsLocal(p, (ac + bc) / 2 + outC * 0.01, (ar + br) / 2 + outR * 0.01) then
+                    outC, outR = -outC, -outR
+                end
+                bestC, bestR, bestOutC, bestOutR, bestDistSq = c, r, outC, outR, distSq
+            end
+        end
+    end
+    return bestC, bestR, bestOutC, bestOutR
+end
+
+-- A terminal at grid position c,r of p, leaving in direction outC,outR.
+function _shapePoly.portAt(p, c, r, outC, outR)
+    return { x = c / p.cols - 0.5, y = r / p.rows - 0.5, exitX = outC, exitY = outR }
+end
+
+-- ports moved from outline p onto reshaped outline np, whose box starts at minC,minR
+-- of p's grid: each to the nearest point of the new outline, keeping its index so
+-- the pipes on it stay put. nil for none.
+function _shapePoly.reseatPorts(ports, p, np, minC, minR)
+    if not ports then return nil end
+    local moved = {}
+    for i, t in ipairs(ports) do
+        local c, r, outC, outR = _shapePoly.nearestOutlinePoint(np, (t.x + 0.5) * p.cols - minC, (t.y + 0.5) * p.rows - minR)
+        moved[i] = _shapePoly.portAt(np, c, r, outC, outR)
+    end
+    return moved
+end
+
+-- ports for e's left-right mirror image (see _shapePoly.mirroredPoints). nil for none.
+function _shapePoly.mirroredPorts(ports)
+    if not ports then return nil end
+    local mirrored = {}
+    for i, t in ipairs(ports) do
+        mirrored[i] = { x = -t.x, y = t.y, exitX = -t.exitX, exitY = t.exitY }
+    end
+    return mirrored
+end
+
+-- Puts any of e's pipes not on a port onto its nearest one.
+function _shapePoly.settleWiresOnPorts(canvas, e)
+    if not e.terminals then return end
+    for _, w in ipairs(canvas.wires) do
+        for _, ends in ipairs({ { "fromElementId", "fromTerminal", "toElementId", "toTerminal" },
+                                { "toElementId", "toTerminal", "fromElementId", "fromTerminal" } }) do
+            if w[ends[1]] == e.id and not w[ends[2]] then
+                local other = _findAnchor(canvas, w[ends[3]])
+                if other then
+                    local ox, oy = _terminals.wireEnd(canvas, other, w[ends[4]])
+                    w[ends[2]] = _terminals.nearest(canvas, e, ox, oy)
+                end
+            end
+        end
+    end
+end
+
+-- Adds a port where a tap at x,y lands on e's outline. False if the tap's too far
+-- from the outline, or on a port that's already there.
+function _shapePoly.addPortAt(canvas, e, x, y)
+    local cx, cy, cw, ch, p = _shapePoly.frame(canvas, e)
+    local c, r, outC, outR = _shapePoly.nearestOutlinePoint(p, _shapePoly.toLocal(cx, cy, cw, ch, p, e.rotation, x, y))
+    local wx, wy = _shapePoly.toWorld(cx, cy, cw, ch, p, e.rotation, c, r)
+    local slop = _shapePoly.PORT_TAP_SLOP_PX
+    if (wx - x) * (wx - x) + (wy - y) * (wy - y) > slop * slop then return false end
+    local port = _shapePoly.portAt(p, c, r, outC, outR)
+    for _, t in ipairs(e.terminals or {}) do
+        if math.abs(t.x - port.x) < 1e-6 and math.abs(t.y - port.y) < 1e-6 then return false end
+    end
+    _pushUndo(canvas)
+    e.terminals = e.terminals or {}
+    table.insert(e.terminals, port)
+    _shapePoly.settleWiresOnPorts(canvas, e)
+    _notifyChanged(canvas)
+    return true
+end
+
+-- Removes the port a tap at x,y lands on, keeping every other pipe on its own port;
+-- one that was on this port moves to the nearest left, or back to the tank's body
+-- if there are none. False if the tap isn't near a port.
+function _shapePoly.removePortAt(canvas, e, x, y)
+    local index = _terminals.nearest(canvas, e, x, y)
+    if not index then return false end
+    local px, py = _terminals.point(canvas, e, index)
+    local slop = _shapePoly.PORT_TAP_SLOP_PX
+    if (px - x) * (px - x) + (py - y) * (py - y) > slop * slop then return false end
+    _pushUndo(canvas)
+    table.remove(e.terminals, index)
+    if #e.terminals == 0 then e.terminals = nil end
+    for _, w in ipairs(canvas.wires) do
+        for _, ends in ipairs({ { "fromElementId", "fromTerminal" }, { "toElementId", "toTerminal" } }) do
+            local terminal = w[ends[2]]
+            if w[ends[1]] == e.id and terminal then
+                if terminal == index then
+                    w[ends[2]] = nil
+                elseif terminal > index then
+                    w[ends[2]] = terminal - 1
+                end
+            end
+        end
+    end
+    _shapePoly.settleWiresOnPorts(canvas, e)
+    _notifyChanged(canvas)
+    return true
+end
+
+-- e's ports, and what to do next while ADD PORT or REMOVE PORT waits on a tap.
+function _shapePoly.drawPorts(canvas, e)
+    if not _shapePoly.allowed(canvas, e) then return end
+    local radius = math.max(2.5, math.min(6, canvas.zoom))
+    for i in ipairs(e.terminals or {}) do
+        local tx, ty = _terminals.point(canvas, e, i)
+        love.graphics.setColor(0, 0, 0, 1)
+        love.graphics.circle("fill", tx, ty, radius + 1)
+        love.graphics.setColor(1, 1, 1, 1)
+        love.graphics.circle("fill", tx, ty, radius)
+    end
+    local pending = canvas.pendingPort
+    if pending and pending.elementId == e.id then
+        love.graphics.setFont(globApp.appFont or love.graphics.getFont())
+        love.graphics.setColor(1, 1, 1, 1)
+        love.graphics.printf(pending.removing and "TAP A PORT TO REMOVE IT" or "TAP THE TANK'S EDGE TO ADD A PORT",
+            canvas.x, canvas.y + 4, canvas.w, "center")
+    end
 end
 
 local function _distPointToSegment(px, py, x1, y1, x2, y2)
@@ -1745,6 +1898,7 @@ function gdsGui_schematic_create(name, page, x, y, anchorPoint, wFrac, hFrac)
     canvas.pendingConnectorColor = nil  -- armed "draw next wire" from the catalog, independent of wireToolActive/the dock toggle; disarms after one connector
     canvas.pendingColorAssignPick = false  -- armed "tap an element or wire to assign its snapshot color"; disarms after one pick
     canvas.pendingWireFromId = nil  -- armed via ADD WIRE in the element edit menu: elementId the next press-drag-release starts a wire from, with no need to land that press on an anchor; disarms after one drag
+    canvas.pendingPort       = nil  -- armed via ADD PORT/REMOVE PORT in the element edit menu: {elementId, removing}, what the next tap does; disarms after one tap
     canvas.paintMode = nil  -- { color = {r,g,b,a} | nil } while the PAINT brush is armed; see gdsGui_schematic_armPaintMode. Unlike the pending* one-shot fields above, stays armed across any number of taps.
     canvas._paintTarget = nil  -- {kind, id} of whatever a "paint" drag's press landed on, between press and release
     canvas._paintButtonName = nil  -- name of the app's PAINT dock button, set via gdsGui_schematic_setPaintButtonName; the swatch palette cascades from it
@@ -2498,6 +2652,7 @@ function gdsGui_schematic_cancelPlacement(canvasName)
         canvas.pendingConnectorColor = nil
         canvas.pendingColorAssignPick = false
         canvas.pendingWireFromId = nil
+        canvas.pendingPort = nil
         canvas.paintMode = nil
         canvas.annunciatorPanelOpen = false
     end
@@ -2550,7 +2705,7 @@ end
 function gdsGui_schematic_isPlacementArmed(canvasName)
     local canvas = _findCanvas(canvasName)
     return canvas ~= nil and (canvas.pendingPlacement ~= nil or canvas.pendingConnectorColor ~= nil or
-        canvas.pendingColorAssignPick or canvas.pendingWireFromId ~= nil)
+        canvas.pendingColorAssignPick or canvas.pendingWireFromId ~= nil or canvas.pendingPort ~= nil)
 end
 
 --------------------------------------------------------------------------------
@@ -4494,7 +4649,11 @@ function gdsGui_schematic_openElementEditMenu(canvasName, elementId)
     if not el then return end
     canvas._elementEditTargetId = elementId
     local options = {_pipes.addLabel(canvas), "RENAME", "PROPERTIES", "DELETE"}
-    if _shapePoly.allowed(canvas, el) then table.insert(options, 3, "MIRROR") end
+    if _shapePoly.allowed(canvas, el) then
+        table.insert(options, 3, "MIRROR")
+        table.insert(options, 4, "ADD PORT")
+        if el.terminals then table.insert(options, 5, "REMOVE PORT") end
+    end
     local title = el.label or elementId
     -- canvas.elementMenuTitleSuffix (optional, by-name like every other
     -- string-registered hook): called as fn(canvasName, elementId) just
@@ -4543,6 +4702,12 @@ function gdsGui_schematic_internal_onElementEditChosen(canvasName, index, option
         canvas.selectedElementId = nil
         local el = _findElement(canvas, elementId)
         if el then _shapePoly.openMirror(canvasName, canvas, el) end
+        return
+    elseif optionText == "ADD PORT" or optionText == "REMOVE PORT" then
+        -- Waits on the next tap, keeping the tank selected, same as ADD WIRE above.
+        canvas._elementEditTargetId = nil
+        gdsGui_schematic_cancelPlacement(canvasName)
+        canvas.pendingPort = { elementId = elementId, removing = optionText == "REMOVE PORT" }
         return
     elseif optionText == "PROPERTIES" then
         -- PROPERTIES tapped: hand off to the properties submenu, keeping the
@@ -5776,6 +5941,86 @@ local function _labelAlphaForZoom(zoom)
     return math.max(0, math.min(1, (zoom - _LABEL_FADE_START_ZOOM) / (_MAX_ZOOM - _LABEL_FADE_START_ZOOM)))
 end
 
+-- The shortest line height still readable, in pixels on screen whatever the font
+-- size setting: below it a label gives up lines rather than shrink further, and
+-- shows nothing once even its first line won't fit.
+_shapePoly.CENTER_TEXT_MIN_LINE_PX = 9
+
+-- The middle of an element's real outline on screen: its polygon's center of area,
+-- since a reshaped tank's outline needn't sit evenly inside its box.
+function _shapePoly.centroid(canvas, e)
+    local cx, cy, cw, ch, p = _shapePoly.frame(canvas, e)
+    local points = {}
+    for i, corner in ipairs(p.corners) do
+        points[i] = { _shapePoly.toWorld(cx, cy, cw, ch, p, e.rotation, corner.c, corner.r) }
+    end
+    local area, sumX, sumY = 0, 0, 0
+    for i, a in ipairs(points) do
+        local b = points[i % #points + 1]
+        local cross = a[1] * b[2] - b[1] * a[2]
+        area = area + cross
+        sumX = sumX + (a[1] + b[1]) * cross
+        sumY = sumY + (a[2] + b[2]) * cross
+    end
+    if math.abs(area) < 1e-6 then return cx, cy end
+    return sumX / (3 * area), sumY / (3 * area)
+end
+
+-- The most of lines (from the first) that fit inside the element's real outline
+-- around its centroid at a readable scale. Returns how many, the scale and their
+-- unscaled width, or nil if not even the first line fits.
+function _shapePoly.fitCenterText(canvas, e, lines, font)
+    local centerX, centerY = _shapePoly.centroid(canvas, e)
+    local margin = 2
+    local function fits(w, h)
+        local halfW, halfH = w / 2 + margin, h / 2 + margin
+        return _shapePoly.containsPoint(canvas, e, centerX - halfW, centerY - halfH)
+            and _shapePoly.containsPoint(canvas, e, centerX + halfW, centerY - halfH)
+            and _shapePoly.containsPoint(canvas, e, centerX - halfW, centerY + halfH)
+            and _shapePoly.containsPoint(canvas, e, centerX + halfW, centerY + halfH)
+    end
+    local minScale = math.min(1, _shapePoly.CENTER_TEXT_MIN_LINE_PX / font:getHeight())
+    for count = #lines, 1, -1 do
+        local textW = 0
+        for i = 1, count do textW = math.max(textW, font:getWidth(lines[i])) end
+        local textH = count * font:getHeight()
+        local scale = 1
+        while scale >= minScale do
+            if fits(textW * scale, textH * scale) then return count, scale, textW end
+            scale = scale * 0.9
+        end
+    end
+    return nil
+end
+
+-- canvas.elementCenterText (optional, by-name like canvas.elementStatusText):
+-- called as fn(canvasName, elementId), returning text to show over the middle of
+-- that element, one reading a line with the most important first, or nil for none.
+-- Unlike the name label below the box, it stays upright whatever the rotation,
+-- doesn't fade with zoom, and sits inside the element's real outline, shrinking and
+-- then dropping its last lines to do so. It's outlined rather than backed by a box,
+-- so it reads over the filled and empty parts of a tank without hiding the level.
+function _shapePoly.drawCenterText(canvas, e)
+    local fn = canvas.elementCenterText and _G[canvas.elementCenterText]
+    local text = fn and fn(canvas.name, e.id)
+    if not text then return end
+    local font = globApp.appFont or love.graphics.getFont()
+    local lines = {}
+    for line in text:gmatch("[^\n]+") do lines[#lines + 1] = line end
+    local count, scale, textW = _shapePoly.fitCenterText(canvas, e, lines, font)
+    if not count then return end
+    local shown = table.concat(lines, "\n", 1, count)
+    local centerX, centerY = _shapePoly.centroid(canvas, e)
+    local x, y = centerX - textW * scale / 2, centerY - count * font:getHeight() * scale / 2
+    love.graphics.setFont(font)
+    love.graphics.setColor(0, 0, 0, 1)
+    for _, offset in ipairs({ { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } }) do
+        love.graphics.printf(shown, x + offset[1], y + offset[2], textW, "center", 0, scale, scale)
+    end
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.printf(shown, x, y, textW, "center", 0, scale, scale)
+end
+
 local function _drawElement(canvas, e, signature)
     local ex, ey, ew, eh = _elementPixelRect(canvas, e)
     -- Drawn exactly as resolved (no extra darken), so an element shows the
@@ -5853,6 +6098,8 @@ local function _drawElement(canvas, e, signature)
     -- the shape's own push/rotate block above, so "below the box" means
     -- below the box as it actually sits rotated).
     local fex, fey, few, feh = _elementFootprintRect(canvas, e)
+    _shapePoly.drawCenterText(canvas, e)
+    _shapePoly.drawPorts(canvas, e)
     -- Flagged by gdsGui_schematic_moved's "element"/"control" dragKind
     -- branches as the specific obstacle a relocation drag is currently
     -- pushing into (via _footprintOverlapsAnother's 2nd return value) —
@@ -8111,6 +8358,21 @@ function gdsGui_schematic_pressed(touchId, x, y)
                 -- gdsGui_schematic_draw, and the release).
                 canvas.wireTool.fromTerminal = (_hitControl(canvas, x, y) == fromAnchor)
                     and _terminals.nearest(canvas, fromAnchor, x, y) or nil
+            end
+            goto continue
+        end
+
+        if canvas.pendingPort then
+            -- Disarms either way, so a tap away from the tank cancels it.
+            local pending = canvas.pendingPort
+            canvas.pendingPort = nil
+            local tank = _findElement(canvas, pending.elementId)
+            if tank then
+                if pending.removing then
+                    _shapePoly.removePortAt(canvas, tank, x, y)
+                else
+                    _shapePoly.addPortAt(canvas, tank, x, y)
+                end
             end
             goto continue
         end

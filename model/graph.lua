@@ -200,11 +200,18 @@ local function buildGraph(elements, controls, wires, componentTypes, positions)
     -- (a diode's anode/cathode, a pump's inlet/outlet). anchorId ->
     -- {terminalIndex -> flow}
     local flowsByNode = {}
+    -- A terminal marked `suction` (an ejector's -- see model/fluid.lua) only draws
+    -- while motive flow runs through its element. anchorId -> {terminalIndex -> true}
+    local suctionTerminals = {}
     local function noteFlowTerminals(anchor)
         for i, t in ipairs(anchor.terminals or {}) do
             if t.flow then
                 flowsByNode[anchor.id] = flowsByNode[anchor.id] or {}
                 flowsByNode[anchor.id][i] = t.flow
+            end
+            if t.suction then
+                suctionTerminals[anchor.id] = suctionTerminals[anchor.id] or {}
+                suctionTerminals[anchor.id][i] = true
             end
         end
     end
@@ -284,6 +291,8 @@ local function buildGraph(elements, controls, wires, componentTypes, positions)
             id = w.id, fromElementId = fromId, toElementId = toId,
             fromFlow = w.fromTerminal and flowsByNode[w.fromElementId] and flowsByNode[w.fromElementId][w.fromTerminal],
             toFlow = w.toTerminal and flowsByNode[w.toElementId] and flowsByNode[w.toElementId][w.toTerminal],
+            suctionOf = (w.fromTerminal and suctionTerminals[w.fromElementId] and suctionTerminals[w.fromElementId][w.fromTerminal] and w.fromElementId)
+                or (w.toTerminal and suctionTerminals[w.toElementId] and suctionTerminals[w.toElementId][w.toTerminal] and w.toElementId) or nil,
         }
     end
     wires = graphWires
@@ -320,7 +329,7 @@ local function buildGraph(elements, controls, wires, componentTypes, positions)
             local inletOf = (fromNode.role == "source" and w.fromFlow == "in" and fromNode.id)
                 or (toNode.role == "source" and w.toFlow == "in" and toNode.id) or nil
             table.insert(edges, { id = w.id, fromId = fromId, toId = toId, directional = directional,
-                blocked = blocked, inletOf = inletOf })
+                blocked = blocked, inletOf = inletOf, suctionOf = w.suctionOf })
         end
     end
 
