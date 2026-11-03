@@ -27,7 +27,7 @@ require("model.media.bleedAir")
 -- Global, not local: this file is at Lua's 200-top-level-local ceiling.
 ModelFluid = require("model.fluid")
 
-APP_VERSION = "1.0.33"
+APP_VERSION = "1.0.37"
 
 -- Shape version of schematicProjects.lua's data, independent of APP_VERSION
 -- (an app update can ship with no data-shape change at all, or vice versa).
@@ -6694,7 +6694,15 @@ function love.quit()
 end
 
 function love.focus(focused)
-    if not focused then _saveSchematicResumeState() end
+    if not focused then
+        _saveSchematicResumeState()
+    else
+        -- The powered-glow effect's cached offscreen canvases/shader (see
+        -- schematic_gdsGuiLib.lua's _glow module) can be left pointing at
+        -- GPU resources an iOS suspend reclaimed while backgrounded —
+        -- force a fresh rebuild now rather than risk reusing them broken.
+        gdsGui_schematic_glowInvalidateResources()
+    end
 end
 
 -- Drawn directly (not as an outputTxtBox widget) and called after gdsGui_draw()
@@ -8139,9 +8147,20 @@ end
 -- Powered parts of an ELECTRICAL schematic glow (gdsGui_schematic_setGlow):
 -- every color except this medium's unpowered gray. Other media stay flat.
 -- Re-run whenever the system or its unpowered color changes.
+--
+-- Gated on the CURRENT SYSTEM's own systemType being "ELECTRICAL" directly
+-- -- not on "medium == ELECTRICAL_MEDIUM", which _currentMedium() also
+-- returns for a system whose systemType has no registered medium at all
+-- (e.g. PRESSURIZATION, which never got its own model/media/*.lua -- see
+-- that function's own fallback comment). That fallback exists so an
+-- unmodeled system's solve/display calls still get SOME style table rather
+-- than crashing, but it was never meant to also opt an unrelated system
+-- into the powered-glow shader pass, which is real GPU work paid every
+-- frame on every unmodeled system's canvas for nothing.
 function schematicRefreshGlow()
+    local sys = schematicStore and _findSystem(schematicStore.currentSystemId)
     local medium = _currentMedium()
-    gdsGui_schematic_setGlow("mainCanvas", medium == ELECTRICAL_MEDIUM, { medium.style.unpowered })
+    gdsGui_schematic_setGlow("mainCanvas", sys ~= nil and sys.systemType == "ELECTRICAL", { medium.style.unpowered })
 end
 
 function schematicPoweredColorChosen(canvasName, index)

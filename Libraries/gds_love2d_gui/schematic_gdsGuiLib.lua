@@ -8313,6 +8313,21 @@ function gdsGui_schematic_setGlow(canvasName, enabled, plainColors)
     if canvas then canvas.glow = enabled and { plain = plainColors or {} } or nil end
 end
 
+-- Drops the cached blur shader/offscreen canvases so _glow.ensureResources
+-- rebuilds them fresh next frame, and gives a previously-_glow.failed
+-- session a clean retry. Call this whenever the app regains focus (see
+-- main.lua's love.focus) — an iOS app suspend/resume is free to reclaim or
+-- invalidate GPU resources like these while backgrounded, and LÖVE's own
+-- Canvas object surviving that (same Lua reference, same reported
+-- dimensions) doesn't guarantee the texture it points at still is: drawing
+-- to/from a canvas the OS already reclaimed is exactly the kind of failure
+-- _glow.guarded exists to catch, but recovering from it needs a FRESH
+-- canvas, not just a reset of graphics state around the same broken one.
+function gdsGui_schematic_glowInvalidateResources()
+    _glow.shader, _glow.canvasA, _glow.canvasB = nil, nil, nil
+    _glow.failed = false
+end
+
 function _glow.applies(canvas, r, g, b)
     if not canvas.glow or not canvas.glow.active then return false end
     -- Grays (and white) never glow, whatever their exact shade.
@@ -8381,34 +8396,79 @@ function _glow.restoreState(st)
     love.graphics.setLineWidth(st.lineWidth)
 end
 
+-- Unconditional known-good baseline -- NOT a restore of anything captured
+-- (contrast restoreState above, which trusts whatever love.graphics.getCanvas()
+-- etc. happened to already be, right or wrong). Used only as a last-resort
+-- recovery when a glow pass fails outright (see _glow.guarded below): if that
+-- failure left the real render target pointed at one of the offscreen glow
+-- canvases (or the shader/blend mode left mid-pass), every draw call AFTER
+-- it -- for the rest of THIS frame and, since nothing else in the app ever
+-- re-asserts canvas=screen on its own, every frame after it too -- would
+-- silently render into/through that broken state instead of the visible
+-- screen (a white/blank canvas that never recovers on its own, exactly the
+-- "freezes and stays frozen until something else happens to reset it"
+-- failure mode a real render-target leak produces).
+function _glow.resetGraphicsState()
+    love.graphics.setCanvas()
+    love.graphics.setShader()
+    love.graphics.setScissor()
+    love.graphics.setBlendMode("alpha")
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.setLineWidth(1)
+end
+
+-- Runs fn() guarded against both a hard Lua error (a stale/invalidated
+-- offscreen Canvas -- e.g. after an iOS app suspend/resume reclaims GPU
+-- memory -- can make love.graphics calls against it throw) AND simply
+-- never trying again once one has failed (_glow.failed latches permanently
+-- -- the effect is purely cosmetic, so disabling it for the rest of this
+-- session is far safer than risking a repeat of whatever just broke).
+-- Either way, the render target/shader/blend state is forced back to a
+-- known-good baseline rather than left wherever the failed call abandoned
+-- it -- see resetGraphicsState's own comment for why that step is the
+-- actual fix, not just belt-and-suspenders.
+function _glow.guarded(fn)
+    if _glow.failed then return end
+    local ok = pcall(fn)
+    if not ok then
+        _glow.failed = true
+        _glow.resetGraphicsState()
+    end
+end
+
 -- Start of a schematic canvas's frame: clears the offscreen glow buffer.
 function _glow.begin(canvas)
     if not canvas.glow then return end
     canvas.glow.active = _glow.ensureResources()
     if not canvas.glow.active then return end
-    local st = _glow.saveState()
-    love.graphics.setCanvas(_glow.canvasA)
-    -- clear() honors the scissor: with the canvas's screen-space scissor
-    -- still set, part of this half-size buffer was never cleared, and the
-    -- blur kept smearing last frame's glow across it.
-    love.graphics.setScissor()
-    love.graphics.clear(0, 0, 0, 0)
-    _glow.restoreState(st)
+    _glow.guarded(function()
+        local st = _glow.saveState()
+        love.graphics.setCanvas(_glow.canvasA)
+        -- clear() honors the scissor: with the canvas's screen-space scissor
+        -- still set, part of this half-size buffer was never cleared, and the
+        -- blur kept smearing last frame's glow across it.
+        love.graphics.setScissor()
+        love.graphics.clear(0, 0, 0, 0)
+        _glow.restoreState(st)
+    end)
+    if _glow.failed then canvas.glow.active = false end
 end
 
 -- Draws drawFn() (an item's bare shape, already in its own glow color) into
 -- the offscreen glow buffer instead of the screen.
 function _glow.capture(drawFn)
-    local st = _glow.saveState()
-    love.graphics.setCanvas(_glow.canvasA)
-    love.graphics.setScissor()
-    love.graphics.setBlendMode("alpha")
-    love.graphics.push()
-    love.graphics.origin()
-    love.graphics.scale(_glow.SCALE)
-    drawFn()
-    love.graphics.pop()
-    _glow.restoreState(st)
+    _glow.guarded(function()
+        local st = _glow.saveState()
+        love.graphics.setCanvas(_glow.canvasA)
+        love.graphics.setScissor()
+        love.graphics.setBlendMode("alpha")
+        love.graphics.push()
+        love.graphics.origin()
+        love.graphics.scale(_glow.SCALE)
+        drawFn()
+        love.graphics.pop()
+        _glow.restoreState(st)
+    end)
 end
 
 -- End of the canvas's frame: blurs the buffer and adds it over the canvas
@@ -8416,39 +8476,41 @@ end
 function _glow.finish(canvas)
     if not canvas.glow or not canvas.glow.active then return end
     canvas.glow.active = false
-    local w, h = _glow.canvasA:getDimensions()
-    local st = _glow.saveState()
-    love.graphics.push()
-    love.graphics.origin()
-    love.graphics.setScissor()
-    love.graphics.setShader(_glow.shader)
-    love.graphics.setBlendMode("alpha", "premultiplied")
-    love.graphics.setColor(1, 1, 1, 1)
-    for _ = 1, _glow.PASSES do
-        love.graphics.setCanvas(_glow.canvasB)
-        love.graphics.clear(0, 0, 0, 0)
-        _glow.shader:send("direction", { _glow.SPREAD / w, 0 })
-        love.graphics.draw(_glow.canvasA)
-        love.graphics.setCanvas(_glow.canvasA)
-        love.graphics.clear(0, 0, 0, 0)
-        _glow.shader:send("direction", { 0, _glow.SPREAD / h })
-        love.graphics.draw(_glow.canvasB)
-    end
-    love.graphics.setShader()
-    love.graphics.setCanvas(st.canvas)
-    love.graphics.setScissor(canvas.x, canvas.y, canvas.w, canvas.h)
-    love.graphics.setBlendMode("add", "premultiplied")
-    local k = math.min(1, _glow.INTENSITY * _glow.pulse())
-    love.graphics.setColor(k, k, k, k)
-    love.graphics.draw(_glow.canvasA, 0, 0, 0, 1 / _glow.SCALE, 1 / _glow.SCALE)
-    -- A second, lighter layer for the bright core when INTENSITY > 1.
-    local extra = _glow.INTENSITY * _glow.pulse() - 1
-    if extra > 0 then
-        love.graphics.setColor(extra, extra, extra, extra)
+    _glow.guarded(function()
+        local w, h = _glow.canvasA:getDimensions()
+        local st = _glow.saveState()
+        love.graphics.push()
+        love.graphics.origin()
+        love.graphics.setScissor()
+        love.graphics.setShader(_glow.shader)
+        love.graphics.setBlendMode("alpha", "premultiplied")
+        love.graphics.setColor(1, 1, 1, 1)
+        for _ = 1, _glow.PASSES do
+            love.graphics.setCanvas(_glow.canvasB)
+            love.graphics.clear(0, 0, 0, 0)
+            _glow.shader:send("direction", { _glow.SPREAD / w, 0 })
+            love.graphics.draw(_glow.canvasA)
+            love.graphics.setCanvas(_glow.canvasA)
+            love.graphics.clear(0, 0, 0, 0)
+            _glow.shader:send("direction", { 0, _glow.SPREAD / h })
+            love.graphics.draw(_glow.canvasB)
+        end
+        love.graphics.setShader()
+        love.graphics.setCanvas(st.canvas)
+        love.graphics.setScissor(canvas.x, canvas.y, canvas.w, canvas.h)
+        love.graphics.setBlendMode("add", "premultiplied")
+        local k = math.min(1, _glow.INTENSITY * _glow.pulse())
+        love.graphics.setColor(k, k, k, k)
         love.graphics.draw(_glow.canvasA, 0, 0, 0, 1 / _glow.SCALE, 1 / _glow.SCALE)
-    end
-    love.graphics.pop()
-    _glow.restoreState(st)
+        -- A second, lighter layer for the bright core when INTENSITY > 1.
+        local extra = _glow.INTENSITY * _glow.pulse() - 1
+        if extra > 0 then
+            love.graphics.setColor(extra, extra, extra, extra)
+            love.graphics.draw(_glow.canvasA, 0, 0, 0, 1 / _glow.SCALE, 1 / _glow.SCALE)
+        end
+        love.graphics.pop()
+        _glow.restoreState(st)
+    end)
 end
 
 -- Glow source for a wire: its own path, a little wider than the wire.
@@ -9082,6 +9144,18 @@ function gdsGui_schematic_draw(pageName)
     local function rectVisible(x, y, w, h)
         return x < vx + vw and x + w > vx and y < vy + vh and y + h > vy
     end
+
+    -- Unconditional self-heal, once per frame, before anything below ever
+    -- touches a render target/shader/blend mode: nothing else in this app
+    -- ever re-asserts "the screen" as the active canvas on its own, so a
+    -- render-target leak from ANY source (a glow pass that failed mid-frame
+    -- last frame — see _glow.guarded's own comment — or a stale GPU
+    -- resource from an iOS app suspend/resume) would otherwise silently
+    -- persist forever, with every draw call from here on landing on
+    -- whatever got left active instead of the visible screen. Cheap (a
+    -- handful of state-setting calls) and always safe to force, whether or
+    -- not anything was actually wrong.
+    _glow.resetGraphicsState()
 
     for _, canvas in ipairs(globApp.objects.schematics) do
         if canvas.page == pageName then
