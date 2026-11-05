@@ -268,9 +268,7 @@ gdsGui_unitTests_registerSuite("gui", function()
 
 		local tempTestFile001_content = "testy2 test"
 
-		local tempTestFile001 = love.filesystem.newFile("tempTestFile001.txt")
-
-		tempTestFile001:open("w")
+		local tempTestFile001 = love.filesystem.openFile("tempTestFile001.txt", "w")
 
 		gdsGui_dev_testExecute {["id"]="doesAboutPageFileExistFalse",
 						["funcName"]={"gdsGui_general_doesAboutPageExist"},

@@ -7,16 +7,25 @@
 -- an unbroken run of such pipes, every one pointing downstream, leads from it to
 -- somewhere the fluid can actually go:
 --   "sink"                    -- an engine or reservoir takes it
---   an open valve or check valve with no other pipe on it -- it spills out
+--   another store with room   -- a tank downhill of it, gaining what this one loses
+--   an open pipe end          -- a valve, check valve, or manifold with no other
+--                                pipe on it, so it leaks: spills out into the open
+--                                air rather than reaching any enclosure -- see
+--                                w.leaking below
 -- and passes through on the way there:
---   "path"                    -- a manifold, which is sealed if nothing leads on
+--   "path"                    -- a manifold, carrying along whatever reaches it
 --   an open "gate"/"gatePole" -- a valve (conducting says which are open)
 --   "directionalGate"         -- a check valve, only the way it conducts
--- Anything else blocks the run, another store or source included: a tank piped
--- to a tank loses nothing.
+-- Anything else blocks the run, another source (a pump, never a store) included.
+-- A receiving store only ever ends a run — gravity doesn't pour through a tank
+-- into whatever's beyond it, even downhill; that leg waits for the tank's own
+-- level, as its own source, to lead somewhere next tick. A full receiving store
+-- blocks the run exactly like any other sealed end, holding its supplier back.
 --
 -- Rates are constant, by design of the request rather than from head pressure,
--- and capacities are read as US gallons (the app stores no unit).
+-- and capacities are read as US gallons (the app stores no unit). A store with
+-- no capacity entered can't be a receiver — see _storeState — so it still
+-- blocks a run reaching it, same as before capacities existed at all.
 --
 -- A running pump is separate from all of that: it ignores gravity markings and
 -- moves fluid from whatever its inlet can draw on to whatever its outlet can
@@ -45,6 +54,20 @@ local function _conducts(node, conducting)
     if node.role == "path" or node.role == "directionalGate" then return true end
     if node.role == "gate" or node.role == "gatePole" then return conducting[node.gateOf or node.id] == true end
     return false
+end
+
+-- store, capacity, gallons currently held -- or nil for a store with no
+-- capacity entered, which never fills or empties and so never receives either.
+local function _storeState(stores, id)
+    local store = stores and stores[id]
+    local capacity = store and tonumber(store.tankMaxCapacity)
+    if not capacity or capacity <= 0 then return nil end
+    return store, capacity, capacity * (store.fillPercent or 100) / 100
+end
+
+local function _storeHasRoom(stores, id)
+    local _, capacity, gallons = _storeState(stores, id)
+    return capacity ~= nil and gallons < capacity
 end
 
 -- Every node reachable from starts over links, where links[id] is a list of
@@ -147,10 +170,17 @@ end
 -- for each open valve. offSources (optional): {sourceId -> true} for each source
 -- switched off, such as a pump, which moves nothing. Returns the table step()
 -- takes: runs (every pipe's upstream/downstream, as {wire, up, down}), incoming
--- (runs by downstream node), and feeding ({storeOrSourceId -> {wireId -> true}},
--- the pipes fluid is leaving that one through). A pipe in no feeding set isn't
--- draining at all. pressures (optional): {pumpId -> PSI}, what drives each pump.
-local function computeFlow(graph, wires, conducting, offSources, pressures)
+-- (runs by downstream node), feeding ({storeOrSourceId -> {wireId -> true}}, the
+-- pipes fluid is leaving that one through -- a pipe in no feeding set isn't
+-- draining at all), receivingStores ({sourceId -> {storeId -> true}}, which
+-- of the stores that source's feeding runs reach actually gain the fluid),
+-- and leakingWires ({wireId -> true}, the pipes among those feeding runs whose
+-- downstream end is an open pipe end rather than a sink or tank -- see the
+-- header comment -- so step() can mark w.leaking on exactly those).
+-- pressures (optional): {pumpId -> PSI}, what drives each pump. stores
+-- (optional): {id -> entity with tankMaxCapacity/fillPercent}, read here only to
+-- tell whether a tank downstream has room to receive gravity flow.
+local function computeFlow(graph, wires, conducting, offSources, pressures, stores)
     local edgeById, pipesOnNode = {}, {}
     for _, e in ipairs(graph.edges) do
         edgeById[e.id] = e
@@ -176,12 +206,22 @@ local function computeFlow(graph, wires, conducting, offSources, pressures)
         end
     end
 
-    -- Walks back up from every outlet to find the runs that lead to one.
-    local leadsOut, nodeLeadsOut, queue, head = {}, {}, {}, 1
+    -- Walks back up from every outlet to find the runs that lead to one. A
+    -- conducting node (a valve, check valve, or now a manifold too -- "path"
+    -- gets no special exemption here any more, so a manifold with only one
+    -- pipe on it leaks exactly like an open valve would) with nothing else on
+    -- it has nowhere to send fluid but out into the open air: leakNodes
+    -- records those so the per-source walk below can tell which of the pipes
+    -- it marks as fed are actually leaking rather than reaching a sink or tank.
+    local leadsOut, nodeLeadsOut, leakNodes, queue, head = {}, {}, {}, {}, 1
     for id in pairs(incoming) do
         local node = graph.nodes[id]
-        if node.role == "sink" or (node.role ~= "path" and _conducts(node, conducting) and pipesOnNode[id] == 1) then
+        if node.role == "sink" or _storeHasRoom(stores, id) then
             nodeLeadsOut[id] = true
+            table.insert(queue, id)
+        elseif _conducts(node, conducting) and pipesOnNode[id] == 1 then
+            nodeLeadsOut[id] = true
+            leakNodes[id] = true
             table.insert(queue, id)
         end
     end
@@ -197,7 +237,11 @@ local function computeFlow(graph, wires, conducting, offSources, pressures)
     end
 
     -- Then down from each source, so a run only counts for one it's fed from.
-    local feeding = {}
+    -- A reached store with room ends its branch there (see the header comment
+    -- on why gravity doesn't pour through a tank into whatever's past it) and
+    -- is recorded as one of that source's receivingStores rather than walked
+    -- further.
+    local feeding, receivingStores, leakingWires = {}, {}, {}
     for id, node in pairs(graph.nodes) do
         if node.role == "source" and not (offSources and offSources[id]) then
             local fed, stack = {}, { id }
@@ -205,7 +249,13 @@ local function computeFlow(graph, wires, conducting, offSources, pressures)
                 for _, run in ipairs(outgoing[table.remove(stack)] or {}) do
                     if leadsOut[run] and not fed[run.wire.id] then
                         fed[run.wire.id] = true
-                        table.insert(stack, run.down)
+                        if run.down ~= id and _storeHasRoom(stores, run.down) then
+                            receivingStores[id] = receivingStores[id] or {}
+                            receivingStores[id][run.down] = true
+                        else
+                            if leakNodes[run.down] then leakingWires[run.wire.id] = true end
+                            table.insert(stack, run.down)
+                        end
                     end
                 end
             end
@@ -214,26 +264,22 @@ local function computeFlow(graph, wires, conducting, offSources, pressures)
     end
     local pumps, downstream, upstream, passes = _pumpRoutes(graph, conducting, offSources, pressures)
     return { graph = graph, wires = wires, runs = runs, incoming = incoming, feeding = feeding,
-        conducting = conducting, pipesOnNode = pipesOnNode, pumps = pumps,
-        downstream = downstream, upstream = upstream, passes = passes }
+        receivingStores = receivingStores, leakingWires = leakingWires, conducting = conducting,
+        pipesOnNode = pipesOnNode, pumps = pumps, downstream = downstream, upstream = upstream, passes = passes }
 end
 
 -- Runs every pump for dt seconds, changing the fill of the stores it moves fluid
 -- between. Returns {wireId -> "forward"|"reverse"}, the pipes it moved fluid
--- through and which way relative to the wire's own from -> to, and whether any
--- store changed.
+-- through and which way relative to the wire's own from -> to; whether any
+-- store changed; and leaking ({wireId -> true}, the last pipe into any open
+-- pipe end a pump (or an ejector it drives) pushed fluid into -- see the
+-- header comment on leakNodes/leakingWires in computeFlow, the gravity-side
+-- counterpart this mirrors).
 local function _stepPumps(flow, stores, dt)
     local graph = flow.graph
-    local pumped, changed = {}, false
+    local pumped, changed, leaking = {}, false, {}
 
-    local function storeState(id)
-        -- nil for a store with no capacity entered, which never fills or empties.
-        local store = stores[id]
-        local capacity = store and tonumber(store.tankMaxCapacity)
-        if not capacity or capacity <= 0 then return nil end
-        local gallons = capacity * (store.fillPercent or 100) / 100
-        return store, capacity, gallons
-    end
+    local function storeState(id) return _storeState(stores, id) end
 
     -- The stores among reached with anything to give.
     local function suppliersIn(reached)
@@ -252,22 +298,40 @@ local function _stepPumps(flow, stores, dt)
     end
 
     -- Whatever among reached can take more, other than the suppliers themselves.
+    -- leakReceivers (a second return) marks which of those receivers is an
+    -- open pipe end rather than a sink or tank -- a valve, check valve, or
+    -- manifold with nothing else on it, "path" getting no exemption here any
+    -- more than it does in computeFlow's own leakNodes.
     local function receiversIn(reached, supplierSet)
-        local receivers = {}
+        local receivers, leakReceivers = {}, {}
         for id in pairs(reached) do
             local node = graph.nodes[id]
             if not supplierSet[id] then
-                local accepts = node.role == "sink"
+                local accepts, isLeak = node.role == "sink", false
                 if stores[id] then
                     local store, capacity, gallons = storeState(id)
                     accepts = not store or gallons < capacity
-                elseif node.role ~= "path" and _conducts(node, flow.conducting) and flow.pipesOnNode[id] == 1 then
-                    accepts = true -- an open valve at the end of the line spills
+                elseif _conducts(node, flow.conducting) and flow.pipesOnNode[id] == 1 then
+                    accepts, isLeak = true, true -- an open pipe end spills
                 end
-                if accepts then table.insert(receivers, id) end
+                if accepts then
+                    table.insert(receivers, id)
+                    if isLeak then leakReceivers[id] = true end
+                end
             end
         end
-        return receivers
+        return receivers, leakReceivers
+    end
+
+    -- The pipe(s) directly feeding a leaking receiver, among the ones allowed
+    -- for this particular delivery (pump.delivery or an ejector's discharge),
+    -- marked in `leaking`.
+    local function markLeaking(leakReceivers, allowed)
+        for id in pairs(leakReceivers) do
+            for _, link in ipairs(flow.upstream[id] or {}) do
+                if allowed[link] then leaking[link.edge.id] = true end
+            end
+        end
     end
 
     -- Split evenly and capped by the emptiest supplier and the fullest receiver,
@@ -308,7 +372,7 @@ local function _stepPumps(flow, stores, dt)
         local suppliers, supplierSet = suppliersIn(pump.inlets)
         if #suppliers > 0 and pump.psi > 0 then
             local gallons = pump.psi * PUMP_RATE_PER_PSI * dt
-            local receivers = receiversIn(pump.outlets, supplierSet)
+            local receivers, leakReceivers = receiversIn(pump.outlets, supplierSet)
             -- Only the pipes actually between a supplier and a receiver.
             local _, drawing = _walk(suppliers, flow.downstream, "to", flow.passes, pump.suction)
             if #receivers > 0 then
@@ -316,11 +380,12 @@ local function _stepPumps(flow, stores, dt)
                 local _, delivering = _walk(receivers, flow.upstream, "from", flow.passes, pump.delivery)
                 markMoving(drawing)
                 markMoving(delivering)
+                markLeaking(leakReceivers, pump.delivery)
             end
 
             for _, ejector in ipairs(pump.ejectors) do
                 local drawn, drawnSet = suppliersIn(ejector.draws)
-                local served = receiversIn(ejector.serves, drawnSet)
+                local served, leakServed = receiversIn(ejector.serves, drawnSet)
                 if #served > 0 then
                     if #drawn > 0 then
                         transfer(drawn, served, gallons * EJECTOR_ENTRAINMENT / #pump.ejectors)
@@ -331,31 +396,56 @@ local function _stepPumps(flow, stores, dt)
                     markMoving(drawing)
                     markMoving(select(2, _walk({ ejector.id }, flow.upstream, "from", flow.passes, pump.delivery)))
                     markMoving(select(2, _walk(served, flow.upstream, "from", flow.passes, ejector.discharge)))
+                    markLeaking(leakServed, ejector.discharge)
                 end
             end
         end
     end
-    return pumped, changed
+    return pumped, changed, leaking
 end
 
 -- Advances everything by dt seconds, writing store.fillPercent (nil reads as
 -- full), w.fluidPercent (nil reads as full), w.fluidMoving (whether fluid is
--- running through that pipe right now) and w.pumpedDirection (which way a pump
--- is driving it, "forward"/"reverse", else nil). stores: {nodeId -> entity with
+-- running through that pipe right now), w.pumpedDirection (which way a pump
+-- is driving it, "forward"/"reverse", else nil), and w.leaking (true while
+-- fluid is moving through that pipe AND its downstream end is an open pipe
+-- end rather than a sink or tank -- see the header comment -- purely a cue
+-- for the GUI layer's own leak-spray animation; the model has already
+-- treated that fluid as gone the moment it's marked fed). stores: {nodeId -> entity with
 -- tankMaxCapacity}; a store with no capacity can't be worked out as a percent,
 -- so it neither loses fluid nor runs dry. pipeUnits: {wireId -> length in grid
 -- units}. A pipe stays full while what feeds it has fluid, then empties at the
--- same flow rate from its upstream end. Returns whether anything changed, and
--- {sourceId -> true} for each source with fluid still leaving through its pipes.
+-- same flow rate from its upstream end -- or, for a gravity-marked pipe no
+-- active source's chain ever structurally reaches at all (an uphill run with
+-- no pump behind it to make up the difference -- see the loop below), reads
+-- empty outright from the start rather than defaulting to full. Returns
+-- whether anything changed, and {sourceId -> true} for each source with
+-- fluid still leaving through its pipes.
 local function step(flow, stores, pipeUnits, dt)
     local changed = false
     local fedAnywhere = {}
     for id, fed in pairs(flow.feeding) do
         for wireId in pairs(fed) do fedAnywhere[wireId] = true end
-        local store = stores[id]
-        local capacity = store and tonumber(store.tankMaxCapacity)
-        if capacity and capacity > 0 and (store.fillPercent or 100) > 0 then
-            store.fillPercent = math.max(0, (store.fillPercent or 100) - DRAIN_RATE * dt / capacity * 100)
+        local store, capacity, gallons = _storeState(stores, id)
+        if store and gallons > 0 then
+            local amount = math.min(DRAIN_RATE * dt, gallons)
+            local receivers = flow.receivingStores[id]
+            if receivers then
+                -- Split evenly, capped by the fullest receiver's own room, so
+                -- what leaves this store always equals what arrives in them.
+                local ids = {}
+                for receiverId in pairs(receivers) do table.insert(ids, receiverId) end
+                for _, receiverId in ipairs(ids) do
+                    local _, receiverCapacity, receiverGallons = _storeState(stores, receiverId)
+                    amount = math.min(amount, (receiverCapacity - receiverGallons) * #ids)
+                end
+                for _, receiverId in ipairs(ids) do
+                    local receiverStore, receiverCapacity, receiverGallons = _storeState(stores, receiverId)
+                    receiverStore.fillPercent = math.min(100, (receiverGallons + amount / #ids) / receiverCapacity * 100)
+                    changed = true
+                end
+            end
+            store.fillPercent = math.max(0, (gallons - amount) / capacity * 100)
             changed = true
         end
     end
@@ -383,10 +473,23 @@ local function step(flow, stores, pipeUnits, dt)
             local seconds = math.max(pipeUnits[w.id] or 1, 1) * PIPE_VOLUME_PER_UNIT / DRAIN_RATE
             w.fluidPercent = math.max(0, (w.fluidPercent or 100) - dt / seconds * 100)
             changed = true
+        elseif not fedAnywhere[w.id] and w.fluidPercent == nil then
+            -- Marked uphill/downhill but never actually fed: no active
+            -- source's gravity chain reaches it at all (not even
+            -- structurally -- see leakNodes/leakingWires above, a
+            -- different case: THAT one's still reached, just with nowhere
+            -- to go). Without a pump behind it either (the next block below
+            -- would otherwise force this back to full), gravity alone could
+            -- never have put fluid in here, so it reads empty outright
+            -- rather than the optimistic default "nil reads as full" --
+            -- which would otherwise paint this pipe as if it were standing
+            -- full of fluid no real, reachable source actually supplied.
+            w.fluidPercent = 0
+            changed = true
         end
     end
 
-    local pumped, pumpChanged = _stepPumps(flow, stores, dt)
+    local pumped, pumpChanged, pumpLeaking = _stepPumps(flow, stores, dt)
     changed = changed or pumpChanged
 
     for _, w in ipairs(flow.wires) do
@@ -397,6 +500,7 @@ local function step(flow, stores, pipeUnits, dt)
             changed = true
         end
         w.fluidMoving = (pumped[w.id] ~= nil) or (fedAnywhere[w.id] and (w.fluidPercent or 100) > 0) or false
+        w.leaking = w.fluidMoving and (pumpLeaking[w.id] or flow.leakingWires[w.id] or false) or false
     end
 
     local stillFeeding = {}

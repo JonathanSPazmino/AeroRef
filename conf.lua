@@ -8,13 +8,15 @@ function love.conf(t)
     t.appendidentity = false            -- Search files in source directory before save directory (boolean)
     t.version = "12.0"                  -- The LÖVE version this game was made for (string)
     t.console = false                   -- Attach a console (boolean, Windows only)
+    t.highdpi = true                    -- Enable high-dpi mode for the window on a Retina display (boolean)
     t.accelerometerjoystick = false     -- Enable the accelerometer on iOS and Android by exposing it as a Joystick (boolean)
     t.externalstorage = false           -- True to save files (and read from the save directory) in external storage on Android (boolean) 
-    t.gammacorrect = false              -- Enable gamma-correct rendering, when supported by the system (boolean)
  
     t.audio.mic = false                 -- Request and use microphone capabilities in Android (boolean)
     t.audio.mixwithsystem = true        -- Keep background music playing when opening LOVE (boolean, iOS and Android only)
- 
+
+    t.graphics.gammacorrect = false     -- Enable gamma-correct rendering, when supported by the system (boolean)
+
     t.window.title = "AeroRef"            -- The window title (string)
     t.window.icon = nil   -- Filepath to an image to use as the window's icon (string)
     t.window.width = 375 				-- The window width (number)
@@ -26,11 +28,20 @@ function love.conf(t)
     t.window.fullscreen = false         -- Enable fullscreen (boolean)
     t.window.fullscreentype = "exclusive" -- Choose between "desktop" fullscreen or "exclusive" fullscreen mode (string)
     t.window.vsync = 1                  -- Vertical sync mode (number)
-    t.window.msaa = 4                   -- Multi-sampled antialiasing: smooth edges on pipes, outlines, circles and rounded menus (number)
+    -- Off, not 4: with it on, this LÖVE 12 (pre-release — see changes.txt)
+    -- Metal backend hard-crashes ("RenderPass Descriptor Validation...
+    -- resolveTexture" assertions, Xcode console) the instant the glow
+    -- shader's offscreen canvases (schematic_gdsGuiLib.lua's _glow) become
+    -- the active render target — Debug-only (Metal API Validation isn't
+    -- run for Release/Archive builds, which is why this only ever showed
+    -- up as a black screen on an Xcode Run, not in the installed app). See
+    -- _glow.ensureResources's own comment for the two variants hit and
+    -- ruled out before landing here. Revisit once the engine's MSAA+Canvas
+    -- interaction is solid enough to turn this back on.
+    t.window.msaa = 0                   -- Multi-sampled antialiasing: smooth edges on pipes, outlines, circles and rounded menus (number)
     t.window.depth = nil                -- The number of bits per sample in the depth buffer
     t.window.stencil = nil              -- The number of bits per sample in the stencil buffer
-    t.window.display = 1                -- Index of the monitor to show the window in (number)
-    t.window.highdpi = true            -- Enable high-dpi mode for the window on a Retina display (boolean)
+    t.window.displayindex = 1           -- Index of the monitor to show the window in (number)
     t.window.usedpiscale = true         -- Enable automatic DPI scaling when highdpi is set to true as well (boolean)
     t.window.orientation = "portrait"  -- Lock to portrait on mobile (iOS/Android)
     t.window.x = nil                    -- The x-coordinate of the window's position in the specified display (number)

@@ -23,6 +23,7 @@ local _BOX_W_FRAC = 0.8
 local _BOX_H_PX   = 140
 local _BTN_H_PX   = 40
 local _HINT_H_PX  = 24  -- extra box height reserved for the constraint hint row, only when one is set
+local _TOP_MARGIN_PX = 8  -- clear space between the box and the screen's top edge
 
 -- How long the input field's border/fill flashes red after a keystroke is
 -- rejected (numericOnly's character filter, the one-decimal-point rule, or
@@ -35,7 +36,11 @@ local function _geometry()
     local w = globApp.safeScreenArea.w * _BOX_W_FRAC
     local h = _BOX_H_PX + ((_prompt and _prompt.hint) and _HINT_H_PX or 0)
     local x = globApp.safeScreenArea.x + (globApp.safeScreenArea.w - w) / 2
-    local y = globApp.safeScreenArea.y + (globApp.safeScreenArea.h - h) / 2
+    -- Pinned near the top edge rather than vertically centered: a touch
+    -- keyboard eats the bottom of the screen the instant this opens (see
+    -- gdsGui_textPrompt_open's own love.keyboard.setTextInput call), and a
+    -- centered box sits right where that keyboard is about to cover it.
+    local y = globApp.safeScreenArea.y + _TOP_MARGIN_PX
     return x, y, w, h
 end
 

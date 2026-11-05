@@ -5,6 +5,44 @@
 ]]
 
 -------------------------------------------------------------------------------
+-- CRASH LOGGING — several freeze/blank-canvas reports on iOS (electrical
+-- glow, pinch-zoom) show no visible error text on-device, so LÖVE's own
+-- error screen apparently isn't rendering there either. This captures
+-- whatever love.errorhandler is given (an uncaught Lua error's message
+-- plus a full stack traceback, taken here while it's still live) to a
+-- file AND the system clipboard, so it's retrievable with no Xcode/cable
+-- needed: after a crash, just paste. _defaultErrorHandler is LÖVE's own
+-- handler, already installed by boot.lua by the time this file is
+-- require()d -- called through to afterward so its normal on-screen
+-- display (whatever that is on this device) still happens too. Every step
+-- here is pcall-guarded: a failure writing the file or touching the
+-- clipboard must never stop the real error from reaching the real handler.
+local _defaultErrorHandler = love.errorhandler
+function love.errorhandler(msg)
+    pcall(function()
+        local full = debug.traceback(tostring(msg), 1)
+        local text = os.date("!%Y-%m-%d %H:%M:%S UTC") .. "\n" .. full
+        love.filesystem.write("crashlog.txt", text)
+        love.system.setClipboardText(text)
+    end)
+    return _defaultErrorHandler(msg)
+end
+
+-- Surfaces the PREVIOUS session's crash (if love.errorhandler above wrote
+-- one) by putting it back on the clipboard once at this next launch too --
+-- covers the case where the user wasn't in a position to copy it
+-- immediately when it happened — then clears the file so it doesn't keep
+-- resurfacing on every future launch.
+do
+    local ok, info = pcall(love.filesystem.getInfo, "crashlog.txt")
+    if ok and info then
+        local okRead, text = pcall(love.filesystem.read, "crashlog.txt")
+        if okRead and text then pcall(love.system.setClipboardText, text) end
+        pcall(love.filesystem.remove, "crashlog.txt")
+    end
+end
+
+-------------------------------------------------------------------------------
 -- LIBRARIES LOAD
 -------------------------------------------------------------------------------
 require("Libraries.gds_love2d_gui.loader_gdsGuiLib")
@@ -27,7 +65,7 @@ require("model.media.bleedAir")
 -- Global, not local: this file is at Lua's 200-top-level-local ceiling.
 ModelFluid = require("model.fluid")
 
-APP_VERSION = "1.0.37"
+APP_VERSION = "1.0.41"
 
 -- Shape version of schematicProjects.lua's data, independent of APP_VERSION
 -- (an app update can ship with no data-shape change at all, or vice versa).
@@ -154,6 +192,32 @@ local _pendingSchematicCompatNotice = nil
 -- entry points below send the user to AircraftGallery ("MY AIRCRAFT")
 -- instead, where their existing aircraft are immediately visible.
 local _schematicJustUpdatedNoSystemOpen = false
+
+-- Set once in love.load(), same moment and same "disk was last written by a
+-- different, non-nil APP_VERSION" test as _schematicJustUpdatedNoSystemOpen
+-- above, but without its extra "no system was open" restriction — this one
+-- fires on ANY update, whether or not a system was left open last session.
+-- Consulted only by navGoToSystemSchematic (the footer dock icon): if the
+-- user already has at least one aircraft, the first trip into the schematic
+-- flow this version lands straight on AircraftGallery instead of jumping
+-- into a live canvas or the SchematicHome picker, so the per-aircraft
+-- compatibility badges _verifyAndRepairSchematicStore just computed (see
+-- _aircraftCompatStatus) are the first thing the user sees. Cleared the
+-- first time navGoToSystemSchematic actually uses it, so every nav after
+-- that behaves exactly as it always has. Global, not local: main.lua is at
+-- Lua's 200-local ceiling (same reason schematicStore/appSettings are global).
+_schematicVersionJustUpdated = false
+
+-- Per-aircraft compatibility result from the load that just ran (see
+-- _verifyAndRepairSchematicStore's "perAircraft" field), keyed by aircraft
+-- id: {failed, modified}, both booleans. Read by _aircraftGalleryItems to set
+-- each tile's compatBadge ("issues" red !, "fixed" yellow ! + green check,
+-- or "ok" a plain green check). Recomputed fresh on every love.load() — not
+-- persisted, and not gated to once per APP_VERSION the way the popup notice
+-- is, since a badge is passive and should always reflect the data's actual,
+-- current state rather than a one-time announcement. Global, not local: see
+-- _schematicVersionJustUpdated just above.
+_aircraftCompatStatus = {}
 
 -------------------------------------------------------------------------------
 -- HELPER FUNCTIONS
@@ -408,6 +472,126 @@ _FLUID_PUMP_TERMINALS = {
     { x =  0.5, y = 0, exitX =  1, exitY = 0, flow = "out" },
 }
 
+-- A fluid pump's case is one icon for OFF and ON, like GENERATOR's housing
+-- above — its impeller overlay (spinning in control mode, same affordance as
+-- the generator's gear) is what shows it's live. The case art's own shading
+-- is darker over the inlet (left, matching _FLUID_PUMP_TERMINALS' flow "in")
+-- and lighter over the outlet (right) side, so the direction fluid moves
+-- through it reads from the icon itself, not just the port arrows.
+-- Globals, not locals: this file sits at Lua's 200-local ceiling.
+_FLUID_PUMP_SPRITE_PATHS = {"Sprites/control_fluidPumpHousing.png", "Sprites/control_fluidPumpHousing.png"}
+_FLUID_PUMP_OVERLAY_SPRITE_PATH = "Sprites/control_fluidPumpRotor.png"
+
+-- A MANIFOLD's one fixed trunk port — its single inlet. Placeholder only:
+-- the instant one's actually placed, schematicElementPlacementConfigured
+-- throws this away and calls _manifoldShapeAndTerminals(n) instead, for
+-- however many OUTFLOW PORTS the pilot just asked for on the placement grid
+-- (_manifoldPortCountRow) — see that generator's own comment for the real
+-- shape/port design. Kept around only as what a MANIFOLD catalog entry
+-- hands addElement before that hook ever runs, and as _shapePoly's own
+-- "no ports yet" starting point if that hook is ever skipped (a test
+-- fixture, say). Global, not local: this file sits at Lua's 200-local
+-- ceiling.
+_MANIFOLD_TERMINALS = {
+    { x = -0.5, y = 0, exitX = -1, exitY = 0 },
+}
+
+-- A MANIFOLD's generated "tube-like splits" — n individual outflow tubes
+-- fanned out from a vertical header spine, fed by one trunk entering the
+-- spine's own left side, each tube its own row 1 empty row apart from its
+-- neighbors so it reads as a separate tube rather than one solid slab (see
+-- the "#"/"." rows this builds, same _shapePoly.pointsFromRows authoring
+-- format a reshaped tank's own outline saves as). Replaces the old "tap
+-- ADD PORT once per pipe" workflow for a freshly placed MANIFOLD — the
+-- pilot states the count up front (_manifoldPortCountRow, at placement)
+-- and the whole graphic is built from it in one step.
+--
+-- Trunk row: the row the single inlet leaves from, as close to vertical
+-- center as an odd total row count allows — lines up with an actual tube
+-- only when n is odd (there's no single "center" tube when n is even; the
+-- trunk still reads fine feeding the spine between two tubes either way).
+-- Returns gridRows, terminals (terminals[1] is always the trunk; [2..n+1]
+-- are the n outflow tubes, top to bottom), cols, rows — cols/rows are the
+-- shape's own grid footprint, which the caller resizes the element to
+-- (gdsGui_schematic_gridUnitsToFrac) since it depends on n, unlike every
+-- other catalog item's fixed gridW/gridH.
+--
+-- Deliberately NO flow = "in"/"out" on these terminals, unlike
+-- _FLUID_PUMP_TERMINALS' own — a manifold is componentType "path"
+-- ("just carries whatever reaches it", per model/graph.lua's own node-role
+-- comment), not a direction-imposing component the way a pump or check
+-- valve is. Tagging a flow here used to BLOCK conduction outright on
+-- whichever tube happened to disagree with a downstream check valve's own
+-- rotation (model/graph.lua's buildGraph: an exact flow tag that disagrees
+-- with a directionalGate's geometric "which way does it conduct" guess is
+-- blocked, not merely overridden, when that gate has no terminals of its
+-- own to overrule its rotation — exactly CHECK VALVE's own case) — fine
+-- for a pump, which really does have one fixed, meaningful "wrong side";
+-- wrong for a fan-out manifold, whose tubes legitimately leave in several
+-- different physical directions none of which should need a downstream
+-- valve specially rotated just to agree with it.
+_MANIFOLD_TRUNK_LEN_GRID, _MANIFOLD_HEADER_W_GRID, _MANIFOLD_TUBE_LEN_GRID = 2, 1, 3
+function _manifoldShapeAndTerminals(n)
+    n = math.max(1, math.floor(n or 1))
+    local rows = 2 * n - 1
+    local cols = _MANIFOLD_TRUNK_LEN_GRID + _MANIFOLD_HEADER_W_GRID + _MANIFOLD_TUBE_LEN_GRID
+    local trunkRow = math.floor((rows - 1) / 2)
+    local gridRows = {}
+    for r = 0, rows - 1 do
+        local line = {}
+        for c = 0, cols - 1 do
+            local filled
+            if c < _MANIFOLD_TRUNK_LEN_GRID then
+                filled = (r == trunkRow)
+            elseif c < _MANIFOLD_TRUNK_LEN_GRID + _MANIFOLD_HEADER_W_GRID then
+                filled = true
+            else
+                filled = (r % 2 == 0)
+            end
+            line[c + 1] = filled and "#" or "."
+        end
+        gridRows[r + 1] = table.concat(line)
+    end
+    local trunkY = (trunkRow + 0.5) / rows - 0.5
+    local terminals = {
+        { x = -0.5, y = trunkY, exitX = -1, exitY = 0 },
+    }
+    -- The same geometry as routes a real pipe could follow: the trunk
+    -- straight into the spine's own centerline, then each tube either
+    -- straight on (the one tube that shares the trunk's own row, when n is
+    -- odd — see _drawPipeTreeSymbol's own "no bend" case) or a single
+    -- rounded bend up/down the spine to its own row and back out —
+    -- schematicElementPlacementConfigured stores this on e.pipeRoutes,
+    -- which is what actually draws a MANIFOLD (shapeType "pipeTree") now,
+    -- in place of the generated outline's own flat polygon fill.
+    local spineX = (_MANIFOLD_TRUNK_LEN_GRID + _MANIFOLD_HEADER_W_GRID / 2) / cols - 0.5
+    local pipeRoutes = { { { -0.5, trunkY }, { spineX, trunkY } } }
+    for k = 1, n do
+        local tubeRow = (k - 1) * 2
+        local tubeY = (tubeRow + 0.5) / rows - 0.5
+        table.insert(terminals, { x = 0.5, y = tubeY, exitX = 1, exitY = 0 })
+        if math.abs(tubeY - trunkY) < 1e-9 then
+            table.insert(pipeRoutes, { { spineX, trunkY }, { 0.5, tubeY } })
+        else
+            table.insert(pipeRoutes, { { spineX, trunkY }, { spineX, tubeY }, { 0.5, tubeY } })
+        end
+    end
+    return gridRows, terminals, cols, rows, pipeRoutes
+end
+
+-- The OUTFLOW PORTS row on a MANIFOLD's placement grid (see
+-- schematicElementPlacementExtraRows) — how many tubes
+-- _manifoldShapeAndTerminals builds the fresh graphic for. 1-8: a real
+-- manifold rarely needs more, and _shapePoly's own outline-point limits
+-- (segmentsTouch's O(corners^2) self-intersection check, run once per edit)
+-- start costing more than this ever needs to spend. Defaults to 2, the
+-- smallest count that actually reads as "splitting."
+function _manifoldPortCountRow(entity)
+    return { key = "manifoldPortCount", label = "OUTFLOW PORTS", target = "field", numeric = true,
+        value = tostring(entity and entity.manifoldPortCount or 2),
+        slider = { min = 1, max = 8, unit = "" } }
+end
+
 -- BATTERY's one wire terminal, the top of the cap in its artwork. Globals, not
 -- locals: this file sits at Lua's 200-local ceiling. Also read by
 -- _convertLegacySchematicSystem, which gives it to batteries saved before they had one.
@@ -427,13 +611,19 @@ _EJECTOR_TERMINALS = {
     { x =  0.5, y = 0, exitX =  1, exitY = 0, flow = "out" },
 }
 
--- A BUS's load (entity.busLoadAmps, nil reads as 0), set on the slider in its
--- PROPERTIES menu and shown in its diagram label.
+-- A BUS's load: entity.loads, an array of {name, amps} added one at a time
+-- from its own PROPERTIES menu's "+ ADD LOAD" row (or the catalog's LIGHT/
+-- MOTOR/HEATER shortcuts — see _openLoadPropertiesGrid) and shown summed in
+-- its diagram label. entity.busLoadAmps (nil reads as 0) is the older
+-- single-slider value this replaced — a bus saved before loads had their
+-- own list still has one and no entity.loads, so _busLoadText adds both
+-- rather than picking one, with no migration step needed either way.
 _BUS_SPRITE_PATH = "Sprites/element_bus.png"
 _BUS_LOAD_MAX_AMPS = 100
 
 function _busLoadText(entity)
     local amps = entity.busLoadAmps or 0
+    for _, load in ipairs(entity.loads or {}) do amps = amps + (load.amps or 0) end
     return string.format("%g %s", amps, amps == 1 and "amp" or "amps")
 end
 
@@ -444,6 +634,12 @@ end
 -- (see schematic_gdsGuiLib.lua's gdsGui_schematic_setPipeConnectors), rather
 -- than as plain wires, and this is what its menus call them: PIPE for a system
 -- carrying liquid, DUCT for one carrying gas.
+--
+-- Changing an existing item below (its sprite(s), terminals, componentType,
+-- default shape, ...)? Read _convertLegacySchematicSystem's own CHECKLIST
+-- comment first — every instance already placed from the old version of
+-- this entry needs its own matching fix-up there, or it's stuck looking/
+-- behaving like the old entry forever.
 local SCHEMATIC_CATALOG = {
     { system = "ELECTRICAL", items = {
         -- componentType: this item's role in the inference model's graph
@@ -537,16 +733,34 @@ local SCHEMATIC_CATALOG = {
               { x =  0.479, y = -0.017, exitX =  1, exitY = 0 },
               { x =  0.008, y = -0.18,  exitX =  0, exitY = -1, signal = true },
           } },
+        -- These three aren't drawn on the canvas at all — a bus's actual
+        -- loads (entity.loads, see _BUS_SPRITE_PATH's own comment above)
+        -- are data hanging off the BUS element, not nodes of their own in
+        -- model/graph.lua, same reasoning ENGINE's own FUEL FLOW property
+        -- gives for not modeling current draw. kind = "load" is its own
+        -- catalog dispatch branch (schematicCatalogItemChosen) rather than
+        -- "element"/"control": tapping one skips placement entirely and
+        -- goes straight to "which bus is this on" (_openLoadBusPicker),
+        -- which is itself a shortcut into the same ADD LOAD flow the green
+        -- "+" on a bus's own PROPERTIES menu opens (see
+        -- schematicElementPropertiesExtraRows) — just with the bus already
+        -- decided by the catalog tap instead of asked for up front. LIGHT/
+        -- MOTOR/HEATER differ only in the NAME a new load's own properties
+        -- grid starts pre-filled with (_openLoadPropertiesGrid); nothing
+        -- downstream ever distinguishes "kind" of load beyond that.
+        { label = "LIGHT",  kind = "load", componentType = "sink" },
+        { label = "MOTOR",  kind = "load", componentType = "sink" },
+        { label = "HEATER", kind = "load", componentType = "sink" },
     }},
     { system = "HYDRAULIC", pipeConnectors = "PIPE", items = {
         -- ACCUMULATOR/PUMP mirror BATTERY/GENERATOR's own split exactly: a
         -- passive always-pressurized element (stored residual pressure,
         -- present whenever placed, like a battery) plus a pilot-switchable
-        -- source control (reuses GENERATOR's own spinning-gear-overlay
-        -- affordance — a motor/engine-driven pump "spinning up" reads the
-        -- same way a generator does). Placing either asks for its nominal
-        -- PRESSURE the same way a new electrical source asks for VOLTAGE,
-        -- right in the unified placement grid (model/media/hydraulic.lua's
+        -- source control (its own case/impeller art — see
+        -- _FLUID_PUMP_SPRITE_PATHS — with the same spinning-overlay-means-
+        -- running affordance as GENERATOR's gear). Placing either asks for
+        -- its nominal PRESSURE the same way a new electrical source asks for
+        -- VOLTAGE, right in the unified placement grid (model/media/hydraulic.lua's
         -- own magnitudeLabel — see main.lua's schematicElementPlacementExtraRows).
         -- No defaultProperties — PRESSURE already comes from the placement
         -- grid's own source TYPE/VALUE row (same reasoning BATTERY's own
@@ -554,13 +768,34 @@ local SCHEMATIC_CATALOG = {
         { label = "ACCUMULATOR", abbrev = "ACUM", kind = "element", shapeType = "rect",
           gridW = 2, gridH = 3, componentType = "source" },
         { label = "PUMP", abbrev = "PUMP", kind = "control", presets = { {"OFF", "ON"} },
-          spritePaths = _GENERATOR_SPRITE_PATHS, overlaySpritePath = _GENERATOR_OVERLAY_SPRITE_PATH,
+          spritePaths = _FLUID_PUMP_SPRITE_PATHS, overlaySpritePath = _FLUID_PUMP_OVERLAY_SPRITE_PATH,
           gridSize = 2, componentType = "source", terminals = _FLUID_PUMP_TERMINALS },
         -- No defaultProperties — PRESSURE is SENSED (schematic
         -- ElementSensedValues' read-only PROPERTIES-menu header), not
         -- authored, same as BUS above.
+        -- NOT reshapable (deliberately no reshapable = true, unlike FUEL
+        -- TANK below) — its real graphic, one fixed trunk port feeding n
+        -- individual "tube-like" outflow stubs off a header spine, is
+        -- generated once, right after placement, from the OUTFLOW PORTS
+        -- count the pilot answers on the placement grid (see
+        -- _manifoldPortCountRow and schematicElementPlacementConfigured's
+        -- own MANIFOLD block, which calls _manifoldShapeAndTerminals(n) and
+        -- resizes the element to whatever footprint that count needs) —
+        -- the GENERATED shape is the whole design surface; hand-reshaping
+        -- or ADD/MOVE/REMOVE PORTing it afterward would only fight that.
+        -- With reshapable unset it keeps every OTHER element's own default
+        -- editing instead: RELOCATE (drag) and ROTATE in 90-degree cardinal
+        -- turns only (a reshapable item is the one exception that rotates
+        -- to any free angle — see gdsGui_schematic_setReshapableKind). The
+        -- element itself still draws from e.shapePoints regardless —
+        -- drawing never checks reshapable, only the edit menu does — so the
+        -- generated outline renders exactly the same either way.
+        -- gridW/gridH below only size the brief placement-drag PREVIEW —
+        -- before NAME/OUTFLOW PORTS is even asked, _pendingElementSizeFrac
+        -- already needs some footprint to snap/collision-check against —
+        -- not the final shape, which replaces both the instant it's known.
         { label = "MANIFOLD", abbrev = "MNFD", kind = "element", shapeType = "rect",
-          gridW = 4, gridH = 2, componentType = "path" },
+          gridW = 8, gridH = 3, componentType = "path", terminals = _MANIFOLD_TERMINALS },
         -- Non-user-operated, one-way flow — same role/geometry-derived
         -- conduction direction as ELECTRICAL's own DIODE above (see
         -- model/graph.lua's _resolveDirectionalEdges), just reusing that
@@ -585,17 +820,41 @@ local SCHEMATIC_CATALOG = {
         -- defaultProperties, since LEVEL is a slider linked to QUANTITY.
         { label = "FUEL TANK", abbrev = "FTNK", kind = "element", shapeType = "rect",
           gridW = 3, gridH = 3, componentType = "source", reshapable = true },
+        -- A tank's own vent: wired to it the same way ENGINE or any other
+        -- sink is, so a FUEL TANK with one actually reaches a "sink" node in
+        -- the graph and one without doesn't — a real, checkable fact about
+        -- the wiring (model/graph.lua can walk it) rather than a flag
+        -- bolted onto the tank. componentType "sink" (not "directionalGate"
+        -- — a valve that'd otherwise read as one-way, but there's no
+        -- "atmosphere" node on its other side to be directional BETWEEN):
+        -- it's the vented end itself, same role ENGINE plays for FUEL FLOW.
+        -- shapeType "circle" reuses RESERVOIR's own plain-sink look (one
+        -- system over, in HYDRAULIC) rather than inventing new art for a
+        -- small fitting; gridW/gridH smaller than RESERVOIR's own so it
+        -- reads as a fitting, not a second tank.
+        --
+        -- NOT wired into any pressure model yet — model/fluid.lua has no
+        -- tank pressure concept at all today, gravity flow there is a flat
+        -- yes/no on a wire's own gravityDirection, not pressure-gated. This
+        -- is deliberately just the element: a tank's own negative-pressure
+        -- buildup (and this valve relieving it) is a separate, not-yet-built
+        -- feature, whenever it lands it'll query the graph for exactly this
+        -- — a FUEL TANK with no wire to a "sink"-role RELIEF VALVE on it.
+        { label = "RELIEF VALVE", abbrev = "RLFV", kind = "element", shapeType = "circle",
+          gridW = 2, gridH = 2, componentType = "sink" },
         -- Boost pump: mirrors HYDRAULIC's own PUMP control above (and
         -- ELECTRICAL's GENERATOR) — a pilot-switchable source, not the
         -- always-present FUEL TANK itself.
         { label = "FUEL PUMP", abbrev = "FPMP", kind = "control", presets = { {"OFF", "ON"} },
-          spritePaths = _GENERATOR_SPRITE_PATHS, overlaySpritePath = _GENERATOR_OVERLAY_SPRITE_PATH,
+          spritePaths = _FLUID_PUMP_SPRITE_PATHS, overlaySpritePath = _FLUID_PUMP_OVERLAY_SPRITE_PATH,
           gridSize = 2, componentType = "source", terminals = _FLUID_PUMP_TERMINALS },
         -- No defaultProperties — PRESSURE is sensed, not authored (same
         -- reasoning MANIFOLD's own comment, above in the HYDRAULIC catalog,
-        -- gives).
+        -- gives). Same generated, NOT reshapable, relocate/cardinal-rotate-
+        -- only design as HYDRAULIC's own MANIFOLD above — see that entry's
+        -- own comment.
         { label = "FUEL MANIFOLD", abbrev = "FMFD", kind = "element", shapeType = "rect",
-          gridW = 4, gridH = 2, componentType = "path" },
+          gridW = 8, gridH = 3, componentType = "path", terminals = _MANIFOLD_TERMINALS },
         -- Same non-user-operated, one-way role as HYDRAULIC's own CHECK
         -- VALVE above (e.g. an anti-siphon or crossfeed check valve).
         { label = "CHECK VALVE", abbrev = "CKVL", kind = "element", shapeType = "diode",
@@ -678,6 +937,21 @@ function _isUnportedFluidPump(sys, control)
     return sys.systemType == "HYDRAULIC" or sys.systemType == "FUEL"
 end
 
+-- A pump still showing GENERATOR's own housing/gear art from before it had
+-- dedicated fluid-pump sprites (_FLUID_PUMP_SPRITE_PATHS/
+-- _FLUID_PUMP_OVERLAY_SPRITE_PATH) — independent of whether it's ALSO
+-- unported (_isUnportedFluidPump just above): a pump ported in the gap
+-- between that change and this one already has terminals (so the function
+-- above says false) but still the old art, so this can't just reuse it.
+-- Sprites are baked onto a control at placement time, not looked up fresh
+-- from the catalog on every draw, so an existing one needs this same
+-- "unported" treatment — _convertLegacySchematicSystem updates it on load.
+function _isGeneratorArtFluidPump(sys, control)
+    if control.componentType ~= "source" then return false end
+    if control.overlaySpritePath ~= _GENERATOR_OVERLAY_SPRITE_PATH then return false end
+    return sys.systemType == "HYDRAULIC" or sys.systemType == "FUEL"
+end
+
 local function _findCatalogEntryForType(systemType)
     for _, sys in ipairs(SCHEMATIC_CATALOG) do
         if sys.system == systemType then return sys end
@@ -756,21 +1030,80 @@ local _schematicCanvasNormalLayout = nil
 local _schematicCanvasZoomedLayout = nil
 
 -- Floating tool dock at the canvas's top-right (ADD / PAINT / ANNUNCIATOR,
--- top to bottom). x and each button's normal y (0-1 of the safe area) are
--- captured once at creation in love.load() for the same reason as
--- _schematicCanvasNormalLayout above. While one tool is active
--- (_activeSchematicTool, see _enterSchematicTool), that tool's button moves
--- up to the top slot and the others are hidden until it's deactivated.
+-- top to bottom), each in its own fixed slot — see _enterSchematicTool.
 local _SCHEMATIC_DOCK_TOOLS = {
     add         = "schematicAddBtn",
     paint       = "schematicPaintBtn",
     annunciator = "schematicAnnunciatorBtn",
+    backGround  = "schematicBackGroundBtn",
 }
-local _schematicDockX      = nil
-local _schematicDockSlotY  = {}   -- button name -> normal y
+-- Same column, same toggle, shown instead of _SCHEMATIC_DOCK_TOOLS while in
+-- control mode (the two sets are mode-exclusive, never shown together —
+-- see schematicDockTogglePressed). Only GEAR today (schematicGearCtlBtn,
+-- replacing its old fixed CT slot above the canvas); add future control-mode
+-- tools here and they'll pick up open/closed dock behavior for free.
+local _SCHEMATIC_CONTROL_DOCK_TOOLS = {
+    gear = "schematicGearCtlBtn",
+}
 local _activeSchematicTool = nil  -- nil | "add" | "paint" | "annunciator"
 local _prevSchematicZoomText = nil
 local _schematicZoomFullScreenFont = nil
+
+-- Whether the floating tool dock above (its own toggle button,
+-- schematicDockToggle, fixed just above ADD at the canvas's top-right
+-- corner) is expanded. true = ADD/PAINT/ANNUNCIATOR/GEAR/AI all show in
+-- their normal slots; false = the dock is collapsed to just the toggle
+-- arrow. Starts open so the five tools stay
+-- exactly as discoverable as before this existed; the user's own choice to
+-- collapse it persists only for the rest of this run (not written to
+-- appSettings) since it's a screen-space convenience, not a durable
+-- preference. Global, not local: main.lua is at Lua's 200-local ceiling.
+_schematicDockOpen = true
+
+-- Same open/closed convenience for the SchematicFullScreen page's own
+-- RETURN/GEAR column (schematicFullScreenDockToggle, that page's top-right
+-- corner — see schematicFullScreenDockTogglePressed), independent of
+-- _schematicDockOpen since it's a different page with its own toggle
+-- button. Starts open for the same discoverability reason. Global, not
+-- local: see _schematicDockOpen above.
+_schematicFullScreenDockOpen = true
+
+-- Hides a dock tool button for EITHER reason it can be hidden: the mode
+-- doesn't allow it right now (hiddenByMode — e.g. ADD/PAINT/ANNUNCIATOR/AI
+-- are design-only, GEAR's control-mode copy is control-only), or the dock
+-- itself is collapsed (_schematicDockOpen false). Every call site that used
+-- to call gdsGui_button_setHidden directly for one of these dock tools goes
+-- through this instead, so the two reasons compose instead of one silently
+-- overwriting the other. Global, not local: see _schematicDockOpen above.
+function _schematicDockSetToolHidden(name, hiddenByMode)
+    gdsGui_button_setHidden(name, hiddenByMode or not _schematicDockOpen)
+end
+
+-- The dock's own open/closed arrow (schematicDockToggle): collapses/expands
+-- whichever tool set applies to the current mode — the five design tools
+-- (_SCHEMATIC_DOCK_TOOLS plus GEAR/AI) or the control tools
+-- (_SCHEMATIC_CONTROL_DOCK_TOOLS) — without touching whatever any of them is
+-- already doing (an armed PAINT mode, an open ADD cascade, an open
+-- ANNUNCIATOR panel, etc. all stay exactly as they were — only their
+-- buttons' visibility changes), so reopening the dock picks up right where
+-- it was left. newState is this toggle's OWN new state (PRESSED = open, its
+-- sprite's chevron pointing up; RELEASED = closed, pointing down). Works in
+-- both modes now — the toggle is no longer deactivated in control mode (see
+-- schematicModeToggled). All three design tools (_SCHEMATIC_DOCK_TOOLS) stay
+-- visible together regardless of which one (if any) is active — see
+-- _enterSchematicTool. Global, not local: see _schematicDockOpen above.
+function schematicDockTogglePressed(newState)
+    _schematicDockOpen = (newState == globApp.BUTTON_STATES.PRESSED)
+    local designing = gdsGui_schematic_getMode("mainCanvas") == "design"
+    for _, name in pairs(_SCHEMATIC_DOCK_TOOLS) do
+        _schematicDockSetToolHidden(name, not designing)
+    end
+    _schematicDockSetToolHidden("schematicGearBtn", not designing)
+    _schematicDockSetToolHidden("schematicAiBtn", not designing)
+    for _, name in pairs(_SCHEMATIC_CONTROL_DOCK_TOOLS) do
+        _schematicDockSetToolHidden(name, designing)
+    end
+end
 
 -- Sentinels for the combination-readout poll in love.update() below (see
 -- "Schematic combination readout") — same dirty-flag-rendering convention as
@@ -906,15 +1239,69 @@ local function _canvasBackgroundPath(aircraft)
     return (aircraft and CANVAS_BACKGROUND_BY_TYPE[aircraft.thumbnail]) or CANVAS_BACKGROUND_DEFAULT
 end
 
+-- The BACKGROUND tool's four independent layers, in the order its menu
+-- lists them (see _openBackgroundMenu) — AIRCRAFT is the full-canvas
+-- watermark (path nil; resolved per-aircraft through _canvasBackgroundPath
+-- instead, same as CANVAS_BACKGROUND_BY_TYPE above); ASU/GPU/FUEL are fixed
+-- corner watermarks (gdsGui_schematic_setCorner*BackgroundImage) — despite
+-- their generic Corner/CornerRight/CornerTopRight filenames (named for WHERE
+-- they're drawn, not what they depict), these ARE actual ASU/GPU/FUEL truck
+-- art, confirmed by opening each file: the "Corner" one reads "ASU",
+-- "CornerRight" reads "AC/DC" (ground power), "CornerTopRight" reads "FUEL".
+-- setter is a by-name global (resolved via _G — see _applySchematicBackgrounds
+-- below), same "callbacks by name" convention every button/menu callback in
+-- this app already uses. Each layer is stored on the aircraft record as its
+-- own nil-guarded boolean (aircraft.bgAircraft/bgAsu/bgGpu/bgFuel — see
+-- _verifyAndRepairSchematicStore, which defaults a legacy record missing
+-- these to true so an existing save keeps looking exactly as it did before
+-- this toggle existed) so each aircraft remembers its own choice, same as
+-- its thumbnail/type. Global, not local: this file is already at Lua's
+-- 200-top-level-local ceiling (see _LEARN_SCHEMATIC_RAW's own comment on
+-- the same constraint).
+_BACKGROUND_LAYERS = {
+    { label = "AIRCRAFT",   field = "bgAircraft", path = nil,
+        setter = "gdsGui_schematic_setBackgroundImage" },
+    { label = "ASU",        field = "bgAsu",  path = "Sprites/bg_schematicCanvasCorner.png",
+        setter = "gdsGui_schematic_setCornerBackgroundImage" },
+    { label = "GPU",        field = "bgGpu",  path = "Sprites/bg_schematicCanvasCornerRight.png",
+        setter = "gdsGui_schematic_setCornerRightBackgroundImage" },
+    { label = "FUEL TRUCK", field = "bgFuel", path = "Sprites/bg_schematicCanvasCornerTopRight.png",
+        setter = "gdsGui_schematic_setCornerTopRightBackgroundImage" },
+}
+
+-- Applies aircraft's four background-layer flags (bgAircraft/bgAsu/bgGpu/
+-- bgFuel — see _BACKGROUND_LAYERS) to mainCanvas's watermark images, each
+-- independently: on sets its layer's own path (AIRCRAFT's resolved per
+-- aircraft type via _canvasBackgroundPath, same as before this toggle
+-- existed), off clears it (nil). aircraft nil (no aircraft open yet, e.g.
+-- at startup before one's chosen) reads as every layer on, same as a
+-- brand-new/legacy aircraft record with no flags saved yet — matching the
+-- look this app had before the BACKGROUND tool existed. Global, not local:
+-- see _BACKGROUND_LAYERS' own comment.
+function _applySchematicBackgrounds(aircraft)
+    for _, layer in ipairs(_BACKGROUND_LAYERS) do
+        local on = not aircraft or aircraft[layer.field] ~= false
+        local path = on and (layer.path or _canvasBackgroundPath(aircraft)) or nil
+        _G[layer.setter]("mainCanvas", path)
+    end
+end
+
 -- Maps schematicStore.aircraft into the aircraftGallery's item list, adding
 -- a resolved thumbnailPath per item without polluting the persisted aircraft
--- record with a derived/absolute-ish path.
+-- record with a derived/absolute-ish path. compatBadge likewise resolved
+-- here from _aircraftCompatStatus (set in love.load() — see its own
+-- declaration) rather than stored on the aircraft record: "issues" (red !)
+-- if any of its systems failed the compatibility check's conversion step,
+-- "fixed" (yellow ! + green check) if one needed converting but came
+-- through fine, else "ok" (plain green check).
 local function _aircraftGalleryItems()
     local items = {}
     for _, aircraft in ipairs(schematicStore.aircraft) do
         local item = {}
         for k, v in pairs(aircraft) do item[k] = v end
         item.thumbnailPath = _aircraftThumbnailPath(aircraft.thumbnail)
+        local status = _aircraftCompatStatus[aircraft.id]
+        item.compatBadge = status and (status.failed and "issues" or status.modified and "fixed" or "ok") or nil
         table.insert(items, item)
     end
     return items
@@ -1152,6 +1539,29 @@ end
 -- schemaVersion, since several of these shape changes shipped without a
 -- schema bump. report(what) is called once per kind of change made, for the
 -- compat notice. Global, not local: main.lua is at Lua's 200-local ceiling.
+--
+-- CHECKLIST — read this before editing SCHEMATIC_CATALOG: an element/control
+-- is only ever BUILT from its catalog entry at the moment it's first placed
+-- (gdsGui_schematic_armElementPlacement/armControlPlacement -> addElement/
+-- addControl). Every field that lands on it that way — spritePath/
+-- spritePaths/overlaySpritePath, terminals, componentType, gridW/gridH (via
+-- its placed w/h), shapePoints (see schematicElementPlacementConfigured's own
+-- post-placement hook, for the one item that needs one) — is baked onto that
+-- SAVED INSTANCE forever after, never re-read from the catalog again. So
+-- changing any of those in the catalog (new sprite, new/changed terminals, a
+-- newly reshapable item, a different default shape, ...) ONLY ever affects a
+-- NEWLY placed one — every instance already saved from before the change
+-- keeps looking/behaving exactly as it did, permanently, unless a matching
+-- step is added below to bring it forward too. The ejector/battery/pump
+-- port, pump artwork, and manifold outline blocks below are the pattern:
+-- detect "still looks like the old shape" (by sprite path, missing
+-- terminals, shapeType, whatever's actually distinctive — never by label,
+-- which the pilot can rename), then write the new field(s) on it, same as a
+-- fresh placement would set them, and bump() a one-line description for the
+-- compat notice. A catalog change with no matching step here will look
+-- correct for every NEW item and silently wrong for every existing one —
+-- exactly the gap this function exists to close, so don't ship one without
+-- checking whether this needs an entry too.
 function _convertLegacySchematicSystem(sys, report)
     local counts = {}
     local function bump(what) counts[what] = (counts[what] or 0) + 1 end
@@ -1190,10 +1600,16 @@ function _convertLegacySchematicSystem(sys, report)
         if retired[w.fromElementId] or retired[w.toElementId] then table.remove(sys.wires, i) end
     end
 
+    -- The tank-like reshapable item specifically (componentType == "source")
+    -- — both fixes below (round tanks, old QUANTITY property) are tank-only
+    -- concerns, and a system can now have more than one reshapable item
+    -- (e.g. FUEL's own FUEL TANK alongside FUEL MANIFOLD — see
+    -- gdsGui_schematic_setReshapableKind's own comment), so "whichever one
+    -- the catalog lists last" is no longer a safe way to find it.
     local catalogEntry = sys.systemType and _findCatalogEntryForType(sys.systemType)
     local reshapableItem
     for _, item in ipairs(catalogEntry and catalogEntry.items or {}) do
-        if item.reshapable then reshapableItem = item end
+        if item.reshapable and item.componentType == "source" then reshapableItem = item end
     end
 
     for _, e in ipairs(sys.elements) do
@@ -1213,6 +1629,61 @@ function _convertLegacySchematicSystem(sys, report)
         if e.spritePath == _BATTERY_SPRITE_PATH and not e.terminals then
             e.terminals = copyPorts(_BATTERY_TERMINALS)
             bump("added battery terminal(s)")
+        end
+        -- A MANIFOLD/FUEL MANIFOLD not yet on the current generated design
+        -- (no sprite, and MANIFOLD is the only componentType "path" rect
+        -- element either system ever had — BUS's own "path" rect always has
+        -- a spritePath, DUCT's lives only in BLEED AIR, never HYDRAULIC/FUEL
+        -- — still "rect": a fully-upgraded one is switched to shapeType
+        -- "pipeTree" below, so this never re-matches one already done)
+        -- picks up the current design the first time its system loads —
+        -- same _manifoldShapeAndTerminals a freshly placed one's own
+        -- OUTFLOW PORTS answer builds (shapePoints for hit-testing,
+        -- pipeRoutes for the actual "real pipe" drawing — see
+        -- _drawPipeTreeSymbol — and shapeType "pipeTree" so it draws that
+        -- way), just with no pilot to ask at load time, so n is instead
+        -- guessed from however many wires are already actually touching it
+        -- (minus 1 for the trunk side, floored at 1) — a closer-to-reality
+        -- starting point than any fixed default, though still only a guess
+        -- (free-attached wires don't record which "side" of the manifold
+        -- each one was ever on). Never touches e.terminals itself: an
+        -- existing manifold's wires are already free-attached wherever they
+        -- each individually land, and forcing them all onto newly-placed
+        -- ports would just visibly bunch them there instead of leaving each
+        -- one put. Runs regardless of whether an EARLIER version of this
+        -- same fix already gave it a shapePoints outline (or flow-tagged
+        -- terminals, stripped below either way) — e.pipeRoutes is what's
+        -- actually missing on any of those older partial states.
+        if (sys.systemType == "HYDRAULIC" or sys.systemType == "FUEL") and e.componentType == "path"
+           and e.shapeType == "rect" and not e.spritePath and not e.pipeRoutes then
+            local wireCount = 0
+            for _, w in ipairs(sys.wires or {}) do
+                if w.fromElementId == e.id or w.toElementId == e.id then wireCount = wireCount + 1 end
+            end
+            local guessedN = math.max(1, math.min(8, wireCount - 1))
+            local gridRows, _, _, _, pipeRoutes = _manifoldShapeAndTerminals(guessedN)
+            e.shapePoints = _shapePoly.pointsFromRows(gridRows)
+            e.pipeRoutes = pipeRoutes
+            e.shapeType = "pipeTree"
+            bump("gave existing manifold(s) the current pipe design")
+        end
+        -- A MANIFOLD/FUEL MANIFOLD generated (see the block just above, from
+        -- before e.shapeType switched to "pipeTree") while
+        -- _manifoldShapeAndTerminals still tagged its own terminals flow =
+        -- "in"/"out" — see that function's own comment on why that was wrong
+        -- for a "path" node and got dropped. A flow tag there could BLOCK a
+        -- tube's wire outright (not just mis-route it) wherever it fed a
+        -- check valve whose own rotation happened to geometrically disagree
+        -- (model/graph.lua's buildGraph) — strips it from every terminal
+        -- this MANIFOLD/FUEL MANIFOLD already generated so an already-built
+        -- one stops silently not conducting through some of its tubes.
+        if (sys.systemType == "HYDRAULIC" or sys.systemType == "FUEL") and e.componentType == "path"
+           and (e.shapeType == "rect" or e.shapeType == "pipeTree") and not e.spritePath and e.terminals then
+            local hadFlow = false
+            for _, t in ipairs(e.terminals) do
+                if t.flow then hadFlow = true; t.flow = nil end
+            end
+            if hadFlow then bump("removed incorrect flow direction from manifold port(s)") end
         end
         if reshapableItem and e.componentType == reshapableItem.componentType then
             -- Tanks saved back when the catalog placed them as circles.
@@ -1240,6 +1711,17 @@ function _convertLegacySchematicSystem(sys, report)
         end
     end
 
+    -- Pumps saved before they had dedicated fluid-pump artwork — still
+    -- showing GENERATOR's own housing/gear (see _isGeneratorArtFluidPump's
+    -- own comment on why this can't just reuse the unported check above).
+    for _, c in ipairs(sys.controls) do
+        if _isGeneratorArtFluidPump(sys, c) then
+            c.spritePaths = _FLUID_PUMP_SPRITE_PATHS
+            c.overlaySpritePath = _FLUID_PUMP_OVERLAY_SPRITE_PATH
+            bump("updated pump(s) to dedicated fluid-pump artwork")
+        end
+    end
+
     for what, n in pairs(counts) do report(what .. " (" .. n .. ")") end
 end
 
@@ -1250,10 +1732,18 @@ end
 -- control/annunciator ids via _dedupeIds. Also converts every system saved
 -- by an earlier app version into the current shape (see
 -- _convertLegacySchematicSystem) and drops wires left pointing at nothing.
--- Returns {notes, conversions, failures, aircraftCount, systemCount} for the one-time
--- compat notice to summarize.
+-- Returns {notes, conversions, failures, perAircraft, aircraftCount, systemCount} for the
+-- one-time compat notice (and the aircraft gallery's per-tile badges — see
+-- perAircraft below) to summarize.
 local function _verifyAndRepairSchematicStore(store)
     local notes, conversions, failures = {}, {}, {}
+    -- One {failed, modified} record per aircraft id, both booleans: failed if
+    -- any of its systems' legacy-shape conversion actually errored (couldn't
+    -- be made compatible), modified if anything about it needed converting
+    -- but came through fine. Consulted by _aircraftGalleryItems for each
+    -- tile's compatBadge. An aircraft with neither flag set needed no repair
+    -- at all — already fully compatible.
+    local perAircraft = {}
     local aircraftList = (store and store.aircraft) or {}
     _dedupeIds(aircraftList, "id", function(old, new)
         return "aircraft id '" .. old .. "' was duplicated — second instance renamed to '" .. new .. "'"
@@ -1262,7 +1752,19 @@ local function _verifyAndRepairSchematicStore(store)
     local aircraftCount, systemCount = 0, 0
     for _, aircraft in ipairs(aircraftList) do
         aircraftCount = aircraftCount + 1
+        local status = { failed = false, modified = false }
+        if aircraft.id ~= nil then perAircraft[aircraft.id] = status end
         aircraft.systems = aircraft.systems or {}
+        -- Nil-guarded defaults for the BACKGROUND tool's four layer flags
+        -- (see _BACKGROUND_LAYERS/_applySchematicBackgrounds) — true so an
+        -- aircraft saved before this toggle existed keeps looking exactly
+        -- as it always did (every layer shown). Not flagged as "modified":
+        -- same convention as sys.elements/wires/etc. just below, a filled-in
+        -- default rather than a notable legacy conversion.
+        if aircraft.bgAircraft == nil then aircraft.bgAircraft = true end
+        if aircraft.bgAsu      == nil then aircraft.bgAsu      = true end
+        if aircraft.bgGpu      == nil then aircraft.bgGpu      = true end
+        if aircraft.bgFuel     == nil then aircraft.bgFuel     = true end
         _dedupeIds(aircraft.systems, "id", function(old, new)
             return "system id '" .. old .. "' was duplicated in aircraft '" .. (aircraft.name or aircraft.id) ..
                 "' — second instance renamed to '" .. new .. "'"
@@ -1275,6 +1777,7 @@ local function _verifyAndRepairSchematicStore(store)
             sys.annunciators = sys.annunciators or {}
             sys.snapshots    = sys.snapshots    or {}
             local sysLabel = sys.name or sys.id or "?"
+            local conversionsBefore = #conversions
             -- Guarded: a malformed record in one system must not stop the app
             -- from starting; it's left as saved and reported instead.
             local converted, convertErr = pcall(_convertLegacySchematicSystem, sys, function(what)
@@ -1283,6 +1786,7 @@ local function _verifyAndRepairSchematicStore(store)
             if not converted then
                 table.insert(failures, "system '" .. sysLabel .. "': couldn't convert from an earlier version (" ..
                     tostring(convertErr) .. ") — left as saved")
+                status.failed = true
             end
             _dedupeIds(sys.elements, "id", function(old, new)
                 return "system '" .. sysLabel .. "': duplicate element id '" .. old .. "' renamed to '" .. new .. "'"
@@ -1313,11 +1817,12 @@ local function _verifyAndRepairSchematicStore(store)
                 table.insert(conversions, "system '" .. sysLabel .. "': removed " .. dangling ..
                     " wire(s) whose element or control no longer exists")
             end
+            if #conversions > conversionsBefore then status.modified = true end
         end
     end
 
-    return { notes = notes, conversions = conversions, failures = failures, aircraftCount = aircraftCount,
-        systemCount = systemCount }
+    return { notes = notes, conversions = conversions, failures = failures, perAircraft = perAircraft,
+        aircraftCount = aircraftCount, systemCount = systemCount }
 end
 
 -- Builds the one-time-per-APP_VERSION info-popup message (see love.load()'s
@@ -1825,16 +2330,17 @@ function _relays.syncGearControl(canvas)
 end
 
 -- All three GEAR buttons (design dock, control mode, and full-screen) show
--- the global position. schematicGearFullScreenBtn is never hidden — see its
--- own creation comment.
+-- the global position. schematicGearFullScreenBtn's own visibility follows
+-- the full-screen page's dock toggle instead (never this function) — see
+-- its own creation comment.
 function _relays.refreshGearButtons(designing)
     local state = appSettings.gearDown and "pushed" or "released"
     gdsGui_button_setState("schematicGearBtn", state)
     gdsGui_button_setState("schematicGearCtlBtn", state)
     gdsGui_button_setState("schematicGearFullScreenBtn", state)
     if designing ~= nil then
-        gdsGui_button_setHidden("schematicGearBtn", not designing)
-        gdsGui_button_setHidden("schematicGearCtlBtn", designing)
+        _schematicDockSetToolHidden("schematicGearBtn", not designing)
+        _schematicDockSetToolHidden("schematicGearCtlBtn", designing)
     end
 end
 
@@ -2140,6 +2646,38 @@ local function _solveCurrentSchematic()
     local medium = _currentMedium()
 
     local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes, _nodePositionsForGraph(canvas))
+
+    -- Which liquid pipes gravity (or a running pump) can actually reach right
+    -- now -- model/fluid.lua's own feeding/pump routes, the same ones
+    -- _fluidTick's live simulation drains by. solve() below has no concept of
+    -- "this wire only carries anything flowing downhill" (it's deliberately
+    -- medium-agnostic -- see model/solver.lua's own header), so left alone it
+    -- would color an uphill, unpumped run as if fed just because it's wired
+    -- up at all; the wire loop further down overrides exactly those back to
+    -- unpowered gray. nil on anything but a PIPE system -- the override never
+    -- applies there, see that same loop.
+    local fluidReachable = nil
+    if canvas.connectorNoun == "PIPE" then
+        local conducting, stores, offSources, pressures = _fluidFlowInputs(canvas, componentTypes)
+        local flow = ModelFluid.computeFlow(graph, canvas.wires, conducting, offSources, pressures, stores)
+        fluidReachable = {}
+        for _, fed in pairs(flow.feeding) do
+            for wireId in pairs(fed) do fluidReachable[wireId] = true end
+        end
+        -- A pump (or the ejector it drives) moves fluid on its own pressure,
+        -- not gravity -- any pipe on one of its routes counts as reachable
+        -- regardless of which way it's marked, same as the live simulation's
+        -- own w.pumpedDirection override (model/fluid.lua's step()).
+        for _, pump in ipairs(flow.pumps) do
+            for link in pairs(pump.delivery) do fluidReachable[link.edge.id] = true end
+            for link in pairs(pump.suction) do fluidReachable[link.edge.id] = true end
+            for _, ejector in ipairs(pump.ejectors) do
+                for link in pairs(ejector.discharge) do fluidReachable[link.edge.id] = true end
+                for link in pairs(ejector.suction) do fluidReachable[link.edge.id] = true end
+            end
+        end
+    end
+
     local sourceStates = _currentSourceStates(canvas, componentTypes)
     local gateStates = _currentGateStates(canvas, componentTypes)
     -- Relays (BUS TIE) join gateStates as already decided: as this
@@ -2257,6 +2795,14 @@ local function _solveCurrentSchematic()
             if feedId then
                 result.wires[w.id] = _colorForPoweredNode(feedId, attribution, canvas, medium.style.powered, nodeStates)
             elseif feedId == false then
+                result.wires[w.id] = medium.style.unpowered
+            end
+            -- A liquid pipe marked with an explicit up/downhill gravityDirection
+            -- that gravity (and no running pump) can't actually reach right
+            -- now -- see fluidReachable above. A level run (gravityDirection nil) is
+            -- untouched: it was never part of gravity's own feeding graph to
+            -- begin with, so it keeps whatever solve() predicted above.
+            if fluidReachable and w.gravityDirection and not fluidReachable[w.id] then
                 result.wires[w.id] = medium.style.unpowered
             end
         end
@@ -3583,26 +4129,41 @@ function drawSchematicAiPanel()
     if not stats then clearCulprit(); return end
     if culpritCanvas then culpritCanvas.aiCulpritId = stats.primaryReasonNodeId end
 
-    love.graphics.setColor(0, 0, 0, 0.72)
-    love.graphics.rectangle("fill", px, py, pw, ph)
-    love.graphics.setColor(1, 1, 0, 1)
-    love.graphics.rectangle("line", px, py, pw, ph)
+    -- Styled like the iOS action sheet every modal menu/popup on the canvas
+    -- uses (_actionSheet, schematic_gdsGuiLib.lua): same themed dark/light
+    -- background and gray title, no more flat black-and-yellow box. Only the
+    -- top corners round — this panel sits flush against the canvas's own
+    -- bottom edge (see _aiPanelRect), so it reads as a sheet attached to
+    -- that edge rather than floating free like the others.
+    local palette = (globApp.themeIsDark == false) and _actionSheet.LIGHT or _actionSheet.DARK
+    local hairline = gdsGui_general_hairline()
+    love.graphics.setColor(palette.bg)
+    _actionSheet.fill(px, py, pw, ph, true, false)
 
     if not _aiPanelFont then _aiPanelFont = gdsGui_general_newFont(13) end
     love.graphics.setFont(_aiPanelFont)
 
-    local lines = {
-        string.format("COMBINATION: %d / %d", stats.combinationIndex, stats.combinationTotal),
-        "PREDICTION CONFIDENCE: " .. (stats.confidencePercent and (stats.confidencePercent .. "%") or "N/A"),
-    }
+    local titleH = _aiPanelFont:getHeight() + 10
+    love.graphics.setColor(palette.title)
+    love.graphics.printf("AI PREDICTION", px, py + 6, pw, "center")
+    love.graphics.setColor(palette.separator)
+    love.graphics.rectangle("fill", px, gdsGui_general_pixelCenter(py + titleH) - hairline / 2, pw, hairline)
+
     -- REASON/FIX only ever appear alongside a confidence shortfall — see
     -- _computeAiPanelStats' own comment on why these fields are only ever
-    -- set together with confidencePercent < 100.
+    -- set together with confidencePercent < 100 — so they're colored as the
+    -- sheet's own "needs attention" red (_actionSheet.isDestructive's color)
+    -- rather than plain body text, same red the annunciator/paint popups'
+    -- destructive rows use.
+    local lines = {
+        { text = string.format("COMBINATION: %d / %d", stats.combinationIndex, stats.combinationTotal), color = palette.text },
+        { text = "PREDICTION CONFIDENCE: " .. (stats.confidencePercent and (stats.confidencePercent .. "%") or "N/A"), color = palette.text },
+    }
     if stats.primaryReasonText then
-        table.insert(lines, "REASON: " .. stats.primaryReasonText)
+        table.insert(lines, { text = "REASON: " .. stats.primaryReasonText, color = palette.destructive })
     end
     if stats.fixInstructionText then
-        table.insert(lines, "FIX: " .. stats.fixInstructionText)
+        table.insert(lines, { text = "FIX: " .. stats.fixInstructionText, color = palette.destructive })
     end
 
     local pad, wrapW, lineGap = 10, pw - 20, 4
@@ -3614,20 +4175,20 @@ function drawSchematicAiPanel()
     -- left over from a longer REASON line that just got shorter) never
     -- leaves a blank gap hanging at the bottom instead of snapping back.
     local lineCounts, totalH = {}, 0
-    for i, text in ipairs(lines) do
-        local _, wrapped = _aiPanelFont:getWrap(text, wrapW)
+    for i, line in ipairs(lines) do
+        local _, wrapped = _aiPanelFont:getWrap(line.text, wrapW)
         lineCounts[i] = math.max(1, #wrapped)
         totalH = totalH + lineCounts[i] * lineH
     end
-    local innerH = ph - pad * 2
+    local innerH = ph - titleH - pad * 2
     local maxScroll = math.max(0, totalH - innerH)
     _aiPanelScrollY = math.max(0, math.min(maxScroll, _aiPanelScrollY))
 
-    love.graphics.setScissor(px, py, pw, ph)
-    local y = py + pad - _aiPanelScrollY
-    for i, text in ipairs(lines) do
-        love.graphics.setColor(1, 1, 0, 1)
-        love.graphics.printf(text, px + pad, y, wrapW, "left")
+    love.graphics.setScissor(px, py + titleH, pw, ph - titleH)
+    local y = py + titleH + pad - _aiPanelScrollY
+    for i, line in ipairs(lines) do
+        love.graphics.setColor(line.color)
+        love.graphics.printf(line.text, px + pad, y, wrapW, "left")
         y = y + lineCounts[i] * lineH
     end
     love.graphics.setScissor()
@@ -3637,11 +4198,12 @@ function drawSchematicAiPanel()
     -- to indicate otherwise.
     if maxScroll > 0 then
         local trackX = px + pw - 6
-        love.graphics.setColor(1, 1, 1, 0.25)
-        love.graphics.rectangle("fill", trackX, py + 2, 3, ph - 4)
-        local thumbH = math.max(14, (innerH / totalH) * (ph - 4))
-        local thumbY = py + 2 + (_aiPanelScrollY / maxScroll) * (ph - 4 - thumbH)
-        love.graphics.setColor(1, 1, 0, 0.8)
+        local trackY, trackH = py + titleH + 2, ph - titleH - 4
+        love.graphics.setColor(palette.separator)
+        love.graphics.rectangle("fill", trackX, trackY, 3, trackH)
+        local thumbH = math.max(14, (innerH / totalH) * trackH)
+        local thumbY = trackY + (_aiPanelScrollY / maxScroll) * (trackH - thumbH)
+        love.graphics.setColor(palette.action)
         love.graphics.rectangle("fill", trackX, thumbY, 3, thumbH)
     end
 
@@ -3662,7 +4224,7 @@ local function _openSystemIntoCanvas(systemId, mode)
     -- elements/wires/controls back in if "undo" were used right after this.
     gdsGui_schematic_clearUndo("mainCanvas")
     _clearMainCanvas()
-    gdsGui_schematic_setBackgroundImage("mainCanvas", _canvasBackgroundPath(_findCurrentAircraft()))
+    _applySchematicBackgrounds(_findCurrentAircraft())
     -- Every value handed to the library is deep-copied off of sys's own
     -- tables (see _deepCopyTable) so mainCanvas never ends up aliasing the
     -- stored record it was just loaded from.
@@ -3683,7 +4245,9 @@ local function _openSystemIntoCanvas(systemId, mode)
             el.voltage = e.voltage
             el.poweredColor = _deepCopyTable(e.poweredColor)
             el.shapePoints = _deepCopyTable(e.shapePoints)
+            el.pipeRoutes = _deepCopyTable(e.pipeRoutes)
             el.busLoadAmps = e.busLoadAmps
+            el.loads = _deepCopyTable(e.loads)
             el.tankMaxCapacity = e.tankMaxCapacity
             el.fillPercent = e.fillPercent
             el.relayLogic = _deepCopyTable(e.relayLogic)
@@ -3738,12 +4302,17 @@ local function _openSystemIntoCanvas(systemId, mode)
     schematicRefreshGlow()
     local catalogEntry = sys.systemType and _findCatalogEntryForType(sys.systemType)
     gdsGui_schematic_setPipeConnectors("mainCanvas", catalogEntry and catalogEntry.pipeConnectors)
-    local reshapableItem
+    -- Every reshapable item this system's catalog offers (e.g. FUEL's own
+    -- FUEL TANK and FUEL MANIFOLD both are) — not just the last one found,
+    -- which would silently cost every earlier one its own ADD PORT/MIRROR
+    -- (see gdsGui_schematic_setReshapableKind's own comment).
+    local reshapableKinds = {}
     for _, item in ipairs(catalogEntry and catalogEntry.items or {}) do
-        if item.reshapable then reshapableItem = item end
+        if item.reshapable then
+            table.insert(reshapableKinds, {shapeType = item.shapeType, componentType = item.componentType})
+        end
     end
-    gdsGui_schematic_setReshapableKind("mainCanvas", reshapableItem and reshapableItem.shapeType,
-        reshapableItem and reshapableItem.componentType)
+    gdsGui_schematic_setReshapableKind("mainCanvas", reshapableKinds)
     local designing = (mode == "design")
     -- Every initial open (design or control) lands at a fixed 1.4x zoom,
     -- vertically centered (see gdsGui_schematic_resetView) rather than the
@@ -3756,14 +4325,17 @@ local function _openSystemIntoCanvas(systemId, mode)
     gdsGui_button_setHidden("schematicContextButton", not designing)
     gdsGui_button_setState("schematicSnapshotBtn", designing and "released" or "deactivated")
     gdsGui_button_setHidden("schematicSnapshotBtn", not designing)
+    gdsGui_button_setState("schematicDockToggle", _schematicDockOpen and "pushed" or "released")
     gdsGui_button_setState("schematicAddBtn", designing and "released" or "deactivated")
-    gdsGui_button_setHidden("schematicAddBtn", not designing)
+    _schematicDockSetToolHidden("schematicAddBtn", not designing)
     gdsGui_button_setState("schematicPaintBtn", designing and "released" or "deactivated")
-    gdsGui_button_setHidden("schematicPaintBtn", not designing)
+    _schematicDockSetToolHidden("schematicPaintBtn", not designing)
     gdsGui_button_setState("schematicAnnunciatorBtn", designing and "released" or "deactivated")
-    gdsGui_button_setHidden("schematicAnnunciatorBtn", not designing)
+    _schematicDockSetToolHidden("schematicAnnunciatorBtn", not designing)
     gdsGui_button_setState("schematicAiBtn", designing and "released" or "deactivated")
-    gdsGui_button_setHidden("schematicAiBtn", not designing)
+    _schematicDockSetToolHidden("schematicAiBtn", not designing)
+    gdsGui_button_setState("schematicBackGroundBtn", designing and "released" or "deactivated")
+    _schematicDockSetToolHidden("schematicBackGroundBtn", not designing)
     _relays.refreshGearButtons(designing)
     _aiPanelOpen = false -- a freshly (re)loaded system starts with the AI panel closed
     gdsGui_button_setState("schematicFullScreenToggle", designing and "deactivated" or "released")
@@ -4091,9 +4663,12 @@ end
 
 -- Full SELECT SYSTEM list — only ever shown for a system with no fixed
 -- systemType (legacy data saved before systems were typed; see _openAddMenu).
+-- Alphabetized (schematicCatalogSystemChosen matches by name, not row
+-- index, so reordering this list needs no change there).
 local function _openSystemSelectMenu(canvasName)
     local names = {}
     for _, sys in ipairs(SCHEMATIC_CATALOG) do table.insert(names, sys.system) end
+    table.sort(names)
     table.insert(names, "RETURN")
     gdsGui_schematic_openMenu(canvasName, "SELECT SYSTEM", names, "schematicCatalogSystemChosen", nil)
 end
@@ -4146,6 +4721,26 @@ function _openFundamentalsMenu(canvasName, sys)
     gdsGui_schematic_openMenu(canvasName, "ADD:", names, "schematicFundamentalChosen", nil, nil, 0.4)
 end
 
+-- Stable-sorts two parallel arrays (a menu's row labels and the matching
+-- "row -> id" lookup built alongside them in the same loop, e.g.
+-- _controlMenuIds) alphabetically by label, keeping each id matched to the
+-- same label at its new position. Needed wherever a menu's onSelect
+-- resolves the tapped row by INDEX into that id array rather than by
+-- matching the option text itself (unlike schematicCatalogItemChosen's own
+-- catalog list just below) — sorting names alone there would silently
+-- point taps at the wrong item.
+local function _sortParallelByLabel(names, ids)
+    local order = {}
+    for i = 1, #names do order[i] = i end
+    table.sort(order, function(a, b) return names[a] < names[b] end)
+    local sortedNames, sortedIds = {}, {}
+    for i, idx in ipairs(order) do
+        sortedNames[i] = names[idx]
+        sortedIds[i] = ids[idx]
+    end
+    for i = 1, #names do names[i] = sortedNames[i]; ids[i] = sortedIds[i] end
+end
+
 -- 2nd level: every one of sys's own catalog items whose componentType
 -- matches role ("OTHER" — see _openFundamentalsMenu above — matches an
 -- item with none at all). PATH's own list gets one extra CONNECTOR row
@@ -4163,6 +4758,11 @@ local function _openTypeMenu(canvasName, sys, role)
             or (role == "gate" and item.componentType == "directionalGate")
         if matches then table.insert(names, item.label) end
     end
+    -- Alphabetized — schematicCatalogItemChosen matches the tapped row by
+    -- its label text against sys.items, not by row index, so reordering
+    -- this list needs no change there (same reasoning for CONNECTOR/RETURN
+    -- below, also matched by their own literal text).
+    table.sort(names)
     if role == "path" then
         local canvas = _findSchematicCanvas()
         if canvas and (#canvas.elements + #canvas.controls) > 0 then
@@ -4218,7 +4818,13 @@ function schematicCatalogSystemChosen(canvasName, index, optionText)
         _openDesignActionsMenu(canvasName)
         return
     end
-    local sys = SCHEMATIC_CATALOG[index]
+    -- Matched by name, not index — _openSystemSelectMenu's own list is now
+    -- alphabetized, so a row's position no longer lines up with
+    -- SCHEMATIC_CATALOG's own (catalog-authoring) order.
+    local sys = nil
+    for _, candidate in ipairs(SCHEMATIC_CATALOG) do
+        if candidate.system == optionText then sys = candidate; break end
+    end
     if not sys then return end
     _catalogChosenSystem = sys
     _openFundamentalsMenu(canvasName, sys)
@@ -4280,6 +4886,7 @@ function schematicCatalogItemChosen(canvasName, index, optionText)
                 table.insert(names, c.label or c.id)
             end
         end
+        _sortParallelByLabel(names, _controlMenuIds)
         table.insert(names, "RETURN")
         gdsGui_schematic_openMenu(canvasName, "CONNECTOR FROM:", names, "schematicConnectorFromChosen", nil)
         return
@@ -4303,6 +4910,11 @@ function schematicCatalogItemChosen(canvasName, index, optionText)
     if item.kind == "element" then
         gdsGui_schematic_armElementPlacement(canvasName, item.shapeType, item.abbrev or item.label, nil, item.label,
             item.defaultProperties, item.spritePath, item.gridW, item.gridH, item.componentType, item.terminals)
+    elseif item.kind == "load" then
+        -- Not a placement at all — see the catalog entry's own comment
+        -- (ELECTRICAL's LIGHT/MOTOR/HEATER). Asks which bus this new load
+        -- belongs to, then jumps straight into ADD LOAD for it.
+        _openLoadBusPicker(canvasName, item.label)
     elseif #item.presets == 1 then
         gdsGui_schematic_armControlPlacement(canvasName, item.presets[1], item.abbrev or item.label, item.callbackFunc, item.label,
             item.spritePaths, item.overlaySpritePath, item.gridSize, item.colorDarkenMul, item.componentType, item.terminals)
@@ -4334,6 +4946,148 @@ function schematicCatalogPresetChosen(canvasName, index, optionText)
 end
 
 -------------------------------------------------------------------------------
+-- SYSTEM SCHEMATIC — ADD LOAD: a bus's loads (entity.loads — see
+-- _BUS_SPRITE_PATH's own comment further up) are plain data hanging off the
+-- BUS element, never a node of their own on the canvas (same reasoning
+-- ENGINE's FUEL FLOW property gives for not modeling current draw), so
+-- creating or editing one never goes through armElementPlacement/
+-- armControlPlacement — it's a NAME/AMPERAGE property grid of its own,
+-- reached two ways: the green "+" row on a bus's own PROPERTIES menu
+-- (schematicElementPropertiesExtraRows further down, bus already known), or
+-- the catalog's LIGHT/MOTOR/HEATER shortcuts just above (bus picked first,
+-- here). Every global below is a cross-call scratch var carrying state
+-- across that grid's own open/save/cancel, same role _catalogChosenSystem/
+-- _catalogChosenControlItem play for the cascade above — globals, not
+-- locals (this file sits at Lua's 200-local ceiling), and global (not
+-- local) functions too: _openLoadBusPicker is called from
+-- schematicCatalogItemChosen above, textually before this section.
+-------------------------------------------------------------------------------
+
+-- The bus this load grid will save onto.
+_pendingLoadBusId = nil
+-- Which of that bus's entity.loads is being edited (1-based), or nil while
+-- the grid is creating a brand new one instead.
+_pendingLoadIndex = nil
+-- The grid's own `rows` table, kept by reference (same "the app can read
+-- back whatever the user entered after SAVE fires" convention
+-- gdsGui_schematic_openPropertyGrid's own comment documents) — canvas.menu
+-- itself is already gone by the time schematicLoadSaved runs.
+_pendingLoadRows = nil
+-- Pre-fills a freshly opened grid's own NAME row — set by
+-- _openLoadBusPicker, read once by schematicLoadBusChosen, nil the rest of
+-- the time (the bus's own "+" row opens straight into _openLoadPropertiesGrid
+-- with no picker step, so it passes its own nil default instead of this).
+_pendingLoadDefaultName = nil
+
+-- All of canvas's BUS elements as parallel (names, ids) arrays, alphabetized
+-- and matched by id rather than position — same shape CONNECTOR/SELECT
+-- CONTROL above use, needed here too since two buses can share a label.
+local function _busList(canvas)
+    local names, ids = {}, {}
+    for _, e in ipairs(canvas.elements) do
+        if e.spritePath == _BUS_SPRITE_PATH then
+            table.insert(names, e.label or e.id)
+            table.insert(ids, e.id)
+        end
+    end
+    _sortParallelByLabel(names, ids)
+    return names, ids
+end
+
+-- Catalog LIGHT/MOTOR/HEATER entry point: which bus is this new load on? An
+-- empty list (no bus placed yet) just falls back to _openTypeMenu's own
+-- empty-list-plus-RETURN case, same as any other role with nothing to offer.
+function _openLoadBusPicker(canvasName, defaultName)
+    local canvas = _findSchematicCanvas()
+    if not canvas then return end
+    local names, ids = _busList(canvas)
+    _controlMenuIds = ids
+    _pendingLoadDefaultName = defaultName
+    table.insert(names, "RETURN")
+    gdsGui_schematic_openMenu(canvasName, "ADD LOAD TO BUS:", names, "schematicLoadBusChosen", nil)
+end
+
+function schematicLoadBusChosen(canvasName, index, optionText)
+    if optionText == "RETURN" then
+        if _catalogChosenSystem then _openTypeMenu(canvasName, _catalogChosenSystem, "sink") end
+        return
+    end
+    local busId = _controlMenuIds[index]
+    if not busId then return end
+    _openLoadPropertiesGrid(canvasName, busId, nil, _pendingLoadDefaultName)
+end
+
+-- Opens the NAME/AMPERAGE grid itself — creating a new load on busId
+-- (loadIndex nil, name pre-filled from defaultName if given) or editing/
+-- deleting entity.loads[loadIndex] (loadIndex set, defaultName ignored:
+-- the existing load's own name wins). Row order matches
+-- schematicLoadSaved's own [1]/[2] reads below.
+function _openLoadPropertiesGrid(canvasName, busId, loadIndex, defaultName)
+    local canvas = _findSchematicCanvas()
+    local entity = canvas and _findSourceEntity(canvas, busId)
+    if not entity then return end
+    local existing = loadIndex and entity.loads and entity.loads[loadIndex]
+    _pendingLoadBusId, _pendingLoadIndex = busId, loadIndex
+    local rows = {
+        { key = "name", label = "NAME", target = "field",
+          value = (existing and existing.name) or defaultName or "" },
+        { key = "amps", label = "AMPERAGE", target = "field", numeric = true,
+          value = string.format("%g", (existing and existing.amps) or 0),
+          slider = { min = 0, max = _BUS_LOAD_MAX_AMPS, unit = "A" } },
+    }
+    if existing then
+        -- buttonColors (see schematic_gdsGuiLib.lua's own comment on it) is
+        -- what makes this cell read as an action instead of a 3rd field —
+        -- tapping it fires straight through to schematicLoadDeleted rather
+        -- than waiting on this grid's own SAVE.
+        table.insert(rows, { key = "__delete", label = "", value = "", choices = { "DELETE LOAD" },
+            buttonColors = { {0.65, 0.18, 0.18, 1} },
+            onChange = function() schematicLoadDeleted(canvasName) end })
+    end
+    _pendingLoadRows = rows
+    gdsGui_schematic_openPropertyGrid(canvasName, existing and "EDIT LOAD" or "ADD LOAD",
+        entity.label or entity.id, rows, true, "schematicLoadSaved", "schematicLoadCancelled")
+end
+
+function schematicLoadSaved(canvasName)
+    local canvas = _findSchematicCanvas()
+    local entity = canvas and _findSourceEntity(canvas, _pendingLoadBusId)
+    local rows = _pendingLoadRows
+    if entity and rows then
+        entity.loads = entity.loads or {}
+        local load = (_pendingLoadIndex and entity.loads[_pendingLoadIndex]) or {}
+        load.name = rows[1].value
+        load.amps = tonumber(rows[2].value) or 0
+        if not _pendingLoadIndex then table.insert(entity.loads, load) end
+        -- Not _resolveAndSaveSchematic() — that's a local defined further
+        -- down the file (BUS PROPERTIES section), out of scope this early;
+        -- these are the exact same two calls it wraps.
+        _requestSchematicSave()
+        _applySolvedColorsToCurrentCombination()
+    end
+    _pendingLoadBusId, _pendingLoadIndex, _pendingLoadRows = nil, nil, nil
+end
+
+function schematicLoadCancelled(canvasName)
+    _pendingLoadBusId, _pendingLoadIndex, _pendingLoadRows = nil, nil, nil
+end
+
+-- Fired by the EDIT LOAD grid's own DELETE row (see _openLoadPropertiesGrid)
+-- while that grid is still open, so — unlike SAVE/CANCEL above, which the
+-- library itself closes before calling out — this closes it explicitly.
+function schematicLoadDeleted(canvasName)
+    local canvas = _findSchematicCanvas()
+    local entity = canvas and _findSourceEntity(canvas, _pendingLoadBusId)
+    if entity and entity.loads and _pendingLoadIndex then
+        table.remove(entity.loads, _pendingLoadIndex)
+        _requestSchematicSave()
+        _applySolvedColorsToCurrentCombination()
+    end
+    _pendingLoadBusId, _pendingLoadIndex, _pendingLoadRows = nil, nil, nil
+    gdsGui_schematic_closeMenu(canvasName)
+end
+
+-------------------------------------------------------------------------------
 -- SYSTEM SCHEMATIC — CONTROL-MODE "SELECT CONTROL" -> "SELECT POSITION" MENUS
 -- Same "RETURN" convention as the design-mode cascade above.
 -------------------------------------------------------------------------------
@@ -4355,6 +5109,7 @@ local function _openSelectControlMenu(canvasName)
             table.insert(names, c.label or c.id)
         end
     end
+    _sortParallelByLabel(names, _controlMenuIds)
     table.insert(names, "RETURN")
     gdsGui_schematic_openMenu(canvasName, "SELECT CONTROL", names, "schematicControlChosen", nil)
 end
@@ -4402,34 +5157,25 @@ end
 -- while a cascade from either entry point is already mid-flight would
 -- silently clobber it and orphan its tracking locals (see
 -- gdsGui_schematic_isMenuOpen).
--- Activating a dock tool moves its button up to the top dock slot (ADD's)
--- and hides the other tools until it's deactivated, so its popup — which
--- always opens just left of the dock at the canvas's top edge (see
--- _toolPopupOrigin in schematic_gdsGuiLib.lua) — sits right beside it.
+-- The other two dock tools stay put and stay visible while one is active —
+-- its popup, which always opens just left of the dock at the canvas's top
+-- edge (see _toolPopupOrigin in schematic_gdsGuiLib.lua), doesn't depend on
+-- which slot the active tool's own button sits in.
 local function _enterSchematicTool(tool)
     _activeSchematicTool = tool
-    local topY = _schematicDockSlotY[_SCHEMATIC_DOCK_TOOLS.add]
-    for t, name in pairs(_SCHEMATIC_DOCK_TOOLS) do
-        if t == tool then
-            gdsGui_button_setPosition(name, _schematicDockX, topY)
-        else
-            gdsGui_button_setHidden(name, true)
-        end
-    end
 end
 
--- Puts every dock tool back in its normal slot. Only unhides them in design
--- mode — a mode switch to control mode ends the active tool too (setMode
--- clears paint/panel/menu state), and the dock stays hidden there.
+-- Resets the tool that was active back to "released". A mode switch to
+-- control mode ends the active tool too (setMode clears paint/panel/menu
+-- state), but only in design mode does the button itself need resetting —
+-- control mode already deactivates all three dock tools' sprites.
 local function _exitSchematicTool()
     if not _activeSchematicTool then return end
+    local name = _SCHEMATIC_DOCK_TOOLS[_activeSchematicTool]
     _activeSchematicTool = nil
     gdsGui_schematic_setMenuAnchorButton("mainCanvas", nil)
-    local designing = gdsGui_schematic_getMode("mainCanvas") == "design"
-    for _, name in pairs(_SCHEMATIC_DOCK_TOOLS) do
-        gdsGui_button_setPosition(name, _schematicDockX, _schematicDockSlotY[name])
-        gdsGui_button_setHidden(name, not designing)
-        if designing then gdsGui_button_setState(name, "released") end
+    if name and gdsGui_schematic_getMode("mainCanvas") == "design" then
+        gdsGui_button_setState(name, "released")
     end
 end
 
@@ -4447,6 +5193,8 @@ local function _schematicToolStillActive(tool)
         -- or the ELEMENT PROPERTIES grid that follows the tap.
         return gdsGui_schematic_isMenuOpen("mainCanvas") or gdsGui_schematic_isPlacementArmed("mainCanvas")
             or gdsGui_textPrompt_isOpen()
+    elseif tool == "backGround" then
+        return gdsGui_schematic_isMenuOpen("mainCanvas")
     end
     return false
 end
@@ -4472,6 +5220,60 @@ function schematicAddBtnPressed(newState)
     else
         gdsGui_schematic_closeMenu("mainCanvas")
         gdsGui_schematic_cancelPlacement("mainCanvas")
+        _exitSchematicTool()
+    end
+end
+
+-- Builds the BACKGROUND tool's toggle menu from the current aircraft's own
+-- four layer flags (_BACKGROUND_LAYERS) — iOS-style ON/OFF switches, one per
+-- layer, that flip and apply live without closing the menu (see
+-- gdsGui_schematic_openMenu's own toggleStates comment). No aircraft open
+-- (shouldn't happen — the dock only exists once one is) reads every switch
+-- as on, matching _applySchematicBackgrounds' own nil-aircraft default.
+-- Global, not local: see _BACKGROUND_LAYERS' own comment.
+function _openBackgroundMenu(canvasName)
+    local aircraft = _findCurrentAircraft()
+    local labels, states = {}, {}
+    for _, layer in ipairs(_BACKGROUND_LAYERS) do
+        table.insert(labels, layer.label)
+        table.insert(states, not aircraft or aircraft[layer.field] ~= false)
+    end
+    gdsGui_schematic_openMenu(canvasName, "SHOW ON CANVAS", labels, "schematicBackgroundToggled", nil, nil, nil, states)
+end
+
+-- Fired by a tap on one of _openBackgroundMenu's switches (toggleStates —
+-- see gdsGui_schematic_openMenu); the menu stays open, so this just persists
+-- the flipped layer onto the current aircraft and re-applies all four to
+-- mainCanvas for an immediate live preview (cheap: four nil checks and at
+-- most four image lookups, not worth special-casing to just the one that
+-- changed).
+function schematicBackgroundToggled(canvasName, index, optionText, newState)
+    local aircraft = _findCurrentAircraft()
+    local layer = _BACKGROUND_LAYERS[index]
+    if not aircraft or not layer then return end
+    aircraft[layer.field] = newState
+    _applySchematicBackgrounds(aircraft)
+    _saveSchematicStore()
+end
+
+-- Dedicated BACKGROUND dock button (schematicBackGroundBtn, just below
+-- ADD/PAINT/ANNUNCIATOR): opens _openBackgroundMenu pinned beside it, same
+-- sticky-toggle + reentrancy-guard convention as schematicAddBtnPressed
+-- above (its menu is a real canvas.menu too, so the same "don't clobber an
+-- already-open cascade" guard applies). Switching the dock button off just
+-- closes the menu — every toggle inside it already applied live via
+-- schematicBackgroundToggled, so there's nothing left to commit or discard.
+function schematicBackGroundBtnPressed(newState)
+    if newState == globApp.BUTTON_STATES.PRESSED then
+        if gdsGui_schematic_isMenuOpen("mainCanvas") or gdsGui_schematic_getMode("mainCanvas") ~= "design" then
+            gdsGui_button_setState("schematicBackGroundBtn", "released")
+            return
+        end
+        _enterSchematicTool("backGround")
+        gdsGui_schematic_setMenuAnchorButton("mainCanvas", "schematicBackGroundBtn")
+        _openBackgroundMenu("mainCanvas")
+    else
+        gdsGui_schematic_closeMenu("mainCanvas")
         _exitSchematicTool()
     end
 end
@@ -4689,6 +5491,10 @@ function schematicAircraftThumbnailChosen(optionText)
     local now = os.date("%Y-%m-%d %H:%M:%S")
     table.insert(schematicStore.aircraft, {
         id = id, name = name, createdAt = now, modifiedAt = now, systems = {}, thumbnail = chosen.key,
+        -- BACKGROUND tool's four layers (_BACKGROUND_LAYERS) — every layer
+        -- on by default, matching the look every aircraft had before this
+        -- toggle existed (see _applySchematicBackgrounds).
+        bgAircraft = true, bgAsu = true, bgGpu = true, bgFuel = true,
     })
     schematicStore.currentAircraftId = id
     _saveSchematicStore()
@@ -5187,6 +5993,11 @@ function love.load()
         and schematicStore.savedByAppVersion ~= nil
         and schematicStore.savedByAppVersion ~= APP_VERSION
         and schematicStore.currentSystemId == nil
+    -- Same test, without the "no system open" restriction — see
+    -- _schematicVersionJustUpdated's own declaration above.
+    _schematicVersionJustUpdated = schematicStore ~= nil
+        and schematicStore.savedByAppVersion ~= nil
+        and schematicStore.savedByAppVersion ~= APP_VERSION
     if schematicStore == nil then
         local migratedSystems = {}
         gdsGui_saveLoad_loadFileContents("schematicDesign.lua")
@@ -5227,6 +6038,7 @@ function love.load()
     -- to once per APP_VERSION, mirroring tcAcceptedVersion's own one-time-
     -- per-version pattern just above.
     local _schematicRepair = _verifyAndRepairSchematicStore(schematicStore)
+    _aircraftCompatStatus = _schematicRepair.perAircraft
     if appSettings.schematicCompatCheckedVersion ~= APP_VERSION then
         _pendingSchematicCompatNotice = _buildSchematicCompatNotice(_schematicLoadStatus, _schematicRepair)
         appSettings.schematicCompatCheckedVersion = APP_VERSION
@@ -5801,19 +6613,46 @@ function love.load()
         0.875, schBtnRowYFrac, "CT", 30, 30,
         "schematicFullScreenTogglePressed", globApp.BUTTON_STATES.DEACTIVATED, true, nil
     )
-    -- ADD ("+"): floating at the canvas's own top-right corner rather than in
-    -- the 4-button row above (containerName nil, same floating-chrome
-    -- convention as every other button here — positioned straight off
-    -- safeScreenArea, not off the canvas box, so it never moves with the
-    -- canvas's own pan/zoom). Design-mode only, same enable/disable gating
-    -- SNAPSHOT uses (see schematicModeToggled/_openSystemIntoCanvas) — the
-    -- sole entry point into the ADD cascade now (see schematicAddBtnPressed),
-    -- replacing the old ACTIONS-menu "ADD ELEMENT/CONTROL" row.
+    -- DOCK TOGGLE: fixed at the canvas's own top-right corner (containerName
+    -- nil, same floating-chrome convention as every other button here —
+    -- positioned straight off safeScreenArea, not off the canvas box, so it
+    -- never moves with the canvas's own pan/zoom), ABOVE the five tool
+    -- buttons below it (ADD/PAINT/ANNUNCIATOR/GEAR/AI — see
+    -- _SCHEMATIC_DOCK_TOOLS/schematicDockTogglePressed). A sticky toggle:
+    -- RELEASED (down chevron) means the dock is collapsed and tapping it
+    -- opens, revealing the tools below; PRESSED (up chevron) means it's open
+    -- and tapping it collapses them back up — standard disclosure-arrow
+    -- convention, matching the tools' own vertical stacking (left/right
+    -- chevrons made sense back when this mirrored the "<" BACK button; it no
+    -- longer does). Design-mode only, same enable/disable gating the five
+    -- tools below it use.
+    gdsGui_button_create("schematicDockToggle", "SystemSchematic", "toggle",
+        "Sprites/button_schematicDockToggle_pressed.png",
+        "Sprites/button_schematicDockToggle_released.png",
+        "Sprites/button_schematicDockToggle_deactivated.png",
+        0.97, schCanvasYFrac, "RT", 36, 36,
+        "schematicDockTogglePressed",
+        _schematicDockOpen and globApp.BUTTON_STATES.PRESSED or globApp.BUTTON_STATES.RELEASED, true, nil
+    )
+    -- ADD ("+"): docked directly below the dock toggle, same floating-chrome
+    -- convention. Design-mode only, same enable/disable gating SNAPSHOT uses
+    -- (see schematicModeToggled/_openSystemIntoCanvas) — the sole entry
+    -- point into the ADD cascade now (see schematicAddBtnPressed), replacing
+    -- the old ACTIONS-menu "ADD ELEMENT/CONTROL" row.
+    -- Vertical spacing for every tool below the dock toggle (ADD/PAINT/
+    -- ANNUNCIATOR/GEAR/AI/BACKGROUND): tightened from a 10px gap to 2px
+    -- (adding BACKGROUND as a 6th tool pushed the column's bottom edge past
+    -- schCombBtnYFrac — see its own "0.75 panelH fraction" comment — so
+    -- COMBINATION PREV/NEXT, which sit at a fixed fraction of the canvas
+    -- for an unrelated reason, started drawing underneath/catching taps
+    -- meant for the new tool at the base 375x667 window size; every button
+    -- here stays the same 36x36 size, only the gap between them shrank).
+    local schDockPitchFrac = (36 + 2) / globApp.safeScreenArea.h
     gdsGui_button_create("schematicAddBtn", "SystemSchematic", "toggle",
         "Sprites/button_schematicAdd_pressed.png",
         "Sprites/button_schematicAdd_released.png",
         "Sprites/button_schematicAdd_deactivated.png",
-        0.97, schCanvasYFrac, "RT", 36, 36,
+        0.97, schCanvasYFrac + schDockPitchFrac, "RT", 36, 36,
         "schematicAddBtnPressed", globApp.BUTTON_STATES.RELEASED, true, nil
     )
     -- PAINT (brush): docked directly below ADD, same floating-chrome
@@ -5828,7 +6667,7 @@ function love.load()
         "Sprites/button_schematicPaint_pressed.png",
         "Sprites/button_schematicPaint_released.png",
         "Sprites/button_schematicPaint_deactivated.png",
-        0.97, schCanvasYFrac + (36 + 10) / globApp.safeScreenArea.h, "RT", 36, 36,
+        0.97, schCanvasYFrac + 2 * schDockPitchFrac, "RT", 36, 36,
         "schematicPaintBtnPressed", globApp.BUTTON_STATES.RELEASED, true, nil
     )
     -- ANNUNCIATOR: docked directly below PAINT, same floating-chrome
@@ -5840,25 +6679,31 @@ function love.load()
         "Sprites/button_schematicAnnunciator_pressed.png",
         "Sprites/button_schematicAnnunciator_released.png",
         "Sprites/button_schematicAnnunciator_deactivated.png",
-        0.97, schCanvasYFrac + 2 * (36 + 10) / globApp.safeScreenArea.h, "RT", 36, 36,
+        0.97, schCanvasYFrac + 3 * schDockPitchFrac, "RT", 36, 36,
         "schematicAnnunciatorBtnPressed", globApp.BUTTON_STATES.RELEASED, true, nil
     )
     -- GEAR: docked directly below ANNUNCIATOR. The aircraft's global gear
     -- position (DOWN = on the ground, UP = airborne — see _relays.GEAR_ID);
     -- a sticky toggle, pressed = DOWN. Design mode only; control mode has
-    -- its own copy, schematicGearCtlBtn, below FULL SCREEN.
+    -- its own copy, schematicGearCtlBtn, below.
     gdsGui_button_create("schematicGearBtn", "SystemSchematic", "toggle",
         "Sprites/button_schematicGear_pressed.png",
         "Sprites/button_schematicGear_released.png",
         "Sprites/button_schematicGear_deactivated.png",
-        0.97, schCanvasYFrac + 3 * (36 + 10) / globApp.safeScreenArea.h, "RT", 36, 36,
+        0.97, schCanvasYFrac + 4 * schDockPitchFrac, "RT", 36, 36,
         "schematicGearBtnPressed", globApp.BUTTON_STATES.RELEASED, true, nil
     )
+    -- GEAR (control mode): same dock column as the design tools above
+    -- (_SCHEMATIC_CONTROL_DOCK_TOOLS), top slot — it's the only control-mode
+    -- tool today, so it sits right under the toggle exactly like ADD does in
+    -- design mode. Used to live in its own fixed CT slot; moved into the
+    -- dock so it collapses/expands with schematicDockToggle like everything
+    -- else, and so future control-mode tools have somewhere to stack below it.
     gdsGui_button_create("schematicGearCtlBtn", "SystemSchematic", "toggle",
         "Sprites/button_schematicGear_pressed.png",
         "Sprites/button_schematicGear_released.png",
         "Sprites/button_schematicGear_deactivated.png",
-        0.875, schCanvasYFrac, "CT", 36, 36,
+        0.97, schCanvasYFrac + schDockPitchFrac, "RT", 36, 36,
         "schematicGearBtnPressed", globApp.BUTTON_STATES.RELEASED, true, nil
     )
     _relays.refreshGearButtons()
@@ -5875,13 +6720,30 @@ function love.load()
         "Sprites/button_schematicAi_pressed.png",
         "Sprites/button_schematicAi_released.png",
         "Sprites/button_schematicAi_deactivated.png",
-        0.97, schCanvasYFrac + 4 * (36 + 10) / globApp.safeScreenArea.h, "RT", 36, 36,
+        0.97, schCanvasYFrac + 5 * schDockPitchFrac, "RT", 36, 36,
         "schematicAiBtnPressed", globApp.BUTTON_STATES.RELEASED, true, nil
     )
-    _schematicDockX = 0.97
-    _schematicDockSlotY[_SCHEMATIC_DOCK_TOOLS.add]         = schCanvasYFrac
-    _schematicDockSlotY[_SCHEMATIC_DOCK_TOOLS.paint]       = schCanvasYFrac + (36 + 10) / globApp.safeScreenArea.h
-    _schematicDockSlotY[_SCHEMATIC_DOCK_TOOLS.annunciator] = schCanvasYFrac + 2 * (36 + 10) / globApp.safeScreenArea.h
+    -- BACKGROUND: docked directly below AI, same floating-chrome convention.
+    -- A sticky toggle like ADD (part of _SCHEMATIC_DOCK_TOOLS' mutually-
+    -- exclusive set, since it opens a real canvas.menu — see
+    -- schematicBackGroundBtnPressed) that opens a small switch-per-row menu
+    -- (_openBackgroundMenu) for independently showing/hiding the aircraft
+    -- watermark and the ASU/GPU/FUEL truck corner watermarks. Design-mode
+    -- only, same enable/disable gating every other dock tool uses.
+    gdsGui_button_create("schematicBackGroundBtn", "SystemSchematic", "toggle",
+        "Sprites/button_schematicBackGround_pressed.png",
+        "Sprites/button_schematicBackGround_released.png",
+        "Sprites/button_schematicBackGround_deactivated.png",
+        0.97, schCanvasYFrac + 6 * schDockPitchFrac, "RT", 36, 36,
+        "schematicBackGroundBtnPressed", globApp.BUTTON_STATES.RELEASED, true, nil
+    )
+    -- The dock starts in whatever state _schematicDockOpen already was (true
+    -- the first time love.load() runs this; otherwise whatever the user last
+    -- left it, since reopening the SystemSchematic page re-runs this setup
+    -- every time — see createSchematicObjects' own call site) — this just
+    -- applies that state to the six tool buttons' visibility, same as
+    -- schematicDockTogglePressed does when actually tapped.
+    schematicDockTogglePressed(_schematicDockOpen and globApp.BUTTON_STATES.PRESSED or globApp.BUTTON_STATES.RELEASED)
     -- COMBINATION PREV/NEXT — design-mode-only, fixed at the left/right
     -- edges of the screen (containerName nil, so like every other floating
     -- schematic chrome button they're positioned straight off safeScreenArea
@@ -5958,10 +6820,7 @@ function love.load()
     -- leftward out of its own dock button — see
     -- _annunciatorPanelGeometry in schematic_gdsGuiLib.lua.
     gdsGui_schematic_setAnnunciatorButtonName("mainCanvas", "schematicAnnunciatorBtn")
-    gdsGui_schematic_setBackgroundImage("mainCanvas", CANVAS_BACKGROUND_DEFAULT)
-    gdsGui_schematic_setCornerBackgroundImage("mainCanvas", "Sprites/bg_schematicCanvasCorner.png")
-    gdsGui_schematic_setCornerRightBackgroundImage("mainCanvas", "Sprites/bg_schematicCanvasCornerRight.png")
-    gdsGui_schematic_setCornerTopRightBackgroundImage("mainCanvas", "Sprites/bg_schematicCanvasCornerTopRight.png")
+    _applySchematicBackgrounds(nil)
     -- Fires on every design-mode edit (add/move/rotate/recolor/rename/
     -- delete/property change — see _notifyChanged in schematic_gdsGuiLib.lua),
     -- so in-progress work survives a quit/background without waiting for the
@@ -6024,29 +6883,54 @@ function love.load()
         _schematicCanvasZoomedLayout.x, _schematicCanvasZoomedLayout.y, _schematicCanvasZoomedLayout.anchorPoint,
         _schematicCanvasZoomedLayout.wFrac, _schematicCanvasZoomedLayout.hFrac)
 
-    -- FULL-SCREEN RETURN BUTTON — tapping it hands mainCanvas back to its
-    -- normal embedded layout on SystemSchematic (see
-    -- schematicFullScreenReturnPressed).
+    -- FULL-SCREEN DOCK TOGGLE — collapses/expands RETURN and GEAR below it
+    -- into a single floating column at this page's own top-right corner,
+    -- same disclosure-arrow convention and vertical stacking as
+    -- schematicDockToggle on SystemSchematic (see
+    -- schematicFullScreenDockTogglePressed). Never deactivated — this page
+    -- is only ever reached from control mode (see schematicFullScreenToggle's
+    -- own comment), so there's no mode to gate it on.
+    gdsGui_button_create("schematicFullScreenDockToggle", "SchematicFullScreen", "toggle",
+        "Sprites/button_schematicDockToggle_pressed.png",
+        "Sprites/button_schematicDockToggle_released.png",
+        "Sprites/button_schematicDockToggle_deactivated.png",
+        0.95, 0.04, "RT", 36, 36,
+        "schematicFullScreenDockTogglePressed",
+        _schematicFullScreenDockOpen and globApp.BUTTON_STATES.PRESSED or globApp.BUTTON_STATES.RELEASED, true, nil
+    )
+    -- FULL-SCREEN RETURN BUTTON — docked directly below the dock toggle,
+    -- same column. Tapping it hands mainCanvas back to its normal embedded
+    -- layout on SystemSchematic (see schematicFullScreenReturnPressed).
     gdsGui_button_create("schematicFullScreenReturnBtn", "SchematicFullScreen", "pushonoff",
         "Sprites/button_smallerScreen_pressed.png",
         "Sprites/button_smallerScreen_released.png",
         "Sprites/button_smallerScreen_deactivated.png",
-        0.95, 0.04, "RT", 36, 36,
+        0.95, 0.04 + (36 + 10) / globApp.safeScreenArea.h, "RT", 36, 36,
         "schematicFullScreenReturnPressed", globApp.BUTTON_STATES.RELEASED, true, nil
     )
-    -- GEAR — this page is only ever reached from control mode (FULL SCREEN
-    -- is disabled while designing — see schematicFullScreenToggle's own
-    -- comment), so unlike schematicGearBtn/schematicGearCtlBtn above, this
-    -- copy is never hidden; it just mirrors the aircraft's global gear
-    -- position same as the other two (see _relays.refreshGearButtons).
-    -- Docked left of the RETURN button, same row.
+    -- GEAR — docked directly below RETURN, same column. This page is only
+    -- ever reached from control mode (FULL SCREEN is disabled while
+    -- designing — see schematicFullScreenToggle's own comment), so unlike
+    -- schematicGearBtn/schematicGearCtlBtn above, this copy's own state is
+    -- never deactivated by mode; it just mirrors the aircraft's global gear
+    -- position same as the other two (see _relays.refreshGearButtons). Its
+    -- visibility follows the dock toggle like RETURN's does, same as every
+    -- other dock tool elsewhere on this page.
     gdsGui_button_create("schematicGearFullScreenBtn", "SchematicFullScreen", "toggle",
         "Sprites/button_schematicGear_pressed.png",
         "Sprites/button_schematicGear_released.png",
         "Sprites/button_schematicGear_deactivated.png",
-        0.95 - (36 + 10) / globApp.safeScreenArea.w, 0.04, "RT", 36, 36,
+        0.95, 0.04 + 2 * (36 + 10) / globApp.safeScreenArea.h, "RT", 36, 36,
         "schematicGearBtnPressed", globApp.BUTTON_STATES.RELEASED, true, nil
     )
+    -- The dock starts in whatever state _schematicFullScreenDockOpen already
+    -- was (true the first time love.load() runs this; otherwise whatever the
+    -- user last left it, since reopening SystemSchematic re-runs this setup
+    -- every time — see createSchematicObjects' own call site) — this just
+    -- applies that state to RETURN/GEAR's visibility, same as
+    -- schematicFullScreenDockTogglePressed does when actually tapped.
+    schematicFullScreenDockTogglePressed(
+        _schematicFullScreenDockOpen and globApp.BUTTON_STATES.PRESSED or globApp.BUTTON_STATES.RELEASED)
 
     ---------------------------------------------------------------------------
     -- SCHEMATIC HOME PAGE (premium feature) — NEW AIRCRAFT / MY AIRCRAFT, the
@@ -6094,9 +6978,15 @@ function love.load()
     -- widget as SCHEMATIC MANAGE GALLERY above, but an aircraft record has no
     -- .elements/.wires of its own (only its systems do), so each tile's
     -- mini-diagram preview area renders blank — just the name label shows.
+    -- A thin strip is carved off its top (unlike manageGallery, which has no
+    -- badges and so no legend) for drawAircraftGalleryLegend()'s key to the
+    -- per-tile compatBadge dot drawn in that corner (see _aircraftCompatStatus).
     ---------------------------------------------------------------------------
-    gdsGui_schematicGallery_create("aircraftGallery", "AircraftGallery", 0, schGalleryYFrac, "LT",
-        1.0, schGalleryHFrac, 2, "NO AIRCRAFT YET")
+    _aircraftGalleryLegendH = 22
+    local aircraftGalleryYFrac = schGalleryYFrac + _aircraftGalleryLegendH / globApp.safeScreenArea.h
+    local aircraftGalleryHFrac = schGalleryHFrac - _aircraftGalleryLegendH / globApp.safeScreenArea.h
+    gdsGui_schematicGallery_create("aircraftGallery", "AircraftGallery", 0, aircraftGalleryYFrac, "LT",
+        1.0, aircraftGalleryHFrac, 2, "NO AIRCRAFT YET")
     gdsGui_schematicGallery_setOnSelect("aircraftGallery", "schematicAircraftGallerySelected")
 
     ---------------------------------------------------------------------------
@@ -6200,14 +7090,44 @@ function love.load()
     selectedTime = 0
 end
 
+-- The gravity/pump inputs model/fluid.lua needs to reason about a PIPE
+-- system right now: which valves are conducting (read literally off their
+-- position LABEL, "CLOSED"/"OFF" holding fluid back, whatever
+-- _isActivePosition's electrical convention says for coloring elsewhere),
+-- each tank/accumulator as a store, and each pump's PSI/on-off state.
+-- Shared by _fluidTick (the live drain simulation, below) and
+-- _solveCurrentSchematic (the static predicted-color pass, which also needs
+-- to know which pipes gravity -- or a running pump -- can actually reach
+-- right now before trusting the generic, gravity-blind electrical-style
+-- solve()'s own reachability for a liquid wire's color; see that function's
+-- own comment).
+function _fluidFlowInputs(canvas, componentTypes)
+    local conducting = {}
+    for _, c in ipairs(canvas.controls) do
+        local label = c.positions and c.positions[c.detentIndex + 1]
+        if componentTypes[c.id] == "gate" and label ~= "CLOSED" and label ~= "OFF" then conducting[c.id] = true end
+    end
+    local stores = {}
+    for _, e in ipairs(canvas.elements) do
+        if _holdsFluid(canvas, e) then stores[e.id] = e end
+    end
+    local offSources, pressures = {}, {}
+    for _, c in ipairs(canvas.controls) do
+        if componentTypes[c.id] == "source" then
+            pressures[c.id] = c.voltage
+            if not _isActivePosition(c) then offSources[c.id] = true end
+        end
+    end
+    return conducting, stores, offSources, pressures
+end
+
 -- Runs the gravity drain and pumps (model/fluid.lua) on the open liquid system, a
--- few times a second, while it's being operated rather than edited. Valve positions
--- are read literally here: a valve labeled CLOSED holds fluid back, whatever
--- _isActivePosition's electrical convention says for coloring.
+-- few times a second, while it's being operated rather than edited.
 function _fluidTick(dt)
     local canvas = _findSchematicCanvas()
+    local pageName = gdsGui_page_currentName()
     if not canvas or canvas.connectorNoun ~= "PIPE" or canvas.mode ~= "control"
-       or gdsGui_page_currentName() ~= "SystemSchematic" then
+       or (pageName ~= "SystemSchematic" and pageName ~= "SchematicFullScreen") then
         return
     end
     _fluidTickElapsed = (_fluidTickElapsed or 0) + dt
@@ -6219,29 +7139,15 @@ function _fluidTick(dt)
     local componentTypes = _buildComponentTypeMap(canvas)
     local positions = _nodePositionsForGraph(canvas)
     local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes, positions)
-    local conducting = {}
-    for _, c in ipairs(canvas.controls) do
-        local label = c.positions and c.positions[c.detentIndex + 1]
-        if componentTypes[c.id] == "gate" and label ~= "CLOSED" and label ~= "OFF" then conducting[c.id] = true end
-    end
-    local stores, pipeUnits = {}, {}
-    for _, e in ipairs(canvas.elements) do
-        if _holdsFluid(canvas, e) then stores[e.id] = e end
-    end
+    local conducting, stores, offSources, pressures = _fluidFlowInputs(canvas, componentTypes)
+    local pipeUnits = {}
     for _, w in ipairs(canvas.wires) do
         local a, b = positions[w.fromElementId], positions[w.toElementId]
         -- Pipes run square, so its length is the two sides; 2 world units a grid unit.
         if a and b then pipeUnits[w.id] = (math.abs(a.x - b.x) * canvas.contentW + math.abs(a.y - b.y) * canvas.contentH) / 2 end
     end
     local before = _currentSourceStates(canvas, componentTypes)
-    local offSources, pressures = {}, {}
-    for _, c in ipairs(canvas.controls) do
-        if componentTypes[c.id] == "source" then
-            pressures[c.id] = c.voltage
-            if not _isActivePosition(c) then offSources[c.id] = true end
-        end
-    end
-    local flow = ModelFluid.computeFlow(graph, canvas.wires, conducting, offSources, pressures)
+    local flow = ModelFluid.computeFlow(graph, canvas.wires, conducting, offSources, pressures, stores)
     local changed, stillFeeding = ModelFluid.step(flow, stores, pipeUnits, elapsed)
     canvas._fluidStillFeeding = stillFeeding
     canvas.emptyPipeColor = _currentMedium().style.unpowered
@@ -6615,6 +7521,7 @@ function love.draw()
     gdsGui_draw()
     drawSchematicZoomFullScreenLabel()
     drawAlarmOverlay()
+    drawAircraftGalleryLegend()
     gdsGui_page_drawUnsafeAreaOverlay()
     gdsGui_container_drawFixed(gdsGui_page_currentName())
     -- Drawn last so the schematic's modal menu (catalog/control/color-picker/
@@ -6745,6 +7652,40 @@ function drawPages()
             love.graphics.rectangle("fill", canvas.x + canvas.w, canvas.y, (sa.x + sa.w) - (canvas.x + canvas.w), canvas.h)
         end
     end
+end
+
+-- Key for the per-tile compatBadge dot drawn in each aircraft gallery tile's
+-- top-right corner (see _aircraftCompatStatus/_aircraftGalleryItems and
+-- gdsGui_schematicGallery_draw's own _galleryBadge.draw call) — drawn in the
+-- thin strip love.load() carved off the top of the "aircraftGallery" widget
+-- for exactly this (see _aircraftGalleryLegendH). Glyphs come straight from
+-- the library (gdsGui_schematicGallery_drawBadgeIcon) so they always match
+-- the real badges pixel-for-pixel; only the label text is this file's call.
+function drawAircraftGalleryLegend()
+    if gdsGui_page_currentName() ~= "AircraftGallery" then return end
+    local gallery
+    for _, g in ipairs(globApp.objects.schematicGalleries) do
+        if g.name == "aircraftGallery" then gallery = g break end
+    end
+    if not gallery then return end
+
+    local r = 6
+    local y = gallery.y - _aircraftGalleryLegendH
+    local font = globApp.appFont or love.graphics.getFont()
+    love.graphics.setFont(font)
+    local cy = y + _aircraftGalleryLegendH / 2
+    local textY = cy - font:getHeight() / 2
+
+    local entries = { { kind = "ok", label = "OK" }, { kind = "fixed", label = "AUTO-FIXED" },
+        { kind = "issues", label = "NEEDS ATTENTION" } }
+    local x = gallery.x + 10
+    for _, entry in ipairs(entries) do
+        gdsGui_schematicGallery_drawBadgeIcon(x + r, cy, r, entry.kind)
+        love.graphics.setColor(1, 1, 1, 0.85)
+        love.graphics.print(entry.label, x + r * 2 + 5, textY)
+        x = x + r * 2 + 5 + font:getWidth(entry.label) + 16
+    end
+    love.graphics.setColor(1, 1, 1, 1)
 end
 
 function drawAlarmOverlay()
@@ -7193,12 +8134,23 @@ end
 -- as it was left (mainCanvas itself is never torn down by navigating away,
 -- so its content/mode/zoom/pan/selection are all still sitting there
 -- untouched) instead of dropping back to the aircraft picker every time.
--- Only a first-ever visit this session (nothing open yet) or a deleted/
--- missing current system falls through to navBackToSchematicHome.
+-- The one exception: the first trip in after an update (see
+-- _schematicVersionJustUpdated) goes to AircraftGallery instead, whether or
+-- not a system is open, so the user lands straight on the compatibility
+-- badges rather than a canvas that gives no sign a check even ran. A
+-- first-ever visit this session with no update pending, or a deleted/missing
+-- current system, falls through to navBackToSchematicHome as before.
 function navGoToSystemSchematic()
     if gdsGui_page_currentName() == "SystemSchematic" then _saveCurrentSystemIfDirty() end
     if not appSettings.schematicUnlocked then
         gdsGui_page_switch("LoadingPaywall", 8, 2, false)
+        return
+    end
+    if _schematicVersionJustUpdated and #schematicStore.aircraft > 0 then
+        _schematicVersionJustUpdated = false
+        gdsGui_schematicGallery_setItems("aircraftGallery", _aircraftGalleryItems())
+        _navSyncAll("AircraftGallery")
+        gdsGui_page_switch("LoadingAircraftGallery", 12, 2, false)
         return
     end
     if schematicStore.currentSystemId and _findSystem(schematicStore.currentSystemId) then
@@ -7281,14 +8233,17 @@ function schematicModeToggled(newState)
     gdsGui_button_setHidden("schematicContextButton", not designing)
     gdsGui_button_setState("schematicSnapshotBtn", designing and "released" or "deactivated")
     gdsGui_button_setHidden("schematicSnapshotBtn", not designing)
+    gdsGui_button_setState("schematicDockToggle", _schematicDockOpen and "pushed" or "released")
     gdsGui_button_setState("schematicAddBtn", designing and "released" or "deactivated")
-    gdsGui_button_setHidden("schematicAddBtn", not designing)
+    _schematicDockSetToolHidden("schematicAddBtn", not designing)
     gdsGui_button_setState("schematicPaintBtn", designing and "released" or "deactivated")
-    gdsGui_button_setHidden("schematicPaintBtn", not designing)
+    _schematicDockSetToolHidden("schematicPaintBtn", not designing)
     gdsGui_button_setState("schematicAnnunciatorBtn", designing and "released" or "deactivated")
-    gdsGui_button_setHidden("schematicAnnunciatorBtn", not designing)
+    _schematicDockSetToolHidden("schematicAnnunciatorBtn", not designing)
     gdsGui_button_setState("schematicAiBtn", designing and "released" or "deactivated")
-    gdsGui_button_setHidden("schematicAiBtn", not designing)
+    _schematicDockSetToolHidden("schematicAiBtn", not designing)
+    gdsGui_button_setState("schematicBackGroundBtn", designing and "released" or "deactivated")
+    _schematicDockSetToolHidden("schematicBackGroundBtn", not designing)
     _relays.refreshGearButtons(designing)
     if not designing then _aiPanelOpen = false end
     gdsGui_button_setState("schematicFullScreenToggle", designing and "deactivated" or "released")
@@ -7337,6 +8292,17 @@ function schematicFullScreenReturnPressed()
     end
     canvas:resize()
     globApp.currentPageIndex = 7
+end
+
+-- Collapses/expands the full-screen page's own RETURN/GEAR column below
+-- schematicFullScreenDockToggle, same disclosure-arrow convention as
+-- schematicDockTogglePressed on SystemSchematic. newState is this toggle's
+-- own new state (PRESSED = open, chevron up; RELEASED = closed, chevron
+-- down).
+function schematicFullScreenDockTogglePressed(newState)
+    _schematicFullScreenDockOpen = (newState == globApp.BUTTON_STATES.PRESSED)
+    gdsGui_button_setHidden("schematicFullScreenReturnBtn", not _schematicFullScreenDockOpen)
+    gdsGui_button_setHidden("schematicGearFullScreenBtn", not _schematicFullScreenDockOpen)
 end
 
 -- Captures the current control-position combination's element/wire colors as
@@ -7939,6 +8905,16 @@ function schematicElementPlacementExtraRows(canvasName, componentType, pending)
     if canvas and pending and _holdsFluid(canvas, pending) then
         for _, r in ipairs(_tankRows(nil)) do table.insert(rows, r) end
     end
+    -- Same structural MANIFOLD/FUEL MANIFOLD signature
+    -- schematicElementPlacementConfigured below matches to actually build
+    -- the graphic from this row's own answer — see its own comment on why
+    -- that's by shape/role rather than by _MANIFOLD_TERMINALS reference
+    -- (pending here is still the uncommitted, uncopied table, so that
+    -- reference check WOULD work at this point, but matching it the one
+    -- consistent way everywhere is less to get wrong later).
+    if pending and pending.componentType == "path" and pending.shapeType == "rect" and not pending.spritePath then
+        table.insert(rows, _manifoldPortCountRow(nil))
+    end
     return rows
 end
 
@@ -7952,9 +8928,47 @@ end
 -- runs). Re-syncs the hidden GEAR control in case GROUND SWITCH DEPENDENT
 -- just turned itself on for the very first time on this canvas, and flags a
 -- bus tie's logic as possibly needing a new row for a brand new voltage.
+-- Also where a freshly placed MANIFOLD gets its actual "tube-like splits"
+-- graphic (_manifoldShapeAndTerminals) built from the OUTFLOW PORTS count
+-- the pilot just answered on the placement grid (_manifoldPortCountRow,
+-- landed on entity.manifoldPortCount by the grid's own target = "field"
+-- auto-write) — addElement itself has no shapePoints parameter (an element
+-- only ever gets one by being reshaped by hand, or loaded from a save that
+-- already has one — see _convertLegacySchematicSystem's own shapeRows
+-- conversion), so it's set here instead, right after it lands on the
+-- canvas with no shape of its own yet. Matched structurally (not by
+-- comparing newEl.terminals against _MANIFOLD_TERMINALS directly —
+-- armElementPlacement's own commit deep-copies whatever terminals table the
+-- catalog handed it, so that table is never actually the same one) — same
+-- componentType "path" + shapeType "rect" + no sprite signature
+-- _convertLegacySchematicSystem's own MANIFOLD fix uses to find existing
+-- ones, which only ever matches a MANIFOLD/FUEL MANIFOLD either catalog
+-- offers (BUS's own "path" rect always has a spritePath; DUCT's is a BLEED
+-- AIR item, unreachable from whichever system is actually open when this
+-- placement just happened).
 function schematicElementPlacementConfigured(canvasName, elementId)
     local canvas = _findSchematicCanvas()
     if not canvas then return end
+    local newEl = _findSourceEntity(canvas, elementId)
+    if newEl and newEl.componentType == "path" and newEl.shapeType == "rect"
+       and not newEl.spritePath and not newEl.shapePoints then
+        local gridRows, terminals, cols, rows, pipeRoutes = _manifoldShapeAndTerminals(tonumber(newEl.manifoldPortCount))
+        -- The generated shape's own grid footprint (cols x rows) replaces
+        -- whatever default gridW/gridH the catalog entry placed it at —
+        -- unlike every other catalog item, a MANIFOLD's real size depends
+        -- on n, decided only just now. Re-centered on where it was actually
+        -- placed (its OLD center, from its OLD w/h) rather than left
+        -- growing only right/down from its existing top-left corner, so it
+        -- doesn't visibly jump away from the tap that placed it.
+        local oldCenterX, oldCenterY = newEl.x + newEl.w / 2, newEl.y + newEl.h / 2
+        local newW, newH = gdsGui_schematic_gridUnitsToFrac(canvasName, cols, rows)
+        newEl.w, newEl.h = newW, newH
+        newEl.x, newEl.y = oldCenterX - newW / 2, oldCenterY - newH / 2
+        newEl.shapePoints = _shapePoly.pointsFromRows(gridRows)
+        newEl.terminals = terminals
+        newEl.pipeRoutes = pipeRoutes
+        newEl.shapeType = "pipeTree"
+    end
     _relays.syncGearControl(canvas)
     local entity = _findSourceEntity(canvas, elementId)
     if entity and entity.voltage then _relays.checkLogic = true end
@@ -7997,14 +9011,26 @@ function schematicElementPropertiesExtraRows(canvasName, elementId)
         for _, r in ipairs(_tankRows(entity)) do table.insert(rows, r) end
     end
     if entity.spritePath == _BUS_SPRITE_PATH then
-        -- A CURRENT property hand-added to an older bus: the slider below
-        -- replaces it, and the library only strips a label it shows as sensed.
+        -- A CURRENT property hand-added to an older bus: the loads below
+        -- replace it, and the library only strips a label it shows as sensed.
         for i = #(entity.properties or {}), 1, -1 do
             if entity.properties[i].key:upper() == "CURRENT" then table.remove(entity.properties, i) end
         end
-        table.insert(rows, { key = "busLoadAmps", label = "LOAD", target = "field", numeric = true,
-            value = string.format("%g", entity.busLoadAmps or 0),
-            slider = { min = 0, max = _BUS_LOAD_MAX_AMPS, unit = "A" } })
+        -- One tappable row per existing load (name as the label, its own
+        -- amperage as the chip — tap either to open EDIT LOAD, same grid
+        -- the catalog's LIGHT/MOTOR/HEATER shortcuts use, with DELETE
+        -- available there too — see _openLoadPropertiesGrid), then a green
+        -- "+" row to start a new one. Replaces the single busLoadAmps
+        -- slider this menu used to show (still summed into _busLoadText
+        -- for a bus saved before loads had their own list).
+        for i, load in ipairs(entity.loads or {}) do
+            table.insert(rows, { key = "__load" .. i, label = load.name or "", value = "",
+                choices = { string.format("%gA", load.amps or 0) },
+                onChange = function() _openLoadPropertiesGrid(canvasName, elementId, i) end })
+        end
+        table.insert(rows, { key = "__addLoad", label = "", value = "", choices = { "+ ADD LOAD" },
+            buttonColors = { {0.15, 0.7, 0.3, 1} },
+            onChange = function() _openLoadPropertiesGrid(canvasName, elementId) end })
     end
     return rows
 end
@@ -8905,7 +9931,12 @@ function schematicFluidPathsTest()
     if not drains({ T, E }, { { "E", "T", "reverse" } }) then return -2 end
     if not holds({ T, E }, { { "T", "E", "reverse" } }) then return -3 end
     if not holds({ T, E }, { { "T", "E", nil } }) then return -4 end
-    -- Another tank at the far end blocks it, either way round.
+    -- Another tank at the far end blocks it, either way round -- here, because
+    -- these hand-built graphs never pass a stores table into computeFlow at
+    -- all, so U can never be read as having room (see schematicFluidPathsTest's
+    -- own ModelFluid.computeFlow call, 3 args, no stores). With one, and actual
+    -- capacity entered, it drains straight into U instead -- see
+    -- schematicFluidGravityTankToTankTest.
     if not holds({ T, { "U", "source" } }, { { "T", "U", "forward" } }) then return -5 end
     if not holds({ T, { "U", "source" } }, { { "T", "U", "reverse" } }) then return -6 end
     -- A valve: closed holds, open passes along to the engine, or spills with nothing beyond it.
@@ -8915,15 +9946,81 @@ function schematicFluidPathsTest()
     if not drains({ T, V, E }, throughValve, { "V" }) then return -8 end
     if not drains({ T, V }, { { "T", "V", "forward" } }, { "V" }) then return -9 end
     if not holds({ T, V }, { { "T", "V", "forward" } }) then return -10 end
-    -- A manifold passes along, but is sealed if nothing leads on.
+    -- A manifold passes along, and -- treated as an open pipe end, same as a
+    -- valve or check valve with nothing else on it -- leaks if nothing leads on.
     local M = { "M", "path" }
-    if not holds({ T, M }, { { "T", "M", "forward" } }) then return -11 end
+    if not drains({ T, M }, { { "T", "M", "forward" } }) then return -11 end
     if not drains({ T, M, E }, { { "T", "M", "forward" }, { "M", "E", "forward" } }) then return -12 end
     -- Every pipe on the way counts: level or uphill further on holds it all back.
     if not holds({ T, M, E }, { { "T", "M", "forward" }, { "M", "E", nil } }) then return -13 end
     if not holds({ T, M, E }, { { "T", "M", "forward" }, { "M", "E", "reverse" } }) then return -14 end
     -- A branch to a second tank doesn't stop the branch that's open.
     if not drains({ T, M, E, { "U", "source" } }, { { "T", "M", "forward" }, { "M", "E", "forward" }, { "M", "U", "forward" } }) then return -15 end
+    return 1
+end
+
+-- A gravity pipe can drain one tank straight into another downhill of it, the
+-- same flat rate as draining to a sink, but only while a stores table says the
+-- receiver has room -- a full tank at the far end blocks the run exactly like
+-- schematicFluidPathsTest's own "another tank blocks it" case (-5/-6 there),
+-- which never passes stores into computeFlow at all and so never finds room.
+function schematicFluidGravityTankToTankTest()
+    local types = { A = "source", B = "source" }
+    local function build(mark)
+        local wires = { { id = "p", fromElementId = "A", toElementId = "B", gravityDirection = mark } }
+        local graph = ModelGraph.buildGraph({ { id = "A" }, { id = "B" } }, {}, wires, types)
+        return wires, graph
+    end
+    local function tanks(a, b)
+        return { tankMaxCapacity = 100, fillPercent = a }, { tankMaxCapacity = 100, fillPercent = b }
+    end
+    local rate = ModelFluid.DRAIN_RATE * 10 -- gallons in 10 seconds, that percent of a 100-gallon tank
+    local cases = {
+        { mark = "forward", supplier = "A", receiver = "B" },
+        { mark = "reverse", supplier = "B", receiver = "A" },
+    }
+
+    -- Moves the same amount off the supplier as lands on the receiver, whichever
+    -- element the gravityDirection marking actually names as upstream.
+    for _, case in ipairs(cases) do
+        local wires, graph = build(case.mark)
+        local fills = { A = 0, B = 0 }
+        fills[case.supplier] = 50
+        local a, b = tanks(fills.A, fills.B)
+        local stores = { A = a, B = b }
+        ModelFluid.step(ModelFluid.computeFlow(graph, wires, {}, nil, nil, stores), stores, {}, 10)
+        if math.abs(stores[case.supplier].fillPercent - (50 - rate)) > 0.0001 then return -1 end
+        if math.abs(stores[case.receiver].fillPercent - rate) > 0.0001 then return -2 end
+        if not wires[1].fluidMoving then return -3 end
+    end
+
+    -- A full receiver blocks the run and holds the supplier back, either way round.
+    for _, case in ipairs(cases) do
+        local wires, graph = build(case.mark)
+        local fills = { A = 0, B = 0 }
+        fills[case.supplier], fills[case.receiver] = 50, 100
+        local a, b = tanks(fills.A, fills.B)
+        local stores = { A = a, B = b }
+        ModelFluid.step(ModelFluid.computeFlow(graph, wires, {}, nil, nil, stores), stores, {}, 10)
+        if stores[case.supplier].fillPercent ~= 50 or stores[case.receiver].fillPercent ~= 100 or wires[1].fluidMoving then
+            return -4
+        end
+    end
+
+    -- No stores table passed to computeFlow at all: unchanged from before this
+    -- feature existed -- a tank piped to a tank still loses nothing.
+    local wires, graph = build("forward")
+    local a, b = tanks(50, 0)
+    ModelFluid.step(ModelFluid.computeFlow(graph, wires, {}), { A = a, B = b }, {}, 10)
+    if a.fillPercent ~= 50 or b.fillPercent ~= 0 then return -5 end
+
+    -- Stops exactly at the receiver topping out, mid-transfer.
+    wires, graph = build("forward")
+    a, b = tanks(50, 99.95)
+    local stores = { A = a, B = b }
+    local flow = ModelFluid.computeFlow(graph, wires, {}, nil, nil, stores)
+    ModelFluid.step(flow, stores, {}, 10)
+    if b.fillPercent ~= 100 or math.abs(a.fillPercent - 49.95) > 0.0001 then return -6 end
     return 1
 end
 
@@ -9206,7 +10303,7 @@ local function _reshapeTestSetup(canvasName)
     table.insert(pages, testPage)
     globApp.currentPageIndex = testPage.index
     canvas.zoom = 8
-    gdsGui_schematic_setReshapableKind(canvasName, "rect", "source")
+    gdsGui_schematic_setReshapableKind(canvasName, {{shapeType = "rect", componentType = "source"}})
     local w, h = 6 / canvas.contentW, 6 / canvas.contentH
     gdsGui_schematic_addElement(canvasName, "tank", "rect", 0, 0, w, h, "T", nil, nil, nil, nil, "source")
     return canvas, canvas.elements[1], function()
@@ -11614,6 +12711,10 @@ gdsGui_unitTests_registerSuite("app", function()
 
     gdsGui_dev_testExecute {["id"]="modelFluid_drainsOnlyWithOpenGravityPath",
         ["funcName"]={"schematicFluidPathsTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1}}
+    gdsGui_dev_testExecute {["id"]="modelFluid_gravityDrainsTankToTankWithRoom",
+        ["funcName"]={"schematicFluidGravityTankToTankTest"},
         ["funcParameters"]={0},
         ["funcExpctOutput"]={1}}
     gdsGui_dev_testExecute {["id"]="modelFluid_pumpTransfersIgnoringGravity",
