@@ -2373,6 +2373,7 @@ end
 function gdsGui_schematic_setMode(canvasName, mode)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
+    local modeChanged = canvas.mode ~= mode
     canvas.mode = mode
     -- pendingColor is a design-mode-only preview (see resolveColor) — left
     -- set (e.g. a picked-but-never-captured color) it would otherwise leak
@@ -2414,6 +2415,25 @@ function gdsGui_schematic_setMode(canvasName, mode)
         canvas.selectedElementId = nil
         canvas.selectedWireId    = nil
     end
+    -- Lets the app keep its own mode-dependent chrome (the EDIT MODE
+    -- toggle's own pressed state, dock tool visibility, etc.) in sync even
+    -- when this library changes mode on its own — e.g. the control-mode
+    -- long-press's auto-promote/revert (gdsGui_schematic_pressed/_update) —
+    -- not just when the app's own toggle button calls this directly. See
+    -- gdsGui_schematic_setModeChangedCallback.
+    if modeChanged and canvas.onModeChanged then
+        _G[canvas.onModeChanged](canvasName, mode)
+    end
+end
+
+-- Registers a string-named callback (resolved via _G, same convention as
+-- every other button/menu callback in this library) fired after every
+-- ACTUAL mode change on this canvas, including ones this library makes on
+-- its own (see gdsGui_schematic_setMode) — so the app can keep its own
+-- mode-dependent UI in sync regardless of what triggered the change.
+function gdsGui_schematic_setModeChangedCallback(canvasName, callbackName)
+    local canvas = _findCanvas(canvasName)
+    if canvas then canvas.onModeChanged = callbackName end
 end
 
 function gdsGui_schematic_getMode(canvasName)
@@ -3205,6 +3225,7 @@ _actionSheet.GAP_PX = 8           -- between the options group and its CANCEL bu
 _actionSheet.MAX_W_PX = 420       -- a sheet's widest, so it doesn't stretch across a tablet
 _actionSheet.RADIUS_PX = 12
 _actionSheet.ROW_H_PX = 44        -- preferred row height (iOS's touch target); falls back to _MENU_ROW_H when a long menu wouldn't fit
+_actionSheet.CONTROL_LONG_PRESS_SECONDS = 0.5 -- how long a held press on an element/control/wire takes to open this menu directly from control mode (iOS's own UILongPressGestureRecognizer default) — see gdsGui_schematic_update's pendingLongPress poll. Shorter than design mode's own _LONG_PRESS_SECONDS since this never promotes into a drag
 _actionSheet.SLIDE_SECONDS = 0.22
 _actionSheet.CANCEL_TEXT = "CANCEL"
 -- Opaque, so a pressed row's fill can overlap the group's rounded corners cleanly.
@@ -5244,6 +5265,17 @@ function gdsGui_schematic_internal_onElementEditChosen(canvasName, index, option
         -- the wire leaves from the port the user means (see pendingWirePortPick
         -- in gdsGui_schematic_pressed).
         local el = _findElement(canvas, elementId)
+        -- Opened via the control-mode long-press (gdsGui_schematic_update),
+        -- not the EDIT MODE toggle: ADD WIRE's own drag/drop only works
+        -- once canvas.mode == "design" (gdsGui_schematic_pressed's
+        -- control-mode branch returns before ever reaching pendingWireFromId/
+        -- pendingWirePortPick) — promote now, and gdsGui_schematic_update's
+        -- own isPlacementArmed poll hands control mode back the moment
+        -- this wire is connected (or abandoned).
+        if canvas.mode ~= "design" then
+            gdsGui_schematic_setMode(canvasName, "design")
+            canvas._autoDesignFromControl = true
+        end
         if el and el.terminals and #el.terminals >= 2 then
             canvas.pendingWirePortPick = elementId
         else
@@ -5267,6 +5299,12 @@ function gdsGui_schematic_internal_onElementEditChosen(canvasName, index, option
         -- MOVE PORT waits on two: the port, then where on the edge it goes.
         canvas._elementEditTargetId = nil
         gdsGui_schematic_cancelPlacement(canvasName)
+        -- Same control-mode-long-press promotion as ADD WIRE above — the
+        -- pendingPort press handling is equally unreachable outside design mode.
+        if canvas.mode ~= "design" then
+            gdsGui_schematic_setMode(canvasName, "design")
+            canvas._autoDesignFromControl = true
+        end
         canvas.pendingPort = { elementId = elementId, removing = optionText == "REMOVE PORT",
             moving = optionText == "MOVE PORT" or nil }
         return
@@ -5496,6 +5534,12 @@ function gdsGui_schematic_internal_onControlEditChosen(canvasName, index, option
         -- resolves a control id just as readily as an element id.
         canvas._controlEditTargetId = nil
         gdsGui_schematic_cancelPlacement(canvasName)
+        -- Same control-mode-long-press promotion as an element's own ADD
+        -- WIRE above.
+        if canvas.mode ~= "design" then
+            gdsGui_schematic_setMode(canvasName, "design")
+            canvas._autoDesignFromControl = true
+        end
         canvas.pendingWireFromId = controlId
         return
     elseif index == offsetAddWire + 1 then
@@ -8309,6 +8353,15 @@ function _wirePath.start(canvasName, wireId)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     gdsGui_schematic_cancelPlacement(canvasName)
+    -- Opened via the control-mode long-press: _wirePath.press is only ever
+    -- reached while canvas.mode == "design" (gdsGui_schematic_pressed's
+    -- control-mode branch returns before it), so promote now — gdsGui_
+    -- schematic_update's isPlacementArmed poll hands control mode back the
+    -- moment pathEdit clears (_wirePath.finish).
+    if canvas.mode ~= "design" then
+        gdsGui_schematic_setMode(canvasName, "design")
+        canvas._autoDesignFromControl = true
+    end
     canvas.pathEdit = { wireId = wireId }
     canvas.selectedWireId = wireId
 end
@@ -10109,13 +10162,29 @@ function gdsGui_schematic_pressed(touchId, x, y)
         end
 
         if canvas.mode == "control" then
-            -- Pure "operate" mode: the only thing a tap can do is cycle a
-            -- control. Color assignment and snapshot capture are design-mode
-            -- (ACTIONS menu) actions now — anything else here just pans.
-            local control = _hitControl(canvas, x, y)
-            if control then
-                control.detentIndex = (control.detentIndex + 1) % control.numDetents
-                _fireControlCallback(control)
+            -- "Operate" mode: a quick tap still cycles a control exactly as
+            -- before (resolved on release now, not here — see
+            -- gdsGui_schematic_released — so a sustained hold can be told
+            -- apart first). A LONG PRESS on any element/control/wire opens
+            -- its action sheet directly instead (gdsGui_schematic_update),
+            -- the iOS long-press-for-context-menu gesture, without first
+            -- needing the EDIT MODE toggle. Same hit-test precedence
+            -- (element, then control, then wire) design mode's own press
+            -- handling below uses.
+            local hitElem = _hitElement(canvas, x, y)
+            local hitCtrl = (not hitElem) and _hitControl(canvas, x, y) or nil
+            local hitWire = (not hitElem and not hitCtrl) and _hitWire(canvas, x, y) or nil
+            if hitElem or hitCtrl or hitWire then
+                canvas.focusTouchId        = touchId
+                canvas.dragStartX          = x
+                canvas.dragStartY          = y
+                canvas.dragMoved           = false
+                canvas.dragKind            = "pendingLongPress"
+                canvas.selectedElementId   = hitElem and hitElem.id or nil
+                canvas.selectedControlId   = hitCtrl and hitCtrl.id or nil
+                canvas.selectedWireId      = hitWire and hitWire.id or nil
+                canvas.longPressTargetKind = hitElem and "element" or (hitCtrl and "control" or "wire")
+                canvas.longPressElapsed    = 0
                 goto continue
             end
             canvas.focusTouchId = touchId
@@ -11111,6 +11180,23 @@ function gdsGui_schematic_released(touchId, x, y)
                     canvas.pendingConnectorColor = nil
                     canvas.wireTool.color = nil
                 end
+            elseif canvas.mode == "control" and canvas.dragKind == "pendingLongPress" and not canvas.dragMoved then
+                -- Released before _actionSheet.CONTROL_LONG_PRESS_SECONDS
+                -- (gdsGui_schematic_update already opens the action sheet and clears
+                -- dragKind once that hold fires, so reaching here always
+                -- means a clean, quick tap) — a control cycles exactly as
+                -- it always did; an element/wire tap does nothing, same as
+                -- before long-press targeting existed in control mode.
+                if canvas.longPressTargetKind == "control" and canvas.selectedControlId then
+                    local control = _findControl(canvas, canvas.selectedControlId)
+                    if control then
+                        control.detentIndex = (control.detentIndex + 1) % control.numDetents
+                        _fireControlCallback(control)
+                    end
+                end
+                canvas.selectedElementId = nil
+                canvas.selectedControlId = nil
+                canvas.selectedWireId    = nil
             elseif canvas.mode == "design" and canvas.dragKind == "pendingLongPress" and not canvas.dragMoved then
                 -- Released before the hold reached _LONG_PRESS_SECONDS
                 -- (gdsGui_schematic_update), and never wandered past tap
@@ -11244,6 +11330,20 @@ function gdsGui_schematic_update(dt)
         if canvas.page ~= activePageName then goto continue end
         _pollMenuHoldToConfirm(canvas, dt)
 
+        -- A long-press menu action opened from control mode (see
+        -- gdsGui_schematic_pressed's control-mode branch and this
+        -- function's own pendingLongPress poll below) auto-promoted into
+        -- "design" so its follow-up drag/tap (EDIT PATH, ADD WIRE, ADD/
+        -- REMOVE/MOVE PORT) would actually be reachable — gdsGui_schematic_
+        -- isPlacementArmed already tracks every one of those pending
+        -- states, so the moment none is left armed, that one action is
+        -- done and control mode is handed back automatically.
+        if canvas._autoDesignFromControl and canvas.mode == "design"
+           and not gdsGui_schematic_isPlacementArmed(canvas.name) then
+            canvas._autoDesignFromControl = nil
+            gdsGui_schematic_setMode(canvas.name, "control")
+        end
+
         -- A stationary held touch on an annunciator-panel row generates no
         -- touchmoved event either, so this poll is what notices the hold has
         -- crossed _LONG_PRESS_SECONDS and opens that row's edit menu — same
@@ -11278,6 +11378,25 @@ function gdsGui_schematic_update(dt)
         if not canvas.focusTouchId or canvas.dragMoved then goto continue end
 
         canvas.longPressElapsed = (canvas.longPressElapsed or 0) + dt
+
+        if canvas.mode == "control" then
+            -- Control mode's own, shorter hold — see
+            -- _actionSheet.CONTROL_LONG_PRESS_SECONDS. Never promotes into a drag like
+            -- design mode's hold does below; it only ever opens the menu.
+            if canvas.longPressElapsed < _actionSheet.CONTROL_LONG_PRESS_SECONDS then goto continue end
+            gdsGui_haptics_feedback("medium")
+            canvas.dragKind     = nil
+            canvas.focusTouchId = nil
+            if canvas.longPressTargetKind == "element" and canvas.selectedElementId then
+                gdsGui_schematic_openElementEditMenu(canvas.name, canvas.selectedElementId)
+            elseif canvas.longPressTargetKind == "control" and canvas.selectedControlId then
+                gdsGui_schematic_openControlEditMenu(canvas.name, canvas.selectedControlId)
+            elseif canvas.longPressTargetKind == "wire" and canvas.selectedWireId then
+                gdsGui_schematic_openWireEditMenu(canvas.name, canvas.selectedWireId)
+            end
+            goto continue
+        end
+
         local holdElem = canvas.longPressTargetKind == "element" and canvas.selectedElementId
             and _findElement(canvas, canvas.selectedElementId)
         local holdSeconds = (holdElem and _shapePoly.allowed(canvas, holdElem)) and _shapePoly.HOLD_SECONDS or _LONG_PRESS_SECONDS

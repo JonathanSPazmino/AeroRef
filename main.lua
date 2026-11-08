@@ -4320,26 +4320,13 @@ local function _openSystemIntoCanvas(systemId, mode)
     -- old mode-dependent zoom/top-aligned view.
     gdsGui_schematic_resetView("mainCanvas", 1.4)
     appSettings.schematicEditMode = designing
+    -- Changing mode fires _onSchematicModeChanged, which syncs every
+    -- mode-dependent button/dock-tool — but it leaves _aiPanelOpen alone on
+    -- a straight design->design or control->control (no actual mode
+    -- change), so it's set explicitly here regardless, same as before.
     gdsGui_schematic_setMode("mainCanvas", designing and "design" or "control")
-    gdsGui_button_setState("schematicModeToggle", designing and "pushed" or "released")
-    gdsGui_button_setState("schematicContextButton", designing and "released" or "deactivated")
-    gdsGui_button_setHidden("schematicContextButton", not designing)
-    gdsGui_button_setState("schematicSnapshotBtn", designing and "released" or "deactivated")
-    gdsGui_button_setHidden("schematicSnapshotBtn", not designing)
-    gdsGui_button_setState("schematicDockToggle", _schematicDockOpen and "pushed" or "released")
-    gdsGui_button_setState("schematicAddBtn", designing and "released" or "deactivated")
-    _schematicDockSetToolHidden("schematicAddBtn", not designing)
-    gdsGui_button_setState("schematicPaintBtn", designing and "released" or "deactivated")
-    _schematicDockSetToolHidden("schematicPaintBtn", not designing)
-    gdsGui_button_setState("schematicAnnunciatorBtn", designing and "released" or "deactivated")
-    _schematicDockSetToolHidden("schematicAnnunciatorBtn", not designing)
-    gdsGui_button_setState("schematicAiBtn", designing and "released" or "deactivated")
-    _schematicDockSetToolHidden("schematicAiBtn", not designing)
-    gdsGui_button_setState("schematicBackGroundBtn", designing and "released" or "deactivated")
-    _schematicDockSetToolHidden("schematicBackGroundBtn", not designing)
-    _relays.refreshGearButtons(designing)
+    _applySchematicModeButtons(designing)
     _aiPanelOpen = false -- a freshly (re)loaded system starts with the AI panel closed
-    gdsGui_button_setState("schematicFullScreenToggle", designing and "deactivated" or "released")
     -- setFontSizeToFit (not a plain setText) since sys.name's length varies
     -- per system — refitting on every load keeps a long name from wrapping/
     -- overflowing at the user's current global font size (see
@@ -6821,6 +6808,11 @@ function love.load()
     -- leftward out of its own dock button — see
     -- _annunciatorPanelGeometry in schematic_gdsGuiLib.lua.
     gdsGui_schematic_setAnnunciatorButtonName("mainCanvas", "schematicAnnunciatorBtn")
+    -- Keeps every mode-dependent button/dock-tool in sync even when the
+    -- library changes mode on its own (the control-mode long-press's
+    -- auto-promote/revert) rather than through schematicModeToggled — see
+    -- _onSchematicModeChanged.
+    gdsGui_schematic_setModeChangedCallback("mainCanvas", "_onSchematicModeChanged")
     _applySchematicBackgrounds(nil)
     -- Fires on every design-mode edit (add/move/rotate/recolor/rename/
     -- delete/property change — see _notifyChanged in schematic_gdsGuiLib.lua),
@@ -7492,9 +7484,7 @@ function love.update(dt)
                 blink.timer = 0
                 blink.state = not blink.state
                 if blink.state then
-                    if love.system.vibrate and appSettings.hapticsEnabled then
-                        love.system.vibrate(0.1)
-                    end
+                    gdsGui_haptics_feedback("warning")
                     if beepSound and appSettings.soundEnabled then
                         love.audio.play(beepSound)
                     end
@@ -7948,9 +7938,7 @@ end
 
 function hapticsToggled(newState)
     appSettings.hapticsEnabled = (newState == globApp.BUTTON_STATES.PRESSED)
-    if appSettings.hapticsEnabled and love.system.vibrate then
-        love.system.vibrate(0.1)
-    end
+    gdsGui_haptics_feedback("light")
     _saveAppSettings()
 end
 
@@ -8226,10 +8214,14 @@ end
 -- SYSTEM SCHEMATIC PAGE CALLBACKS
 -------------------------------------------------------------------------------
 
-function schematicModeToggled(newState)
-    local designing = (newState == globApp.BUTTON_STATES.PRESSED)
-    appSettings.schematicEditMode = designing
-    gdsGui_schematic_setMode("mainCanvas", designing and "design" or "control")
+-- Every button/dock-tool visual that tracks design-vs-control mode, shared
+-- by the EDIT MODE toggle (schematicModeToggled), a freshly (re)loaded
+-- system (_openSystemIntoCanvas), and a mode change the library makes on
+-- its own — the control-mode long-press's auto-promote/revert
+-- (_onSchematicModeChanged) — so all three stay in sync no matter which of
+-- them actually changed the mode.
+function _applySchematicModeButtons(designing)
+    gdsGui_button_setState("schematicModeToggle", designing and "pushed" or "released")
     gdsGui_button_setState("schematicContextButton", designing and "released" or "deactivated")
     gdsGui_button_setHidden("schematicContextButton", not designing)
     gdsGui_button_setState("schematicSnapshotBtn", designing and "released" or "deactivated")
@@ -8246,9 +8238,33 @@ function schematicModeToggled(newState)
     gdsGui_button_setState("schematicBackGroundBtn", designing and "released" or "deactivated")
     _schematicDockSetToolHidden("schematicBackGroundBtn", not designing)
     _relays.refreshGearButtons(designing)
-    if not designing then _aiPanelOpen = false end
     gdsGui_button_setState("schematicFullScreenToggle", designing and "deactivated" or "released")
+end
+
+function schematicModeToggled(newState)
+    local designing = (newState == globApp.BUTTON_STATES.PRESSED)
+    appSettings.schematicEditMode = designing
+    -- Changing mode fires _onSchematicModeChanged below, which does the
+    -- actual button/dock-tool/AI-panel sync — the one place that happens,
+    -- so it stays identical whether this toggle or the library's own
+    -- auto-promote/revert is what changed the mode.
+    gdsGui_schematic_setMode("mainCanvas", designing and "design" or "control")
     _saveAppSettings()
+end
+
+-- Fired by the library itself (gdsGui_schematic_setMode) whenever
+-- mainCanvas's mode changes by ANY means, including the control-mode
+-- long-press's own auto-promote/revert (gdsGui_schematic_pressed/_update in
+-- schematic_gdsGuiLib.lua) rather than this app's EDIT MODE toggle button —
+-- keeps every mode-dependent button/dock-tool visual honest either way.
+-- Deliberately doesn't touch appSettings.schematicEditMode/_saveAppSettings:
+-- an auto-promoted "design" mode is a transient implementation detail of
+-- one menu action, not a persisted user preference to restore on next launch.
+function _onSchematicModeChanged(canvasName, mode)
+    if canvasName ~= "mainCanvas" then return end
+    local designing = (mode == "design")
+    _applySchematicModeButtons(designing)
+    if not designing then _aiPanelOpen = false end
 end
 
 -- Control-mode "full screen": re-homes the live mainCanvas object onto its
@@ -8474,7 +8490,7 @@ function captureSchematicSnapshot()
     _recomputeDeducedGateStates()
     _setSnapshotLabelText(gdsGui_schematic_countSnapshots("mainCanvas"))
     _requestSchematicSave()
-    if appSettings.hapticsEnabled and love.system.vibrate then love.system.vibrate(0.1) end
+    gdsGui_haptics_feedback("success")
     if appSettings.soundEnabled and singleChimeSound then love.audio.play(singleChimeSound) end
     _flagLockedRuleContradictionIfAny("mainCanvas")
 end
