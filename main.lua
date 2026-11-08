@@ -6813,6 +6813,14 @@ function love.load()
     -- auto-promote/revert) rather than through schematicModeToggled — see
     -- _onSchematicModeChanged.
     gdsGui_schematic_setModeChangedCallback("mainCanvas", "_onSchematicModeChanged")
+    -- These float above the canvas rather than sitting flush in a header/
+    -- footer row, so they get the same soft elevation shadow a dragged
+    -- element already draws with (see _selection.beginLift in
+    -- schematic_gdsGuiLib.lua) instead of looking pasted flat onto it.
+    for _, name in pairs(_SCHEMATIC_DOCK_TOOLS) do gdsGui_button_setFloatingShadow(name, true) end
+    gdsGui_button_setFloatingShadow("schematicDockToggle", true)
+    gdsGui_button_setFloatingShadow("schematicModeToggle", true)
+    gdsGui_button_setFloatingShadow("schematicFullScreenToggle", true)
     _applySchematicBackgrounds(nil)
     -- Fires on every design-mode edit (add/move/rotate/recolor/rename/
     -- delete/property change — see _notifyChanged in schematic_gdsGuiLib.lua),

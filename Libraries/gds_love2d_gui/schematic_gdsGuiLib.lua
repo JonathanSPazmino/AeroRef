@@ -3573,8 +3573,12 @@ local function _drawMenuBox(owner, menu)
     local sliding = layout.reveal < 1
     if sliding then love.graphics.intersectScissor(owner.x, owner.y, owner.w, owner.h) end
 
+    -- Same soft elevation shadow a dragged element draws with (see
+    -- _selection.beginLift) -- this modal sheet floats above the canvas
+    -- too. Faded out mid-slide along with the sheet itself (layout.reveal).
+    gdsGui_general_drawShadow(x, layout.y, w, layout.h, _actionSheet.RADIUS_PX, 0, 4, 14, 0.35 * layout.reveal)
     love.graphics.setColor(palette.bg)
-    love.graphics.rectangle("fill", x, layout.y, w, layout.h, _actionSheet.RADIUS_PX, _actionSheet.RADIUS_PX)
+    gdsGui_general_drawRoundedRect(x, layout.y, w, layout.h, _actionSheet.RADIUS_PX)
     if menu.title then
         love.graphics.setColor(palette.title)
         love.graphics.printf(menu.title, x, layout.y + 8, w, "center")
@@ -3631,8 +3635,11 @@ local function _drawMenuBox(owner, menu)
 
     local cancel = layout.cancel
     if cancel then
+        if pressed ~= cancel.hit then
+            gdsGui_general_drawShadow(x, cancel.y, w, cancel.h, _actionSheet.RADIUS_PX, 0, 4, 14, 0.35 * layout.reveal)
+        end
         love.graphics.setColor(pressed == cancel.hit and palette.pressed or palette.bg)
-        love.graphics.rectangle("fill", x, cancel.y, w, cancel.h, _actionSheet.RADIUS_PX, _actionSheet.RADIUS_PX)
+        gdsGui_general_drawRoundedRect(x, cancel.y, w, cancel.h, _actionSheet.RADIUS_PX)
         love.graphics.setColor(palette.action)
         love.graphics.printf(cancel.text, x, cancel.y + (cancel.h - love.graphics.getFont():getHeight()) / 2, w, "center")
     end
@@ -9098,6 +9105,143 @@ function _glow.finish(canvas)
     end)
 end
 
+--------------------------------------------------------------------------------
+-- MENU BACKDROP BLUR — a real frosted-glass material behind an open action
+-- sheet (gdsGui_schematic_drawMenuOverlay/_drawMenuBox), replacing what
+-- would otherwise be a flat dim rectangle over the sharp canvas. Global,
+-- not local, same as _actionSheet/_propertyGrid/_galleryBadge above — this
+-- file is already at Lua's 200-top-level-local ceiling.
+--
+-- gdsGui_schematic_draw (below) redirects a canvas's ENTIRE normal draw
+-- pass into _menuBackdrop.full instead of the screen, for exactly the
+-- frames a menu is open on it — a plain, full-WINDOW-resolution (1:1)
+-- canvas, deliberately NOT scaled, so every existing absolute-pixel
+-- love.graphics.setScissor(canvas.x, ...) call inside that draw pass keeps
+-- clipping to the right place with no change to it at all. Once that pass
+-- finishes, the captured frame is downsampled and blurred (canvasA/
+-- canvasB, the same separable-Gaussian ping-pong _glow.finish already
+-- uses, just this module's own instances so the two never fight over the
+-- same canvas in one frame) and drawn to the screen in its place —
+-- _drawMenuBox's own existing dim rect + panel then layer on top of that
+-- exactly as before, with no changes needed there.
+--
+-- Same plain/pcall-guarded canvas pattern as _glow throughout (see
+-- conf.lua's own t.window.msaa=0 comment on the Metal-backend crash this
+-- sidesteps): any failure here just skips the blur for the rest of this
+-- session and that canvas's content draws straight to the screen as
+-- always, identical to before this module existed.
+--------------------------------------------------------------------------------
+
+_menuBackdrop = {}
+_menuBackdrop.SCALE = 0.35   -- ping-pong blur resolution, relative to the window
+_menuBackdrop.PASSES = 3     -- more than _glow's own 2 -- a modal backdrop wants to read as clearly out-of-focus
+_menuBackdrop.SPREAD = 2.2
+
+function _menuBackdrop.ensureResources()
+    if _menuBackdrop.failed then return false end
+    if not _menuBackdrop.shader then
+        local ok, shader = pcall(love.graphics.newShader, [[
+            uniform vec2 direction;
+            vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
+                vec4 sum = Texel(tex, tc) * 0.2270270270;
+                sum += Texel(tex, tc + direction * 1.3846153846) * 0.3162162162;
+                sum += Texel(tex, tc - direction * 1.3846153846) * 0.3162162162;
+                sum += Texel(tex, tc + direction * 3.2307692308) * 0.0702702703;
+                sum += Texel(tex, tc - direction * 3.2307692308) * 0.0702702703;
+                return sum * color;
+            }
+        ]])
+        if not ok then _menuBackdrop.failed = true; return false end
+        _menuBackdrop.shader = shader
+    end
+    local fullW = math.max(1, love.graphics.getWidth())
+    local fullH = math.max(1, love.graphics.getHeight())
+    local w = math.max(1, math.ceil(fullW * _menuBackdrop.SCALE))
+    local h = math.max(1, math.ceil(fullH * _menuBackdrop.SCALE))
+    if not _menuBackdrop.full or _menuBackdrop.full:getWidth() ~= fullW or _menuBackdrop.full:getHeight() ~= fullH
+       or not _menuBackdrop.canvasA or _menuBackdrop.canvasA:getWidth() ~= w then
+        -- Same pcall guard as the shader above, and for the same reason
+        -- _glow.ensureResources gives: a window-size change mid-session can
+        -- land here again well after startup, and love.graphics.newCanvas is
+        -- just as able to fail/throw on a size it doesn't like as the shader
+        -- compile is.
+        local ok, full, a, b = pcall(function()
+            -- Deliberately plain (no msaa option) -- see conf.lua's own
+            -- t.window.msaa comment; _glow hit two separate Metal validation
+            -- crashes mixing an MSAA canvas into a shader ping-pong on this
+            -- LÖVE 12 pre-release backend, and this is the exact same kind
+            -- of ping-pong.
+            local newFull = love.graphics.newCanvas(fullW, fullH)
+            local newA, newB = love.graphics.newCanvas(w, h), love.graphics.newCanvas(w, h)
+            newA:setFilter("linear", "linear")
+            newB:setFilter("linear", "linear")
+            return newFull, newA, newB
+        end)
+        if not ok then _menuBackdrop.failed = true; return false end
+        _menuBackdrop.full, _menuBackdrop.canvasA, _menuBackdrop.canvasB = full, a, b
+    end
+    return true
+end
+
+function _menuBackdrop.guarded(fn)
+    if _menuBackdrop.failed then return end
+    local ok = pcall(fn)
+    if not ok then
+        _menuBackdrop.failed = true
+        _glow.resetGraphicsState()
+    end
+end
+
+-- Redirects every draw call that follows (until _menuBackdrop.finish) into
+-- the full-resolution capture canvas instead of the screen. Only called
+-- when canvas.menu is actually set, so this costs nothing on any frame
+-- without an open menu.
+function _menuBackdrop.begin()
+    _menuBackdrop.active = _menuBackdrop.ensureResources()
+    if not _menuBackdrop.active then return end
+    _menuBackdrop.guarded(function()
+        love.graphics.setCanvas(_menuBackdrop.full)
+        love.graphics.setScissor()
+        love.graphics.clear(0, 0, 0, 0)
+    end)
+    if _menuBackdrop.failed then _menuBackdrop.active = false end
+end
+
+-- Ends the redirect, blurs the captured frame, and draws the blurred
+-- result to the screen in its place -- gdsGui_schematic_drawMenuOverlay's
+-- own dim rect + panel, drawn later this same frame, then layer on top of
+-- it exactly as they already do over the sharp canvas.
+function _menuBackdrop.finish()
+    if not _menuBackdrop.active then return end
+    _menuBackdrop.active = false
+    _menuBackdrop.guarded(function()
+        local w, h = _menuBackdrop.canvasA:getDimensions()
+        love.graphics.setCanvas()
+        love.graphics.setShader()
+        love.graphics.setScissor()
+        love.graphics.setBlendMode("alpha")
+        love.graphics.setColor(1, 1, 1, 1)
+        love.graphics.setCanvas(_menuBackdrop.canvasA)
+        love.graphics.clear(0, 0, 0, 0)
+        love.graphics.draw(_menuBackdrop.full, 0, 0, 0, _menuBackdrop.SCALE, _menuBackdrop.SCALE)
+        love.graphics.setShader(_menuBackdrop.shader)
+        for _ = 1, _menuBackdrop.PASSES do
+            love.graphics.setCanvas(_menuBackdrop.canvasB)
+            love.graphics.clear(0, 0, 0, 0)
+            _menuBackdrop.shader:send("direction", { _menuBackdrop.SPREAD / w, 0 })
+            love.graphics.draw(_menuBackdrop.canvasA)
+            love.graphics.setCanvas(_menuBackdrop.canvasA)
+            love.graphics.clear(0, 0, 0, 0)
+            _menuBackdrop.shader:send("direction", { 0, _menuBackdrop.SPREAD / h })
+            love.graphics.draw(_menuBackdrop.canvasB)
+        end
+        love.graphics.setShader()
+        love.graphics.setCanvas()
+        love.graphics.draw(_menuBackdrop.canvasA, 0, 0, 0, 1 / _menuBackdrop.SCALE, 1 / _menuBackdrop.SCALE)
+        love.graphics.setColor(1, 1, 1, 1)
+    end)
+end
+
 -- Glow source for a wire: its own path, a little wider than the wire.
 function _glow.wire(plan, zoom, wireWidth, r, g, b, bendRadius)
     _glow.capture(function()
@@ -9637,7 +9781,7 @@ local function _drawOneConnectorTarget(canvas, anchor, snapTarget, snapTerminal)
             local tx, ty = _terminals.point(canvas, anchor, i)
             if snapTarget and snapTarget.id == anchor.id and snapTerminal == i then
                 love.graphics.setColor(_CONNECTOR_SNAP_COLOR[1], _CONNECTOR_SNAP_COLOR[2], _CONNECTOR_SNAP_COLOR[3], 1)
-                love.graphics.circle("fill", tx, ty, rad)
+                gdsGui_general_drawCircle(tx, ty, rad)
                 love.graphics.setColor(1, 1, 1, 1)
                 love.graphics.circle("line", tx, ty, rad)
             else
@@ -9651,7 +9795,7 @@ local function _drawOneConnectorTarget(canvas, anchor, snapTarget, snapTerminal)
     local rad = _CONNECTOR_TARGET_RADIUS_PX * canvas.zoom
     if snapTarget and snapTarget.id == anchor.id then
         love.graphics.setColor(_CONNECTOR_SNAP_COLOR[1], _CONNECTOR_SNAP_COLOR[2], _CONNECTOR_SNAP_COLOR[3], 1)
-        love.graphics.circle("fill", cx, cy, rad)
+        gdsGui_general_drawCircle(cx, cy, rad)
         love.graphics.setColor(1, 1, 1, 1)
         love.graphics.circle("line", cx, cy, rad)
     else
@@ -9744,6 +9888,17 @@ function gdsGui_schematic_draw(pageName)
 
     for _, canvas in ipairs(globApp.objects.schematics) do
         if canvas.page == pageName then
+            -- An open menu (gdsGui_schematic_drawMenuOverlay, drawn later
+            -- this frame) gets a real blurred backdrop instead of a flat
+            -- dim rect — see _menuBackdrop's own header comment. Redirects
+            -- every draw call below into an offscreen buffer instead of
+            -- the screen; _menuBackdrop.finish (at the bottom of this same
+            -- iteration) blurs it and draws it to the screen in its place.
+            local backdropActive = false
+            if canvas.menu then
+                _menuBackdrop.begin()
+                backdropActive = _menuBackdrop.active
+            end
             love.graphics.setScissor(canvas.x, canvas.y, canvas.w, canvas.h)
             vx, vy = canvas.x - cullPad, canvas.y - cullPad
             vw, vh = canvas.w + cullPad * 2, canvas.h + cullPad * 2
@@ -9914,6 +10069,7 @@ function gdsGui_schematic_draw(pageName)
             end
 
             love.graphics.setColor(1, 1, 1, 1)
+            if backdropActive then _menuBackdrop.finish() end
             love.graphics.setScissor()
         end
     end

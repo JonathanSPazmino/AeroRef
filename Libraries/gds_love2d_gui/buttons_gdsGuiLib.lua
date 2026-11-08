@@ -30,6 +30,23 @@ local function _isPressed(button, x, y)
     return x >= button.myx and x <= button.myMaxx and y >= button.myy and y <= button.myMaxy
 end
 
+-- Press-feedback pulse timing (see gdsGui_button_update/_draw): dips to
+-- PULSE_DIP scale right on a RELEASED->PRESSED transition, then eases
+-- linearly back to 1.0 over PULSE_SECONDS. A fixed-duration tap pulse, not
+-- a sustained "scale while PRESSED" -- PRESSED also means "toggled on" for
+-- a toggle-type button, which stays PRESSED indefinitely once flipped on,
+-- so binding scale to that state would leave every ON toggle permanently
+-- shrunk instead of just tapped.
+local _PULSE_SECONDS = 0.15
+local _PULSE_DIP = 0.05
+
+--[[ 1.0 at rest; mid-dip-and-recover right after a press. ]]
+local function _pulseScale(button)
+    local t = button._pressPulseT
+    if not t then return 1 end
+    return 1 - _PULSE_DIP * math.max(0, 1 - t / _PULSE_SECONDS)
+end
+
 --[[ Invokes a button's callback function if it exists. ]]
 local function _executeCallback(button)
     if button.callbackFunc then
@@ -102,6 +119,13 @@ function gdsGui_button_create(label, page, buttonType, imgPressed, imgReleased, 
     newButton.callbackFunc = callbackFunc
     newButton.hapticEnabled = (hapticEnabled == true)
     newButton.hidden = false
+    -- Press-feedback pulse (see gdsGui_button_update/_draw): nil whenever
+    -- settled at rest, so most buttons cost nothing extra per frame.
+    newButton._pressPulseT = nil
+    -- Opt-in soft drop shadow for UI that visually floats above other
+    -- content (a dock tool button over the canvas) rather than sitting
+    -- flush in a header/footer row -- see gdsGui_button_setFloatingShadow.
+    newButton.floatingShadow = false
 
     -- The new resize method for this object
     function newButton:resize()
@@ -140,6 +164,20 @@ function gdsGui_button_create(label, page, buttonType, imgPressed, imgReleased, 
 end
 
 --[[
+    Advances every button's press-feedback pulse (see _pulseScale above).
+    Settled (_pressPulseT nil) buttons are skipped, so this costs nothing
+    for the vast majority of buttons on any given frame.
+]]
+function gdsGui_button_update(dt)
+    for _, button in ipairs(globApp.objects.buttons) do
+        if button._pressPulseT then
+            button._pressPulseT = button._pressPulseT + dt
+            if button._pressPulseT >= _PULSE_SECONDS then button._pressPulseT = nil end
+        end
+    end
+end
+
+--[[
     Draws all buttons that belong to the specified page.
 ]]
 function gdsGui_button_draw(pageName)
@@ -148,7 +186,17 @@ function gdsGui_button_draw(pageName)
         if button.page == pageName and not button.ownerContainer and not button.hidden then
             local imageToDraw = button.images[button.state]
             if imageToDraw then
-                love.graphics.draw(imageToDraw, button.myx, button.myy, 0, button.factorWidth, button.factorHeight)
+                if button.floatingShadow then
+                    gdsGui_general_drawShadow(button.myx, button.myy, button.mywidth, button.myheight,
+                        math.min(button.mywidth, button.myheight) * 0.22, 0, 3, 8, 0.35)
+                    love.graphics.setColor(1, 1, 1, 1)
+                end
+                local scale = _pulseScale(button)
+                local cx = button.myx + button.mywidth / 2
+                local cy = button.myy + button.myheight / 2
+                love.graphics.draw(imageToDraw, cx, cy, 0,
+                    button.factorWidth * scale, button.factorHeight * scale,
+                    imageToDraw:getWidth() / 2, imageToDraw:getHeight() / 2)
             end
         end
     end
@@ -156,7 +204,8 @@ end
 
 --[[
     The old gui_buttons_update function is now deprecated and removed.
-    Its logic has been replaced by the .resize() method on each button object.
+    Its logic has been replaced by the .resize() method on each button object,
+    plus gdsGui_button_update above for the press-feedback pulse.
 ]]
 
 --[[
@@ -182,10 +231,12 @@ function gdsGui_button_pressed(x, y, button, istouch)
             if p.type == "toggle" then
                 if p.state == globApp.BUTTON_STATES.RELEASED then
                     p.state = globApp.BUTTON_STATES.PRESSED
+                    p._pressPulseT = 0
                     if p.hapticEnabled then gdsGui_haptics_vibrate() end
                     _executeCallback(p)
                 elseif p.state == globApp.BUTTON_STATES.PRESSED then
                     p.state = globApp.BUTTON_STATES.RELEASED
+                    p._pressPulseT = 0
                     if p.hapticEnabled then gdsGui_haptics_vibrate() end
                     _executeCallback(p)
                 end
@@ -194,12 +245,14 @@ function gdsGui_button_pressed(x, y, button, istouch)
                 -- so the button stays locked until externally reset via setState.
                 if p.state == globApp.BUTTON_STATES.RELEASED then
                     p.state = globApp.BUTTON_STATES.PRESSED
+                    p._pressPulseT = 0
                     if p.hapticEnabled then gdsGui_haptics_vibrate() end
                     _executeCallback(p)
                 end
             elseif p.type == "pushonoff" then
                 if p.state == globApp.BUTTON_STATES.RELEASED then
                     p.state = globApp.BUTTON_STATES.PRESSED
+                    p._pressPulseT = 0
                     if p.hapticEnabled then gdsGui_haptics_vibrate() end
                     -- For pushonoff, callback is usually on release.
                 end
@@ -281,6 +334,21 @@ function gdsGui_button_setHidden(buttonName, hidden)
     for _, b in ipairs(globApp.objects.buttons) do
         if b.name == buttonName then
             b.hidden = hidden
+            return
+        end
+    end
+end
+
+--[[
+    Opts a button into the soft floating-elevation shadow (see
+    gdsGui_button_draw) -- for chrome that visually floats above other
+    content (a dock tool button over the canvas), not a flush header/footer
+    button. Off by default.
+]]
+function gdsGui_button_setFloatingShadow(buttonName, floating)
+    for _, b in ipairs(globApp.objects.buttons) do
+        if b.name == buttonName then
+            b.floatingShadow = floating
             return
         end
     end

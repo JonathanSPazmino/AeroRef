@@ -159,6 +159,7 @@ function gdsGui_update (dt)
 
 	end
 
+	gdsGui_button_update(dt)
 	gdsGui_outputTxtBox_update(dt)
 	gdsGui_table_physicsUpdate(dt)
 	gdsGui_container_physicsUpdate(dt)
@@ -477,6 +478,96 @@ end
 function gdsGui_general_pixelCenter (v)
 	local dpi = love.graphics.getDPIScale()
 	return (math.floor(v * dpi) + 0.5) / dpi
+end
+
+--------------------------------------------------------------------------------
+-- ROUNDED-RECT / SHADOW SDF SHADER
+--
+-- conf.lua turns window MSAA off (see its own comment on a documented LÖVE
+-- 12 Metal-backend crash when an offscreen canvas mixes with it), so every
+-- plain love.graphics.rectangle(..., radius, radius)/circle(...) call draws
+-- with a hard, aliased edge. This is an MSAA-independent alternative: a
+-- signed-distance-field shader giving a rounded rect (or, with radius ==
+-- half its own size, a circle) a smooth analytic edge -- and, with a wider
+-- falloff instead of a hard one, the same shader doubles as a soft drop
+-- shadow. No canvases, no render-target changes, nothing in the family of
+-- the MSAA crash above -- just an ordinary shader on an ordinary immediate
+-- draw. Lazily built and pcall-guarded like every other shader in this app;
+-- gdsGui_general_drawRoundedRect falls back to a plain aliased rectangle if
+-- the shader ever fails to compile on some backend, and
+-- gdsGui_general_drawShadow simply skips the shadow (nothing worth faking
+-- with a hard edge).
+--------------------------------------------------------------------------------
+
+local _sdf = { failed = false, shader = nil }
+
+function _sdf.ensureShader()
+	if _sdf.failed then return false end
+	if _sdf.shader then return true end
+	local ok, shader = pcall(love.graphics.newShader, [[
+		uniform vec2 pixelSize; // full size of the drawn quad, in pixels
+		uniform vec2 halfSize;  // half the SHAPE's own size (unpadded), in pixels
+		uniform float radius;   // corner radius, in pixels ( == min(halfSize) for a circle )
+		uniform float softness; // 0 (or near it) = crisp edge; larger = a soft shadow falloff
+		vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
+			vec2 p = (tc - 0.5) * pixelSize;
+			vec2 q = abs(p) - halfSize + radius;
+			float dist = min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - radius;
+			float edge = max(softness, 0.75);
+			float alpha = 1.0 - smoothstep(-edge, edge, dist);
+			return vec4(color.rgb, color.a * alpha);
+		}
+	]])
+	if not ok then _sdf.failed = true; return false end
+	_sdf.shader = shader
+	return true
+end
+
+-- Crisp, MSAA-independent rounded rect (radius in px; clamped to a circle
+-- once it reaches half the shorter side). Falls back to an ordinary
+-- love.graphics.rectangle("fill", ...) on any shader failure.
+function gdsGui_general_drawRoundedRect(x, y, w, h, radius)
+	radius = math.min(radius, math.min(w, h) / 2)
+	if not _sdf.ensureShader() then
+		love.graphics.rectangle("fill", x, y, w, h, radius, radius)
+		return
+	end
+	local prevShader = love.graphics.getShader()
+	_sdf.shader:send("pixelSize", {w, h})
+	_sdf.shader:send("halfSize", {w / 2, h / 2})
+	_sdf.shader:send("radius", radius)
+	_sdf.shader:send("softness", 0)
+	love.graphics.setShader(_sdf.shader)
+	love.graphics.rectangle("fill", x, y, w, h)
+	love.graphics.setShader(prevShader)
+end
+
+-- A circle of the given pixel radius, same crisp/MSAA-independent edge.
+function gdsGui_general_drawCircle(cx, cy, r)
+	gdsGui_general_drawRoundedRect(cx - r, cy - r, r * 2, r * 2, r)
+end
+
+-- A soft drop shadow for a rounded rect (or circle) of size w,h/radius that
+-- would otherwise sit at x,y -- offset by ox,oy and padded by `blur` px of
+-- soft falloff. alpha is the shadow's own peak opacity (typically
+-- 0.2-0.4); the caller's own current color is restored afterward. A no-op
+-- if the shader failed to compile (no cheap fallback worth a hard-edged
+-- "shadow").
+function gdsGui_general_drawShadow(x, y, w, h, radius, ox, oy, blur, alpha)
+	if not _sdf.ensureShader() then return end
+	radius = math.min(radius, math.min(w, h) / 2)
+	local pad = blur
+	local prevShader = love.graphics.getShader()
+	local pr, pg, pb, pa = love.graphics.getColor()
+	_sdf.shader:send("pixelSize", {w + pad * 2, h + pad * 2})
+	_sdf.shader:send("halfSize", {w / 2, h / 2})
+	_sdf.shader:send("radius", radius)
+	_sdf.shader:send("softness", blur)
+	love.graphics.setShader(_sdf.shader)
+	love.graphics.setColor(0, 0, 0, alpha)
+	love.graphics.rectangle("fill", x + ox - pad, y + oy - pad, w + pad * 2, h + pad * 2)
+	love.graphics.setShader(prevShader)
+	love.graphics.setColor(pr, pg, pb, pa)
 end
 
 function gdsGui_general_smartFontScaling (minFontPercentSize, maxFontPercentSize)
