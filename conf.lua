@@ -15,7 +15,15 @@ function love.conf(t)
     t.audio.mic = false                 -- Request and use microphone capabilities in Android (boolean)
     t.audio.mixwithsystem = true        -- Keep background music playing when opening LOVE (boolean, iOS and Android only)
 
-    t.graphics.gammacorrect = false     -- Enable gamma-correct rendering, when supported by the system (boolean)
+    -- On: blends the glow halo, the pipe wall/body/light/fluid/streak
+    -- layers, and the dashed color-sequence wires (an ambiguous multi-
+    -- source node) in linear light instead of raw sRGB, so overlapping
+    -- semi-transparent layers mix the way they'd actually look instead of
+    -- muddying/darkening at the seams. Changes how every existing alpha
+    -- value and palette color actually renders -- if anything reads
+    -- noticeably off (too washed out/too dark) after this, it's a palette
+    -- value to retune, not a sign this should go back to false.
+    t.graphics.gammacorrect = true      -- Enable gamma-correct rendering, when supported by the system (boolean)
 
     t.window.title = "AeroRef"            -- The window title (string)
     t.window.icon = nil   -- Filepath to an image to use as the window's icon (string)

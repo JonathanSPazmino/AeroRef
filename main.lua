@@ -2647,23 +2647,24 @@ local function _solveCurrentSchematic()
 
     local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes, _nodePositionsForGraph(canvas))
 
-    -- Which liquid pipes gravity (or a running pump) can actually reach right
-    -- now -- model/fluid.lua's own feeding/pump routes, the same ones
-    -- _fluidTick's live simulation drains by. solve() below has no concept of
-    -- "this wire only carries anything flowing downhill" (it's deliberately
-    -- medium-agnostic -- see model/solver.lua's own header), so left alone it
-    -- would color an uphill, unpumped run as if fed just because it's wired
-    -- up at all; the wire loop further down overrides exactly those back to
-    -- unpowered gray. nil on anything but a PIPE system -- the override never
-    -- applies there, see that same loop.
+    -- Which liquid pipes could plausibly have standing fluid in them right
+    -- now -- model/fluid.lua's own wetWires (a dead stub off a wet manifold
+    -- still counts, same as the live simulation's own hasFluid treats it --
+    -- see that function's own comment) plus any pump/ejector route, the same
+    -- ones _fluidTick's live simulation drains/pressurizes by. solve() below
+    -- has no concept of "this wire only carries anything flowing downhill"
+    -- (it's deliberately medium-agnostic -- see model/solver.lua's own
+    -- header), so left alone it would color an uphill, unpumped, never-wet
+    -- run as if fed just because it's wired up at all; the wire loop further
+    -- down overrides exactly those back to unpowered gray. nil on anything
+    -- but a PIPE system -- the override never applies there, see that same
+    -- loop.
     local fluidReachable = nil
     if canvas.connectorNoun == "PIPE" then
         local conducting, stores, offSources, pressures = _fluidFlowInputs(canvas, componentTypes)
         local flow = ModelFluid.computeFlow(graph, canvas.wires, conducting, offSources, pressures, stores)
         fluidReachable = {}
-        for _, fed in pairs(flow.feeding) do
-            for wireId in pairs(fed) do fluidReachable[wireId] = true end
-        end
+        for wireId in pairs(flow.wetWires) do fluidReachable[wireId] = true end
         -- A pump (or the ejector it drives) moves fluid on its own pressure,
         -- not gravity -- any pipe on one of its routes counts as reachable
         -- regardless of which way it's marked, same as the live simulation's

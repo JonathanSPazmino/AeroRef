@@ -1095,13 +1095,17 @@ function _shapePoly.edgePoint(canvas, e, x, y, axis, sign)
     return _shapePoly.toWorld(cx, cy, cw, ch, p, e.rotation, lx + best * stepC, ly + best * stepR)
 end
 
--- A tank's own corners round off by this much (world units, scaled by zoom
--- like any other schematic linework) -- e.fillPercent ~= nil is the same
--- "this holds a fluid level" signal _drawElement's own drawLevel dispatch
--- already keys off, so only an actual tank-like element (reshaped or still
--- its catalog default rect) gets the rounded look; a plain bus/duct/engine
--- stays sharp-cornered. Kept modest -- a gentle rounded-rect, not a stadium.
-_shapePoly.CORNER_RADIUS_UNITS = 2 * _GRID_SPACING_PX
+-- A tank's own corners round off by this fraction of its own smaller
+-- on-screen dimension (NOT a fixed/zoom-scaled pixel size -- a constant
+-- size grows to swallow a small tank, or exceed half of ANY tank's own
+-- width/height at high enough zoom, and the per-corner clamp below then has
+-- nowhere left to go but the shape's own half-width/half-height, drawing a
+-- stadium or, on a square tank, a flat circle instead of a rounded rect).
+-- e.fillPercent ~= nil is the same "this holds a fluid level" signal
+-- _drawElement's own drawLevel dispatch already keys off, so only an actual
+-- tank-like element (reshaped or still its catalog default rect) gets the
+-- rounded look; a plain bus/duct/engine stays sharp-cornered.
+_shapePoly.CORNER_RADIUS_FRACTION = 0.1
 
 -- How many straight pieces to approximate an arc of radius r with, fine
 -- enough to look smooth at any zoom. Self-contained rather than reusing
@@ -1136,6 +1140,30 @@ function _shapePoly.roundedOutline(p, ew, eh, radius)
         local c = p.corners[((i - 1) % n) + 1]
         return left + c.c * cw, top + c.r * ch
     end
+
+    -- The single shortest edge anywhere in the shape caps the radius
+    -- globally, before any of the PER-corner clamping below. Two corners
+    -- sharing one edge each independently clamping against just THAT edge's
+    -- own half-length can still leave their two arcs meeting exactly flush
+    -- (a zero-length straight stretch between them) -- and a RUN of several
+    -- such short edges in a row (a reshape's own grid "staircase" tracing a
+    -- near-diagonal line, say) can carry that all the way into arcs two or
+    -- three corners apart actually overlapping, a polygon
+    -- love.math.triangulate legitimately refuses outright -- which used to
+    -- fall back silently to the sharp-cornered path below (see drawLocal's
+    -- own pcall), reading as "no rounding happened at all" rather than the
+    -- crash this exact shape used to cause before that guard existed.
+    -- Capping well under half the single shortest edge, up front, leaves
+    -- slack everywhere, not just at that one edge.
+    local minLen = math.huge
+    for i = 1, n do
+        local ax, ay = vertex(i)
+        local bx, by = vertex(i + 1)
+        local len = math.sqrt((bx - ax) ^ 2 + (by - ay) ^ 2)
+        if len > 1e-6 and len < minLen then minLen = len end
+    end
+    if minLen < math.huge then radius = math.min(radius, minLen * 0.4) end
+
     local arcs = {}
     for i = 1, n do
         local ax, ay = vertex(i - 1)
@@ -1185,27 +1213,36 @@ end
 
 -- Filled body and white outline, in the caller's already centered+rotated
 -- space; r,g,b,a is the fill, outlineAlpha the outline (0 for a glow halo).
--- zoom (optional, 1 when omitted -- the mini gallery-tile preview's own
--- call has no canvas/zoom of its own to give) scales a tank's rounded
--- corners (see CORNER_RADIUS_UNITS above) the same way every other bit of
--- schematic linework scales; everything else keeps its sharp corners.
-function _shapePoly.drawLocal(e, ew, eh, r, g, b, a, outlineAlpha, zoom)
+-- ew,eh already reflect the current zoom (same pixel box every other shape
+-- in this file draws into), so a tank's rounded corners (see
+-- CORNER_RADIUS_FRACTION above) scale with it automatically, with no zoom
+-- parameter of its own needed.
+function _shapePoly.drawLocal(e, ew, eh, r, g, b, a, outlineAlpha)
     local p = _shapePoly.parse(e.shapePoints)
-    local radius = (e.fillPercent ~= nil) and math.min(_shapePoly.CORNER_RADIUS_UNITS * (zoom or 1), ew / 2, eh / 2) or 0
+    local radius = (e.fillPercent ~= nil) and (math.min(ew, eh) * _shapePoly.CORNER_RADIUS_FRACTION) or 0
     love.graphics.setColor(r, g, b, a)
     if radius > 0.25 then
         local segs, arcs, fillPoints = _shapePoly.roundedOutline(p, ew, eh, radius)
-        for _, t in ipairs(love.math.triangulate(fillPoints)) do
-            love.graphics.polygon("fill", t[1], t[2], t[3], t[4], t[5], t[6])
-        end
-        love.graphics.setColor(1, 1, 1, outlineAlpha)
-        for _, seg in ipairs(segs) do love.graphics.line(seg[1], seg[2], seg[3], seg[4]) end
-        for _, arc in ipairs(arcs) do
-            if arc.r > 0 then
-                love.graphics.arc("line", "open", arc.cx, arc.cy, arc.r, arc.a1, arc.a2, _shapePoly.arcSegments(arc.r))
+        -- Guarded: a few sampled arc points landing exactly on top of each
+        -- other (an extreme reshape, a corner radius right at its own
+        -- per-corner clamp) can hand triangulate a degenerate polygon it
+        -- refuses outright (LÖVE throws, not returns nil/empty) -- falls
+        -- back to the plain sharp-cornered fill below rather than crashing
+        -- the whole app over one tank's rounded corners.
+        local ok, triangles = pcall(love.math.triangulate, fillPoints)
+        if ok then
+            for _, t in ipairs(triangles) do
+                love.graphics.polygon("fill", t[1], t[2], t[3], t[4], t[5], t[6])
             end
+            love.graphics.setColor(1, 1, 1, outlineAlpha)
+            for _, seg in ipairs(segs) do love.graphics.line(seg[1], seg[2], seg[3], seg[4]) end
+            for _, arc in ipairs(arcs) do
+                if arc.r > 0 then
+                    love.graphics.arc("line", "open", arc.cx, arc.cy, arc.r, arc.a1, arc.a2, _shapePoly.arcSegments(arc.r))
+                end
+            end
+            return
         end
-        return
     end
     local cw, ch = ew / p.cols, eh / p.rows
     local left, top = -ew / 2, -eh / 2
@@ -6602,7 +6639,7 @@ local function _drawElement(canvas, e, signature)
             love.graphics.push()
             love.graphics.translate(ex + ew / 2, ey + eh / 2)
             love.graphics.rotate(math.rad(e.rotation or 0))
-            _shapePoly.drawLocal(e, ew, eh, r, g, b, a, outline, canvas.zoom)
+            _shapePoly.drawLocal(e, ew, eh, r, g, b, a, outline)
             love.graphics.pop()
         elseif e.shapeType == "circle" then
             -- Every shapeType is rotatable now (move/rotate mode applies
@@ -6630,8 +6667,7 @@ local function _drawElement(canvas, e, signature)
             love.graphics.push()
             love.graphics.translate(ex + ew / 2, ey + eh / 2)
             love.graphics.rotate(math.rad(e.rotation or 0))
-            local radius = (e.fillPercent ~= nil)
-                and math.min(_shapePoly.CORNER_RADIUS_UNITS * canvas.zoom, ew / 2, eh / 2) or 0
+            local radius = (e.fillPercent ~= nil) and (math.min(ew, eh) * _shapePoly.CORNER_RADIUS_FRACTION) or 0
             love.graphics.rectangle("fill", -ew / 2, -eh / 2, ew, eh, radius, radius)
             love.graphics.setColor(1, 1, 1, outline)
             love.graphics.rectangle("line", -ew / 2, -eh / 2, ew, eh, radius, radius)
@@ -7628,13 +7664,24 @@ function _drawPipeTreeSymbol(canvas, e, ex, ey, ew, eh, r, g, b, a, isHalo)
                 if dir then
                     -- A wire's own "forward" means fromElementId -> toElementId.
                     -- When this port IS that from-end, forward already means
-                    -- "out of the manifold" -- the same inner (route[1]) ->
-                    -- outer (route[#route], the port) sense these points are
-                    -- stored in, so the label carries over as-is; when this
-                    -- port is the wire's TO-end instead, forward means "into"
-                    -- it -- the opposite sense along this route -- so flip it.
-                    if not atFromEnd then dir = (dir == "reverse") and "forward" or "reverse" end
-                    _pipes.drawFlowDashes(canvas, { pumpedDirection = dir }, planFor(route), widths.fluid, r, g, b)
+                    -- fluid leaving the manifold through it; when this port is
+                    -- the wire's TO-end instead, forward means fluid arriving
+                    -- through it.
+                    local outOfManifold = (atFromEnd and dir == "forward") or (not atFromEnd and dir == "reverse")
+                    -- Every tube route's own points run spine (route[1]) ->
+                    -- port (route[#route]), so "leaving the manifold" is
+                    -- route-forward (t increasing) there -- but the trunk
+                    -- (route 1, terminal 1) is stored the OPPOSITE way, port
+                    -- (route[1]) -> spine (route[#route]) -- see
+                    -- _manifoldShapeAndTerminals in main.lua, whose trunk
+                    -- terminal sits at this shape's x = -0.5 edge while every
+                    -- tube's own sits at x = 0.5 -- so "leaving" is
+                    -- route-REVERSE there instead. Missing this is exactly
+                    -- what made a manifold's own inlet (route 1) animate
+                    -- backward while every outflow tube animated correctly.
+                    local portAtStart = (i == 1)
+                    local routeDir = (outOfManifold ~= portAtStart) and "forward" or "reverse"
+                    _pipes.drawFlowDashes(canvas, { pumpedDirection = routeDir }, planFor(route), widths.fluid, r, g, b)
                 end
             end
         end
@@ -8742,13 +8789,17 @@ end
 -- gets a soft, slowly pulsing halo in its own color, so live parts read as
 -- energized at a glance. A striped color sequence (no single answer) never
 -- glows. How: each glowing item's shape is also drawn into an offscreen
--- canvas at half resolution (_glow.capture), which is blurred with a
+-- canvas at SCALE resolution (_glow.capture), which is blurred with a
 -- separable Gaussian shader and added over the schematic once per frame
 -- (_glow.finish) — a real blur, so overlapping wires and corners stay
 -- smooth instead of stacking into blocks.
 --------------------------------------------------------------------------------
 
-_glow.SCALE = 0.5        -- offscreen glow resolution, relative to the screen
+-- 0.75, not the full screen: the blur already hides most of the resolution
+-- loss (that's the whole point of blurring it), so this buys back edge
+-- definition around small/thin elements a plain half-res capture used to
+-- round off, for ~2.25x the blur fragment cost rather than 4x at 1.0.
+_glow.SCALE = 0.75       -- offscreen glow resolution, relative to the screen
 _glow.PASSES = 2         -- blur iterations (each one horizontal + vertical)
 _glow.SPREAD = 1.0       -- blur tap distance, in offscreen pixels
 _glow.INTENSITY = 0.75   -- composite strength before the pulse

@@ -70,12 +70,35 @@ local function _storeHasRoom(stores, id)
     return capacity ~= nil and gallons < capacity
 end
 
+-- Whether a "source" node itself currently holds anything: true for a store
+-- with no capacity entered (can't be worked out as a percent, so it neither
+-- loses fluid nor runs dry -- same as _storeState's own convention) or one
+-- with gallons > 0, same rule step()'s own hasFluid uses for a run's up end.
+local function _nodeHasFluid(stores, id)
+    local _, capacity, gallons = _storeState(stores, id)
+    return capacity == nil or gallons > 0
+end
+
 -- Every node reachable from starts over links, where links[id] is a list of
 -- {edge, from, to} and nextKey says which end to walk to. Only passes(id) nodes
 -- are walked on from (starts always are). allowed (optional) limits the walk to
--- those links. Returns the reached nodes and the links used, both as sets.
+-- those links. Returns the reached nodes (a set) and the links used -- still a
+-- set for every existing truthy/membership use (if allowed[link]/for link in
+-- pairs(used)), but each value is the order that link was actually touched in
+-- (1, 2, 3, ...) rather than a flat `true`, a deterministic tie-break
+-- _stepPumps' own markMoving needs: a loop of conducting nodes reaches a
+-- non-directional edge from BOTH ends (once as whichever link first
+-- discovered a node, once more as the mirror addLink gives every such edge
+-- for reachability -- see _pumpRoutes), so the same wire can land in here
+-- twice, one entry per direction. Letting pairs() iteration order settle
+-- which one "wins" would make the stored order, not either direction's own
+-- meaning, decide -- and that order isn't guaranteed stable across rebuilds
+-- of this same table, which is exactly what let a looped pipe's displayed
+-- flow flip between forward/reverse from one tick to the next. The sequence
+-- number here lets a caller that cares (markMoving) always prefer whichever
+-- direction this SAME deterministic walk actually reached first, instead.
 local function _walk(starts, links, nextKey, passes, allowed)
-    local reached, isStart, used, stack = {}, {}, {}, {}
+    local reached, isStart, used, stack, order = {}, {}, {}, {}, 0
     for _, id in ipairs(starts) do
         reached[id], isStart[id] = true, true
         table.insert(stack, id)
@@ -85,7 +108,8 @@ local function _walk(starts, links, nextKey, passes, allowed)
         if isStart[id] or passes(id) then
             for _, link in ipairs(links[id] or {}) do
                 if not allowed or allowed[link] then
-                    used[link] = true
+                    order = order + 1
+                    used[link] = order
                     local nextId = link[nextKey]
                     if not reached[nextId] then
                         reached[nextId] = true
@@ -206,6 +230,41 @@ local function computeFlow(graph, wires, conducting, offSources, pressures, stor
         end
     end
 
+    -- Every node a real source's standing fluid could plausibly reach via a
+    -- valid, direction-respecting chain of runs (gravity's own up -> down,
+    -- never against a check valve/pump port -- the same runs built above) --
+    -- regardless of whether that chain actually terminates anywhere useful.
+    -- A dead stub off a wet manifold is still wet (step()'s own hasFluid is
+    -- the live, tick-over-tick counterpart of this -- see its own comment
+    -- on run.up) even though nothing ever drains through it; this is the
+    -- one-shot, purely-structural version a static color prediction needs,
+    -- with no tick history (w.fluidPercent) to read instead. wetNodes[id]
+    -- is left false (not nil) while id is still being resolved, so a cycle
+    -- of conducting nodes doesn't recurse forever -- it just isn't wet
+    -- through that cycle alone, same as it genuinely wouldn't be.
+    local wetNodes = {}
+    local function isWet(id)
+        local known = wetNodes[id]
+        if known ~= nil then return known end
+        wetNodes[id] = false
+        local node = graph.nodes[id]
+        local wet
+        if node.role == "source" then
+            wet = _nodeHasFluid(stores, id)
+        else
+            wet = false
+            for _, run in ipairs(incoming[id] or {}) do
+                if isWet(run.up) then wet = true break end
+            end
+        end
+        wetNodes[id] = wet
+        return wet
+    end
+    local wetWires = {}
+    for _, run in ipairs(runs) do
+        if isWet(run.up) then wetWires[run.wire.id] = true end
+    end
+
     -- Walks back up from every outlet to find the runs that lead to one. A
     -- conducting node (a valve, check valve, or now a manifold too -- "path"
     -- gets no special exemption here any more, so a manifold with only one
@@ -264,7 +323,7 @@ local function computeFlow(graph, wires, conducting, offSources, pressures, stor
     end
     local pumps, downstream, upstream, passes = _pumpRoutes(graph, conducting, offSources, pressures)
     return { graph = graph, wires = wires, runs = runs, incoming = incoming, feeding = feeding,
-        receivingStores = receivingStores, leakingWires = leakingWires, conducting = conducting,
+        receivingStores = receivingStores, leakingWires = leakingWires, wetWires = wetWires, conducting = conducting,
         pipesOnNode = pipesOnNode, pumps = pumps, downstream = downstream, upstream = upstream, passes = passes }
 end
 
@@ -361,10 +420,36 @@ local function _stepPumps(flow, stores, dt)
         end
     end
 
+    -- Marks every wire a delivery walk (used, see _walk's own "used" return)
+    -- touched as pumped, and which way. A loop of conducting ("path") nodes
+    -- -- two manifolds tied together by more than one pipe, say -- puts the
+    -- SAME non-directional wire into `used` TWICE: once as the link that
+    -- discovered a node, once more as the mirror _pumpRoutes' own addLink
+    -- adds for every non-directional edge (so reachability works walking
+    -- either way), picked up again once the walk explores that already-
+    -- reached node's own outgoing links. Which of the two actually matches
+    -- the real flow depends on the loop's own layout, not on which way
+    -- either wire happens to be drawn -- so picking the "natural" (as-drawn)
+    -- direction whenever both are present, tried first, got it right for
+    -- one of the loop's pipes and backwards for the other, consistently
+    -- (stable, but still wrong for that one). _walk's own order (see its
+    -- comment) is the real tie-break: whichever direction THIS walk
+    -- actually reached that edge through FIRST, by its own deterministic
+    -- traversal, is the one that reflects how the flow actually got there --
+    -- and unlike pairs() order over a freshly-rebuilt table, that's a
+    -- function of the graph alone, identical every time this same shape is
+    -- walked, which is what stops the random flip-flopping.
     local function markMoving(used)
-        for link in pairs(used) do
-            local ends = graph.wireEnds[link.edge.id]
-            pumped[link.edge.id] = (ends and ends.toId == link.from) and "reverse" or "forward"
+        local winner = {} -- edgeId -> {link = ..., order = ...}
+        for link, order in pairs(used) do
+            local edgeId = link.edge.id
+            if not winner[edgeId] or order < winner[edgeId].order then
+                winner[edgeId] = { link = link, order = order }
+            end
+        end
+        for edgeId, entry in pairs(winner) do
+            local ends = graph.wireEnds[edgeId]
+            pumped[edgeId] = (ends and ends.toId == entry.link.from) and "reverse" or "forward"
         end
     end
 
