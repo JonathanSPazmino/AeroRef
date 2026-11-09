@@ -5705,6 +5705,23 @@ local function _applyTheme(isDark)
     for _, pair in ipairs(_learnUpdates) do
         gdsGui_outputTxtBox_setText(pair.name, _learnSegsColored(pair.raw, isDark))
     end
+    -- Every settings checkbox (DISPLAY/TIMER SOUND/HAPTICS/FUEL TYPE/UNITS)
+    -- re-tints navy in LIGHT MODE -- the yellow sprite reads fine against
+    -- DARK MODE's near-black container background but washes out against
+    -- LIGHT MODE's light-gray one.
+    local _checkboxNames = {
+        "displayDarkCheckbox", "displayWhiteCheckbox",
+        "soundOnCheckbox", "soundOffCheckbox",
+        "hapticsOnCheckbox", "hapticsOffCheckbox",
+        "fuelTypeAvfuelCheckbox", "fuelTypeJetfuelCheckbox",
+        "volumeUnitGallonsCheckbox", "volumeUnitLitersCheckbox",
+    }
+    local _checkboxPressed     = isDark and "Sprites/button_checkbox_pressed.png"     or "Sprites/button_checkbox_navy_pressed.png"
+    local _checkboxReleased    = isDark and "Sprites/button_checkbox_released.png"    or "Sprites/button_checkbox_navy_released.png"
+    local _checkboxDeactivated = isDark and "Sprites/button_checkbox_deactivated.png" or "Sprites/button_checkbox_navy_deactivated.png"
+    for _, name in ipairs(_checkboxNames) do
+        gdsGui_button_setImages(name, _checkboxPressed, _checkboxReleased, _checkboxDeactivated)
+    end
 end
 
 local function _applyFontSize(fontSize)
@@ -5719,7 +5736,10 @@ local function _applyFontSize(fontSize)
         "dutyStartBox", "dutyMaxHoursBox", "lastFlightBox",
         "dutyOutBox", "departByBox",
         -- settings labels
-        "displayModeLabel", "soundsLabel", "hapticsLabel", "fontSizeLabel",
+        "displayDarkLabel", "displayWhiteLabel",
+        "soundsOnLabel", "soundsOffLabel",
+        "hapticsOnLabel", "hapticsOffLabel",
+        "fontSizeLabel",
         -- learn page content
         "timerLearnContent", "windLearnContent", "calcLearnContent",
         "dutyLearnContent", "settingsLearnContent", "schematicLearnContent",
@@ -6486,41 +6506,79 @@ function love.load()
     local settingsRowY     = 12
     local settingsLabelW   = _w(240)
     local settingsLabelH   = 40
+    -- Every settings choice below (DISPLAY, SOUNDS, HAPTICS, FUEL TYPE,
+    -- UNITS) uses the same vertical-checkbox-list design: one row per
+    -- option, a "stickyToggle" checkbox apiece (fires only RELEASED->
+    -- PRESSED, then ignores taps until the OTHER row's callback explicitly
+    -- releases it via gdsGui_button_setState), mutually exclusive within
+    -- the pair rather than a single two-sided switch.
+    local settingsRowY2 = settingsRowY + settingsLabelH
+    local settingsCheckboxSize = 28
 
     gdsGui_container_create("displaySettings", "Settings", "DISPLAY", 32, 0)
-    gdsGui_outputTxtBox_create("displayModeLabel", "Settings", nil,
+    gdsGui_outputTxtBox_create("displayDarkLabel", "Settings", nil,
         12, settingsRowY, "LT", settingsLabelW, settingsLabelH,
-        {1, 1, 1, 1}, "DARK / WHITE MODE", settingsFontSize, "displaySettings"
+        {1, 1, 1, 1}, "DARK MODE", settingsFontSize, "displaySettings"
     )
-    gdsGui_button_create("darkModeToggle", "Settings", "toggle",
-        "Sprites/button_bwmode_dark_released.png", "Sprites/button_bwmode_white_pressed.png",
-        "Sprites/button_timer_mode_deactivated.png",
-        settingsBtnX, settingsRowY, "RT", settingsBtnW, settingsBtnH,
-        "darkModeToggled", globApp.BUTTON_STATES.PRESSED, true, "displaySettings"
+    gdsGui_button_create("displayDarkCheckbox", "Settings", "stickyToggle",
+        "Sprites/button_checkbox_pressed.png", "Sprites/button_checkbox_released.png",
+        "Sprites/button_checkbox_deactivated.png",
+        settingsBtnX, settingsRowY, "RT", settingsCheckboxSize, settingsCheckboxSize,
+        "displayDarkSelected", globApp.BUTTON_STATES.RELEASED, true, "displaySettings"
+    )
+    gdsGui_outputTxtBox_create("displayWhiteLabel", "Settings", nil,
+        12, settingsRowY2, "LT", settingsLabelW, settingsLabelH,
+        {1, 1, 1, 1}, "LIGHT MODE", settingsFontSize, "displaySettings"
+    )
+    gdsGui_button_create("displayWhiteCheckbox", "Settings", "stickyToggle",
+        "Sprites/button_checkbox_pressed.png", "Sprites/button_checkbox_released.png",
+        "Sprites/button_checkbox_deactivated.png",
+        settingsBtnX, settingsRowY2, "RT", settingsCheckboxSize, settingsCheckboxSize,
+        "displayWhiteSelected", globApp.BUTTON_STATES.RELEASED, true, "displaySettings"
     )
 
-    gdsGui_container_create("soundsSettings", "Settings", "SOUNDS", 32, 0)
-    gdsGui_outputTxtBox_create("soundsLabel", "Settings", nil,
+    gdsGui_container_create("soundsSettings", "Settings", "TIMER SOUND", 32, 0)
+    gdsGui_outputTxtBox_create("soundsOnLabel", "Settings", nil,
         12, settingsRowY, "LT", settingsLabelW, settingsLabelH,
-        {1, 1, 1, 1}, "TIMER SOUND ON / OFF", settingsFontSize, "soundsSettings"
+        {1, 1, 1, 1}, "ON", settingsFontSize, "soundsSettings"
     )
-    gdsGui_button_create("soundToggle", "Settings", "toggle",
-        "Sprites/button_onoff_on_released.png", "Sprites/button_onoff_off_pressed.png",
-        "Sprites/button_timer_mode_deactivated.png",
-        settingsBtnX, settingsRowY, "RT", settingsBtnW, settingsBtnH,
-        "soundToggled", globApp.BUTTON_STATES.PRESSED, true, "soundsSettings"
+    gdsGui_button_create("soundOnCheckbox", "Settings", "stickyToggle",
+        "Sprites/button_checkbox_pressed.png", "Sprites/button_checkbox_released.png",
+        "Sprites/button_checkbox_deactivated.png",
+        settingsBtnX, settingsRowY, "RT", settingsCheckboxSize, settingsCheckboxSize,
+        "soundOnSelected", globApp.BUTTON_STATES.RELEASED, true, "soundsSettings"
+    )
+    gdsGui_outputTxtBox_create("soundsOffLabel", "Settings", nil,
+        12, settingsRowY2, "LT", settingsLabelW, settingsLabelH,
+        {1, 1, 1, 1}, "OFF", settingsFontSize, "soundsSettings"
+    )
+    gdsGui_button_create("soundOffCheckbox", "Settings", "stickyToggle",
+        "Sprites/button_checkbox_pressed.png", "Sprites/button_checkbox_released.png",
+        "Sprites/button_checkbox_deactivated.png",
+        settingsBtnX, settingsRowY2, "RT", settingsCheckboxSize, settingsCheckboxSize,
+        "soundOffSelected", globApp.BUTTON_STATES.RELEASED, true, "soundsSettings"
     )
 
     gdsGui_container_create("hapticsSettings", "Settings", "HAPTICS", 32, 0)
-    gdsGui_outputTxtBox_create("hapticsLabel", "Settings", nil,
+    gdsGui_outputTxtBox_create("hapticsOnLabel", "Settings", nil,
         12, settingsRowY, "LT", settingsLabelW, settingsLabelH,
-        {1, 1, 1, 1}, "VIBRATION ON / OFF", settingsFontSize, "hapticsSettings"
+        {1, 1, 1, 1}, "ON", settingsFontSize, "hapticsSettings"
     )
-    gdsGui_button_create("hapticsToggle", "Settings", "toggle",
-        "Sprites/button_onoff_on_released.png", "Sprites/button_onoff_off_pressed.png",
-        "Sprites/button_timer_mode_deactivated.png",
-        settingsBtnX, settingsRowY, "RT", settingsBtnW, settingsBtnH,
-        "hapticsToggled", globApp.BUTTON_STATES.PRESSED, false, "hapticsSettings"
+    gdsGui_button_create("hapticsOnCheckbox", "Settings", "stickyToggle",
+        "Sprites/button_checkbox_pressed.png", "Sprites/button_checkbox_released.png",
+        "Sprites/button_checkbox_deactivated.png",
+        settingsBtnX, settingsRowY, "RT", settingsCheckboxSize, settingsCheckboxSize,
+        "hapticsOnSelected", globApp.BUTTON_STATES.RELEASED, true, "hapticsSettings"
+    )
+    gdsGui_outputTxtBox_create("hapticsOffLabel", "Settings", nil,
+        12, settingsRowY2, "LT", settingsLabelW, settingsLabelH,
+        {1, 1, 1, 1}, "OFF", settingsFontSize, "hapticsSettings"
+    )
+    gdsGui_button_create("hapticsOffCheckbox", "Settings", "stickyToggle",
+        "Sprites/button_checkbox_pressed.png", "Sprites/button_checkbox_released.png",
+        "Sprites/button_checkbox_deactivated.png",
+        settingsBtnX, settingsRowY2, "RT", settingsCheckboxSize, settingsCheckboxSize,
+        "hapticsOffSelected", globApp.BUTTON_STATES.RELEASED, true, "hapticsSettings"
     )
 
     gdsGui_container_create("fontSizeSettings", "Settings", "FONT SIZE", 32, 0)
@@ -6534,15 +6592,6 @@ function love.load()
         {frame = "Sprites/scrollbar_bg.png", thumb = "Sprites/scrollbar_thumb.png"},
         true, "fontSizeSettings"
     )
-
-    -- FUEL TYPE and UNITS: each a vertical list of options, one checkbox
-    -- row apiece (not a single two-sided switch) -- picking one checks it
-    -- and unchecks its sibling, radio-button style. Each checkbox is a
-    -- "stickyToggle" button (fires only RELEASED->PRESSED, then ignores
-    -- further taps until the OTHER row's callback explicitly releases it
-    -- via gdsGui_button_setState below) -- see fuelTypeAvfuelSelected etc.
-    local settingsRowY2 = settingsRowY + settingsLabelH
-    local settingsCheckboxSize = 28
 
     -- FUEL TYPE: which density (model/fluid.lua has no notion of this —
     -- it's purely a display-layer conversion) the control-mode tank
@@ -7079,9 +7128,12 @@ function love.load()
     gdsGui_container_finalise("TermsAndConditions")
 
     _applyTheme(appSettings.darkMode)
-    gdsGui_button_setState("darkModeToggle", appSettings.darkMode       and "pushed" or "released")
-    gdsGui_button_setState("soundToggle",    appSettings.soundEnabled   and "pushed" or "released")
-    gdsGui_button_setState("hapticsToggle",  appSettings.hapticsEnabled and "pushed" or "released")
+    gdsGui_button_setState("displayDarkCheckbox",  appSettings.darkMode     and "pushed" or "released")
+    gdsGui_button_setState("displayWhiteCheckbox", not appSettings.darkMode and "pushed" or "released")
+    gdsGui_button_setState("soundOnCheckbox",      appSettings.soundEnabled     and "pushed" or "released")
+    gdsGui_button_setState("soundOffCheckbox",     not appSettings.soundEnabled and "pushed" or "released")
+    gdsGui_button_setState("hapticsOnCheckbox",    appSettings.hapticsEnabled     and "pushed" or "released")
+    gdsGui_button_setState("hapticsOffCheckbox",   not appSettings.hapticsEnabled and "pushed" or "released")
     gdsGui_button_setState("fuelTypeAvfuelCheckbox",  appSettings.fuelType ~= "JETFUEL" and "pushed" or "released")
     gdsGui_button_setState("fuelTypeJetfuelCheckbox", appSettings.fuelType == "JETFUEL" and "pushed" or "released")
     gdsGui_button_setState("volumeUnitGallonsCheckbox", appSettings.volumeUnit ~= "LITER" and "pushed" or "released")
@@ -7999,23 +8051,47 @@ end
 -- SETTINGS CALLBACKS
 -------------------------------------------------------------------------------
 
-function darkModeToggled(newState)
-    appSettings.darkMode = (newState == globApp.BUTTON_STATES.PRESSED)
+-- DISPLAY / TIMER SOUND / HAPTICS checkboxes: same mutually-exclusive
+-- checkbox-pair pattern as FUEL TYPE / UNITS below -- selecting one
+-- explicitly releases its sibling here, since a stickyToggle button only
+-- ever un-presses itself via an outside gdsGui_button_setState call.
+function displayDarkSelected()
+    appSettings.darkMode = true
+    gdsGui_button_setState("displayWhiteCheckbox", "released")
     _applyTheme(appSettings.darkMode)
     _saveAppSettings()
 end
 
-function soundToggled(newState)
-    appSettings.soundEnabled = (newState == globApp.BUTTON_STATES.PRESSED)
-    if appSettings.soundEnabled and singleChimeSound then
-        love.audio.play(singleChimeSound)
-    end
+function displayWhiteSelected()
+    appSettings.darkMode = false
+    gdsGui_button_setState("displayDarkCheckbox", "released")
+    _applyTheme(appSettings.darkMode)
     _saveAppSettings()
 end
 
-function hapticsToggled(newState)
-    appSettings.hapticsEnabled = (newState == globApp.BUTTON_STATES.PRESSED)
+function soundOnSelected()
+    appSettings.soundEnabled = true
+    gdsGui_button_setState("soundOffCheckbox", "released")
+    if singleChimeSound then love.audio.play(singleChimeSound) end
+    _saveAppSettings()
+end
+
+function soundOffSelected()
+    appSettings.soundEnabled = false
+    gdsGui_button_setState("soundOnCheckbox", "released")
+    _saveAppSettings()
+end
+
+function hapticsOnSelected()
+    appSettings.hapticsEnabled = true
+    gdsGui_button_setState("hapticsOffCheckbox", "released")
     gdsGui_haptics_feedback("light")
+    _saveAppSettings()
+end
+
+function hapticsOffSelected()
+    appSettings.hapticsEnabled = false
+    gdsGui_button_setState("hapticsOnCheckbox", "released")
     _saveAppSettings()
 end
 

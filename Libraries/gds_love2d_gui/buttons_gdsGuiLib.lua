@@ -47,6 +47,15 @@ local function _pulseScale(button)
     return 1 - _PULSE_DIP * math.max(0, 1 - t / _PULSE_SECONDS)
 end
 
+--[[ Public wrapper so a container-owned button's own draw path (in
+     container_gdsGuiLib.lua -- a separate draw path from gdsGui_button_draw
+     below, since a container-owned button draws as part of its container's
+     own pass) can apply the same tap feedback instead of sitting dead
+     still. ]]
+function gdsGui_button_pulseScale(button)
+    return _pulseScale(button)
+end
+
 --[[ Invokes a button's callback function if it exists. ]]
 local function _executeCallback(button)
     if button.callbackFunc then
@@ -304,6 +313,28 @@ function gdsGui_button_setState(buttonName, state)
         if b.name == buttonName then
             b.state = targetState
             b.deactivated = (targetState == globApp.BUTTON_STATES.DEACTIVATED)
+            return
+        end
+    end
+end
+
+--[[
+    Swaps a button's sprite images in place (e.g. a theme change re-tinting
+    a checkbox) -- same three-state imgPressed/imgReleased/imgDeactivated
+    arguments as gdsGui_button_create, nil leaving a state's current image
+    untouched. Re-derives factorWidth/factorHeight from the new RELEASED
+    (or PRESSED) image so a differently-sized replacement still fills the
+    button's own on-screen footprint correctly.
+]]
+function gdsGui_button_setImages(buttonName, imgPressed, imgReleased, imgDeactivated)
+    for _, b in ipairs(globApp.objects.buttons) do
+        if b.name == buttonName then
+            if imgDeactivated then b.images[globApp.BUTTON_STATES.DEACTIVATED] = love.graphics.newImage(imgDeactivated) end
+            if imgReleased    then b.images[globApp.BUTTON_STATES.RELEASED]    = love.graphics.newImage(imgReleased) end
+            if imgPressed     then b.images[globApp.BUTTON_STATES.PRESSED]     = love.graphics.newImage(imgPressed) end
+            local baseImage = b.images[globApp.BUTTON_STATES.RELEASED] or b.images[globApp.BUTTON_STATES.PRESSED]
+            b.factorWidth  = baseImage and (b.mywidth  / baseImage:getWidth())  or 1
+            b.factorHeight = baseImage and (b.myheight / baseImage:getHeight()) or 1
             return
         end
     end

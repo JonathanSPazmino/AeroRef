@@ -45,6 +45,12 @@ local CONT_BOUNCE_STOP_V  = 5.0
 local PADDING    = 8    -- px gap around/between objects inside a container
 local MIN_ITEM_W = 120  -- px: min item width before layout adds a second column
 
+-- A body panel's corner radius and matching soft drop shadow (see
+-- _drawContainer) -- pageHeader/pageFooter stay square, since those sit
+-- flush against the screen edge where a rounded corner would just show a
+-- gap rather than read as a floating card.
+local CONTAINER_CORNER_RADIUS = 10
+
 -- ---------------------------------------------------------------------------
 --  PAGE SCROLLBAR CONSTANTS
 -- ---------------------------------------------------------------------------
@@ -819,7 +825,20 @@ local function _setClip(clip)
     end
 end
 
-local function _drawWidget(obj, clip)
+-- Re-applies the rounded-card stencil (see _drawContainer) -- a widget that
+-- calls love.graphics.reset() (several do) drops it along with everything
+-- else reset() clears, which would otherwise leave the REST of that card's
+-- content unclipped for the rest of this draw pass.
+local function _setRoundedStencil(roundedFrame)
+    if not roundedFrame then return end
+    local f = roundedFrame.f
+    love.graphics.stencil(function()
+        love.graphics.rectangle("fill", f.x, f.y, f.width, f.height, roundedFrame.radius, roundedFrame.radius)
+    end, "replace", 1)
+    love.graphics.setStencilTest("gequal", 1)
+end
+
+local function _drawWidget(obj, clip, roundedFrame)
     if obj.hidden then return end
     local ot = obj.objectType
 
@@ -827,7 +846,16 @@ local function _drawWidget(obj, clip)
         local img = obj.images[obj.state]
         if img then
             love.graphics.setColor(1, 1, 1, 1)
-            love.graphics.draw(img, obj.myx, obj.myy, 0, obj.factorWidth, obj.factorHeight)
+            -- Center-based transform (matching gdsGui_button_draw's own
+            -- press-feedback pulse) so a container-owned button dips and
+            -- recovers on tap the same as a page-level one, instead of
+            -- sitting dead still -- see gdsGui_button_pulseScale.
+            local scale = gdsGui_button_pulseScale(obj)
+            local cx = obj.myx + obj.mywidth / 2
+            local cy = obj.myy + obj.myheight / 2
+            love.graphics.draw(img, cx, cy, 0,
+                obj.factorWidth * scale, obj.factorHeight * scale,
+                img:getWidth() / 2, img:getHeight() / 2)
         end
 
     elseif ot == "outputTextBox" then
@@ -840,8 +868,9 @@ local function _drawWidget(obj, clip)
         gdsGui_rotaryKnob_drawSingle(obj)
     end
 
-    -- Restore clip after any widget that may call love.graphics.reset().
+    -- Restore clip/stencil after any widget that may call love.graphics.reset().
     _setClip(clip)
+    _setRoundedStencil(roundedFrame)
 end
 
 local function _drawContainer(cont, clip)
@@ -856,13 +885,34 @@ local function _drawContainer(cont, clip)
         effectiveClip = f
     end
 
+    -- Body panels float as rounded cards with a soft drop shadow underneath;
+    -- pageHeader/pageFooter stay flush and square (see CONTAINER_CORNER_RADIUS).
+    -- The shadow is drawn before the clip/stencil below so its blur isn't
+    -- itself clipped to the card's own bounds.
+    local rounded = cont.pageRole ~= "pageHeader" and cont.pageRole ~= "pageFooter"
+    local roundedFrame = rounded and { f = f, radius = CONTAINER_CORNER_RADIUS } or nil
+    if rounded then
+        gdsGui_general_drawShadow(f.x, f.y, f.width, f.height, CONTAINER_CORNER_RADIUS, 0, 2, 8, 0.28)
+    end
+
     _setClip(effectiveClip)
+
+    -- A rounded-rect stencil so the header/footer/background fills below
+    -- (still drawn as plain rectangles, same as ever) end up clipped to
+    -- rounded OUTER corners only -- rounding each one individually would
+    -- wrongly round the flat seam between the header strip and the body
+    -- beneath it too.
+    _setRoundedStencil(roundedFrame)
 
     -- Background + border.
     love.graphics.setColor(cont.bgColor[1], cont.bgColor[2], cont.bgColor[3], cont.bgColor[4] or 1)
     love.graphics.rectangle("fill", f.x, f.y, f.width, f.height)
     love.graphics.setColor(cont.borderColor[1], cont.borderColor[2], cont.borderColor[3], 1)
-    love.graphics.rectangle("line", f.x, f.y, f.width, f.height)
+    if rounded then
+        love.graphics.rectangle("line", f.x, f.y, f.width, f.height, CONTAINER_CORNER_RADIUS, CONTAINER_CORNER_RADIUS)
+    else
+        love.graphics.rectangle("line", f.x, f.y, f.width, f.height)
+    end
 
     -- Header strip.
     if hr.height > 0 then
@@ -877,7 +927,7 @@ local function _drawContainer(cont, clip)
         end
         for _, entry in ipairs(cont.objects) do
             if entry.role == "header" then
-                _drawWidget(entry.ref, effectiveClip)
+                _drawWidget(entry.ref, effectiveClip, roundedFrame)
             end
         end
     end
@@ -885,22 +935,24 @@ local function _drawContainer(cont, clip)
     -- Content (scroll-role) widgets.
     for _, entry in ipairs(cont.objects) do
         if entry.role == "scroll" then
-            _drawWidget(entry.ref, effectiveClip)
+            _drawWidget(entry.ref, effectiveClip, roundedFrame)
         end
     end
 
     -- Footer strip.
     if fr.height > 0 then
         _setClip(effectiveClip)
+        _setRoundedStencil(roundedFrame)
         love.graphics.setColor(cont.footerColor[1], cont.footerColor[2], cont.footerColor[3], 1)
         love.graphics.rectangle("fill", fr.x, fr.y, fr.width, fr.height)
         for _, entry in ipairs(cont.objects) do
             if entry.role == "footer" then
-                _drawWidget(entry.ref, effectiveClip)
+                _drawWidget(entry.ref, effectiveClip, roundedFrame)
             end
         end
     end
 
+    if rounded then love.graphics.setStencilTest() end
     love.graphics.setScissor()
 end
 

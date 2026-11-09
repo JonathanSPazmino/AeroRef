@@ -7,6 +7,71 @@ local librarySpritesPath = "Libraries/gds_love2d_gui/librarySprites/"
 local _COLOR_BAR_FOCUSED   = {0, 0, 1, 1}
 local _COLOR_BAR_UNFOCUSED = {0, 1, 0, 1}
 
+-- Detent marks: a short tick at each discrete step a slider will actually
+-- snap to (numTotalValues -- see the drag/step/snap logic further down),
+-- drawn on the track under the thumb so the full set of stops reads at a
+-- glance instead of only the one currently selected. A slider with a lot
+-- of steps (e.g. a 5-minute-granularity duty-time scale, 289 of them) would
+-- just paint a solid line at one tick per step, so the count is thinned to
+-- a readable density -- the two end ticks always stay, so the slider's
+-- full range still reads even when thinned.
+local _DETENT_MAX_TICKS = 24
+local function _drawDetentMarks(x)
+	local n = x.numTotalValues
+	if not n or n < 2 or not x.frame or not x.bar then return end
+	local isDark = not globApp.themeTextColor or globApp.themeTextColor[1] > 0.5
+	love.graphics.setColor(isDark and {1, 1, 0, 1} or {0.05, 0.10, 0.40, 1})
+	local stride = math.max(1, math.ceil((n - 1) / _DETENT_MAX_TICKS))
+	if x.orientation == "vertical" then
+		local span = x.frame.height - x.bar.height
+		local tickW = math.max(2, x.frame.width * 0.4)
+		local cx = x.frame.x + x.frame.width / 2
+		local i = 0
+		while i <= n - 1 do
+			local cy = x.frame.y + (i / (n - 1)) * span + x.bar.height / 2
+			love.graphics.rectangle("fill", cx - tickW / 2, cy - 1, tickW, 2)
+			if i == n - 1 then break end
+			i = math.min(i + stride, n - 1)
+		end
+	else
+		local span = x.frame.width - x.bar.width
+		local tickH = math.max(2, x.frame.height * 0.4)
+		local cy = x.frame.y + x.frame.height / 2
+		local i = 0
+		while i <= n - 1 do
+			local cx = x.frame.x + (i / (n - 1)) * span + x.bar.width / 2
+			love.graphics.rectangle("fill", cx - 1, cy - tickH / 2, 2, tickH)
+			if i == n - 1 then break end
+			i = math.min(i + stride, n - 1)
+		end
+	end
+	love.graphics.setColor(1, 1, 1, 1)
+end
+
+-- Progress fill: dims the track past the thumb (not-yet-reached side) so
+-- the current value reads from the track itself at a glance, iOS-slider
+-- style, instead of only from the thumb's own position. Drawn before the
+-- detent marks above so they stay fully legible on both sides of the thumb
+-- rather than dimming along with the track underneath them.
+local function _drawFilledTrack(x)
+	if not x.frame or not x.bar then return end
+	love.graphics.setColor(0, 0, 0, 0.35)
+	if x.orientation == "vertical" then
+		local remainY = x.bar.y + x.bar.height / 2
+		local remainH = (x.frame.y + x.frame.height) - remainY
+		if remainH > 0 then
+			love.graphics.rectangle("fill", x.frame.x, remainY, x.frame.width, remainH)
+		end
+	else
+		local remainX = x.bar.x + x.bar.width / 2
+		local remainW = (x.frame.x + x.frame.width) - remainX
+		if remainW > 0 then
+			love.graphics.rectangle("fill", remainX, x.frame.y, remainW, x.frame.height)
+		end
+	end
+	love.graphics.setColor(1, 1, 1, 1)
+end
+
 -- scrollbars = {}
 globApp.objects.scrollBars = {}
 
@@ -359,6 +424,8 @@ function gdsGui_scrollBar_drawSingle(x)
 	else
 		love.graphics.rectangle("fill", x.frame.x, x.frame.y, x.frame.width, x.frame.height)
 	end
+	_drawFilledTrack(x)
+	_drawDetentMarks(x)
 	if x.bar.img then
 		love.graphics.draw(x.bar.img, x.bar.x, x.bar.y, x.bar.rotation, x.bar.scaleX, x.bar.scaleY, x.bar.originX, 0)
 	else
@@ -422,6 +489,8 @@ function gdsGui_scrollBar_draw (pageName)
 					else
 						love.graphics.rectangle("fill", x.frame.x, x.frame.y, x.frame.width, x.frame.height)
 					end
+					_drawFilledTrack(x)
+					_drawDetentMarks(x)
 
 					---------------------------------------------------------------------------
 											--BAR
