@@ -5940,6 +5940,8 @@ function love.load()
     if appSettings.soundEnabled     == nil then appSettings.soundEnabled     = true  end
     if appSettings.hapticsEnabled   == nil then appSettings.hapticsEnabled   = true  end
     if appSettings.fontSize         == nil then appSettings.fontSize         = 12    end
+    if appSettings.fuelType         == nil then appSettings.fuelType         = "AVFUEL" end
+    if appSettings.volumeUnit       == nil then appSettings.volumeUnit       = "GAL" end
     -- System Schematic is a paid feature; schematicUnlocked is a placeholder
     -- entitlement flag (no real store/IAP integration exists in this pure-Lua
     -- app yet) flipped true by the Simulate Purchase button on the paywall page.
@@ -6533,6 +6535,66 @@ function love.load()
         true, "fontSizeSettings"
     )
 
+    -- FUEL TYPE and UNITS: each a vertical list of options, one checkbox
+    -- row apiece (not a single two-sided switch) -- picking one checks it
+    -- and unchecks its sibling, radio-button style. Each checkbox is a
+    -- "stickyToggle" button (fires only RELEASED->PRESSED, then ignores
+    -- further taps until the OTHER row's callback explicitly releases it
+    -- via gdsGui_button_setState below) -- see fuelTypeAvfuelSelected etc.
+    local settingsRowY2 = settingsRowY + settingsLabelH
+    local settingsCheckboxSize = 28
+
+    -- FUEL TYPE: which density (model/fluid.lua has no notion of this —
+    -- it's purely a display-layer conversion) the control-mode tank
+    -- quick-view's weight-equivalent line uses — see AVFUEL_LBS_PER_GAL/
+    -- JETFUEL_LBS_PER_GAL.
+    gdsGui_container_create("fuelTypeSettings", "Settings", "FUEL TYPE", 32, 0)
+    gdsGui_outputTxtBox_create("fuelTypeAvfuelLabel", "Settings", nil,
+        12, settingsRowY, "LT", settingsLabelW, settingsLabelH,
+        {1, 1, 1, 1}, "AVFUEL", settingsFontSize, "fuelTypeSettings"
+    )
+    gdsGui_button_create("fuelTypeAvfuelCheckbox", "Settings", "stickyToggle",
+        "Sprites/button_checkbox_pressed.png", "Sprites/button_checkbox_released.png",
+        "Sprites/button_checkbox_deactivated.png",
+        settingsBtnX, settingsRowY, "RT", settingsCheckboxSize, settingsCheckboxSize,
+        "fuelTypeAvfuelSelected", globApp.BUTTON_STATES.RELEASED, true, "fuelTypeSettings"
+    )
+    gdsGui_outputTxtBox_create("fuelTypeJetfuelLabel", "Settings", nil,
+        12, settingsRowY2, "LT", settingsLabelW, settingsLabelH,
+        {1, 1, 1, 1}, "JETFUEL", settingsFontSize, "fuelTypeSettings"
+    )
+    gdsGui_button_create("fuelTypeJetfuelCheckbox", "Settings", "stickyToggle",
+        "Sprites/button_checkbox_pressed.png", "Sprites/button_checkbox_released.png",
+        "Sprites/button_checkbox_deactivated.png",
+        settingsBtnX, settingsRowY2, "RT", settingsCheckboxSize, settingsCheckboxSize,
+        "fuelTypeJetfuelSelected", globApp.BUTTON_STATES.RELEASED, true, "fuelTypeSettings"
+    )
+
+    -- UNITS: GALLONS or LITERS for every fuel-quantity display in the app
+    -- (the design-mode tank label's own QUANTITY line and the control-mode
+    -- quick-view alike — see _tankVolumeText).
+    gdsGui_container_create("volumeUnitSettings", "Settings", "UNITS", 32, 0)
+    gdsGui_outputTxtBox_create("volumeUnitGallonsLabel", "Settings", nil,
+        12, settingsRowY, "LT", settingsLabelW, settingsLabelH,
+        {1, 1, 1, 1}, "GALLONS", settingsFontSize, "volumeUnitSettings"
+    )
+    gdsGui_button_create("volumeUnitGallonsCheckbox", "Settings", "stickyToggle",
+        "Sprites/button_checkbox_pressed.png", "Sprites/button_checkbox_released.png",
+        "Sprites/button_checkbox_deactivated.png",
+        settingsBtnX, settingsRowY, "RT", settingsCheckboxSize, settingsCheckboxSize,
+        "volumeUnitGallonsSelected", globApp.BUTTON_STATES.RELEASED, true, "volumeUnitSettings"
+    )
+    gdsGui_outputTxtBox_create("volumeUnitLitersLabel", "Settings", nil,
+        12, settingsRowY2, "LT", settingsLabelW, settingsLabelH,
+        {1, 1, 1, 1}, "LITERS", settingsFontSize, "volumeUnitSettings"
+    )
+    gdsGui_button_create("volumeUnitLitersCheckbox", "Settings", "stickyToggle",
+        "Sprites/button_checkbox_pressed.png", "Sprites/button_checkbox_released.png",
+        "Sprites/button_checkbox_deactivated.png",
+        settingsBtnX, settingsRowY2, "RT", settingsCheckboxSize, settingsCheckboxSize,
+        "volumeUnitLitersSelected", globApp.BUTTON_STATES.RELEASED, true, "volumeUnitSettings"
+    )
+
     ---------------------------------------------------------------------------
     -- SYSTEM SCHEMATIC PAGE (premium feature)
     -- The canvas is NOT container-managed (container_gdsGuiLib.lua only lays
@@ -6813,6 +6875,9 @@ function love.load()
     -- auto-promote/revert) rather than through schematicModeToggled — see
     -- _onSchematicModeChanged.
     gdsGui_schematic_setModeChangedCallback("mainCanvas", "_onSchematicModeChanged")
+    -- Control-mode tap on a plain element (a fluid tank, say) with its own
+    -- quick view -- see _elementControlRows.
+    gdsGui_schematic_setElementControlRowsCallback("mainCanvas", "_elementControlRows")
     -- These float above the canvas rather than sitting flush in a header/
     -- footer row, so they get the same soft elevation shadow a dragged
     -- element already draws with (see _selection.beginLift in
@@ -7017,6 +7082,10 @@ function love.load()
     gdsGui_button_setState("darkModeToggle", appSettings.darkMode       and "pushed" or "released")
     gdsGui_button_setState("soundToggle",    appSettings.soundEnabled   and "pushed" or "released")
     gdsGui_button_setState("hapticsToggle",  appSettings.hapticsEnabled and "pushed" or "released")
+    gdsGui_button_setState("fuelTypeAvfuelCheckbox",  appSettings.fuelType ~= "JETFUEL" and "pushed" or "released")
+    gdsGui_button_setState("fuelTypeJetfuelCheckbox", appSettings.fuelType == "JETFUEL" and "pushed" or "released")
+    gdsGui_button_setState("volumeUnitGallonsCheckbox", appSettings.volumeUnit ~= "LITER" and "pushed" or "released")
+    gdsGui_button_setState("volumeUnitLitersCheckbox",  appSettings.volumeUnit == "LITER" and "pushed" or "released")
     _applyFontSize(appSettings.fontSize)
 
     -- mainCanvas starts empty; _openSystemIntoCanvas() sets its mode and the
@@ -7950,6 +8019,38 @@ function hapticsToggled(newState)
     _saveAppSettings()
 end
 
+-- FUEL TYPE / UNITS checkboxes: each pair is mutually exclusive (radio-
+-- button behavior built from two "stickyToggle" buttons) -- selecting one
+-- explicitly releases its sibling here, since a stickyToggle button only
+-- ever un-presses itself via an outside gdsGui_button_setState call.
+function fuelTypeAvfuelSelected()
+    appSettings.fuelType = "AVFUEL"
+    gdsGui_button_setState("fuelTypeJetfuelCheckbox", "released")
+    gdsGui_haptics_feedback("light")
+    _saveAppSettings()
+end
+
+function fuelTypeJetfuelSelected()
+    appSettings.fuelType = "JETFUEL"
+    gdsGui_button_setState("fuelTypeAvfuelCheckbox", "released")
+    gdsGui_haptics_feedback("light")
+    _saveAppSettings()
+end
+
+function volumeUnitGallonsSelected()
+    appSettings.volumeUnit = "GAL"
+    gdsGui_button_setState("volumeUnitLitersCheckbox", "released")
+    gdsGui_haptics_feedback("light")
+    _saveAppSettings()
+end
+
+function volumeUnitLitersSelected()
+    appSettings.volumeUnit = "LITER"
+    gdsGui_button_setState("volumeUnitGallonsCheckbox", "released")
+    gdsGui_haptics_feedback("light")
+    _saveAppSettings()
+end
+
 function fontSizeChanged(pos)
     local fontSize = 12 + math.floor(4 * pos + 0.5)
     appSettings.fontSize = fontSize
@@ -8740,6 +8841,36 @@ function schematicElementSensedValues(canvasName, elementId)
     return values
 end
 
+-- Standard rule-of-thumb fuel weights, used only by the display-layer GAL/
+-- LITER-to-LBS conversion below -- model/fluid.lua itself has no notion of
+-- fuel type or weight, just gallons. Global, not local: this file is
+-- already at Lua's 200-top-level-local ceiling.
+AVFUEL_LBS_PER_GAL = 6.0   -- 100LL avgas
+JETFUEL_LBS_PER_GAL = 6.7  -- Jet-A
+LITERS_PER_GALLON = 3.78541
+
+-- gallons, formatted per appSettings.volumeUnit (GAL, the default, or
+-- LITER) -- shared by _tankCenterText below and the control-mode tank
+-- quick-view's own quantity row (schematic_gdsGuiLib.lua's
+-- gdsGui_schematic_openElementControlRows, via _elementControlRows), so
+-- the setting works consistently everywhere a tank's volume is shown.
+function _tankVolumeText(gallons)
+    if appSettings.volumeUnit == "LITER" then
+        local liters = gallons * LITERS_PER_GALLON
+        return string.format(liters >= 100 and "%.0f L" or "%.1f L", liters)
+    end
+    return string.format(gallons >= 100 and "%.0f GAL" or "%.1f GAL", gallons)
+end
+
+-- gallons, as a pounds-weight string, using appSettings.fuelType's density.
+-- Weight is always shown in LBS regardless of appSettings.volumeUnit --
+-- only the volume side has a GAL/LITER choice.
+function _tankWeightText(gallons)
+    local lbsPerGal = appSettings.fuelType == "JETFUEL" and JETFUEL_LBS_PER_GAL or AVFUEL_LBS_PER_GAL
+    local lbs = gallons * lbsPerGal
+    return string.format(lbs >= 100 and "%.0f LBS" or "%.1f LBS", lbs)
+end
+
 -- What a liquid tank's center label says, one reading a line: its quantity (left
 -- out with no MAX CAPACITY to work it out from, and in gallons like model/fluid.lua
 -- reads capacities), its level (nil reads as full, same as the schematic's fill)
@@ -8752,7 +8883,7 @@ function _tankCenterText(entity, sensedPressure, unit)
     local capacity = tonumber(entity.tankMaxCapacity)
     if capacity and capacity > 0 then
         local gallons = capacity * percent / 100
-        lines[#lines + 1] = string.format(gallons >= 100 and "%.0f GAL" or "%.1f GAL", gallons)
+        lines[#lines + 1] = _tankVolumeText(gallons)
     end
     lines[#lines + 1] = string.format("%.0f%%", percent)
     local value, suffix = (sensedPressure or ""):match("^(%-?[%d%.]+)(.*)$")
@@ -8904,6 +9035,38 @@ function _tankRows(entity)
     end
     quantityFromLevel()
     return { capacityRow, levelRow, quantityRow }
+end
+
+-- gdsGui_schematic_openElementControlRows' own callback (registered once
+-- in love.load() via gdsGui_schematic_setElementControlRowsCallback): a
+-- fluid tank's control-mode quick view -- nil for anything else, so
+-- tapping a plain valve/manifold/check-valve in control mode still does
+-- nothing, same as today. Unlike _tankRows' own LEVEL/QUANTITY rows
+-- (design mode's PROPERTIES menu, only actually applied if/when SAVE is
+-- tapped), this one commits the instant the slider moves and there's
+-- nothing left to do on close -- same "not undoable, same as any other
+-- instrument interaction" convention gdsGui_schematic_setControlPosition
+-- already uses for a control's own tap in control mode.
+function _elementControlRows(canvasName, elementId)
+    local canvas = _findSchematicCanvas()
+    if not canvas or canvas.name ~= canvasName then return nil end
+    local entity = _findSourceEntity(canvas, elementId)
+    if not entity or not _holdsFluid(canvas, entity) then return nil end
+    local capacity = tonumber(entity.tankMaxCapacity)
+    if not capacity or capacity <= 0 then return nil end
+    local levelRow = { key = "fillPercent", label = "LEVEL", target = "field", numeric = true,
+        value = string.format("%.12g", entity.fillPercent or 100),
+        slider = { min = 0, max = 100, unit = "%", format = "%.0f" } }
+    local quantityRow = { key = "elementControlQuantity", label = "QUANTITY", target = "derived", value = "" }
+    local function applyLevel()
+        entity.fillPercent = tonumber(levelRow.value) or entity.fillPercent or 100
+        local gallons = capacity * entity.fillPercent / 100
+        quantityRow.value = _tankVolumeText(gallons) .. " / " .. _tankWeightText(gallons)
+        _requestSchematicSave()
+    end
+    levelRow.onChange = applyLevel
+    applyLevel()
+    return { levelRow, quantityRow }
 end
 
 -- canvas.elementPlacementExtraRows hook (wired up once in love.load()):

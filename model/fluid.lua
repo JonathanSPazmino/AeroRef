@@ -49,6 +49,19 @@ local PIPE_VOLUME_PER_UNIT = 0.01
 local PUMP_RATE_PER_PSI = 1 / 3
 -- Gallons an ejector draws per gallon of the motive flow driving it.
 local EJECTOR_ENTRAINMENT = 1
+-- A gravity-fed line's own "pressure" for the contention check below --
+-- fixed at 0 and below any real pump (pump.psi is always > 0 once it's
+-- actually running, see _stepPumps' own gate), so a running pump always
+-- outranks gravity at a shared junction; two gravity attempts always tie at
+-- 0, which is exactly "never reversed" (see _resolveContention).
+local GRAVITY_PRESSURE = 0
+
+-- A gravity-only leak's own nominal PSI for the leak-SPRAY animation's own
+-- intensity scaling (w.leakPressure, set in step() below) -- deliberately
+-- NOT the same as GRAVITY_PRESSURE above (that 0 exists purely so gravity
+-- never wins a pressure-contention tie; reused here it would wrongly
+-- suppress a gravity-fed leak's spray to nothing).
+local GRAVITY_LEAK_BASELINE_PSI = 3
 
 local function _conducts(node, conducting)
     if node.role == "path" or node.role == "directionalGate" then return true end
@@ -77,6 +90,130 @@ end
 local function _nodeHasFluid(stores, id)
     local _, capacity, gallons = _storeState(stores, id)
     return capacity == nil or gallons > 0
+end
+
+-- The stores among `reached` with anything to give -- hoisted out of
+-- _stepPumps (which still has its own thin closure wrapping this) so
+-- computeFlow can preview the exact same thing before any pump actually
+-- runs, for the pressure-contention check below.
+local function _suppliersIn(stores, reached)
+    local suppliers, supplierSet = {}, {}
+    for id in pairs(reached) do
+        if stores and stores[id] then
+            local store, _, gallons = _storeState(stores, id)
+            if not store or gallons > 0 then
+                table.insert(suppliers, id)
+                supplierSet[id] = true
+            end
+        end
+    end
+    return suppliers, supplierSet
+end
+
+-- Whatever among `reached` can take more, other than the suppliers
+-- themselves -- same hoist as _suppliersIn above, for the same reason.
+local function _receiversIn(graph, stores, conducting, pipesOnNode, reached, supplierSet)
+    local receivers, leakReceivers = {}, {}
+    for id in pairs(reached) do
+        local node = graph.nodes[id]
+        if not supplierSet[id] then
+            local accepts, isLeak = node.role == "sink", false
+            if stores and stores[id] then
+                local store, capacity, gallons = _storeState(stores, id)
+                accepts = not store or gallons < capacity
+            elseif _conducts(node, conducting) and pipesOnNode[id] == 1 then
+                accepts, isLeak = true, true -- an open pipe end spills
+            end
+            if accepts then
+                table.insert(receivers, id)
+                if isLeak then leakReceivers[id] = true end
+            end
+        end
+    end
+    return receivers, leakReceivers
+end
+
+-- Resolves pressure contention among `attempts` (nodeId -> array of
+-- {wireId, pressure, kind = "gravity"|"pump", down = nodeId, otherEnd =
+-- nodeId, sourceId|pumpId}), built while walking gravity's own per-source
+-- reach and previewing each pump's own delivery -- see computeFlow's two
+-- call sites below. A node reached by 2+ DISTINCT wires (de-duped by wire
+-- id first -- the same wire can show up once as a gravity attempt and once
+-- as a pump attempt when a pump is pushing through an otherwise gravity-
+-- marked pipe, in which case the pump's own pressure wins outright, same
+-- as a pump already overriding gravity's own display direction everywhere
+-- else in this file) has its single STRICT, UNIQUE lowest-pressure wire
+-- marked as having lost; a tie -- gravity vs. gravity (both GRAVITY_
+-- PRESSURE), or an exact PSI match between two pumps -- reverses nothing,
+-- matching the gravity-vs-gravity case (no head-pressure data here to
+-- break a tie -- see this file's header comment). Returns {wireId ->
+-- attempt} for exactly the wires that lost.
+-- A loop of conducting ("path") nodes puts the SAME non-directional edge
+-- into a `used` table (see _walk's own comment) TWICE -- once per
+-- direction -- since a walk restricted to non-directional edges can touch
+-- either side of one. Only one direction is the walk's own real, as-
+-- reached-first direction; _stepPumps' own markMoving already picks it
+-- via `used`'s order values for display -- this is the exact same
+-- selection, hoisted so the contention preview below can use the same
+-- canonical direction per edge a real pump delivery would, instead of
+-- treating a merely-touched reverse-direction link as its own attempt.
+-- Returns {edgeId -> link}.
+local function _deliveryWinners(used)
+    local winners = {}
+    for link, order in pairs(used) do
+        local edgeId = link.edge.id
+        if not winners[edgeId] or order < winners[edgeId].order then
+            winners[edgeId] = { link = link, order = order }
+        end
+    end
+    local byEdge = {}
+    for edgeId, entry in pairs(winners) do byEdge[edgeId] = entry.link end
+    return byEdge
+end
+
+local function _resolveContention(attempts)
+    local losers = {}
+    for _, list in pairs(attempts) do
+        if #list >= 2 then
+            local byWire = {}
+            for _, a in ipairs(list) do
+                local existing = byWire[a.wireId]
+                if not existing or a.kind == "pump" then byWire[a.wireId] = a end
+            end
+            local distinct = 0
+            for _ in pairs(byWire) do distinct = distinct + 1 end
+            if distinct >= 2 then
+                -- The GLOBAL lowest pressure here, directional (a check
+                -- valve's or a pump's own outlet port -- both equally
+                -- one-way) wires included: a directional wire's pressure
+                -- still has to be genuinely beaten, not just ignored, or an
+                -- ordinary wire tied with a protected one at the same low
+                -- pressure would wrongly look like a unique minimum on its
+                -- own and get reversed against a tie it never actually won.
+                local minPressure, minCount = nil, 0
+                for _, a in pairs(byWire) do
+                    if not minPressure or a.pressure < minPressure then minPressure, minCount = a.pressure, 1
+                    elseif a.pressure == minPressure then minCount = minCount + 1 end
+                end
+                -- Only reverse when that unique global minimum is actually
+                -- eligible to -- there's no such thing as reversing
+                -- something that already only flows one way. A directional
+                -- wire holding the (unique) lowest pressure means nothing
+                -- reverses at all: it's already the lowest, so nothing
+                -- else here outranks it enough to push it back, and it
+                -- can't be pushed back itself either.
+                if minCount == 1 then
+                    for _, a in pairs(byWire) do
+                        if a.pressure == minPressure then
+                            if not a.directional then losers[a.wireId] = a end
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return losers
 end
 
 -- Every node reachable from starts over links, where links[id] is a list of
@@ -298,33 +435,170 @@ local function computeFlow(graph, wires, conducting, offSources, pressures, stor
     -- Then down from each source, so a run only counts for one it's fed from.
     -- A reached store with room ends its branch there (see the header comment
     -- on why gravity doesn't pour through a tank into whatever's past it) and
-    -- is recorded as one of that source's receivingStores rather than walked
-    -- further.
-    local feeding, receivingStores, leakingWires = {}, {}, {}
-    for id, node in pairs(graph.nodes) do
-        if node.role == "source" and not (offSources and offSources[id]) then
-            local fed, stack = {}, { id }
-            while #stack > 0 do
-                for _, run in ipairs(outgoing[table.remove(stack)] or {}) do
-                    if leadsOut[run] and not fed[run.wire.id] then
-                        fed[run.wire.id] = true
-                        if run.down ~= id and _storeHasRoom(stores, run.down) then
-                            receivingStores[id] = receivingStores[id] or {}
-                            receivingStores[id][run.down] = true
-                        else
-                            if leakNodes[run.down] then leakingWires[run.wire.id] = true end
-                            table.insert(stack, run.down)
+    -- is recorded into `out.receivingStores` rather than walked further.
+    -- Every such fed wire is also recorded as an "attempt" on whichever node
+    -- it reaches (reversedWires nil, i.e. the first, discovery-only pass
+    -- below) -- for the pressure-contention check once every source's reach
+    -- AND every pump's own preview, right after, is known.
+    --
+    -- Once contention is resolved (reversedWires given, the second, real
+    -- pass below), a wire that lost (reversedWires[run.wire.id]) is
+    -- redirected to its own one-hop destination instead, and -- since
+    -- fluid never actually reached run.down through it this tick -- the
+    -- walk does NOT continue past it, so a chain of any length past a
+    -- reversed wire correctly stops being "fed" by this source too, not
+    -- just the reversed wire itself.
+    local attempts = {}
+    local function walkSource(id, reversedWires, out)
+        local fed, stack = {}, { id }
+        while #stack > 0 do
+            for _, run in ipairs(outgoing[table.remove(stack)] or {}) do
+                if leadsOut[run] and not fed[run.wire.id] then
+                    fed[run.wire.id] = true
+                    if not reversedWires then
+                        attempts[run.down] = attempts[run.down] or {}
+                        table.insert(attempts[run.down], { wireId = run.wire.id, pressure = GRAVITY_PRESSURE,
+                            kind = "gravity", down = run.down, otherEnd = run.up, sourceId = id,
+                            directional = edgeById[run.wire.id].directional })
+                    end
+                    local lost = reversedWires and reversedWires[run.wire.id]
+                    if lost then
+                        -- lost.destId was chosen excluding whichever ONE
+                        -- source's own attempt happened to "win" the
+                        -- gravity-vs-gravity dedup in _resolveContention
+                        -- (the same shared wire can be fed by more than
+                        -- one source -- see walkSource's own pass-1 call).
+                        -- A DIFFERENT source re-walking this same wire here
+                        -- could still find that destination IS itself, so
+                        -- the self-credit guard is re-checked per source,
+                        -- not just once globally.
+                        if lost.destId and lost.destId ~= id then
+                            out.receivingStores[id] = out.receivingStores[id] or {}
+                            out.receivingStores[id][lost.destId] = true
+                        elseif lost.leak then
+                            out.leakingWires[run.wire.id] = true
                         end
+                    elseif run.down ~= id and _storeHasRoom(stores, run.down) then
+                        out.receivingStores[id] = out.receivingStores[id] or {}
+                        out.receivingStores[id][run.down] = true
+                    else
+                        if leakNodes[run.down] then out.leakingWires[run.wire.id] = true end
+                        table.insert(stack, run.down)
                     end
                 end
             end
+        end
+        return fed
+    end
+
+    -- Pass 1: discovery only -- attempts, and which wires this graph's
+    -- gravity even structurally reaches at all. receivingStores/
+    -- leakingWires here are provisional (contention-unaware) and thrown
+    -- away once resolution is known; pass 2 below produces the real ones.
+    local discard = { receivingStores = {}, leakingWires = {} }
+    for id, node in pairs(graph.nodes) do
+        if node.role == "source" and not (offSources and offSources[id]) then
+            walkSource(id, nil, discard)
+        end
+    end
+
+    local pumps, downstream, upstream, passes = _pumpRoutes(graph, conducting, offSources, pressures)
+
+    -- Preview, using this tick's pre-transfer stores snapshot, exactly which
+    -- node(s) each running pump would actually deliver into -- the same
+    -- computation _stepPumps makes for real, just ahead of time so a pump's
+    -- own attempts can be weighed against gravity's (and each other's)
+    -- before any fillPercent actually changes. An off/dry/0-PSI pump never
+    -- attempts anything, same gate _stepPumps itself uses for a real transfer.
+    -- Attempts are recorded at EVERY node the delivery reaches (pump.outlets,
+    -- the full walked set), not just its final accepted receivers -- a plain
+    -- pass-through junction two pipes meet at is exactly where real backflow
+    -- would show up, same as gravity's own attempts above already cover a
+    -- bare junction, not just a store. _deliveryWinners picks each edge's
+    -- one canonical direction, same as a real delivery's own markMoving
+    -- would, so a loop's mirror-direction touch on an edge never counts as
+    -- its own separate attempt.
+    local pumpSupplierSets = {}
+    for _, pump in ipairs(pumps) do
+        local _, supplierSet = _suppliersIn(stores, pump.inlets)
+        pumpSupplierSets[pump.id] = supplierSet
+        if next(supplierSet) and pump.psi > 0 then
+            for edgeId, link in pairs(_deliveryWinners(pump.delivery)) do
+                local rid = link.to
+                attempts[rid] = attempts[rid] or {}
+                table.insert(attempts[rid], { wireId = edgeId, pressure = pump.psi,
+                    kind = "pump", down = rid, otherEnd = link.from, pumpId = pump.id,
+                    directional = edgeById[edgeId].directional })
+            end
+        end
+    end
+
+    -- Where fluid reversed out of `startId` (a losing wire's own other
+    -- end) actually ends up: a plain trace back through `incoming` --
+    -- exactly the same pipes that would normally feed INTO startId --
+    -- until a store with room (a real backflow destination) or a genuine
+    -- dead pipe end (a leak) is reached. This is still a single, direct
+    -- trace, not a recursive re-solve of whatever else might be
+    -- contending further back (see this file's own scope note) -- it
+    -- just follows an otherwise-uncontested path to where it actually
+    -- goes, the same privilege the forward walk above already has.
+    -- exclude: a set of ids ({id -> true}) this trace must never land on
+    -- as a destination -- the wire's own source (gravity), or the pump's
+    -- own suppliers (pump): redirecting fluid right back into a store
+    -- it's simultaneously being drained from/credited into is a real
+    -- no-op, but step()'s drain/transfer and receivingStores writes share
+    -- that one store table, so crediting and draining it in the same
+    -- tick would silently lose fluid instead of cancelling out -- so
+    -- those ids are skipped as a destination (the trace just continues
+    -- past them looking for anywhere else).
+    local function findReversalDestination(startId, exclude)
+        local visited, stack = {}, { startId }
+        while #stack > 0 do
+            local id = table.remove(stack)
+            if not visited[id] then
+                visited[id] = true
+                if not (exclude and exclude[id]) and _storeHasRoom(stores, id) then return id, false end
+                if leakNodes[id] then return nil, true end
+                for _, run in ipairs(incoming[id] or {}) do
+                    table.insert(stack, run.up)
+                end
+            end
+        end
+        return nil, false
+    end
+
+    -- Resolve contention and give every losing wire a REAL destination,
+    -- rather than just blocking it. A loser whose trace finds neither a
+    -- store nor a dead end anywhere back up its own chain (it dead-ends
+    -- into something else entirely, or loops) keeps today's plain-
+    -- delivery behavior instead.
+    local reversed = {}
+    for wireId, loser in pairs(_resolveContention(attempts)) do
+        local exclude = (loser.kind == "gravity") and { [loser.sourceId] = true } or pumpSupplierSets[loser.pumpId]
+        local destId, leak = findReversalDestination(loser.otherEnd, exclude)
+        if destId or leak then
+            local ends = graph.wireEnds[wireId]
+            local direction = (ends and ends.fromId == loser.down) and "forward" or "reverse"
+            reversed[wireId] = { direction = direction, destId = destId, leak = leak,
+                kind = loser.kind, sourceId = loser.sourceId, pumpId = loser.pumpId }
+        end
+    end
+
+    -- Pass 2: the real, final walk, now contention-aware -- see
+    -- walkSource's own comment for why this has to be a fresh walk rather
+    -- than a patch of pass 1's output.
+    local feeding, receivingStores, leakingWires = {}, {}, {}
+    for id, node in pairs(graph.nodes) do
+        if node.role == "source" and not (offSources and offSources[id]) then
+            local fed = walkSource(id, reversed, { receivingStores = receivingStores, leakingWires = leakingWires })
             if next(fed) then feeding[id] = fed end
         end
     end
-    local pumps, downstream, upstream, passes = _pumpRoutes(graph, conducting, offSources, pressures)
+
     return { graph = graph, wires = wires, runs = runs, incoming = incoming, feeding = feeding,
         receivingStores = receivingStores, leakingWires = leakingWires, wetWires = wetWires, conducting = conducting,
-        pipesOnNode = pipesOnNode, pumps = pumps, downstream = downstream, upstream = upstream, passes = passes }
+        pipesOnNode = pipesOnNode, pumps = pumps, downstream = downstream, upstream = upstream, passes = passes,
+        reversed = reversed }
 end
 
 -- Runs every pump for dt seconds, changing the fill of the stores it moves fluid
@@ -340,55 +614,26 @@ local function _stepPumps(flow, stores, dt)
 
     local function storeState(id) return _storeState(stores, id) end
 
-    -- The stores among reached with anything to give.
-    local function suppliersIn(reached)
-        local suppliers, supplierSet = {}, {}
-        for id in pairs(reached) do
-            -- Only a store holds anything to draw: a pump upstream, on or off, doesn't.
-            if stores[id] then
-                local store, _, gallons = storeState(id)
-                if not store or gallons > 0 then
-                    table.insert(suppliers, id)
-                    supplierSet[id] = true
-                end
-            end
-        end
-        return suppliers, supplierSet
-    end
-
-    -- Whatever among reached can take more, other than the suppliers themselves.
-    -- leakReceivers (a second return) marks which of those receivers is an
-    -- open pipe end rather than a sink or tank -- a valve, check valve, or
-    -- manifold with nothing else on it, "path" getting no exemption here any
-    -- more than it does in computeFlow's own leakNodes.
+    -- Thin wrappers over the module-scope versions above (hoisted so
+    -- computeFlow can preview the exact same thing before any pump
+    -- actually runs, for the pressure-contention check -- see its own
+    -- comment and _resolveContention).
+    local function suppliersIn(reached) return _suppliersIn(stores, reached) end
     local function receiversIn(reached, supplierSet)
-        local receivers, leakReceivers = {}, {}
-        for id in pairs(reached) do
-            local node = graph.nodes[id]
-            if not supplierSet[id] then
-                local accepts, isLeak = node.role == "sink", false
-                if stores[id] then
-                    local store, capacity, gallons = storeState(id)
-                    accepts = not store or gallons < capacity
-                elseif _conducts(node, flow.conducting) and flow.pipesOnNode[id] == 1 then
-                    accepts, isLeak = true, true -- an open pipe end spills
-                end
-                if accepts then
-                    table.insert(receivers, id)
-                    if isLeak then leakReceivers[id] = true end
-                end
-            end
-        end
-        return receivers, leakReceivers
+        return _receiversIn(graph, stores, flow.conducting, flow.pipesOnNode, reached, supplierSet)
     end
 
     -- The pipe(s) directly feeding a leaking receiver, among the ones allowed
     -- for this particular delivery (pump.delivery or an ejector's discharge),
-    -- marked in `leaking`.
-    local function markLeaking(leakReceivers, allowed)
+    -- marked in `leaking` -- with the real driving PSI (an ejector's own
+    -- discharge is driven by its pump's psi too, same as its motive line),
+    -- not just a bare true, so step() can scale the leak-spray animation's
+    -- own intensity by it. Still truthy everywhere this is already read as
+    -- a boolean.
+    local function markLeaking(leakReceivers, allowed, psi)
         for id in pairs(leakReceivers) do
             for _, link in ipairs(flow.upstream[id] or {}) do
-                if allowed[link] then leaking[link.edge.id] = true end
+                if allowed[link] then leaking[link.edge.id] = psi end
             end
         end
     end
@@ -440,16 +685,9 @@ local function _stepPumps(flow, stores, dt)
     -- function of the graph alone, identical every time this same shape is
     -- walked, which is what stops the random flip-flopping.
     local function markMoving(used)
-        local winner = {} -- edgeId -> {link = ..., order = ...}
-        for link, order in pairs(used) do
-            local edgeId = link.edge.id
-            if not winner[edgeId] or order < winner[edgeId].order then
-                winner[edgeId] = { link = link, order = order }
-            end
-        end
-        for edgeId, entry in pairs(winner) do
+        for edgeId, link in pairs(_deliveryWinners(used)) do
             local ends = graph.wireEnds[edgeId]
-            pumped[edgeId] = (ends and ends.toId == entry.link.from) and "reverse" or "forward"
+            pumped[edgeId] = (ends and ends.toId == link.from) and "reverse" or "forward"
         end
     end
 
@@ -458,14 +696,47 @@ local function _stepPumps(flow, stores, dt)
         if #suppliers > 0 and pump.psi > 0 then
             local gallons = pump.psi * PUMP_RATE_PER_PSI * dt
             local receivers, leakReceivers = receiversIn(pump.outlets, supplierSet)
+            -- A receiver this pump lost a pressure contention for (see
+            -- computeFlow's own preview/_resolveContention) is carved out
+            -- of its normal delivery here -- its share instead goes
+            -- backward through the losing wire itself, below, so the
+            -- pump's remaining, unaffected receivers still split the full
+            -- `gallons` among just themselves rather than a smaller cut.
+            local originalReceiverCount = #receivers
+            local redirected = {}
+            for wireId, r in pairs(flow.reversed) do
+                if r.pumpId == pump.id then table.insert(redirected, { wireId = wireId, r = r }) end
+            end
+            if #redirected > 0 then
+                local excluded = {}
+                for _, item in ipairs(redirected) do excluded[item.r.down] = true end
+                local filtered, filteredLeak = {}, {}
+                for _, rid in ipairs(receivers) do
+                    if not excluded[rid] then table.insert(filtered, rid) end
+                end
+                for rid in pairs(leakReceivers) do
+                    if not excluded[rid] then filteredLeak[rid] = true end
+                end
+                receivers, leakReceivers = filtered, filteredLeak
+            end
             -- Only the pipes actually between a supplier and a receiver.
             local _, drawing = _walk(suppliers, flow.downstream, "to", flow.passes, pump.suction)
             if #receivers > 0 then
                 transfer(suppliers, receivers, gallons)
                 local _, delivering = _walk(receivers, flow.upstream, "from", flow.passes, pump.delivery)
-                markMoving(drawing)
                 markMoving(delivering)
-                markLeaking(leakReceivers, pump.delivery)
+                markLeaking(leakReceivers, pump.delivery, pump.psi)
+            end
+            if #receivers > 0 or #redirected > 0 then markMoving(drawing) end
+            for _, item in ipairs(redirected) do
+                local r, wireId = item.r, item.wireId
+                local share = gallons / math.max(originalReceiverCount, 1)
+                if r.destId then
+                    transfer(suppliers, { r.destId }, share)
+                elseif r.leak then
+                    leaking[wireId] = true
+                end
+                pumped[wireId] = r.direction
             end
 
             for _, ejector in ipairs(pump.ejectors) do
@@ -481,7 +752,7 @@ local function _stepPumps(flow, stores, dt)
                     markMoving(drawing)
                     markMoving(select(2, _walk({ ejector.id }, flow.upstream, "from", flow.passes, pump.delivery)))
                     markMoving(select(2, _walk(served, flow.upstream, "from", flow.passes, ejector.discharge)))
-                    markLeaking(leakServed, ejector.discharge)
+                    markLeaking(leakServed, ejector.discharge, pump.psi)
                 end
             end
         end
@@ -578,7 +849,12 @@ local function step(flow, stores, pipeUnits, dt)
     changed = changed or pumpChanged
 
     for _, w in ipairs(flow.wires) do
-        w.pumpedDirection = pumped[w.id]
+        -- A gravity-kind reversal (see computeFlow's own preview/
+        -- _resolveContention) never touches `pumped` -- only _stepPumps
+        -- does -- so it's read back from flow.reversed directly here. A
+        -- pump-kind reversal already set pumped[w.id] itself, same as any
+        -- other pump-driven wire, so this is a no-op for that case.
+        w.pumpedDirection = pumped[w.id] or (flow.reversed[w.id] and flow.reversed[w.id].direction)
         -- A pipe a pump is pushing through is full, whatever gravity left in it.
         if pumped[w.id] and w.fluidPercent then
             w.fluidPercent = nil
@@ -586,6 +862,13 @@ local function step(flow, stores, pipeUnits, dt)
         end
         w.fluidMoving = (pumped[w.id] ~= nil) or (fedAnywhere[w.id] and (w.fluidPercent or 100) > 0) or false
         w.leaking = w.fluidMoving and (pumpLeaking[w.id] or flow.leakingWires[w.id] or false) or false
+        -- The real driving PSI behind this leak, for the GUI's own
+        -- leak-spray animation to scale its intensity by -- pumpLeaking
+        -- now carries a real number (see markLeaking above) when a pump
+        -- drives it; anything else leaking (gravity alone) gets the flat
+        -- baseline, since gravity has no PSI of its own.
+        w.leakPressure = w.leaking and
+            ((type(pumpLeaking[w.id]) == "number" and pumpLeaking[w.id]) or GRAVITY_LEAK_BASELINE_PSI) or nil
     end
 
     local stillFeeding = {}

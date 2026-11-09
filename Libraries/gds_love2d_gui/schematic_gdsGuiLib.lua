@@ -2178,6 +2178,13 @@ function gdsGui_schematic_create(name, page, x, y, anchorPoint, wFrac, hFrac)
     canvas._pendingDragUndoSnapshot = nil
     canvas.panStartX         = 0   -- canvas.panX/panY at the start of a "pan" drag
     canvas.panStartY         = 0
+    -- Blended 50/50 with the previous frame's instantaneous delta each
+    -- "pan" moved event (see gdsGui_schematic_moved), same smoothing
+    -- outputTxtBox_gdsGuiLib.lua's own scroll velocity uses — drives the
+    -- post-release coast in gdsGui_schematic_update below.
+    canvas.panVelX           = 0
+    canvas.panVelY           = 0
+    canvas._panCoasting      = false
     canvas.menu              = nil  -- generic modal list: {title, options, onSelect, onCancel}
     canvas.pendingPlacement  = nil  -- armed "place next tap": {kind, shapeType|positions, label, ...}
     canvas.pendingConnectorColor = nil  -- armed "draw next wire" from the catalog, independent of wireToolActive/the dock toggle; disarms after one connector
@@ -3225,7 +3232,6 @@ _actionSheet.GAP_PX = 8           -- between the options group and its CANCEL bu
 _actionSheet.MAX_W_PX = 420       -- a sheet's widest, so it doesn't stretch across a tablet
 _actionSheet.RADIUS_PX = 12
 _actionSheet.ROW_H_PX = 44        -- preferred row height (iOS's touch target); falls back to _MENU_ROW_H when a long menu wouldn't fit
-_actionSheet.CONTROL_LONG_PRESS_SECONDS = 0.5 -- how long a held press on an element/control/wire takes to open this menu directly from control mode (iOS's own UILongPressGestureRecognizer default) — see gdsGui_schematic_update's pendingLongPress poll. Shorter than design mode's own _LONG_PRESS_SECONDS since this never promotes into a drag
 _actionSheet.SLIDE_SECONDS = 0.22
 _actionSheet.CANCEL_TEXT = "CANCEL"
 -- Opaque, so a pressed row's fill can overlap the group's rounded corners cleanly.
@@ -5272,17 +5278,6 @@ function gdsGui_schematic_internal_onElementEditChosen(canvasName, index, option
         -- the wire leaves from the port the user means (see pendingWirePortPick
         -- in gdsGui_schematic_pressed).
         local el = _findElement(canvas, elementId)
-        -- Opened via the control-mode long-press (gdsGui_schematic_update),
-        -- not the EDIT MODE toggle: ADD WIRE's own drag/drop only works
-        -- once canvas.mode == "design" (gdsGui_schematic_pressed's
-        -- control-mode branch returns before ever reaching pendingWireFromId/
-        -- pendingWirePortPick) — promote now, and gdsGui_schematic_update's
-        -- own isPlacementArmed poll hands control mode back the moment
-        -- this wire is connected (or abandoned).
-        if canvas.mode ~= "design" then
-            gdsGui_schematic_setMode(canvasName, "design")
-            canvas._autoDesignFromControl = true
-        end
         if el and el.terminals and #el.terminals >= 2 then
             canvas.pendingWirePortPick = elementId
         else
@@ -5306,12 +5301,6 @@ function gdsGui_schematic_internal_onElementEditChosen(canvasName, index, option
         -- MOVE PORT waits on two: the port, then where on the edge it goes.
         canvas._elementEditTargetId = nil
         gdsGui_schematic_cancelPlacement(canvasName)
-        -- Same control-mode-long-press promotion as ADD WIRE above — the
-        -- pendingPort press handling is equally unreachable outside design mode.
-        if canvas.mode ~= "design" then
-            gdsGui_schematic_setMode(canvasName, "design")
-            canvas._autoDesignFromControl = true
-        end
         canvas.pendingPort = { elementId = elementId, removing = optionText == "REMOVE PORT",
             moving = optionText == "MOVE PORT" or nil }
         return
@@ -5541,12 +5530,6 @@ function gdsGui_schematic_internal_onControlEditChosen(canvasName, index, option
         -- resolves a control id just as readily as an element id.
         canvas._controlEditTargetId = nil
         gdsGui_schematic_cancelPlacement(canvasName)
-        -- Same control-mode-long-press promotion as an element's own ADD
-        -- WIRE above.
-        if canvas.mode ~= "design" then
-            gdsGui_schematic_setMode(canvasName, "design")
-            canvas._autoDesignFromControl = true
-        end
         canvas.pendingWireFromId = controlId
         return
     elseif index == offsetAddWire + 1 then
@@ -5591,6 +5574,87 @@ function gdsGui_schematic_internal_onControlEditCancelled(canvasName)
         canvas._controlEditTargetId = nil
         canvas.selectedControlId = nil
     end
+end
+
+-- CONTROL-MODE "operate" menu (see gdsGui_schematic_pressed/_released's
+-- "controlTap" dragKind): an iOS-styled list of ONLY this control's own
+-- positions — unlike gdsGui_schematic_openControlEditMenu above (design
+-- mode's fuller ADD WIRE/PROPERTIES/position/DELETE menu), there's nothing
+-- else here. Picking one jumps straight to it (gdsGui_schematic_
+-- setControlPosition, the same function the old tap-to-cycle gesture this
+-- replaces used) instead of stepping through positions one tap at a time.
+function gdsGui_schematic_openControlPositionMenu(canvasName, controlId)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return end
+    local ctrl = _findControl(canvas, controlId)
+    if not ctrl or not ctrl.positions or #ctrl.positions == 0 then return end
+    canvas._controlTapTargetId = controlId
+    canvas.selectedControlId = controlId -- the usual selection frame while the menu is open
+    gdsGui_schematic_openMenu(canvasName, gdsGui_schematic_elementPropertiesTitle(ctrl.label or controlId), ctrl.positions,
+        "gdsGui_schematic_internal_onControlPositionChosen", "gdsGui_schematic_internal_onControlPositionCancelled")
+end
+
+function gdsGui_schematic_internal_onControlPositionChosen(canvasName, index, optionText)
+    local canvas = _findCanvas(canvasName)
+    if not canvas or not canvas._controlTapTargetId then return end
+    local controlId = canvas._controlTapTargetId
+    canvas._controlTapTargetId = nil
+    canvas.selectedControlId = nil
+    gdsGui_haptics_feedback("selection")
+    gdsGui_schematic_setControlPosition(canvasName, controlId, index - 1)
+end
+
+function gdsGui_schematic_internal_onControlPositionCancelled(canvasName)
+    local canvas = _findCanvas(canvasName)
+    if canvas then
+        canvas._controlTapTargetId = nil
+        canvas.selectedControlId = nil
+    end
+end
+
+-- CONTROL-MODE element quick view (see gdsGui_schematic_pressed/_released's
+-- "elementTap" dragKind): lets the app layer offer a focused, LIVE-
+-- committing popup for a plain element with nothing of its own like a
+-- control's positions -- a fluid tank's quantity, say -- without it
+-- needing control-mode positions of its own. Kept domain-agnostic the
+-- same way elementPropertiesExtraRows/elementSensedValues already are: a
+-- string-named callback the app registers (gdsGui_schematic_
+-- setElementControlRowsCallback), resolved via _G, asked for a `rows`
+-- array (the same shape gdsGui_schematic_openPropertyGrid already takes)
+-- -- nil/empty means nothing to show, so nothing happens at all, same as
+-- tapping a plain element in control mode always has.
+function gdsGui_schematic_openElementControlRows(canvasName, elementId)
+    local canvas = _findCanvas(canvasName)
+    if not canvas then return end
+    local el = _findElement(canvas, elementId)
+    if not el or not canvas.elementControlRows then return end
+    local fn = _G[canvas.elementControlRows]
+    local rows = fn and fn(canvasName, elementId)
+    if not rows or not rows[1] then return end
+    canvas._elementControlRowsTargetId = elementId
+    canvas.selectedElementId = elementId
+    gdsGui_schematic_openPropertyGrid(canvasName, gdsGui_schematic_elementPropertiesTitle(el.label or elementId), nil, rows,
+        false, "gdsGui_schematic_internal_onElementControlRowsClosed", "gdsGui_schematic_internal_onElementControlRowsClosed")
+end
+
+-- Shared SAVE/CANCEL handler: every row here already commits live via its
+-- own onChange (see _elementControlRows in main.lua), so there's nothing
+-- left to apply on close either way -- just clear the selection.
+function gdsGui_schematic_internal_onElementControlRowsClosed(canvasName)
+    local canvas = _findCanvas(canvasName)
+    if canvas then
+        canvas._elementControlRowsTargetId = nil
+        canvas.selectedElementId = nil
+    end
+end
+
+-- Registers the string-named callback gdsGui_schematic_openElementControlRows
+-- consults (resolved via _G, same convention as every other button/menu
+-- callback here) to ask the app for a control-mode element's own quick-
+-- view rows, if it has any at all.
+function gdsGui_schematic_setElementControlRowsCallback(canvasName, callbackName)
+    local canvas = _findCanvas(canvasName)
+    if canvas then canvas.elementControlRows = callbackName end
 end
 
 --------------------------------------------------------------------------------
@@ -6668,6 +6732,68 @@ function _shapePoly.drawCenterText(canvas, e)
     love.graphics.printf(shown, x, y, textW, "center", 0, scale, scale)
 end
 
+--------------------------------------------------------------------------------
+-- COLOR TRANSITIONS — a plain-color element/control/wire (see
+-- gdsGui_schematic_resolveDisplayColor) cross-fades to a NEW resolved color
+-- instead of snapping to it instantly, e.g. a bus energizing or a snapshot
+-- combination replaying a different capture. Global, not local, same as
+-- _actionSheet/_menuBackdrop/_galleryBadge above — this file is already at
+-- Lua's 200-top-level-local ceiling.
+--
+-- Scoped to the plain (single, non-striped) color path only -- the
+-- resolveColorSequence ("striped", multiple simultaneous colors) path, and
+-- the wire-bundle color-band pass, keep today's instant snap; blending a
+-- whole sequence coherently is a meaningfully bigger problem, not worth it
+-- for a less common case. No canvases, no shaders -- a pure per-draw-call
+-- color lerp, same cost class as everything else in these draw functions.
+--
+-- Transition state lives directly on the entity table itself
+-- (entity._colorBlend), the same convention pendingColor/predictedColor
+-- already use for transient per-entity cosmetic state, keyed by the
+-- entity's own object identity rather than a separate id-indexed cache.
+--------------------------------------------------------------------------------
+
+_colorBlend = {}
+_colorBlend.DURATION = 0.25 -- seconds
+
+-- The color entity._colorBlend (cb) is currently actually showing --
+-- mid-transition if cb.startTime is set, else its settled target.
+function _colorBlend.sample(cb)
+    if not cb.startTime then return cb.to[1], cb.to[2], cb.to[3], cb.to[4] end
+    local t = math.min(1, (love.timer.getTime() - cb.startTime) / _colorBlend.DURATION)
+    t = t * t * (3 - 2 * t) -- smoothstep ease
+    return cb.from[1] + (cb.to[1] - cb.from[1]) * t, cb.from[2] + (cb.to[2] - cb.from[2]) * t,
+        cb.from[3] + (cb.to[3] - cb.from[3]) * t, cb.from[4] + (cb.to[4] - cb.from[4]) * t
+end
+
+-- Call once per entity per frame with its freshly resolved target color;
+-- returns the color to actually draw with this frame (the target itself,
+-- most frames -- or a blended in-between while a transition is running).
+function _colorBlend.resolve(entity, r, g, b, a)
+    local cb = entity._colorBlend
+    if cb and cb.to[1] == r and cb.to[2] == g and cb.to[3] == b and cb.to[4] == a then
+        if not cb.startTime then return r, g, b, a end -- settled; common case
+    else
+        -- The target changed (or this is the first time this entity's
+        -- color was ever resolved) -- (re)start a transition from whatever
+        -- is CURRENTLY actually showing, so a change arriving mid-transition
+        -- doesn't pop. First time: nothing to transition from, so from==to
+        -- and it reads as already settled.
+        local fromR, fromG, fromB, fromA = r, g, b, a
+        if cb then fromR, fromG, fromB, fromA = _colorBlend.sample(cb) end
+        entity._colorBlend = { to = { r, g, b, a }, from = { fromR, fromG, fromB, fromA }, startTime = love.timer.getTime() }
+        cb = entity._colorBlend
+    end
+    local t = (love.timer.getTime() - cb.startTime) / _colorBlend.DURATION
+    if t >= 1 then
+        cb.from, cb.startTime = nil, nil -- settled
+        return r, g, b, a
+    end
+    t = t * t * (3 - 2 * t)
+    return cb.from[1] + (r - cb.from[1]) * t, cb.from[2] + (g - cb.from[2]) * t,
+        cb.from[3] + (b - cb.from[3]) * t, cb.from[4] + (a - cb.from[4]) * t
+end
+
 local function _drawElement(canvas, e, signature)
     local ex, ey, ew, eh = _elementPixelRect(canvas, e)
     -- Drawn exactly as resolved (no extra darken), so an element shows the
@@ -6745,6 +6871,7 @@ local function _drawElement(canvas, e, signature)
         _drawColorSequenceStriped(ex, ey, ew, eh, sequence, drawShapeWithColor)
     else
         local r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "element", e.id, signature)
+        r, g, b, a = _colorBlend.resolve(e, r, g, b, a)
         if _glow.applies(canvas, r, g, b) then _glow.halo(canvas.zoom, r, g, b, drawShapeWithColor) end
         drawShapeWithColor(r, g, b, a)
     end
@@ -8045,12 +8172,19 @@ end
 -- stand-in for the direction arrow's design-mode "which way" -- here it's
 -- "and it's going nowhere but out."
 --------------------------------------------------------------------------------
-_pipes.LEAK_DROPLETS = 5
+_pipes.LEAK_DROPLETS = 6     -- reference count, at LEAK_REFERENCE_PSI
 _pipes.LEAK_SPEED = 1.6      -- droplet cycles a second
-_pipes.LEAK_RANGE_MULT = 7   -- how far a droplet travels, in multiples of the pipe's own fluid width
-_pipes.LEAK_DROOP_MULT = 4   -- how far it falls as it ages, same units
+_pipes.LEAK_RANGE_MULT = 28  -- how far a droplet travels, in multiples of the pipe's own fluid width -- also the reference range, at LEAK_REFERENCE_PSI
 _pipes.LEAK_RADIUS_MULT = 0.6 -- droplet size, same units
 _pipes.LEAK_SPREAD_RAD = 0.7  -- max angle either side of straight out a droplet can fling
+_pipes.LEAK_REFERENCE_PSI = 15 -- the pressure LEAK_DROPLETS/LEAK_RANGE_MULT above are tuned for -- a
+                               -- typical pump's own PSI (GRAVITY_LEAK_BASELINE_PSI, in model/fluid.lua,
+                               -- is well below this on purpose -- gravity alone is the weak case)
+_pipes.LEAK_MIN_INTENSITY = 0.6 -- floor/ceiling on the pressure-driven scale-up/down below. The floor
+                                 -- is deliberately not much below 1 -- a pipe's own fluid width is only
+                                 -- a few px on this app's small canvas, so a leak scaled much smaller
+                                 -- than "reference" stops reading as a spray at all, not just a weaker one.
+_pipes.LEAK_MAX_INTENSITY = 2.0
 
 -- The leak spray (see the section header) for one pipe, colored r,g,b (the
 -- pipe's own resolved fluid color). Droplet paths are deterministic from the
@@ -8064,21 +8198,39 @@ function _pipes.drawLeakSpray(canvas, w, plan, r, g, b)
     local x, y, tx, ty = _pipes.outputPoint(pieces, total, dir, _pipes.ARROW_INSET_PX, canvas.zoom)
     if not x then return end
     local fluidW = _pipes.fluidWidth(canvas)
-    local range, droop = fluidW * _pipes.LEAK_RANGE_MULT, fluidW * _pipes.LEAK_DROOP_MULT
+    -- How hard the fluid is actually being pushed scales the spray itself,
+    -- not just its look -- a weak gravity trickle sprays less/shorter than
+    -- a pump-driven blast (w.leakPressure, set in model/fluid.lua's step()
+    -- -- real PSI for a pump-driven leak, a flat baseline for gravity alone,
+    -- since gravity has no PSI of its own).
+    local intensity = math.max(_pipes.LEAK_MIN_INTENSITY, math.min(_pipes.LEAK_MAX_INTENSITY,
+        (w.leakPressure or _pipes.LEAK_REFERENCE_PSI) / _pipes.LEAK_REFERENCE_PSI))
+    local dropletCount = math.max(2, math.floor(_pipes.LEAK_DROPLETS * intensity + 0.5))
+    local range = fluidW * _pipes.LEAK_RANGE_MULT * intensity
     local radius = fluidW * _pipes.LEAK_RADIUS_MULT
+    local onePx = 1 / love.graphics.getDPIScale()
     local now = _selection.now()
-    for i = 1, _pipes.LEAK_DROPLETS do
+    for i = 1, dropletCount do
         local seed = ((string.byte(w.id, 1) or 1) * 7 + i * 31) % 97 / 97
-        local phase = (now * _pipes.LEAK_SPEED + i / _pipes.LEAK_DROPLETS) % 1
+        local phase = (now * _pipes.LEAK_SPEED + i / dropletCount) % 1
         local spread = (seed - 0.5) * 2 * _pipes.LEAK_SPREAD_RAD
         local cs, sn = math.cos(spread), math.sin(spread)
         local dx, dy = tx * cs - ty * sn, tx * sn + ty * cs
+        -- Straight line the whole way along the pipe's own direction (dx,dy
+        -- -- its tangent, rotated by this droplet's own spread above) --
+        -- no added world-down droop, so it sprays the way the pipe actually
+        -- points instead of always arcing toward the bottom of the screen.
         local dropX = x + dx * range * phase
-        -- Falls away (world-down, same as love2d's own +y) as it ages, so it
-        -- arcs rather than flying in a dead-straight line.
-        local dropY = y + dy * range * phase + droop * phase * phase
+        local dropY = y + dy * range * phase
+        -- A bright rim one device pixel wide keeps a droplet readable
+        -- against a pipe of a similar hue right behind it (the usual case --
+        -- a leak sprays from the pipe it's leaking out of), the same
+        -- rim-for-contrast trick the chevron/direction-arrow drawing uses.
+        local dropRadius = math.max(2, radius * (1 - phase * 0.5))
+        love.graphics.setColor(1, 1, 1, (1 - phase) * 0.6)
+        love.graphics.circle("fill", dropX, dropY, dropRadius + onePx)
         love.graphics.setColor(r, g, b, (1 - phase) * 0.9)
-        love.graphics.circle("fill", dropX, dropY, math.max(1, radius * (1 - phase * 0.5)))
+        love.graphics.circle("fill", dropX, dropY, dropRadius)
     end
     love.graphics.setColor(1, 1, 1, 1)
 end
@@ -8360,15 +8512,6 @@ function _wirePath.start(canvasName, wireId)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     gdsGui_schematic_cancelPlacement(canvasName)
-    -- Opened via the control-mode long-press: _wirePath.press is only ever
-    -- reached while canvas.mode == "design" (gdsGui_schematic_pressed's
-    -- control-mode branch returns before it), so promote now — gdsGui_
-    -- schematic_update's isPlacementArmed poll hands control mode back the
-    -- moment pathEdit clears (_wirePath.finish).
-    if canvas.mode ~= "design" then
-        gdsGui_schematic_setMode(canvasName, "design")
-        canvas._autoDesignFromControl = true
-    end
     canvas.pathEdit = { wireId = wireId }
     canvas.selectedWireId = wireId
 end
@@ -9616,6 +9759,7 @@ local function _drawWire(canvas, w, plan, signature)
         drawBands(colors[1], wireWidth)
     else
         local r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "wire", w.id, signature)
+        r, g, b, a = _colorBlend.resolve(w, r, g, b, a)
         local bendRadius = _pipes.bendRadius(canvas)
         if _glow.applies(canvas, r, g, b) then _glow.wire(plan, canvas.zoom, wireWidth, r, g, b, bendRadius) end
         love.graphics.setColor(r, g, b, a)
@@ -9704,6 +9848,7 @@ local function _drawControl(canvas, c, signature)
         _drawColorSequenceStriped(cx - rad, cy - rad, rad * 2, rad * 2, sequence, drawBodyWithColor)
     else
         r, g, b, a = gdsGui_schematic_resolveDisplayColor(canvas.name, "control", c.id, signature)
+        r, g, b, a = _colorBlend.resolve(c, r, g, b, a)
         if _glow.applies(canvas, r, g, b) then _glow.halo(canvas.zoom, r, g, b, drawBodyWithColor) end
         drawBodyWithColor(r, g, b, a)
     end
@@ -9999,7 +10144,6 @@ function gdsGui_schematic_draw(pageName)
                     if plan and wireVisible(plan) then
                         _pipes.drawEmptiedRun(canvas, w, plan)
                         _pipes.drawDirectionArrow(canvas, w, plan)
-                        _pipes.drawLeak(canvas, w, plan, signature)
                     end
                 end
             end
@@ -10021,6 +10165,18 @@ function gdsGui_schematic_draw(pageName)
                     if lift > 0 then _selection.beginLift(ccx, ccy, crad * 2, crad * 2, lift) end
                     _drawControl(canvas, c, signature)
                     if lift > 0 then love.graphics.pop() end
+                end
+            end
+            -- Leak spray (see _pipes.drawLeak): drawn after elements/controls,
+            -- not in the per-wire pass above -- a dead-end leak sits right at
+            -- a valve/manifold port, and that element's own redraw (just
+            -- above) would otherwise paint straight over the spray.
+            if _pipes.isLiquid(canvas) then
+                for _, w in ipairs(canvas.wires) do
+                    local plan = wirePlans[w.id]
+                    if plan and wireVisible(plan) then
+                        _pipes.drawLeak(canvas, w, plan, signature)
+                    end
                 end
             end
             _glow.finish(canvas)
@@ -10318,29 +10474,37 @@ function gdsGui_schematic_pressed(touchId, x, y)
         end
 
         if canvas.mode == "control" then
-            -- "Operate" mode: a quick tap still cycles a control exactly as
-            -- before (resolved on release now, not here — see
-            -- gdsGui_schematic_released — so a sustained hold can be told
-            -- apart first). A LONG PRESS on any element/control/wire opens
-            -- its action sheet directly instead (gdsGui_schematic_update),
-            -- the iOS long-press-for-context-menu gesture, without first
-            -- needing the EDIT MODE toggle. Same hit-test precedence
-            -- (element, then control, then wire) design mode's own press
-            -- handling below uses.
-            local hitElem = _hitElement(canvas, x, y)
-            local hitCtrl = (not hitElem) and _hitControl(canvas, x, y) or nil
-            local hitWire = (not hitElem and not hitCtrl) and _hitWire(canvas, x, y) or nil
-            if hitElem or hitCtrl or hitWire then
-                canvas.focusTouchId        = touchId
-                canvas.dragStartX          = x
-                canvas.dragStartY          = y
-                canvas.dragMoved           = false
-                canvas.dragKind            = "pendingLongPress"
-                canvas.selectedElementId   = hitElem and hitElem.id or nil
-                canvas.selectedControlId   = hitCtrl and hitCtrl.id or nil
-                canvas.selectedWireId      = hitWire and hitWire.id or nil
-                canvas.longPressTargetKind = hitElem and "element" or (hitCtrl and "control" or "wire")
-                canvas.longPressElapsed    = 0
+            -- "Operate" mode: tapping (or holding — there's no timed
+            -- long-press distinction here) a control opens an iOS-styled
+            -- menu listing its own positions directly (gdsGui_schematic_
+            -- released below) instead of cycling it one step at a time.
+            -- Anything without positions of its own (a plain element, a
+            -- wire) has nothing to select here at all — same as tapping
+            -- empty canvas space.
+            local control = _hitControl(canvas, x, y)
+            if control then
+                canvas.focusTouchId  = touchId
+                canvas.dragStartX    = x
+                canvas.dragStartY    = y
+                canvas.dragMoved     = false
+                canvas.dragKind      = "controlTap"
+                canvas._controlTapId = control.id
+                goto continue
+            end
+            -- A plain element (a tank, say) has no positions of its own,
+            -- but the app layer may still have something quick to show for
+            -- it (gdsGui_schematic_openElementControlRows below) -- same
+            -- "resolve what to do about it on release" deferral as a
+            -- control's own tap just above; an element with nothing to
+            -- show there just does nothing, same as today.
+            local elem = _hitElement(canvas, x, y)
+            if elem then
+                canvas.focusTouchId  = touchId
+                canvas.dragStartX    = x
+                canvas.dragStartY    = y
+                canvas.dragMoved     = false
+                canvas.dragKind      = "elementTap"
+                canvas._elementTapId = elem.id
                 goto continue
             end
             canvas.focusTouchId = touchId
@@ -10923,6 +11087,22 @@ function gdsGui_schematic_moved(touchId, x, y)
                 math.abs(y - canvas.dragStartY) > _ELEMENT_TAP_SLOP_PX) then
                 canvas.dragMoved = true
             end
+        elseif canvas.dragKind == "controlTap" then
+            -- Same tap-vs-drag slop cancel as "pendingLongPress" above —
+            -- dragging off a control cancels its position menu instead of
+            -- opening it on release.
+            if not canvas.dragMoved and
+               (math.abs(x - canvas.dragStartX) > _ELEMENT_TAP_SLOP_PX or
+                math.abs(y - canvas.dragStartY) > _ELEMENT_TAP_SLOP_PX) then
+                canvas.dragMoved = true
+            end
+        elseif canvas.dragKind == "elementTap" then
+            -- Same tap-vs-drag slop cancel as "controlTap" above.
+            if not canvas.dragMoved and
+               (math.abs(x - canvas.dragStartX) > _ELEMENT_TAP_SLOP_PX or
+                math.abs(y - canvas.dragStartY) > _ELEMENT_TAP_SLOP_PX) then
+                canvas.dragMoved = true
+            end
         elseif canvas.dragKind == "reshape" and canvas.selectedElementId then
             local elem = _findElement(canvas, canvas.selectedElementId)
             if elem and canvas._shapeDrag and _shapePoly.updateDrag(canvas, elem, x, y) and not canvas.dragMoved then
@@ -11088,9 +11268,20 @@ function gdsGui_schematic_moved(touchId, x, y)
                 canvas.dragMoved = true
             end
         elseif canvas.dragKind == "pan" then
+            local oldPanX, oldPanY = canvas.panX, canvas.panY
             canvas.panX = canvas.panStartX + (x - canvas.dragStartX)
             canvas.panY = canvas.panStartY + (y - canvas.dragStartY)
             _clampPan(canvas)
+            -- Instantaneous this-event velocity, blended 50/50 with the
+            -- running value — same smoothing outputTxtBox_gdsGuiLib.lua's
+            -- own drag-velocity tracking uses — so gdsGui_schematic_released
+            -- has something to coast with once the finger lifts (see
+            -- gdsGui_schematic_update's own coast step).
+            local frameDt = globApp.lastDt or 0
+            if frameDt > 0 then
+                canvas.panVelX = canvas.panVelX * 0.5 + ((canvas.panX - oldPanX) / frameDt) * 0.5
+                canvas.panVelY = canvas.panVelY * 0.5 + ((canvas.panY - oldPanY) / frameDt) * 0.5
+            end
         end
 
         ::continue::
@@ -11336,23 +11527,16 @@ function gdsGui_schematic_released(touchId, x, y)
                     canvas.pendingConnectorColor = nil
                     canvas.wireTool.color = nil
                 end
-            elseif canvas.mode == "control" and canvas.dragKind == "pendingLongPress" and not canvas.dragMoved then
-                -- Released before _actionSheet.CONTROL_LONG_PRESS_SECONDS
-                -- (gdsGui_schematic_update already opens the action sheet and clears
-                -- dragKind once that hold fires, so reaching here always
-                -- means a clean, quick tap) — a control cycles exactly as
-                -- it always did; an element/wire tap does nothing, same as
-                -- before long-press targeting existed in control mode.
-                if canvas.longPressTargetKind == "control" and canvas.selectedControlId then
-                    local control = _findControl(canvas, canvas.selectedControlId)
-                    if control then
-                        control.detentIndex = (control.detentIndex + 1) % control.numDetents
-                        _fireControlCallback(control)
-                    end
-                end
-                canvas.selectedElementId = nil
-                canvas.selectedControlId = nil
-                canvas.selectedWireId    = nil
+            elseif canvas.mode == "control" and canvas.dragKind == "controlTap" and not canvas.dragMoved then
+                -- A clean tap (or hold — there's no timing distinction any
+                -- more) on a control: show its own positions as an
+                -- iOS-styled menu instead of cycling it one step at a time.
+                gdsGui_schematic_openControlPositionMenu(canvas.name, canvas._controlTapId)
+            elseif canvas.mode == "control" and canvas.dragKind == "elementTap" and not canvas.dragMoved then
+                -- A clean tap on a plain element -- only opens anything if
+                -- the app layer actually has a quick view for it (a fluid
+                -- tank's quantity, say); nothing otherwise, same as today.
+                gdsGui_schematic_openElementControlRows(canvas.name, canvas._elementTapId)
             elseif canvas.mode == "design" and canvas.dragKind == "pendingLongPress" and not canvas.dragMoved then
                 -- Released before the hold reached _LONG_PRESS_SECONDS
                 -- (gdsGui_schematic_update), and never wandered past tap
@@ -11455,6 +11639,16 @@ function gdsGui_schematic_released(touchId, x, y)
             if canvas.dragKind == "reshape" and canvas._shapeDrag and canvas._shapeDrag.isSide and not canvas.dragMoved then
                 canvas.reshapeModeActive = false
             end
+            -- Finger lifted off an actual pan drag with enough carried
+            -- velocity -- coast (gdsGui_schematic_update), rather than
+            -- stopping dead. 8.0 px/s, same COAST_STOP_VEL threshold
+            -- outputTxtBox_gdsGuiLib.lua's own scroll coast uses.
+            if canvas.dragKind == "pan" and
+               (math.abs(canvas.panVelX) > 8.0 or math.abs(canvas.panVelY) > 8.0) then
+                canvas._panCoasting = true
+            else
+                canvas.panVelX, canvas.panVelY, canvas._panCoasting = 0, 0, false
+            end
             canvas.focusTouchId       = nil
             canvas.dragKind           = nil
             canvas._shapeDrag         = nil
@@ -11486,18 +11680,24 @@ function gdsGui_schematic_update(dt)
         if canvas.page ~= activePageName then goto continue end
         _pollMenuHoldToConfirm(canvas, dt)
 
-        -- A long-press menu action opened from control mode (see
-        -- gdsGui_schematic_pressed's control-mode branch and this
-        -- function's own pendingLongPress poll below) auto-promoted into
-        -- "design" so its follow-up drag/tap (EDIT PATH, ADD WIRE, ADD/
-        -- REMOVE/MOVE PORT) would actually be reachable — gdsGui_schematic_
-        -- isPlacementArmed already tracks every one of those pending
-        -- states, so the moment none is left armed, that one action is
-        -- done and control mode is handed back automatically.
-        if canvas._autoDesignFromControl and canvas.mode == "design"
-           and not gdsGui_schematic_isPlacementArmed(canvas.name) then
-            canvas._autoDesignFromControl = nil
-            gdsGui_schematic_setMode(canvas.name, "control")
+        -- Post-release pan coast (see gdsGui_schematic_moved's velocity
+        -- tracking and gdsGui_schematic_released's seeding of this flag) --
+        -- same friction-decay formula outputTxtBox_gdsGuiLib.lua's own
+        -- scroll coast uses (SCROLL_FRICTION = 3.5), just reusing the
+        -- canvas's existing rigid _clampPan every frame instead of a
+        -- rubber-band+spring boundary (pan/zoom have no overshoot model
+        -- here, unlike those scroll widgets). A fresh "pan" drag pauses
+        -- this for free (the dragKind guard below), and a pinch in
+        -- progress is excluded since it drives panX/Y itself.
+        if canvas._panCoasting and canvas.dragKind ~= "pan" and not (canvas.pinch and canvas.pinch.active) then
+            canvas.panVelX = canvas.panVelX * math.exp(-3.5 * dt)
+            canvas.panVelY = canvas.panVelY * math.exp(-3.5 * dt)
+            canvas.panX = canvas.panX + canvas.panVelX * dt
+            canvas.panY = canvas.panY + canvas.panVelY * dt
+            _clampPan(canvas)
+            if math.abs(canvas.panVelX) < 8.0 and math.abs(canvas.panVelY) < 8.0 then
+                canvas._panCoasting = false
+            end
         end
 
         -- A stationary held touch on an annunciator-panel row generates no
@@ -11534,24 +11734,6 @@ function gdsGui_schematic_update(dt)
         if not canvas.focusTouchId or canvas.dragMoved then goto continue end
 
         canvas.longPressElapsed = (canvas.longPressElapsed or 0) + dt
-
-        if canvas.mode == "control" then
-            -- Control mode's own, shorter hold — see
-            -- _actionSheet.CONTROL_LONG_PRESS_SECONDS. Never promotes into a drag like
-            -- design mode's hold does below; it only ever opens the menu.
-            if canvas.longPressElapsed < _actionSheet.CONTROL_LONG_PRESS_SECONDS then goto continue end
-            gdsGui_haptics_feedback("medium")
-            canvas.dragKind     = nil
-            canvas.focusTouchId = nil
-            if canvas.longPressTargetKind == "element" and canvas.selectedElementId then
-                gdsGui_schematic_openElementEditMenu(canvas.name, canvas.selectedElementId)
-            elseif canvas.longPressTargetKind == "control" and canvas.selectedControlId then
-                gdsGui_schematic_openControlEditMenu(canvas.name, canvas.selectedControlId)
-            elseif canvas.longPressTargetKind == "wire" and canvas.selectedWireId then
-                gdsGui_schematic_openWireEditMenu(canvas.name, canvas.selectedWireId)
-            end
-            goto continue
-        end
 
         local holdElem = canvas.longPressTargetKind == "element" and canvas.selectedElementId
             and _findElement(canvas, canvas.selectedElementId)
