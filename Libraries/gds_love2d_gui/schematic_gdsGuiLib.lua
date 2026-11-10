@@ -11354,6 +11354,119 @@ function gdsGui_schematic_pressed(touchId, x, y)
     end
 end
 
+-- Auto-pans the canvas, every frame, while an element MOVE or a reshape-
+-- handle drag is held with the finger/cursor near the edge of the visible
+-- canvas rect -- same purpose a file manager's drag-to-the-edge autoscroll
+-- or a drawing app's canvas edge-pan serves: without it, relocating an
+-- element to (or reshaping a tank's corner out past) whatever happens to be
+-- in view right now is simply impossible, since the rest of the diagram the
+-- user would drag it onto is scrolled off-screen with no way to reach it
+-- mid-drag. One shared namespace, called from gdsGui_schematic_update for
+-- every canvas in globApp.objects.schematics regardless of which system
+-- (ELECTRICAL/HYDRAULIC/FUEL/PRESSURIZATION/...) it belongs to -- there is
+-- only the one canvas type and the one update loop, so this is already
+-- global across every system by construction, not something each needs its
+-- own copy of. Global, not local (same reason _shapePoly/_propertyGrid
+-- elsewhere in this file are): this file is already at its 200-local-per-
+-- chunk ceiling, and a global table doesn't count against that.
+_edgePan = {}
+_edgePan.MARGIN_PX = 36    -- how close to the canvas edge (screen px) triggers panning
+_edgePan.SPEED_PX_S = 420  -- pan speed (screen px/sec) at the very edge, ramping from 0 at the margin's outer boundary
+
+-- The whole-element MOVE drag's own "follow the touch" step: snaps (x,y) to
+-- the grid, then either applies it or leaves elem where it was if that would
+-- overlap another element -- factored out of gdsGui_schematic_moved's own
+-- "element" dragKind branch below so _edgePan.update (further down) can
+-- re-run the exact same step on every frame the drag is held near the
+-- canvas edge, not just on an actual touchmoved/mousemoved event.
+function _edgePan.applyElementDragPosition(canvas, elem, x, y)
+    local fracX, fracY = _toFraction(canvas, x - canvas.dragOffsetX, y - canvas.dragOffsetY)
+    local candX, candY = _snapElementToGrid(canvas, fracX, fracY, elem.w, elem.h)
+    -- Elements (unlike wires — see _footprintOverlapsAnother's own comment)
+    -- can never overlap: simply don't apply the candidate position at all
+    -- when it would, so the element just stops following the finger right
+    -- at the obstacle's edge instead of passing through it.
+    local px, py = _toPixel(canvas, candX, candY)
+    local pw, ph = elem.w * canvas.contentW * canvas.zoom, elem.h * canvas.contentH * canvas.zoom
+    if _isQuarterTurnRotation(elem.rotation) then pw, ph = ph, pw end
+    local blocked, obstacle
+    if elem.shapePoints then
+        local p = _shapePoly.parse(elem.shapePoints)
+        local bw, bh = elem.w * canvas.contentW * canvas.zoom, elem.h * canvas.contentH * canvas.zoom
+        blocked, obstacle = _shapePoly.blockedAt(canvas, elem, p, px + bw / 2, py + bh / 2,
+            bw / p.cols, bh / p.rows, elem.rotation)
+    else
+        blocked, obstacle = _footprintOverlapsAnother(canvas, px + pw / 2, py + ph / 2, pw / 2, ph / 2, elem.id)
+    end
+    -- Flags the obstacle actually in the way so _drawElement/_drawControl can
+    -- highlight it red for as long as the drag keeps pushing into it --
+    -- cleared the instant it's clear again (nil obstacle) or the gesture
+    -- ends (gdsGui_schematic_released's own cleanup).
+    canvas.collidingObstacleId = obstacle and obstacle.id or nil
+    if not blocked then
+        elem.x, elem.y = candX, candY
+    end
+end
+
+function _edgePan.update(canvas, dt)
+    if canvas.dragKind ~= "element" and canvas.dragKind ~= "reshape" then return end
+    if canvas.pinch and canvas.pinch.active then return end
+    local touch = canvas.focusTouchId and canvas.touches[canvas.focusTouchId]
+    if not touch then return end
+    local x, y = touch.x, touch.y
+
+    -- Nested (not a sibling top-level local) for the same 200-local-per-
+    -- chunk reason _edgePan itself is one table rather than several locals
+    -- -- a local inside a function body doesn't count against that budget.
+    local function intensity(dist)
+        return math.max(0, math.min(1, (_edgePan.MARGIN_PX - dist) / _edgePan.MARGIN_PX))
+    end
+    local dPanX = intensity(x - canvas.x) * _edgePan.SPEED_PX_S * dt
+        - intensity(canvas.x + canvas.w - x) * _edgePan.SPEED_PX_S * dt
+    local dPanY = intensity(y - canvas.y) * _edgePan.SPEED_PX_S * dt
+        - intensity(canvas.y + canvas.h - y) * _edgePan.SPEED_PX_S * dt
+    if dPanX == 0 and dPanY == 0 then return end
+
+    local prevPanX, prevPanY = canvas.panX, canvas.panY
+    canvas.panX = canvas.panX + dPanX
+    canvas.panY = canvas.panY + dPanY
+    _clampPan(canvas)
+    -- What actually took effect, which can fall short of the requested dPanX/Y
+    -- once _clampPan has pinned the view against the content's own edge.
+    local appliedDX, appliedDY = canvas.panX - prevPanX, canvas.panY - prevPanY
+
+    -- A reshape drag's own corner math (_shapePoly.updateDrag) measures how
+    -- far the cursor has moved from canvas.dragStartX/Y in raw SCREEN
+    -- pixels -- correct as long as the pan stays put, but the pan itself
+    -- just moved the WORLD under a cursor that hasn't physically moved at
+    -- all, which that measurement has no way to see. Shifting dragStartX/Y
+    -- by the same applied amount keeps it meaning "moved this far in WORLD
+    -- terms", so the corner stays glued to the cursor through the pan
+    -- instead of visibly drifting off it. A plain element MOVE doesn't need
+    -- this -- _applyElementDragPosition re-reads panX/Y fresh every call via
+    -- _toFraction, so it already tracks correctly without it -- but shifting
+    -- it unconditionally here is still harmless for that case too, since the
+    -- only other thing dragStartX/Y feeds for an "element" drag is the
+    -- already-long-past tap-vs-drag slop check.
+    canvas.dragStartX = canvas.dragStartX + appliedDX
+    canvas.dragStartY = canvas.dragStartY + appliedDY
+
+    -- The finger/cursor itself hasn't moved (that's exactly why this is
+    -- driven from the per-frame update loop rather than a touchmoved event),
+    -- but the world just slid out from under it -- re-run the same "follow
+    -- the touch" step the drag's own moved-event branch uses, against the
+    -- SAME screen position but the NEW pan, so the dragged element/handle
+    -- stays glued to the finger through the newly revealed area instead of
+    -- visually lagging behind while the canvas pans past it.
+    if canvas.dragKind == "element" and canvas.selectedElementId then
+        local elem = _findElement(canvas, canvas.selectedElementId)
+        if elem then _edgePan.applyElementDragPosition(canvas, elem, x, y) end
+    elseif canvas.dragKind == "reshape" and canvas.selectedElementId then
+        local elem = _findElement(canvas, canvas.selectedElementId)
+        if elem and canvas._shapeDrag then _shapePoly.updateDrag(canvas, elem, x, y) end
+    end
+end
+
 function gdsGui_schematic_moved(touchId, x, y)
     local activePageName = _getActivePageName()
     -- For a "directionalGate" element (DIODE) being rotated
@@ -11516,36 +11629,7 @@ function gdsGui_schematic_moved(touchId, x, y)
             end
         elseif canvas.dragKind == "element" and canvas.selectedElementId then
             local elem = _findElement(canvas, canvas.selectedElementId)
-            if elem then
-                local fracX, fracY = _toFraction(canvas, x - canvas.dragOffsetX, y - canvas.dragOffsetY)
-                local candX, candY = _snapElementToGrid(canvas, fracX, fracY, elem.w, elem.h)
-                -- Elements (unlike wires — see _footprintOverlapsAnother's
-                -- own comment) can never overlap: simply don't apply the
-                -- candidate position at all when it would, so the element
-                -- just stops following the finger right at the obstacle's
-                -- edge instead of passing through it.
-                local px, py = _toPixel(canvas, candX, candY)
-                local pw, ph = elem.w * canvas.contentW * canvas.zoom, elem.h * canvas.contentH * canvas.zoom
-                if _isQuarterTurnRotation(elem.rotation) then pw, ph = ph, pw end
-                local blocked, obstacle
-                if elem.shapePoints then
-                    local p = _shapePoly.parse(elem.shapePoints)
-                    local bw, bh = elem.w * canvas.contentW * canvas.zoom, elem.h * canvas.contentH * canvas.zoom
-                    blocked, obstacle = _shapePoly.blockedAt(canvas, elem, p, px + bw / 2, py + bh / 2,
-                        bw / p.cols, bh / p.rows, elem.rotation)
-                else
-                    blocked, obstacle = _footprintOverlapsAnother(canvas, px + pw / 2, py + ph / 2, pw / 2, ph / 2, elem.id)
-                end
-                -- Flags the obstacle actually in the way so _drawElement/
-                -- _drawControl can highlight it red for as long as the drag
-                -- keeps pushing into it — cleared the instant it's clear
-                -- again (nil obstacle) or the gesture ends (gdsGui_schematic_
-                -- released's own cleanup).
-                canvas.collidingObstacleId = obstacle and obstacle.id or nil
-                if not blocked then
-                    elem.x, elem.y = candX, candY
-                end
-            end
+            if elem then _edgePan.applyElementDragPosition(canvas, elem, x, y) end
             if not canvas.dragMoved and
                (math.abs(x - canvas.dragStartX) > _ELEMENT_TAP_SLOP_PX or
                 math.abs(y - canvas.dragStartY) > _ELEMENT_TAP_SLOP_PX) then
@@ -12081,6 +12165,7 @@ function gdsGui_schematic_update(dt)
         end
         if canvas.page ~= activePageName then goto continue end
         _pollMenuHoldToConfirm(canvas, dt)
+        _edgePan.update(canvas, dt)
 
         -- Post-release pan coast (see gdsGui_schematic_moved's velocity
         -- tracking and gdsGui_schematic_released's seeding of this flag) --
