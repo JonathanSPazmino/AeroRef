@@ -78,9 +78,19 @@ local function _storeState(stores, id)
     return store, capacity, capacity * (store.fillPercent or 100) / 100
 end
 
+-- A store below capacity always has room; one already AT capacity still
+-- does if it's leaking out an open port (store.openPortLeaking -- set by
+-- the app layer before computeFlow/step ever runs, via
+-- gdsGui_schematic_elementHasOpenPort, since this module has no notion of
+-- an element's own terminals to work that out itself). A store like that
+-- is never truly sealed full the way one with no leak is: what leaks out
+-- keeps making room for gravity (or a pump) to keep topping it back up,
+-- holding it at its cap in a moving equilibrium rather than blocking
+-- everything upstream of it outright.
 local function _storeHasRoom(stores, id)
-    local _, capacity, gallons = _storeState(stores, id)
-    return capacity ~= nil and gallons < capacity
+    local store, capacity, gallons = _storeState(stores, id)
+    if capacity == nil then return false end
+    return gallons < capacity or store.openPortLeaking == true
 end
 
 -- Whether a "source" node itself currently holds anything: true for a store
@@ -792,8 +802,16 @@ local function step(flow, stores, pipeUnits, dt)
                 local ids = {}
                 for receiverId in pairs(receivers) do table.insert(ids, receiverId) end
                 for _, receiverId in ipairs(ids) do
-                    local _, receiverCapacity, receiverGallons = _storeState(stores, receiverId)
-                    amount = math.min(amount, (receiverCapacity - receiverGallons) * #ids)
+                    local receiverStore, receiverCapacity, receiverGallons = _storeState(stores, receiverId)
+                    -- A leaking receiver already at capacity has zero LITERAL
+                    -- headroom (receiverCapacity - receiverGallons == 0), which
+                    -- would otherwise clamp amount to 0 and block the transfer
+                    -- outright -- skip the cap for it; the open-port-leak loop
+                    -- further down drains it back down again right after, so
+                    -- what arrives here doesn't actually overfill it.
+                    if not (receiverStore.openPortLeaking and receiverGallons >= receiverCapacity) then
+                        amount = math.min(amount, (receiverCapacity - receiverGallons) * #ids)
+                    end
                 end
                 for _, receiverId in ipairs(ids) do
                     local receiverStore, receiverCapacity, receiverGallons = _storeState(stores, receiverId)
@@ -803,6 +821,24 @@ local function step(flow, stores, pipeUnits, dt)
             end
             store.fillPercent = math.max(0, (gallons - amount) / capacity * 100)
             changed = true
+        end
+    end
+
+    -- A store with an open port (store.openPortLeaking, same field
+    -- _storeHasRoom reads above) genuinely loses fluid through it, same
+    -- DRAIN_RATE as any other gravity-driven loss -- independent of
+    -- flow.feeding above, which only covers loss through a MARKED pipe run,
+    -- not an opening in the element's own body. Runs after the feeding loop
+    -- so it applies on top of whatever inflow that loop just granted this
+    -- tick (see its own receiver-headroom exception just above) rather than
+    -- being immediately overwritten by it.
+    for id, store in pairs(stores) do
+        if store.openPortLeaking then
+            local _, capacity, gallons = _storeState(stores, id)
+            if capacity and gallons > 0 then
+                store.fillPercent = math.max(0, (gallons - DRAIN_RATE * dt) / capacity * 100)
+                changed = true
+            end
         end
     end
 

@@ -611,6 +611,31 @@ _EJECTOR_TERMINALS = {
     { x =  0.5, y = 0, exitX =  1, exitY = 0, flow = "out" },
 }
 
+-- Every CHECK VALVE's own two ports -- anode/input on the left, cathode/
+-- output on the right at rotation 0, same positions ELECTRICAL's DIODE
+-- above already uses (both draw via the identical _drawDiodeSymbol, so the
+-- same offsets line up on either one). A connector can now only land on
+-- one of these two exact points, not the valve's body generally -- see
+-- _terminals.nearest, which already requires a terminals array to resolve
+-- any terminal at all; an anchor with none (every CHECK VALVE, until now)
+-- falls through to a generic, anywhere-on-the-body connection instead.
+_CHECK_VALVE_TERMINALS = {
+    { x = -0.416, y = 0.03,  exitX = -1, exitY = 0, flow = "in" },
+    { x =  0.419, y = 0.009, exitX =  1, exitY = 0, flow = "out" },
+}
+
+-- Every single-pole SWITCH-like gate's own two ports -- measured off
+-- control_switchClosed.png's own two terminal rings (top common, bottom
+-- contact; see that sprite), shared by every system's reskin of the same
+-- control (SWITCH, SHUTOFF VALVE, FUEL SHUTOFF VALVE, BLEED VALVE,
+-- OUTFLOW VALVE). Same "terminals array required to land a connector
+-- there at all" reasoning as _CHECK_VALVE_TERMINALS above -- DPST SWITCH
+-- and BUS TIE already define their own for this same reason.
+_SWITCH_TERMINALS = {
+    { x = 0, y = -0.42, exitX = 0, exitY = -1 },
+    { x = 0, y =  0.42, exitX = 0, exitY =  1 },
+}
+
 -- A BUS's load: entity.loads, an array of {name, amps} added one at a time
 -- from its own PROPERTIES menu's "+ ADD LOAD" row (or the catalog's LIGHT/
 -- MOTOR/HEATER shortcuts — see _openLoadPropertiesGrid) and shown summed in
@@ -696,7 +721,7 @@ local SCHEMATIC_CATALOG = {
               { x =  0.419, y = 0.009, exitX =  1, exitY = 0, flow = "out" },
           } },
         { label = "SWITCH", abbrev = "SWCH",    kind = "control", presets = { {"OPEN", "CLOSED"}, {"OPEN", "CLOSED", "STBY"} },
-          spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate" },
+          spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate", terminals = _SWITCH_TERMINALS },
         -- Double pole, single throw: two mechanically-ganged switch poles
         -- (the crossbar linking them in the artwork) that open/close
         -- together — an interactive OPEN/CLOSED gate like SWITCH above, just
@@ -802,14 +827,14 @@ local SCHEMATIC_CATALOG = {
         -- same vector symbol for a check valve rather than a dedicated
         -- fluid-power glyph (no art asset for one exists yet).
         { label = "CHECK VALVE", abbrev = "CVLV", kind = "element", shapeType = "diode",
-          gridW = 2, gridH = 2, componentType = "directionalGate" },
+          gridW = 2, gridH = 2, componentType = "directionalGate", terminals = _CHECK_VALVE_TERMINALS },
         -- A 3rd AUTO position (e.g. a PTU/priority valve) behaves exactly
         -- like SWITCH's own STBY above — not "CLOSED", so it reads as the
         -- inactive/open position for gate-blocking purposes, just a named
         -- 3rd detent rather than a special case.
         { label = "SHUTOFF VALVE", abbrev = "HSOV", kind = "control",
           presets = { {"CLOSED", "OPEN"}, {"CLOSED", "OPEN", "AUTO"} },
-          spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate" },
+          spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate", terminals = _SWITCH_TERMINALS },
         { label = "RESERVOIR", abbrev = "RSVR", kind = "element", shapeType = "circle",
           gridW = 3, gridH = 3, componentType = "sink" },
     }},
@@ -858,7 +883,7 @@ local SCHEMATIC_CATALOG = {
         -- Same non-user-operated, one-way role as HYDRAULIC's own CHECK
         -- VALVE above (e.g. an anti-siphon or crossfeed check valve).
         { label = "CHECK VALVE", abbrev = "CKVL", kind = "element", shapeType = "diode",
-          gridW = 2, gridH = 2, componentType = "directionalGate" },
+          gridW = 2, gridH = 2, componentType = "directionalGate", terminals = _CHECK_VALVE_TERMINALS },
         -- A jet pump: no moving parts and nothing to switch, so an element. Fuel a
         -- pump drives into its motive port draws more in through its suction port,
         -- and both leave through its discharge (see model/fluid.lua). A one-way role
@@ -869,7 +894,7 @@ local SCHEMATIC_CATALOG = {
           terminals = _EJECTOR_TERMINALS },
         { label = "FUEL SHUTOFF VALVE", abbrev = "FSOV", kind = "control",
           presets = { {"CLOSED", "OPEN"}, {"CLOSED", "OPEN", "AUTO"} },
-          spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate" },
+          spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate", terminals = _SWITCH_TERMINALS },
         { label = "ENGINE", abbrev = "ENGN", kind = "element", shapeType = "rect",
           defaultProperties = {"FUEL FLOW"}, gridW = 3, gridH = 2, componentType = "sink" },
     }},
@@ -892,12 +917,12 @@ local SCHEMATIC_CATALOG = {
         -- CHECK VALVE above (e.g. an engine-to-engine isolation check
         -- valve preventing backflow).
         { label = "CHECK VALVE", abbrev = "BCVL", kind = "element", shapeType = "diode",
-          gridW = 2, gridH = 2, componentType = "directionalGate" },
+          gridW = 2, gridH = 2, componentType = "directionalGate", terminals = _CHECK_VALVE_TERMINALS },
         -- The pilot-operated shutoff itself, same single-item pattern as
         -- ELECTRICAL's own SWITCH (the valve body IS the control; there's
         -- no separate static "valve element" + "switch control" pair).
         { label = "BLEED VALVE", abbrev = "BVLV", kind = "control", presets = { {"CLOSED", "OPEN"} },
-          spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate" },
+          spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate", terminals = _SWITCH_TERMINALS },
     }},
     { system = "PRESSURIZATION", pipeConnectors = "DUCT", items = {
         -- Converted from a static element to a control (like ELECTRICAL's
@@ -906,7 +931,7 @@ local SCHEMATIC_CATALOG = {
         -- cabin air escape, closed holds pressure, same role SHUTOFF
         -- VALVE/BLEED VALVE play in their own systems.
         { label = "OUTFLOW VALVE", abbrev = "OFVL", kind = "control", presets = { {"CLOSED", "OPEN"} },
-          spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate" },
+          spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate", terminals = _SWITCH_TERMINALS },
         -- Deliberately untagged: an avionics logic box, not a flow node —
         -- nothing current/fluid/air passes THROUGH a controller the way it
         -- does through every componentType above, so no source/path/gate/
@@ -7231,7 +7256,15 @@ function _fluidFlowInputs(canvas, componentTypes)
     end
     local stores = {}
     for _, e in ipairs(canvas.elements) do
-        if _holdsFluid(canvas, e) then stores[e.id] = e end
+        if _holdsFluid(canvas, e) then
+            stores[e.id] = e
+            -- Lets model/fluid.lua's own _storeHasRoom treat a tank that's
+            -- leaking out an unconnected port as never truly sealed full --
+            -- see that function's own comment. The model has no notion of
+            -- "terminals" itself, so this is computed here, the one layer
+            -- that actually has canvas.elements/wires to check it against.
+            e.openPortLeaking = gdsGui_schematic_elementHasOpenPort(canvas.name, e.id)
+        end
     end
     local offSources, pressures = {}, {}
     for _, c in ipairs(canvas.controls) do

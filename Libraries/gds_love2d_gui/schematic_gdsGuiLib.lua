@@ -1141,74 +1141,141 @@ function _shapePoly.roundedOutline(p, ew, eh, radius)
         return left + c.c * cw, top + c.r * ch
     end
 
-    -- The single shortest edge anywhere in the shape caps the radius
-    -- globally, before any of the PER-corner clamping below. Two corners
-    -- sharing one edge each independently clamping against just THAT edge's
-    -- own half-length can still leave their two arcs meeting exactly flush
-    -- (a zero-length straight stretch between them) -- and a RUN of several
-    -- such short edges in a row (a reshape's own grid "staircase" tracing a
-    -- near-diagonal line, say) can carry that all the way into arcs two or
-    -- three corners apart actually overlapping, a polygon
-    -- love.math.triangulate legitimately refuses outright -- which used to
-    -- fall back silently to the sharp-cornered path below (see drawLocal's
-    -- own pcall), reading as "no rounding happened at all" rather than the
-    -- crash this exact shape used to cause before that guard existed.
-    -- Capping well under half the single shortest edge, up front, leaves
-    -- slack everywhere, not just at that one edge.
-    local minLen = math.huge
+    -- Edge lengths, computed once so the per-corner loop below can reuse
+    -- them (for its own two adjacent edges) without re-measuring.
+    local edgeLen = {}
     for i = 1, n do
         local ax, ay = vertex(i)
         local bx, by = vertex(i + 1)
-        local len = math.sqrt((bx - ax) ^ 2 + (by - ay) ^ 2)
-        if len > 1e-6 and len < minLen then minLen = len end
+        edgeLen[i] = math.sqrt((bx - ax) ^ 2 + (by - ay) ^ 2)
     end
-    if minLen < math.huge then radius = math.min(radius, minLen * 0.4) end
+
+    -- Shortest distance from point (px,py) to the segment (ax,ay)-(bx,by).
+    local function pointSegDist(px, py, ax, ay, bx, by)
+        local dx, dy = bx - ax, by - ay
+        local lenSq = dx * dx + dy * dy
+        local t = lenSq > 1e-9 and math.max(0, math.min(1, ((px - ax) * dx + (py - ay) * dy) / lenSq)) or 0
+        local cx, cy = ax + t * dx, ay + t * dy
+        return math.sqrt((px - cx) ^ 2 + (py - cy) ^ 2)
+    end
+
+    -- A corner's own two adjacent edges already cap ITS radius (lenA/2,
+    -- lenB/2 below), which alone guarantees any two corners sharing a single
+    -- edge can't overlap (their radii can sum to at most that edge's own
+    -- length). What that doesn't catch is a thin/stretched shape where two
+    -- corners that AREN'T adjacent -- opposite sides of a dart, say -- sit
+    -- physically close together: each one's own local check passes, but
+    -- their arcs can still cross, which love.math.triangulate legitimately
+    -- refuses outright (used to fall back silently to the fully sharp-
+    -- cornered path below -- see drawLocal's own pcall -- rather than the
+    -- crash this exact shape used to cause before a cap existed). Capping
+    -- each corner's radius by its OWN clearance -- the closest approach of
+    -- its vertex to any edge it isn't already touching -- catches that
+    -- directly, is purely a function of this shape's own proportions, and so
+    -- (unlike an earlier version of this cap, keyed off a short EDGE
+    -- elsewhere in the shape with no particular relation to ew/eh) scales
+    -- the exact same way at every zoom level rather than only clearing
+    -- love.math.triangulate's okay at some.
+    -- Overall winding sign (shoelace), used below to tell a convex corner
+    -- from a reflex one -- a corner's own turn direction matching the
+    -- shape's dominant winding is convex; opposite is reflex.
+    local signedArea = 0
+    for i = 1, n do
+        local ax, ay = vertex(i)
+        local bx, by = vertex(i + 1)
+        signedArea = signedArea + (ax * by - bx * ay)
+    end
 
     local arcs = {}
     for i = 1, n do
         local ax, ay = vertex(i - 1)
         local px, py = vertex(i)
         local bx, by = vertex(i + 1)
-        local lenA = math.sqrt((px - ax) ^ 2 + (py - ay) ^ 2)
-        local lenB = math.sqrt((bx - px) ^ 2 + (by - py) ^ 2)
-        local r = (lenA > 1e-6 and lenB > 1e-6) and math.min(radius, lenA / 2, lenB / 2) or 0
+        local lenA, lenB = edgeLen[((i - 2) % n) + 1], edgeLen[i]
+        local adjA, adjB = ((i - 2) % n) + 1, i
+        local clearance = math.huge
+        for k = 1, n do
+            if k ~= adjA and k ~= adjB then
+                local eax, eay = vertex(k)
+                local ebx, eby = vertex(k + 1)
+                local d = pointSegDist(px, py, eax, eay, ebx, eby)
+                if d < clearance then clearance = d end
+            end
+        end
+        local farCap = (clearance < math.huge) and (clearance * 0.45) or radius
+
+        local r = 0
+        local entryX, entryY, exitX, exitY, cx, cy
+        if lenA > 1e-6 and lenB > 1e-6 then
+            local d1x, d1y = (px - ax) / lenA, (py - ay) / lenA   -- incoming edge direction
+            local d2x, d2y = (bx - px) / lenB, (by - py) / lenB   -- outgoing edge direction
+            -- The tangent-point distance along each edge and the center's
+            -- distance from the corner both depend on the corner's own
+            -- HALF-ANGLE, not just r -- backing up by exactly r (as an
+            -- earlier version of this did) only happens to work for an
+            -- exact 90deg corner; any other angle produced a center that
+            -- wasn't actually equidistant from both edges, i.e. a bogus
+            -- "rounded" corner love.math.triangulate was right to refuse
+            -- (intermittently, depending on just how bogus a given r made
+            -- it) -- which is what made this flip between round and sharp
+            -- from one zoom level to the next on the very same tank.
+            local v1x, v1y, v2x, v2y = -d1x, -d1y, d2x, d2y
+            local dot = math.max(-1, math.min(1, v1x * v2x + v1y * v2y))
+            local turnCross = d1x * d2y - d1y * d2x
+            local isReflex = turnCross * signedArea < 0
+            -- dot near +1: a near-zero-width spike (can't round with a
+            -- finite tangent length). dot near -1: a near-straight corner
+            -- (no turn to round in the first place; the bisector below is
+            -- undefined right at the limit). Either way, and for a reflex
+            -- corner (bulges outward, not handled here), leave it sharp
+            -- rather than risk a wrong-direction or degenerate arc.
+            if not isReflex and dot > -0.999 and dot < 0.999 then
+                local half = math.acos(dot) / 2
+                -- tangentDist is the distance backed up along each edge; r =
+                -- tangentDist*tan(half) and centerDist = tangentDist/cos(half),
+                -- so each of the three caps (base radius ceiling, clearance
+                -- margin on the CENTER's reach, and the edges' own room)
+                -- converts to a tangentDist bound the same way.
+                local tangentDist = math.min(lenA / 2, lenB / 2,
+                    radius / math.tan(half), farCap * math.cos(half))
+                local centerDist = tangentDist / math.cos(half)
+                local bx2, by2 = v1x + v2x, v1y + v2y
+                local blen = math.sqrt(bx2 * bx2 + by2 * by2)
+                if tangentDist > 0.25 and blen > 1e-6 then
+                    local bux, buy = bx2 / blen, by2 / blen
+                    r = tangentDist * math.tan(half)
+                    entryX, entryY = px - d1x * tangentDist, py - d1y * tangentDist
+                    exitX, exitY = px + d2x * tangentDist, py + d2y * tangentDist
+                    cx, cy = px + bux * centerDist, py + buy * centerDist
+                end
+            end
+        end
         if r > 0.25 then
-            local d1x, d1y = (px - ax) / lenA, (py - ay) / lenA
-            local d2x, d2y = (bx - px) / lenB, (by - py) / lenB
-            local entryX, entryY = px - d1x * r, py - d1y * r
-            local cx, cy = entryX + d2x * r, entryY + d2y * r
-            local a1 = math.atan2(-d2y, -d2x)
-            local sweep = math.atan2(d1y, d1x) - a1
+            local a1 = math.atan2(entryY - cy, entryX - cx)
+            local a2 = math.atan2(exitY - cy, exitX - cx)
+            local sweep = a2 - a1
             if sweep > math.pi then sweep = sweep - 2 * math.pi elseif sweep < -math.pi then sweep = sweep + 2 * math.pi end
             arcs[i] = { cx = cx, cy = cy, r = r, a1 = a1, a2 = a1 + sweep,
-                entryX = entryX, entryY = entryY, exitX = px + d2x * r, exitY = py + d2y * r }
+                px = px, py = py, entryX = entryX, entryY = entryY, exitX = exitX, exitY = exitY }
         else
-            arcs[i] = { r = 0, entryX = px, entryY = py, exitX = px, exitY = py }
+            arcs[i] = { r = 0, px = px, py = py, entryX = px, entryY = py, exitX = px, exitY = py }
         end
     end
 
-    local segs, fillPoints = {}, {}
-    local function addFillPoint(x, y)
-        local n = #fillPoints
-        fillPoints[n + 1], fillPoints[n + 2] = x, y
-    end
+    -- Straight stretches to stroke for the OUTLINE between one corner's own
+    -- arc and the next's (see drawLocal -- the fill no longer needs these:
+    -- it's carved out of the plain sharp polygon with a stencil instead of
+    -- built as one big custom polygon, so there's no fillPoints list here
+    -- any more).
+    local segs = {}
     for i = 1, n do
         local prev = arcs[((i - 2) % n) + 1]
         local cur = arcs[i]
         if math.abs(prev.exitX - cur.entryX) > 0.1 or math.abs(prev.exitY - cur.entryY) > 0.1 then
             segs[#segs + 1] = { prev.exitX, prev.exitY, cur.entryX, cur.entryY }
-            addFillPoint(prev.exitX, prev.exitY)
-            addFillPoint(cur.entryX, cur.entryY)
-        end
-        if cur.r > 0 then
-            local steps = _shapePoly.arcSegments(cur.r)
-            for s = 0, steps do
-                local ang = cur.a1 + (cur.a2 - cur.a1) * s / steps
-                addFillPoint(cur.cx + math.cos(ang) * cur.r, cur.cy + math.sin(ang) * cur.r)
-            end
         end
     end
-    return segs, arcs, fillPoints
+    return segs, arcs
 end
 
 -- Filled body and white outline, in the caller's already centered+rotated
@@ -1220,38 +1287,58 @@ end
 function _shapePoly.drawLocal(e, ew, eh, r, g, b, a, outlineAlpha)
     local p = _shapePoly.parse(e.shapePoints)
     local radius = (e.fillPercent ~= nil) and (math.min(ew, eh) * _shapePoly.CORNER_RADIUS_FRACTION) or 0
-    love.graphics.setColor(r, g, b, a)
-    if radius > 0.25 then
-        local segs, arcs, fillPoints = _shapePoly.roundedOutline(p, ew, eh, radius)
-        -- Guarded: a few sampled arc points landing exactly on top of each
-        -- other (an extreme reshape, a corner radius right at its own
-        -- per-corner clamp) can hand triangulate a degenerate polygon it
-        -- refuses outright (LÖVE throws, not returns nil/empty) -- falls
-        -- back to the plain sharp-cornered fill below rather than crashing
-        -- the whole app over one tank's rounded corners.
-        local ok, triangles = pcall(love.math.triangulate, fillPoints)
-        if ok then
-            for _, t in ipairs(triangles) do
-                love.graphics.polygon("fill", t[1], t[2], t[3], t[4], t[5], t[6])
-            end
-            love.graphics.setColor(1, 1, 1, outlineAlpha)
-            for _, seg in ipairs(segs) do love.graphics.line(seg[1], seg[2], seg[3], seg[4]) end
-            for _, arc in ipairs(arcs) do
-                if arc.r > 0 then
-                    love.graphics.arc("line", "open", arc.cx, arc.cy, arc.r, arc.a1, arc.a2, _shapePoly.arcSegments(arc.r))
-                end
-            end
-            return
-        end
-    end
     local cw, ch = ew / p.cols, eh / p.rows
     local left, top = -ew / 2, -eh / 2
-    for _, t in ipairs(p.triangles) do
-        love.graphics.polygon("fill", left + t[1] * cw, top + t[2] * ch, left + t[3] * cw, top + t[4] * ch,
-            left + t[5] * cw, top + t[6] * ch)
+    local function fillSharpBody()
+        for _, t in ipairs(p.triangles) do
+            love.graphics.polygon("fill", left + t[1] * cw, top + t[2] * ch, left + t[3] * cw, top + t[4] * ch,
+                left + t[5] * cw, top + t[6] * ch)
+        end
     end
+
+    if radius <= 0.25 then
+        love.graphics.setColor(r, g, b, a)
+        fillSharpBody()
+        love.graphics.setColor(1, 1, 1, outlineAlpha)
+        _shapePoly.strokeEdges(p, ew, eh)
+        return
+    end
+
+    -- Rounded corners are carved out of the plain sharp fill with a stencil
+    -- rather than built as one big custom polygon and handed to
+    -- love.math.triangulate -- an earlier version did that, and triangulate
+    -- turned out to reject it almost arbitrarily (small floating-point
+    -- differences between near-collinear arc-sampled points flipping it
+    -- between accepting and refusing the exact same shape), which is what
+    -- made corners round at one zoom level and sharp at the next on the very
+    -- same tank. Every primitive used here instead -- p.triangles (already
+    -- validated once, at parse time), a plain 3-point corner triangle, and
+    -- an arc "fill" "pie" slice -- is one the GPU rasterizes directly, with
+    -- no polygon validity question to get a different answer on.
+    local segs, arcs = _shapePoly.roundedOutline(p, ew, eh, radius)
+    love.graphics.stencil(fillSharpBody, "replace", 1)
+    for _, arc in ipairs(arcs) do
+        if arc.r > 0 then
+            love.graphics.stencil(function()
+                love.graphics.polygon("fill", arc.px, arc.py, arc.entryX, arc.entryY, arc.exitX, arc.exitY)
+            end, "replace", 0)
+            love.graphics.stencil(function()
+                love.graphics.arc("fill", "pie", arc.cx, arc.cy, arc.r, arc.a1, arc.a2, _shapePoly.arcSegments(arc.r))
+            end, "replace", 1)
+        end
+    end
+    love.graphics.setStencilTest("gequal", 1)
+    love.graphics.setColor(r, g, b, a)
+    fillSharpBody()
+    love.graphics.setStencilTest()
+
     love.graphics.setColor(1, 1, 1, outlineAlpha)
-    _shapePoly.strokeEdges(p, ew, eh)
+    for _, seg in ipairs(segs) do love.graphics.line(seg[1], seg[2], seg[3], seg[4]) end
+    for _, arc in ipairs(arcs) do
+        if arc.r > 0 then
+            love.graphics.arc("line", "open", arc.cx, arc.cy, arc.r, arc.a1, arc.a2, _shapePoly.arcSegments(arc.r))
+        end
+    end
 end
 
 function _shapePoly.strokeEdges(p, ew, eh)
@@ -1286,24 +1373,79 @@ function _shapePoly.levelLineY(canvas, e)
     return maxY - (maxY - minY) * e.fillPercent / 100, maxY
 end
 
+_shapePoly.WAVE_AMPLITUDE_PX = 0.6 -- how far the fluid's top surface rises/dips, screen px at zoom 1
+_shapePoly.WAVE_CYCLES = 1.8       -- how many full up/down cycles span the tank's own on-screen width
+_shapePoly.WAVE_SPEED = 0.5        -- cycles/second the ripple travels sideways
+_shapePoly.WAVE_SAMPLES = 28       -- points sampled along the curve -- the mask polygon's own
+                                     -- smoothness, not a strip count, since the edge it cuts is an
+                                     -- exact curve rather than an approximation of one.
+_shapePoly.WAVE_TAPER_PERCENT = 6  -- fillPercent span, right at 100, over which the ripple damps to
+                                     -- flat -- a brimming tank has no headspace left to slosh in.
+
 -- Draws an element's whole body dimmed, then again in full color below its fill
--- line, by way of drawBody(r, g, b, a). A scissor is what keeps that line level
--- on screen while the body draws turned.
+-- line, by way of drawBody(r, g, b, a). Always top-of-tank-to-bottom oriented
+-- (the fill line runs level on screen, however the element itself is turned),
+-- regardless of the tank's own port locations or count. The line's own top
+-- edge ripples side to side instead of sitting dead flat, as a fluid-movement
+-- cue: a real sine curve, sampled into a polygon and used as a stencil mask
+-- for a SINGLE drawBody call. Two earlier versions got tried and dropped:
+-- thin vertical scissor strips (plain intersectScissor is screen-axis-aligned
+-- rectangles only, so a single call can't bend into a curve) approximated the
+-- wave as a staircase AND, on a non-rectangular tank (a triangle tapering to
+-- a point), chopped the shape's own diagonal edge into visible steps too --
+-- repeatedly re-rasterizing it against each strip's hard rectangular cut,
+-- rather than once, whole, the way a single mask leaves it. A line stroked
+-- along the curve on top of that fixed the stepping but, drawn across the
+-- element's full bounding-box width with no shape awareness, overshot past
+-- the same triangle's slanted sides. A stencil mask has neither problem: it
+-- clips the one drawBody call to the exact curve, so the shape's own edges
+-- rasterize normally and only the fill boundary follows the wave. Safe to use
+-- a stencil here because gdsGui_schematic_draw runs after gdsGui_container_draw
+-- has already finished and disabled its own rounded-card stencil test (see
+-- _setRoundedStencil in container_gdsGuiLib.lua) -- nothing else has a stencil
+-- test active while this runs, and every Canvas that can be the active render
+-- target here (_glow.canvasA/B, _menuBackdrop.full) is created with
+-- stencil=true for exactly this. The mask is erased right after use so no
+-- leftover stencil value can bleed into another element's draw this frame.
 function _shapePoly.drawLevel(canvas, e, drawBody, r, g, b, a)
     local shade = _shapePoly.EMPTY_SHADE
     drawBody(r * shade, g * shade, b * shade, a)
     if e.fillPercent <= 0 then return end
     local lineY, maxY = _shapePoly.levelLineY(canvas, e)
-    -- The scissor is in screen space, which ignores the transform, so the line
-    -- and bottom go through it: a lifted tank (see _selection.beginLift) draws
-    -- scaled, and its level must scale with it.
+    local ex, _, ew = _elementPixelRect(canvas, e)
+    -- Everything below is in screen space, which ignores the transform, so the
+    -- line and bottom go through it: a lifted tank (see _selection.beginLift)
+    -- draws scaled, and its level/ripple must scale with it.
+    local screenX1 = love.graphics.transformPoint(ex, lineY)
+    local screenX2 = love.graphics.transformPoint(ex + ew, lineY)
+    local left, right = math.min(screenX1, screenX2), math.max(screenX1, screenX2)
     local _, screenLineY = love.graphics.transformPoint(0, lineY)
     local _, screenMaxY = love.graphics.transformPoint(0, maxY)
-    local top = math.floor(screenLineY + 0.5)
-    local prevX, prevY, prevW, prevH = love.graphics.getScissor()
-    love.graphics.intersectScissor(0, top, love.graphics.getWidth(), math.ceil(screenMaxY) + 1 - top)
+    local bottom = math.ceil(screenMaxY) + 1
+    local taper = math.min(1, (100 - e.fillPercent) / _shapePoly.WAVE_TAPER_PERCENT)
+    local amp = _shapePoly.WAVE_AMPLITUDE_PX * canvas.zoom * taper
+    local now = _selection.now()
+
+    local points = {}
+    for s = 0, _shapePoly.WAVE_SAMPLES do
+        local t = s / _shapePoly.WAVE_SAMPLES
+        local phase = t * _shapePoly.WAVE_CYCLES * math.pi * 2 + now * _shapePoly.WAVE_SPEED
+        table.insert(points, left + (right - left) * t)
+        table.insert(points, screenLineY + amp * math.sin(phase))
+    end
+    table.insert(points, right)
+    table.insert(points, bottom)
+    table.insert(points, left)
+    table.insert(points, bottom)
+    local maskTop = math.floor(screenLineY - amp) - 1
+
+    love.graphics.stencil(function() love.graphics.polygon("fill", points) end, "replace", 1)
+    love.graphics.setStencilTest("gequal", 1)
     drawBody(r, g, b, a)
-    if prevX then love.graphics.setScissor(prevX, prevY, prevW, prevH) else love.graphics.setScissor() end
+    love.graphics.setStencilTest()
+    love.graphics.stencil(function()
+        love.graphics.rectangle("fill", left, maskTop, right - left, bottom - maskTop)
+    end, "replace", 0)
 end
 
 -- Reshape-mode affordance: a square handle on every draggable corner.
@@ -6853,6 +6995,9 @@ local function _drawElement(canvas, e, signature)
     end
 
     -- A tank showing its level; its powered-glow halo stays the whole body.
+    -- Always top-of-tank-to-bottom oriented, regardless of port location or
+    -- count -- see _shapePoly.drawLevel's own wavy top surface for the
+    -- fluid-movement cue instead of a port-draining animation.
     if e.fillPercent then
         local drawWhole = drawShapeWithColor
         drawShapeWithColor = function(r, g, b, a, isHalo)
@@ -8173,66 +8318,309 @@ end
 -- "and it's going nowhere but out."
 --------------------------------------------------------------------------------
 _pipes.LEAK_DROPLETS = 6     -- reference count, at LEAK_REFERENCE_PSI
-_pipes.LEAK_SPEED = 1.6      -- droplet cycles a second
-_pipes.LEAK_RANGE_MULT = 28  -- how far a droplet travels, in multiples of the pipe's own fluid width -- also the reference range, at LEAK_REFERENCE_PSI
+_pipes.LEAK_SPEED = 1.2      -- droplet cycles a second, AT LEAK_SPEED_MAX_PSI (full speed, the cap) --
+                               -- see the speed calculation in drawLeakSprayAt, which uses this and
+                               -- the next 2 constants instead of the general intensity/LEAK_REFERENCE_PSI
+                               -- below (droplet count/size's own reference PSI is tuned much lower,
+                               -- matching a typical pump -- speed instead keeps climbing well past that,
+                               -- all the way out to a genuinely high-pressure pump before it maxes out).
+_pipes.LEAK_SPEED_MAX_PSI = 50  -- the cap: speed climbs with pressure up to here and no higher beyond it
+_pipes.LEAK_SPEED_MIN_FACTOR = 0.2 -- slowest the cycle ever runs (at/near zero pressure) -- low enough
+                                    -- to read as a lazy trickle, but never literally 0 (frozen droplets
+                                    -- look broken, not just slow).
+_pipes.LEAK_SPEED_TRANSITION_SECONDS = 3 -- how long a pressure change (the pump switching on/off, say)
+                                          -- takes to fully settle into the leak's new speed, eased
+                                          -- rather than snapped -- see drawLeakSprayAt's own state table.
+_pipes._leakSpeedState = {} -- seedKey -> {speedFactor, phaseBase, lastTime}, persisted across frames
+                             -- so the eased transition above (and the phase it drives) has something
+                             -- to continue from each time a leak is drawn again.
+_pipes.LEAK_RANGE_MULT = 3   -- how far a droplet travels, in multiples of the pipe's own fluid
+                               -- width -- a fixed reach every leak gets regardless of its own
+                               -- pressure (that's what LEAK_SPEED above is for instead).
 _pipes.LEAK_RADIUS_MULT = 0.6 -- droplet size, same units
-_pipes.LEAK_SPREAD_RAD = 0.7  -- max angle either side of straight out a droplet can fling
-_pipes.LEAK_REFERENCE_PSI = 15 -- the pressure LEAK_DROPLETS/LEAK_RANGE_MULT above are tuned for -- a
-                               -- typical pump's own PSI (GRAVITY_LEAK_BASELINE_PSI, in model/fluid.lua,
-                               -- is well below this on purpose -- gravity alone is the weak case)
+_pipes.LEAK_WIDTH_MULT = 2    -- total lateral spread, in multiples of the pipe's own fluid width --
+                               -- a narrow, straight-out jet rather than a widening cone
+_pipes.LEAK_REFERENCE_PSI = 15 -- the pressure LEAK_DROPLETS above is tuned for -- a typical pump's own
+                               -- PSI (GRAVITY_LEAK_BASELINE_PSI, in model/fluid.lua, is well below this
+                               -- on purpose -- gravity alone is the weak case)
 _pipes.LEAK_MIN_INTENSITY = 0.6 -- floor/ceiling on the pressure-driven scale-up/down below. The floor
                                  -- is deliberately not much below 1 -- a pipe's own fluid width is only
                                  -- a few px on this app's small canvas, so a leak scaled much smaller
                                  -- than "reference" stops reading as a spray at all, not just a weaker one.
 _pipes.LEAK_MAX_INTENSITY = 2.0
+-- A small fraction of ARROW_INSET_PX (the direction arrow's own clearance,
+-- tuned so its chevron tip doesn't visually collide with the joint) -- a
+-- leak isn't a symbol that needs that much clearance, it IS the opening,
+-- so it belongs right at the dead end's own literal position (e.g. a check
+-- valve's output port) instead of visibly starting a little way upstream
+-- of it. Not exactly 0: pathPieces' corner-rounding can leave a genuinely
+-- zero-length final piece sitting right at that literal endpoint, which
+-- has no defined tangent (see pointOnPiece) -- outputPoint then returns
+-- nil and the whole spray silently never draws. Any positive inset lands
+-- in the piece just before that zero-length one instead.
+_pipes.LEAK_INSET_PX = 0.5
 
 -- The leak spray (see the section header) for one pipe, colored r,g,b (the
 -- pipe's own resolved fluid color). Droplet paths are deterministic from the
 -- wire's own id and droplet index rather than math.random, so every canvas
 -- drawing the same wire at the same moment in time draws the identical
 -- spray, with no per-wire particle state to keep between frames.
-function _pipes.drawLeakSpray(canvas, w, plan, r, g, b)
-    local dir = w.pumpedDirection or w.gravityDirection
-    if not dir then return end
-    local pieces, total = _pipes.pathPieces(canvas, plan)
-    local x, y, tx, ty = _pipes.outputPoint(pieces, total, dir, _pipes.ARROW_INSET_PX, canvas.zoom)
-    if not x then return end
+-- One droplet's outline: a point trailing behind (away from the direction
+-- of travel, tx,ty) smoothly rounding into a 240-degree arc on the leading
+-- side -- a teardrop, not a circle, so a droplet in flight reads as moving
+-- the way it's actually moving instead of a generic dot. cx,cy is the
+-- droplet's own center; px,py is the unit vector perpendicular to tx,ty
+-- (same one the lateral jitter above is built from).
+-- Not `local` -- this file is already at Lua's 200-top-level-local ceiling
+-- (see CLAUDE.md); every other constant/helper added after that point
+-- already follows this same pattern.
+_TEARDROP_SEGMENTS = 8
+function _teardropVertices(cx, cy, tx, ty, px, py, radius)
+    local tailLen = radius * 1.8
+    local verts = { cx - tx * tailLen, cy - ty * tailLen }
+    for i = 0, _TEARDROP_SEGMENTS do
+        local a = math.rad(-120 + 240 * i / _TEARDROP_SEGMENTS)
+        local u, v = math.cos(a) * radius, math.sin(a) * radius
+        verts[#verts + 1] = cx + tx * u + px * v
+        verts[#verts + 1] = cy + ty * u + py * v
+    end
+    return verts
+end
+
+-- The droplet rendering shared by both leak sources (see the section
+-- header): a dead-end pipe (_pipes.drawLeakSpray, below) and an element's
+-- own disconnected port (_pipes.drawOpenPortLeaks, further down) -- same
+-- narrow straight jet either way, just anchored/aimed differently.
+-- seedKey makes each spray's droplet paths deterministic (see the section
+-- header's own comment) without requiring a wire id specifically.
+function _pipes.drawLeakSprayAt(canvas, seedKey, x, y, tx, ty, leakPressure, r, g, b)
     local fluidW = _pipes.fluidWidth(canvas)
     -- How hard the fluid is actually being pushed scales the spray itself,
     -- not just its look -- a weak gravity trickle sprays less/shorter than
-    -- a pump-driven blast (w.leakPressure, set in model/fluid.lua's step()
-    -- -- real PSI for a pump-driven leak, a flat baseline for gravity alone,
-    -- since gravity has no PSI of its own).
+    -- a pump-driven blast (leakPressure, set in model/fluid.lua's step()
+    -- for a pipe leak -- real PSI for a pump-driven leak, a flat baseline
+    -- for gravity alone; 0, an open port's own case -- nothing's actually
+    -- pushing an unconnected port -- clamps to that same gravity floor;
+    -- nil would instead read as LEAK_REFERENCE_PSI's own full intensity).
     local intensity = math.max(_pipes.LEAK_MIN_INTENSITY, math.min(_pipes.LEAK_MAX_INTENSITY,
-        (w.leakPressure or _pipes.LEAK_REFERENCE_PSI) / _pipes.LEAK_REFERENCE_PSI))
+        (leakPressure or _pipes.LEAK_REFERENCE_PSI) / _pipes.LEAK_REFERENCE_PSI))
     local dropletCount = math.max(2, math.floor(_pipes.LEAK_DROPLETS * intensity + 0.5))
-    local range = fluidW * _pipes.LEAK_RANGE_MULT * intensity
+    -- DISTANCE is fixed (LEAK_RANGE_MULT fluid-widths, always) -- pressure
+    -- instead speeds the animation up or slows it down (see the phase
+    -- computation in the droplet loop below), rather than changing how far
+    -- it reaches.
+    local range = fluidW * _pipes.LEAK_RANGE_MULT
     local radius = fluidW * _pipes.LEAK_RADIUS_MULT
     local onePx = 1 / love.graphics.getDPIScale()
     local now = _selection.now()
+    local halfWidth = fluidW * _pipes.LEAK_WIDTH_MULT / 2
+    local px, py = -ty, tx -- unit vector perpendicular to the spray's own direction
+    -- Pressure speeds the cycle up or slows it down -- its OWN scale, not
+    -- the general intensity above (droplet count/size there is tuned
+    -- against a typical pump's PSI; speed instead keeps climbing until a
+    -- genuinely high-pressure LEAK_SPEED_MAX_PSI, the cap). Distance itself
+    -- stays fixed at LEAK_RANGE_MULT regardless either way (see range, above).
+    local targetSpeedFactor = math.max(_pipes.LEAK_SPEED_MIN_FACTOR, math.min(1,
+        (leakPressure or _pipes.LEAK_SPEED_MAX_PSI) / _pipes.LEAK_SPEED_MAX_PSI))
+    -- Eased toward targetSpeedFactor, taking LEAK_SPEED_TRANSITION_SECONDS
+    -- to fully settle on ANY pressure change (a pump switching on/off, say)
+    -- -- a fixed DURATION, not a fixed rate, so a small change doesn't
+    -- finish almost instantly while only a big one actually takes the full
+    -- 3 seconds. Persisted per leak (seedKey) across frames, since a
+    -- transition needs to remember where it started and when. Phase itself
+    -- is accumulated the same way (state.phaseBase += speed * dt) rather
+    -- than the simpler now * speed used before this -- speed now changes
+    -- continuously while easing, and now * speed jumps discontinuously
+    -- (by an amount proportional to now, the app's whole running time)
+    -- the instant speed itself changes, which an accumulator sidesteps.
+    local state = _pipes._leakSpeedState[seedKey]
+    if not state then
+        state = { speedFactor = targetSpeedFactor, fromFactor = targetSpeedFactor,
+            toFactor = targetSpeedFactor, transitionStart = now, phaseBase = 0, lastTime = now }
+        _pipes._leakSpeedState[seedKey] = state
+    end
+    local dt = math.max(0, now - state.lastTime)
+    state.lastTime = now
+    if targetSpeedFactor ~= state.toFactor then
+        -- Pressure just changed -- start a fresh 3-second transition from
+        -- wherever the displayed speed actually sits right now (mid-
+        -- transition or already settled, either way), not from the old
+        -- target, so a pressure change arriving before the previous one
+        -- finished still eases smoothly instead of jumping to catch up.
+        state.fromFactor = state.speedFactor
+        state.toFactor = targetSpeedFactor
+        state.transitionStart = now
+    end
+    local t = math.min(1, (now - state.transitionStart) / _pipes.LEAK_SPEED_TRANSITION_SECONDS)
+    state.speedFactor = state.fromFactor + (state.toFactor - state.fromFactor) * t
+    local speed = _pipes.LEAK_SPEED * state.speedFactor
+    state.phaseBase = (state.phaseBase + speed * dt) % 1
     for i = 1, dropletCount do
-        local seed = ((string.byte(w.id, 1) or 1) * 7 + i * 31) % 97 / 97
-        local phase = (now * _pipes.LEAK_SPEED + i / dropletCount) % 1
-        local spread = (seed - 0.5) * 2 * _pipes.LEAK_SPREAD_RAD
-        local cs, sn = math.cos(spread), math.sin(spread)
-        local dx, dy = tx * cs - ty * sn, tx * sn + ty * cs
-        -- Straight line the whole way along the pipe's own direction (dx,dy
-        -- -- its tangent, rotated by this droplet's own spread above) --
-        -- no added world-down droop, so it sprays the way the pipe actually
-        -- points instead of always arcing toward the bottom of the screen.
-        local dropX = x + dx * range * phase
-        local dropY = y + dy * range * phase
+        local seed = ((string.byte(seedKey, 1) or 1) * 7 + i * 31) % 97 / 97
+        local phase = (state.phaseBase + i / dropletCount) % 1
+        -- Straight line the whole way along tx,ty (no droop toward world-
+        -- down, no angular fan-out either, so it stays a narrow jet
+        -- instead of a widening cone) -- each droplet's own small, FIXED
+        -- sideways offset (not growing with phase) is what gives the jet
+        -- its ~LEAK_WIDTH_MULT-fluid-widths-wide body.
+        local lateral = (seed - 0.5) * 2 * halfWidth
+        local dropX = x + tx * range * phase + px * lateral
+        local dropY = y + ty * range * phase + py * lateral
         -- A bright rim one device pixel wide keeps a droplet readable
-        -- against a pipe of a similar hue right behind it (the usual case --
-        -- a leak sprays from the pipe it's leaking out of), the same
-        -- rim-for-contrast trick the chevron/direction-arrow drawing uses.
+        -- against a pipe/tank of a similar hue right behind it (the usual
+        -- case -- a leak sprays from the very thing it's leaking out of),
+        -- the same rim-for-contrast trick the chevron/direction-arrow
+        -- drawing uses.
         local dropRadius = math.max(2, radius * (1 - phase * 0.5))
         love.graphics.setColor(1, 1, 1, (1 - phase) * 0.6)
-        love.graphics.circle("fill", dropX, dropY, dropRadius + onePx)
+        love.graphics.polygon("fill", _teardropVertices(dropX, dropY, tx, ty, px, py, dropRadius + onePx))
         love.graphics.setColor(r, g, b, (1 - phase) * 0.9)
-        love.graphics.circle("fill", dropX, dropY, dropRadius)
+        love.graphics.polygon("fill", _teardropVertices(dropX, dropY, tx, ty, px, py, dropRadius))
     end
     love.graphics.setColor(1, 1, 1, 1)
+end
+
+-- A directionalGate (check valve) element's own OUTPUT-side point and
+-- outward unit direction -- the "forward" side its own rotation faces (see
+-- model/graph.lua's _directionalGateForwardVector and this file's own
+-- _drawDiodeSymbol, both using the same "rotation 0 points +x" convention).
+-- A check valve that's the dead end of a leaking wire realistically leaks
+-- PAST its own seal, out this side, not back out the pipe feeding its
+-- other (input) side -- see _pipes.drawLeakSpray below, the only caller.
+function _pipes.directionalGateOutputPoint(canvas, e)
+    local _, _, ew, eh = _elementPixelRect(canvas, e)
+    local cx, cy = _elementCenter(canvas, e)
+    local rad = math.rad(e.rotation or 0)
+    local fx, fy = math.cos(rad), math.sin(rad)
+    -- Projects onto whichever half-extent the forward axis actually runs
+    -- along, so a tall/narrow or wide/short valve still lands its output
+    -- point right at its own edge instead of overshooting a non-square one.
+    local half = math.abs(fx) >= math.abs(fy) and ew / 2 or eh / 2
+    return cx + fx * half, cy + fy * half, fx, fy
+end
+
+function _pipes.drawLeakSpray(canvas, w, plan, r, g, b)
+    local dir = w.pumpedDirection or w.gravityDirection
+    if not dir then return end
+    -- The dead end is whichever side of the wire fluid is heading TOWARD
+    -- (forward: the "to" element; reverse: the "from" one) -- if that's a
+    -- check valve, spray from its own output side (above) instead of the
+    -- wire's own literal end, which sits at the valve's INPUT side.
+    local deadEndId = (dir == "reverse") and w.fromElementId or w.toElementId
+    local gate = deadEndId and _findElement(canvas, deadEndId)
+    local x, y, tx, ty
+    if gate and gate.componentType == "directionalGate" then
+        x, y, tx, ty = _pipes.directionalGateOutputPoint(canvas, gate)
+    else
+        local pieces, total = _pipes.pathPieces(canvas, plan)
+        x, y, tx, ty = _pipes.outputPoint(pieces, total, dir, _pipes.LEAK_INSET_PX, canvas.zoom)
+    end
+    if not x then return end
+    _pipes.drawLeakSprayAt(canvas, w.id, x, y, tx, ty, w.leakPressure, r, g, b)
+end
+
+-- Whether element e has any terminal with no wire plugged into it at all --
+-- the shared test both _pipes.drawOpenPortLeaks below (which also needs to
+-- know WHICH terminal, to spray from it) and the public
+-- gdsGui_schematic_elementHasOpenPort wrapper (which only needs yes/no --
+-- model/fluid.lua reads that, via the app layer, to let a leaking tank
+-- still accept gravity/pump inflow at 100% instead of blocking it like a
+-- genuinely sealed full tank) run.
+-- Not `local` -- this file is already at Lua's 200-top-level-local ceiling
+-- (see CLAUDE.md).
+function _elementHasOpenTerminal(canvas, e)
+    if not e.terminals then return false end
+    local connected = {}
+    for _, w in ipairs(canvas.wires) do
+        if w.fromElementId == e.id and w.fromTerminal then connected[w.fromTerminal] = true end
+        if w.toElementId == e.id and w.toTerminal then connected[w.toTerminal] = true end
+    end
+    for i in ipairs(e.terminals) do
+        if not connected[i] then return true end
+    end
+    return false
+end
+
+-- Public wrapper for the app layer (main.lua's own _fluidFlowInputs, not
+-- this file, which must stay domain-agnostic about what an "open port"
+-- means to the fluid MODEL specifically -- see _elementHasOpenTerminal's
+-- own comment).
+function gdsGui_schematic_elementHasOpenPort(canvasName, elementId)
+    local canvas = _findCanvas(canvasName)
+    local e = canvas and _findElement(canvas, elementId)
+    return e ~= nil and _elementHasOpenTerminal(canvas, e)
+end
+
+-- A tank (or any other fluid-holding source) with a port that has no wire
+-- plugged into it at all -- not a dead-end PIPE (see the section header
+-- and _pipes.drawLeak/drawLeakSpray above, model/fluid.lua's own leak
+-- detection), just an opening in the element's own body with nothing
+-- connected -- sprays the same way, aimed along the straight line from the
+-- element's own center through that port (not the port's stored exit
+-- normal -- a port off the element's own centerline would otherwise aim
+-- parallel to the edge instead of outward through the opening itself).
+function _pipes.drawOpenPortLeaks(canvas, signature)
+    if not _pipes.isLiquid(canvas) or canvas.mode ~= "control" then return end
+    for _, e in ipairs(canvas.elements) do
+        if e.componentType == "source" and e.shapeType and e.terminals and (e.fillPercent or 100) > 0 then
+            local connected, tankPsi = {}, 0
+            for _, w in ipairs(canvas.wires) do
+                if w.fromElementId == e.id and w.fromTerminal then connected[w.fromTerminal] = true end
+                if w.toElementId == e.id and w.toTerminal then connected[w.toTerminal] = true end
+                -- Whether a pump wired to this tank (through one of its
+                -- OTHER, connected ports) is actually switched on right now,
+                -- and if so its own real PSI -- its own position's LABEL,
+                -- not w.pumpedDirection (set only once the model has
+                -- actually resolved a full delivery route for it, which a
+                -- pump switched on but routing its flow through a different
+                -- port, or into an already-full tank with nowhere to put
+                -- it, would leave unset even though the pump itself is
+                -- genuinely running and genuinely pressurizing this port
+                -- too) -- so a pump control sitting OFF leaves tankPsi at 0
+                -- exactly as the open port itself has no pump of its own.
+                -- A tank's own fill level does NOT factor in here (it did
+                -- before -- see model/fluid.lua's own "no tank pressure
+                -- concept" comment on the FUEL TANK catalog entry -- a
+                -- full-but-unpumped tank isn't actually under any more
+                -- pressure than an empty one in this model, so its leak
+                -- shouldn't look stronger either). The highest PSI of
+                -- possibly several pumps wins.
+                if w.fromElementId == e.id or w.toElementId == e.id then
+                    local otherId = (w.fromElementId == e.id) and w.toElementId or w.fromElementId
+                    local pump = _findControl(canvas, otherId)
+                    if pump and pump.componentType == "source" then
+                        local label = pump.positions and pump.positions[(pump.detentIndex or 0) + 1]
+                        if label ~= "OFF" and label ~= "CLOSED" then
+                            local psi = tonumber(pump.voltage)
+                            if psi and psi > tankPsi then tankPsi = psi end
+                        end
+                    end
+                end
+            end
+            local cx, cy = _elementCenter(canvas, e)
+            for i in ipairs(e.terminals) do
+                if not connected[i] then
+                    local px, py = _terminals.point(canvas, e, i)
+                    if px then
+                        local dx, dy = px - cx, py - cy
+                        local len = math.sqrt(dx * dx + dy * dy)
+                        if len > 0.001 then
+                            local tx, ty = dx / len, dy / len
+                            local r, g, b = gdsGui_schematic_resolveDisplayColor(canvas.name, "element", e.id, signature)
+                            -- An open port has no pump/wire of its own to
+                            -- carry a real PSI -- 0 (same as a dead-end
+                            -- PIPE leak with nothing pushing it -- see
+                            -- drawLeakSpray above) unless a pump elsewhere
+                            -- on this same tank is actually running right
+                            -- now (tankPsi, above), in which case that
+                            -- pump's own real PSI applies here too.
+                            _pipes.drawLeakSprayAt(canvas, e.id .. i, px, py, tx, ty, tankPsi, r, g, b)
+                        end
+                    end
+                end
+            end
+        end
+    end
 end
 
 -- The leak spray, drawn only in control mode and only on a pipe step()
@@ -9098,7 +9486,15 @@ function _glow.ensureResources()
             -- sequence yet. conf.lua turning off the window's own msaa is
             -- the other half of this fix: with no resolveTexture anywhere
             -- in the renderer, neither failure can occur, by construction.
-            local newA, newB = love.graphics.newCanvas(w, h), love.graphics.newCanvas(w, h)
+            -- stencil=true (plain, no msaa -- same reasoning as the comment
+            -- above): every normal element draw, not just the halo capture
+            -- passes, lands on canvasA while a glow pass is active (see the
+            -- main loop below), and _shapePoly.drawLevel's wave-curve mask
+            -- needs a real stencil buffer on whatever canvas is bound, or
+            -- LÖVE throws "Drawing to the stencil buffer with a Canvas
+            -- active requires ... stencil=true".
+            local newA = love.graphics.newCanvas(w, h, { stencil = true })
+            local newB = love.graphics.newCanvas(w, h, { stencil = true })
             -- Drawn back at full size: linear, so the glow scales up soft rather than blocky.
             newA:setFilter("linear", "linear")
             newB:setFilter("linear", "linear")
@@ -9314,7 +9710,12 @@ function _menuBackdrop.ensureResources()
             -- crashes mixing an MSAA canvas into a shader ping-pong on this
             -- LÖVE 12 pre-release backend, and this is the exact same kind
             -- of ping-pong.
-            local newFull = love.graphics.newCanvas(fullW, fullH)
+            -- stencil=true on "full": every element behind an open modal
+            -- menu draws into this buffer (see gdsGui_schematic_draw's own
+            -- backdropActive redirect below), and _shapePoly.drawLevel's
+            -- wave-curve mask needs a real stencil buffer on whatever canvas
+            -- is bound -- same reasoning as _glow.ensureResources above.
+            local newFull = love.graphics.newCanvas(fullW, fullH, { stencil = true })
             local newA, newB = love.graphics.newCanvas(w, h), love.graphics.newCanvas(w, h)
             newA:setFilter("linear", "linear")
             newB:setFilter("linear", "linear")
@@ -10178,6 +10579,7 @@ function gdsGui_schematic_draw(pageName)
                         _pipes.drawLeak(canvas, w, plan, signature)
                     end
                 end
+                _pipes.drawOpenPortLeaks(canvas, signature)
             end
             _glow.finish(canvas)
             _drawAnnunciators(canvas)
