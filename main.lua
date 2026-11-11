@@ -1408,7 +1408,15 @@ local function _systemGalleryItems(aircraft)
     local items = {}
     if not aircraft then return items end
     local byType = {}
-    for _, sys in ipairs(aircraft.systems) do byType[sys.systemType] = sys end
+    -- A system missing systemType (a stray legacy record, or one caught
+    -- mid-creation) is tolerated everywhere else this field is read (e.g.
+    -- _convertLegacySchematicSystem, _findCatalogEntryForType callers below)
+    -- via "sys.systemType and ..." -- this was the one spot indexing a table
+    -- by it directly, with no guard, crashing instead of just leaving that
+    -- system unmatched to a catalog tile the same way those do.
+    for _, sys in ipairs(aircraft.systems) do
+        if sys.systemType then byType[sys.systemType] = sys end
+    end
     for _, catalogEntry in ipairs(SCHEMATIC_CATALOG) do
         local sys = byType[catalogEntry.system]
         local item
