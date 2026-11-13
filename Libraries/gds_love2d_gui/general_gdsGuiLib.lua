@@ -1051,7 +1051,13 @@ function gdsGui_general_mousepressed (x, y, button, istouch, presses)
 		globApp.userInput = calledFunction
 
 		if not schematicHardMenuOpen then
-			gdsGui_button_pressed (x,y,button,istouch) --runs when clicked on created buttons
+			-- A press landing inside a registered scroll dock (see
+			-- gdsGui_button_setScrollDockRect in buttons_gdsGuiLib.lua) owns
+			-- this press instead -- it fires the normal gdsGui_button_pressed
+			-- itself, once release reveals whether this was a tap or a drag.
+			if not gdsGui_button_dockGatePressed ("mouse", x, y, button, istouch) then
+				gdsGui_button_pressed (x,y,button,istouch) --runs when clicked on created buttons
+			end
 		end
 
 		if not schematicModalOpen then
@@ -1149,7 +1155,14 @@ function gdsGui_general_mousereleased (x, y, button, istouch, presses)
 			gdsGui_page_loadingTouched (x, y)
 
 			if not schematicHardMenuOpen then
-				gdsGui_button_released (x, y, 1, istouch, presses)
+				-- Same scroll-dock gate as gdsGui_general_mousepressed above --
+				-- a mouse-drag never flips globApp.userInput away from
+				-- "<btn> click pressed" (only touchmoved's slide-sensitivity
+				-- check does that -- see gdsGui_general_touchmoved), so this
+				-- release always reaches here even after a full drag.
+				if not gdsGui_button_dockGateReleased ("mouse", x, y, 1, istouch) then
+					gdsGui_button_released (x, y, 1, istouch, presses)
+				end
 			end
 
 			-- gdsGui_button_released above may itself have run a callback
@@ -1198,6 +1211,11 @@ function gdsGui_general_mousemoved (x, y, button, istouch, presses)
 	-- On mobile, love.mousemoved fires for touch events (istouch=true) in addition
 	-- to love.touchmoved. Skip here to avoid applying scroll deltas twice.
 	if presses then return end
+
+	-- button = dx, istouch = dy for this callback (see note above). A no-op
+	-- unless "mouse" is actively captured by a registered scroll dock (see
+	-- gdsGui_button_dockGatePressed above).
+	gdsGui_button_dockGateMoved ("mouse", x, y, button, istouch)
 
 	gdsGui_scrollBar_holdAndDrag ("mouse", x, y, button, istouch)
 
@@ -1348,7 +1366,10 @@ function gdsGui_general_touchpressed (id, x, y, dx, dy, pressure)
 	globApp.userInput = calledFunction -- insert code below this line to user glob var
 
 	if not schematicHardMenuOpen then
-		gdsGui_button_pressed (x,y,1,true) --runs when clicked on created buttons
+		-- Same scroll-dock gate as gdsGui_general_mousepressed above.
+		if not gdsGui_button_dockGatePressed (id, x, y, 1, true) then
+			gdsGui_button_pressed (x,y,1,true) --runs when clicked on created buttons
+		end
 	end
 
 	if not schematicModalOpen then
@@ -1404,6 +1425,12 @@ function gdsGui_general_touchmoved (id, x, y, dx, dy, pressure)
 	-- comment on gdsGui_schematic_isHardMenuOpen.
 	local schematicHardMenuOpen = gdsGui_schematic_isHardMenuOpen()
 
+	-- Scroll dock drag, if "id" is actively captured by one (see
+	-- gdsGui_button_dockGatePressed) -- independent of the slide-sensitivity/
+	-- schematicModalOpen gating below, same as gdsGui_schematic_moved just
+	-- under it.
+	local dockHandled = gdsGui_button_dockGateMoved (id, x, y, dx, dy)
+
 	-- Handle scrollbar and knob drag for this specific touch independently.
 	if not schematicModalOpen then
 		gdsGui_scrollBar_holdAndDrag (id, x, y, 1, true)
@@ -1422,7 +1449,7 @@ function gdsGui_general_touchmoved (id, x, y, dx, dy, pressure)
 
 			end
 
-			if not schematicHardMenuOpen then
+			if not schematicHardMenuOpen and not dockHandled then
 				gdsGui_button_released (x, y, 1, true)
 			end
 
@@ -1464,6 +1491,16 @@ function gdsGui_general_touchreleased (id, x, y, dx, dy, pressure)
 	-- comment on gdsGui_schematic_isHardMenuOpen.
 	local schematicHardMenuOpen = gdsGui_schematic_isHardMenuOpen()
 
+	-- Scroll dock release, if "id" was captured (see gdsGui_button_dockGatePressed)
+	-- -- called unconditionally, BEFORE the globApp.userInput tap/slide check
+	-- below, since a real drag always trips that check's own "slide" state
+	-- (see gdsGui_general_touchmoved's slideSensitivity) and would otherwise
+	-- skip this release's dock handling entirely, leaving its capture never
+	-- cleared. Whether this ends up firing a replayed tap or nothing at all
+	-- (a drag) is decided entirely inside the gate, independent of
+	-- globApp.userInput.
+	local dockHandled = gdsGui_button_dockGateReleased (id, x, y, 1, true)
+
 	local calledFunction = "touch released"
 
 	if globApp.userInput == "touch pressed" then
@@ -1483,7 +1520,7 @@ function gdsGui_general_touchreleased (id, x, y, dx, dy, pressure)
 		-- re-hit-tested against the new page's loading-link hit box.
 		gdsGui_page_loadingTouched (x, y)
 
-		if not schematicHardMenuOpen then
+		if not schematicHardMenuOpen and not dockHandled then
 			gdsGui_button_released (x, y, 1, istouch, presses)		gdsGui_inputTxtBox_pressed (x,y,button,istouch) --runs when clicked or touched on textboxes
 		end
 

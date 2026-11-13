@@ -384,3 +384,148 @@ function gdsGui_button_setFloatingShadow(buttonName, floating)
         end
     end
 end
+
+--------------------------------------------------------------------------------
+-- SCROLL DOCKS — a named screen-space region where a press-and-drag scrolls
+-- a group of floating buttons instead of tapping whichever one it landed on.
+--
+-- Buttons here have no notion of "this touch turned into a scroll, don't
+-- fire" -- a "toggle" button fires its callback the instant it's pressed
+-- (see gdsGui_button_pressed above), so a drag starting on one would already
+-- have fired before any movement could be measured. gdsGui_general_mouse/
+-- touchpressed/_moved/_released (general_gdsGuiLib.lua) each call the three
+-- gate functions below BEFORE their own normal gdsGui_button_pressed/
+-- _released call for the same event, and skip that normal call whenever the
+-- gate reports it already owns this touch/mouse id -- see each gate
+-- function's own comment for exactly what that means at that stage of the
+-- gesture.
+--
+-- The app layer owns the geometry and the "what does this group mean"
+-- entirely (via gdsGui_button_setScrollDockRect, called every frame the
+-- dock's own rect needs to track something live, e.g. a resize) -- this is
+-- purely geometric gating plus a drag threshold, same "opaque to why"
+-- contract gdsGui_schematic_setInputBlockRect already uses for the canvas.
+--------------------------------------------------------------------------------
+
+globApp.objects.buttonScrollDocks = {}
+
+local _DOCK_DRAG_THRESHOLD_PX = 6
+
+--[[
+    Registers (or, passing a nil rect, clears) a scroll dock by name. rect is
+    {x, y, w, h} in screen pixels; scrollCallbackName (ignored when rect is
+    nil) is a by-name callback, resolved via _G[...] same convention as every
+    other string-registered callback in this library, called as
+    fn(deltaPixelsY) once per drag move past the threshold (positive delta =
+    finger/cursor moved down since the last move).
+]]
+function gdsGui_button_setScrollDockRect(dockName, pageName, rect, scrollCallbackName)
+    for _, d in ipairs(globApp.objects.buttonScrollDocks) do
+        if d.name == dockName then
+            d.page = pageName
+            d.rect = rect
+            d.scrollCallback = rect and scrollCallbackName or nil
+            return
+        end
+    end
+    table.insert(globApp.objects.buttonScrollDocks, {
+        name = dockName, page = pageName, rect = rect,
+        scrollCallback = rect and scrollCallbackName or nil, capture = nil,
+    })
+end
+
+local function _findScrollDockAt(pageName, x, y)
+    for _, d in ipairs(globApp.objects.buttonScrollDocks) do
+        if d.page == pageName and d.rect and
+           x >= d.rect.x and x <= d.rect.x + d.rect.w and
+           y >= d.rect.y and y <= d.rect.y + d.rect.h then
+            return d
+        end
+    end
+    return nil
+end
+
+local function _findScrollDockByCapture(id)
+    for _, d in ipairs(globApp.objects.buttonScrollDocks) do
+        if d.capture and d.capture.id == id then return d end
+    end
+    return nil
+end
+
+--[[
+    Call before dispatching a press to gdsGui_button_pressed. Returns true
+    (and starts tracking this touch/mouse id) when (x,y) lands inside a
+    registered scroll dock on the active page -- the caller must skip its
+    own normal gdsGui_button_pressed call for THIS press when true, since
+    gdsGui_button_dockGateReleased below is what actually fires it, once it
+    knows whether the gesture turned out to be a tap or a drag. Returns
+    false (do nothing, handle this press exactly as before) for every press
+    outside every registered dock.
+
+    Also sets globApp.buttonPressConsumed, same as gdsGui_button_pressed
+    itself does on a hit -- a dock's own drag rect is deliberately bigger
+    than the sum of its buttons' hitboxes (it has to cover the GAPS between
+    them too, or a drag starting in a gap would fall straight through to
+    whatever's underneath), so a press landing in one of those gaps has no
+    button of its own to be "consumed" by. Without this, something layered
+    under the dock (e.g. a schematic canvas's own pan) would see the SAME
+    press as a miss on every button and handle it too, double-driving the
+    gesture alongside the dock scroll this gate is about to start.
+]]
+function gdsGui_button_dockGatePressed(id, x, y, button, istouch)
+    if button and button ~= 1 then return false end
+    local d = _findScrollDockAt(_getActivePageName(), x, y)
+    if not d then return false end
+    d.capture = { id = id, startX = x, startY = y, lastY = y, isDrag = false }
+    globApp.buttonPressConsumed = true
+    return true
+end
+
+--[[
+    Call on every move for this id. While movement since the press stays
+    under the drag threshold this does nothing but keep waiting; once past
+    it, this and every subsequent move scrolls (calls the dock's registered
+    callback with the pixel delta since the last move) and a tap can no
+    longer fire for this gesture. Returns true for as long as a capture for
+    this id is live (even before the threshold trips), so the caller can
+    skip whatever per-move button bookkeeping it would otherwise do --
+    harmless either way for a "toggle" button (which only reacts on press),
+    but matters for a "pushonoff" one.
+]]
+function gdsGui_button_dockGateMoved(id, x, y, dx, dy)
+    local d = _findScrollDockByCapture(id)
+    if not d then return false end
+    local c = d.capture
+    if not c.isDrag and (math.abs(y - c.startY) > _DOCK_DRAG_THRESHOLD_PX or math.abs(x - c.startX) > _DOCK_DRAG_THRESHOLD_PX) then
+        c.isDrag = true
+    end
+    if c.isDrag and d.scrollCallback then
+        local fn = _G[d.scrollCallback]
+        if fn then fn(y - c.lastY) end
+    end
+    c.lastY = y
+    return true
+end
+
+--[[
+    Call on release for this id, BEFORE the caller's own normal
+    gdsGui_button_released. A gesture that never crossed the drag threshold
+    replays as a plain tap -- gdsGui_button_pressed then gdsGui_button_released,
+    both at this exact release point -- so whichever button the finger is
+    still over fires exactly as if the dock had never intercepted the press;
+    one that did drag ends here with no tap at all. Returns true once a
+    capture for this id existed (even when nothing ends up firing), so the
+    caller knows to skip its own release handling for this same event; false
+    when this id was never captured (nothing to do).
+]]
+function gdsGui_button_dockGateReleased(id, x, y, button, istouch)
+    local d = _findScrollDockByCapture(id)
+    if not d then return false end
+    local wasDrag = d.capture.isDrag
+    d.capture = nil
+    if not wasDrag then
+        gdsGui_button_pressed(x, y, 1, istouch)
+        gdsGui_button_released(x, y, 1, istouch)
+    end
+    return true
+end

@@ -9510,15 +9510,20 @@ function _glow.ensureResources()
             -- sequence yet. conf.lua turning off the window's own msaa is
             -- the other half of this fix: with no resolveTexture anywhere
             -- in the renderer, neither failure can occur, by construction.
-            -- stencil=true (plain, no msaa -- same reasoning as the comment
-            -- above): every normal element draw, not just the halo capture
+            -- Plain creation, no stencil option here -- on this LÖVE 12.0.0
+            -- build, newCanvas no longer accepts one at all ("Invalid
+            -- texture setting name: stencil"; it may have during an earlier
+            -- pre-release snapshot, which is what this code was originally
+            -- written against). A stencil buffer is requested per-bind
+            -- instead, at each setCanvas(...) call below that actually needs
+            -- one -- every normal element draw, not just the halo capture
             -- passes, lands on canvasA while a glow pass is active (see the
             -- main loop below), and _shapePoly.drawLevel's wave-curve mask
             -- needs a real stencil buffer on whatever canvas is bound, or
             -- LÖVE throws "Drawing to the stencil buffer with a Canvas
             -- active requires ... stencil=true".
-            local newA = love.graphics.newCanvas(w, h, { stencil = true })
-            local newB = love.graphics.newCanvas(w, h, { stencil = true })
+            local newA = love.graphics.newCanvas(w, h)
+            local newB = love.graphics.newCanvas(w, h)
             -- Drawn back at full size: linear, so the glow scales up soft rather than blocky.
             newA:setFilter("linear", "linear")
             newB:setFilter("linear", "linear")
@@ -9598,7 +9603,7 @@ function _glow.begin(canvas)
     if not canvas.glow.active then return end
     _glow.guarded(function()
         local st = _glow.saveState()
-        love.graphics.setCanvas(_glow.canvasA)
+        love.graphics.setCanvas({ _glow.canvasA, stencil = true })
         -- clear() honors the scissor: with the canvas's screen-space scissor
         -- still set, part of this half-size buffer was never cleared, and the
         -- blur kept smearing last frame's glow across it.
@@ -9614,7 +9619,7 @@ end
 function _glow.capture(drawFn)
     _glow.guarded(function()
         local st = _glow.saveState()
-        love.graphics.setCanvas(_glow.canvasA)
+        love.graphics.setCanvas({ _glow.canvasA, stencil = true })
         love.graphics.setScissor()
         love.graphics.setBlendMode("alpha")
         love.graphics.push()
@@ -9641,11 +9646,11 @@ function _glow.finish(canvas)
         love.graphics.setBlendMode("alpha", "premultiplied")
         love.graphics.setColor(1, 1, 1, 1)
         for _ = 1, _glow.PASSES do
-            love.graphics.setCanvas(_glow.canvasB)
+            love.graphics.setCanvas({ _glow.canvasB, stencil = true })
             love.graphics.clear(0, 0, 0, 0)
             _glow.shader:send("direction", { _glow.SPREAD / w, 0 })
             love.graphics.draw(_glow.canvasA)
-            love.graphics.setCanvas(_glow.canvasA)
+            love.graphics.setCanvas({ _glow.canvasA, stencil = true })
             love.graphics.clear(0, 0, 0, 0)
             _glow.shader:send("direction", { 0, _glow.SPREAD / h })
             love.graphics.draw(_glow.canvasB)
@@ -9734,12 +9739,17 @@ function _menuBackdrop.ensureResources()
             -- crashes mixing an MSAA canvas into a shader ping-pong on this
             -- LÖVE 12 pre-release backend, and this is the exact same kind
             -- of ping-pong.
-            -- stencil=true on "full": every element behind an open modal
-            -- menu draws into this buffer (see gdsGui_schematic_draw's own
-            -- backdropActive redirect below), and _shapePoly.drawLevel's
-            -- wave-curve mask needs a real stencil buffer on whatever canvas
-            -- is bound -- same reasoning as _glow.ensureResources above.
-            local newFull = love.graphics.newCanvas(fullW, fullH, { stencil = true })
+            -- Plain creation (see _glow.ensureResources's own comment on why
+            -- -- same LÖVE 12.0.0 API change, same fix). "full" needs a
+            -- stencil buffer requested at BIND time instead (see its own
+            -- setCanvas call in _menuBackdrop.begin below): every element
+            -- behind an open modal menu draws into this buffer (see
+            -- gdsGui_schematic_draw's own backdropActive redirect below),
+            -- and _shapePoly.drawLevel's wave-curve mask needs a real
+            -- stencil buffer on whatever canvas is bound. canvasA/canvasB
+            -- below are pure blur ping-pong -- no element ever draws into
+            -- them with a stencil op, so they don't need one.
+            local newFull = love.graphics.newCanvas(fullW, fullH)
             local newA, newB = love.graphics.newCanvas(w, h), love.graphics.newCanvas(w, h)
             newA:setFilter("linear", "linear")
             newB:setFilter("linear", "linear")
@@ -9768,7 +9778,7 @@ function _menuBackdrop.begin()
     _menuBackdrop.active = _menuBackdrop.ensureResources()
     if not _menuBackdrop.active then return end
     _menuBackdrop.guarded(function()
-        love.graphics.setCanvas(_menuBackdrop.full)
+        love.graphics.setCanvas({ _menuBackdrop.full, stencil = true })
         love.graphics.setScissor()
         love.graphics.clear(0, 0, 0, 0)
     end)

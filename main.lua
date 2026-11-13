@@ -1085,6 +1085,29 @@ local _SCHEMATIC_DOCK_TOOLS = {
 local _SCHEMATIC_CONTROL_DOCK_TOOLS = {
     gear = "schematicGearCtlBtn",
 }
+-- Ordered top-to-bottom sequence for each mode's dock column, used only by
+-- the scrollable "wheel" below (_schematicDockLayoutApply) to know each
+-- button's slot index — _SCHEMATIC_DOCK_TOOLS/_SCHEMATIC_CONTROL_DOCK_TOOLS
+-- above are keyed by role instead of ordered, so they can't drive layout
+-- math on their own. Global, not local: main.lua is at Lua's 200-local
+-- ceiling.
+-- TEST ONLY — schematicTestBtn1/2/3 (created further down, alongside
+-- BACKGROUND) exist purely so the scrollable wheel has something to scroll
+-- to on a screen tall enough to already fit all six real tools. Remove
+-- these three names (and their gdsGui_button_create calls, and the matching
+-- gdsGui_button_setFloatingShadow calls) once manual testing is done.
+_SCHEMATIC_DOCK_ORDER_DESIGN = {
+    "schematicAddBtn", "schematicPaintBtn", "schematicAnnunciatorBtn",
+    "schematicGearBtn", "schematicAiBtn", "schematicBackGroundBtn",
+    "schematicTestBtn1", "schematicTestBtn2", "schematicTestBtn3",
+}
+_SCHEMATIC_DOCK_ORDER_CONTROL = { "schematicGearCtlBtn" }
+-- COMBINATION PREV/NEXT's own fixed width (see their create calls near
+-- schCombBtnYFrac below) — shared with _aiPanelRect, which insets its own
+-- width by exactly this much on each side so the AI panel fits between the
+-- two buttons rather than under them. Global, not local: see
+-- _SCHEMATIC_DOCK_ORDER_DESIGN above.
+_SCHEMATIC_COMB_BTN_W = 32
 local _activeSchematicTool = nil  -- nil | "add" | "paint" | "annunciator"
 local _prevSchematicZoomText = nil
 local _schematicZoomFullScreenFont = nil
@@ -1116,7 +1139,132 @@ _schematicFullScreenDockOpen = true
 -- through this instead, so the two reasons compose instead of one silently
 -- overwriting the other. Global, not local: see _schematicDockOpen above.
 function _schematicDockSetToolHidden(name, hiddenByMode)
-    gdsGui_button_setHidden(name, hiddenByMode or not _schematicDockOpen)
+    gdsGui_button_setHidden(name, hiddenByMode or not _schematicDockOpen or _schematicDockScrolledOut[name] or false)
+end
+
+-- Scrollable "wheel" for the dock column above: the user drags directly on
+-- the tool buttons (gdsGui_button_dockGateMoved/_Pressed/_Released in
+-- buttons_gdsGuiLib.lua, wired up through gdsGui_button_setScrollDockRect
+-- below) to reveal tools that don't fit within
+-- _SCHEMATIC_DOCK_WHEEL_HEIGHT_FRAC of the live canvas's own height —
+-- anything outside that window is fully hidden (not just scrolled
+-- off-screen), per _schematicDockLayoutApply below. schematicDockToggle
+-- itself sits outside the drag rect (see _syncSchematicDockScrollRect) and
+-- never moves with it. 0 = scrolled to the top (every mode starts here).
+-- Global, not local: see _schematicDockOpen above.
+_schematicDockScrollY = 0
+-- Per-button "would this slot fall outside the wheel's own visible window"
+-- flag, keyed by button name — populated fresh every
+-- _schematicDockLayoutApply call and consulted by _schematicDockSetToolHidden
+-- above so a scroll doesn't need its own copy of the mode/dock-open hidden
+-- logic. Global, not local: see _schematicDockOpen above.
+_schematicDockScrolledOut = {}
+-- Fixed fraction pitch between consecutive dock slots (set once, alongside
+-- the buttons themselves, in createSchematicObjects — see schDockPitchFrac's
+-- own comment there) — multiplying it by the CURRENT safeScreenArea.h
+-- below gives the live pixel pitch, so this stays correct across a resize
+-- without needing its own resize hook. Global, not local: see
+-- _schematicDockOpen above.
+_schematicDockPitchFrac = 0
+_SCHEMATIC_DOCK_WHEEL_HEIGHT_FRAC = 0.75
+
+function _findButtonByName(name)
+    for _, b in ipairs(globApp.objects.buttons) do
+        if b.name == name then return b end
+    end
+    return nil
+end
+
+-- Shared by _schematicDockLayoutApply/_syncSchematicDockScrollRect below:
+-- the wheel's own on-screen window, top/height in pixels. Height is
+-- _SCHEMATIC_DOCK_WHEEL_HEIGHT_FRAC of the live canvas height EXCEPT it
+-- never reaches past COMBINATION NEXT's own top edge -- on a small enough
+-- canvas, 3/4 of its height can be taller than the gap above NEXT (NEXT's
+-- own height is a fixed 64px, not a fraction of the canvas, so that gap
+-- doesn't shrink in lockstep with the 3/4 window the way two fractions of
+-- the same thing would), and a tool button sitting in that leftover sliver
+-- would draw UNDER NEXT with nothing to hide it -- the exact overlap this
+-- wheel exists to prevent. Returns nil if there's no toggle/canvas to
+-- measure against yet. Global, not local: see _schematicDockOpen above.
+function _schematicDockWindow()
+    local toggle = _findButtonByName("schematicDockToggle")
+    local cx, cy, cw, ch = gdsGui_schematic_getCanvasRect("mainCanvas")
+    if not toggle or not cx then return nil end
+    -- One pitch below the toggle's own TOP (not its bottom edge) -- exactly
+    -- where ADD/schematicGearCtlBtn's own fraction-based y already placed
+    -- them pre-wheel (schCanvasYFrac + 1*schDockPitchFrac), 2px further down
+    -- than the toggle's bottom edge to preserve that same inter-tool gap.
+    local pitch     = _schematicDockPitchFrac * globApp.safeScreenArea.h
+    local windowTop = toggle.myy + pitch
+    local windowH   = ch * _SCHEMATIC_DOCK_WHEEL_HEIGHT_FRAC
+    local nextBtn   = _findButtonByName("schematicCombNextBtn")
+    if nextBtn then
+        windowH = math.min(windowH, nextBtn.myy - windowTop)
+    end
+    return toggle, windowTop, math.max(0, windowH)
+end
+
+-- Repositions every dock tool in the CURRENTLY ACTIVE mode's column against
+-- _schematicDockScrollY, clamping that offset to whatever actually overflows
+-- the wheel's own window (see _schematicDockWindow above), and marks any
+-- slot that falls outside it as hidden through the normal
+-- _schematicDockSetToolHidden chokepoint (hiddenByMode false — an
+-- active-mode member is never hidden for mode reasons). Cheap enough (at
+-- most 6 buttons) to call unconditionally every frame (see love.update) as
+-- well as on every drag move, so resize/mode-change/scroll all self-correct
+-- without needing their own separate call sites.
+function _schematicDockLayoutApply()
+    local toggle, windowTop, windowH = _schematicDockWindow()
+    if not toggle then return end
+    local designing = gdsGui_schematic_getMode("mainCanvas") == "design"
+    local order = designing and _SCHEMATIC_DOCK_ORDER_DESIGN or _SCHEMATIC_DOCK_ORDER_CONTROL
+    local pitch     = _schematicDockPitchFrac * globApp.safeScreenArea.h
+    local btnH      = toggle.myheight
+    local contentH  = (#order - 1) * pitch + btnH
+    local maxScroll = math.max(0, contentH - windowH)
+    _schematicDockScrollY = math.max(0, math.min(maxScroll, _schematicDockScrollY))
+    for i, name in ipairs(order) do
+        local btn = _findButtonByName(name)
+        if btn then
+            local y = windowTop + (i - 1) * pitch - _schematicDockScrollY
+            btn.myy    = math.floor(y)
+            btn.myMaxy = btn.myy + btn.myheight
+            -- Buttons have no partial-clip draw mode (fully shown or fully
+            -- gdsGui_button_setHidden'd, nothing in between) -- so ANY
+            -- overlap with the window edge hides the whole button, not just
+            -- a button that's entirely past it, or a half-cut button would
+            -- hang below the wheel's own window and into whatever sits
+            -- right under it (originally COMBINATION NEXT, the exact
+            -- overlap this wheel exists to fix).
+            _schematicDockScrolledOut[name] = (y < windowTop) or (y + btn.myheight > windowTop + windowH)
+            _schematicDockSetToolHidden(name, false)
+        end
+    end
+end
+
+-- Keeps the drag-catching rect (gdsGui_button_setScrollDockRect) flush with
+-- the wheel's own current window every frame (resize-safe, same convention
+-- as _syncAiPanelInputBlock) — cleared entirely while the dock is collapsed
+-- so an empty-looking strip over the canvas doesn't swallow a pan/select tap
+-- meant for whatever's drawn underneath it.
+function _syncSchematicDockScrollRect()
+    local toggle, windowTop, windowH = _schematicDockWindow()
+    if not toggle or not _schematicDockOpen or gdsGui_page_currentName() ~= "SystemSchematic" then
+        gdsGui_button_setScrollDockRect("schematicToolDock", "SystemSchematic", nil, nil)
+        return
+    end
+    gdsGui_button_setScrollDockRect("schematicToolDock", "SystemSchematic",
+        { x = toggle.myx, y = windowTop, w = toggle.mywidth, h = windowH },
+        "schematicDockScrolled")
+end
+
+-- gdsGui_button_setScrollDockRect's own by-name drag callback (see
+-- _syncSchematicDockScrollRect above) — deltaY is a raw pixel offset since
+-- the drag's last move (positive = finger moved down); content follows the
+-- finger, so it's subtracted from the stored offset.
+function schematicDockScrolled(deltaY)
+    _schematicDockScrollY = _schematicDockScrollY - deltaY
+    _schematicDockLayoutApply()
 end
 
 -- The dock's own open/closed arrow (schematicDockToggle): collapses/expands
@@ -1140,6 +1288,11 @@ function schematicDockTogglePressed(newState)
     end
     _schematicDockSetToolHidden("schematicGearBtn", not designing)
     _schematicDockSetToolHidden("schematicAiBtn", not designing)
+    -- TEST ONLY — remove alongside schematicTestBtn1/2/3 (see
+    -- _SCHEMATIC_DOCK_ORDER_DESIGN's own comment).
+    _schematicDockSetToolHidden("schematicTestBtn1", not designing)
+    _schematicDockSetToolHidden("schematicTestBtn2", not designing)
+    _schematicDockSetToolHidden("schematicTestBtn3", not designing)
     for _, name in pairs(_SCHEMATIC_CONTROL_DOCK_TOOLS) do
         _schematicDockSetToolHidden(name, designing)
     end
@@ -4097,16 +4250,19 @@ function schematicAiBtnPressed(newState)
     _aiPanelScrollY = 0 -- fresh scroll position each time the panel is (re)opened
 end
 
--- The panel's own on-screen rectangle, pinned to the bottom 1/4 of the
--- live canvas — shared by drawSchematicAiPanel (what actually gets drawn)
--- and _syncAiPanelInputBlock (what gets blocked/scroll-forwarded), so the
--- two can never drift out of sync with each other. nil if there's no
--- canvas to pin to at all.
+-- The panel's own on-screen rectangle, pinned to the bottom 1/4 of the live
+-- canvas — shared by drawSchematicAiPanel (what actually gets drawn) and
+-- _syncAiPanelInputBlock (what gets blocked/scroll-forwarded), so the two
+-- can never drift out of sync with each other. nil if there's no canvas to
+-- pin to at all. Inset horizontally by _SCHEMATIC_COMB_BTN_W on each side so
+-- the panel fits BETWEEN the COMBINATION PREV/NEXT buttons (now flush with
+-- this same bottom edge — see their own create-call comment) instead of
+-- running underneath them.
 local function _aiPanelRect()
     local cx, cy, cw, ch = gdsGui_schematic_getCanvasRect("mainCanvas")
     if not cx then return nil end
     local panelH = ch * 0.25
-    return cx, cy + ch - panelH, cw, panelH
+    return cx + _SCHEMATIC_COMB_BTN_W, cy + ch - panelH, cw - 2 * _SCHEMATIC_COMB_BTN_W, panelH
 end
 
 -- gdsGui_schematic_setInputBlockRect's own by-name wheel/drag callback
@@ -6796,6 +6952,10 @@ function love.load()
     -- meant for the new tool at the base 375x667 window size; every button
     -- here stays the same 36x36 size, only the gap between them shrank).
     local schDockPitchFrac = (36 + 2) / globApp.safeScreenArea.h
+    -- Published for the scrollable wheel (_schematicDockLayoutApply) to
+    -- derive the live pixel pitch against whatever safeScreenArea.h is at
+    -- the time, not just this one setup call — see its own comment.
+    _schematicDockPitchFrac = schDockPitchFrac
     gdsGui_button_create("schematicAddBtn", "SystemSchematic", "toggle",
         "Sprites/button_schematicAdd_pressed.png",
         "Sprites/button_schematicAdd_released.png",
@@ -6885,6 +7045,37 @@ function love.load()
         0.97, schCanvasYFrac + 6 * schDockPitchFrac, "RT", 36, 36,
         "schematicBackGroundBtnPressed", globApp.BUTTON_STATES.RELEASED, true, nil
     )
+    -- TEST ONLY — three placeholder tools (reusing existing sprites, no
+    -- callback of their own) so the scrollable wheel has something to
+    -- scroll to even on a screen tall enough to already fit all six real
+    -- tools. Remove these three gdsGui_button_create calls, their matching
+    -- gdsGui_button_setFloatingShadow calls just below, and every other
+    -- spot tagged "TEST ONLY — ... schematicTestBtn1/2/3" once manual
+    -- testing of the wheel is done.
+    gdsGui_button_create("schematicTestBtn1", "SystemSchematic", "toggle",
+        "Sprites/button_schematicHomeNew_pressed.png",
+        "Sprites/button_schematicHomeNew_released.png",
+        "Sprites/button_schematicHomeNew_deactivated.png",
+        0.97, schCanvasYFrac + 7 * schDockPitchFrac, "RT", 36, 36,
+        nil, globApp.BUTTON_STATES.RELEASED, true, nil
+    )
+    gdsGui_button_create("schematicTestBtn2", "SystemSchematic", "toggle",
+        "Sprites/button_schematicHomeLoad_pressed.png",
+        "Sprites/button_schematicHomeLoad_released.png",
+        "Sprites/button_schematicHomeLoad_deactivated.png",
+        0.97, schCanvasYFrac + 8 * schDockPitchFrac, "RT", 36, 36,
+        nil, globApp.BUTTON_STATES.RELEASED, true, nil
+    )
+    gdsGui_button_create("schematicTestBtn3", "SystemSchematic", "toggle",
+        "Sprites/button_schematicBack_pressed.png",
+        "Sprites/button_schematicBack_released.png",
+        "Sprites/button_schematicBack_deactivated.png",
+        0.97, schCanvasYFrac + 9 * schDockPitchFrac, "RT", 36, 36,
+        nil, globApp.BUTTON_STATES.RELEASED, true, nil
+    )
+    gdsGui_button_setFloatingShadow("schematicTestBtn1", true)
+    gdsGui_button_setFloatingShadow("schematicTestBtn2", true)
+    gdsGui_button_setFloatingShadow("schematicTestBtn3", true)
     -- The dock starts in whatever state _schematicDockOpen already was (true
     -- the first time love.load() runs this; otherwise whatever the user last
     -- left it, since reopening the SystemSchematic page re-runs this setup
@@ -6896,26 +7087,29 @@ function love.load()
     -- edges of the screen (containerName nil, so like every other floating
     -- schematic chrome button they're positioned straight off safeScreenArea
     -- and never move with the canvas's own pan/zoom). Anchored bottom (LB/RB)
-    -- at the AI panel's own top edge (_aiPanelRect: cy + ch*(1-0.25), same
-    -- 0.25 panelH fraction) so the buttons sit flush atop the panel instead
-    -- of overlapping it once it's open. Each press walks the control-position
+    -- flush with the canvas's OWN bottom edge (schCanvasYFrac + schCanvasHFrac
+    -- — on a tall/narrow screen the dock column's own tools (ADD/PAINT/.../
+    -- BACKGROUND) can run past the old 0.75-of-canvas spot these used to sit
+    -- at, so they're pinned to the true bottom instead to guarantee no
+    -- overlap). _aiPanelRect insets its own width to fit between them rather
+    -- than the other way around. Each press walks the control-position
     -- combination counter one step (see gdsGui_schematic_stepCombination) —
     -- deactivated whenever there's nothing to cycle (control mode, or fewer
     -- than 2 total combinations), see the per-frame poll in love.update()
     -- below.
-    local schCombBtnYFrac = schCanvasYFrac + schCanvasHFrac * 0.75
+    local schCombBtnYFrac = schCanvasYFrac + schCanvasHFrac
     gdsGui_button_create("schematicCombPrevBtn", "SystemSchematic", "pushonoff",
         "Sprites/button_schematicCombPrev_pressed.png",
         "Sprites/button_schematicCombPrev_released.png",
         "Sprites/button_schematicCombPrev_deactivated.png",
-        0, schCombBtnYFrac, "LB", 32, 64,
+        0, schCombBtnYFrac, "LB", _SCHEMATIC_COMB_BTN_W, 64,
         "schematicCombPrevPressed", globApp.BUTTON_STATES.DEACTIVATED, true, nil
     )
     gdsGui_button_create("schematicCombNextBtn", "SystemSchematic", "pushonoff",
         "Sprites/button_schematicCombNext_pressed.png",
         "Sprites/button_schematicCombNext_released.png",
         "Sprites/button_schematicCombNext_deactivated.png",
-        1, schCombBtnYFrac, "RB", 32, 64,
+        1, schCombBtnYFrac, "RB", _SCHEMATIC_COMB_BTN_W, 64,
         "schematicCombNextPressed", globApp.BUTTON_STATES.DEACTIVATED, true, nil
     )
     -- One header row, left to right: ZOOM (shortest, fixed-ish length —
@@ -6960,6 +7154,13 @@ function love.load()
         {1, 1, 1, 1}, "", 12, nil
     )
     gdsGui_schematic_create("mainCanvas", "SystemSchematic", schCanvasXFrac, schCanvasYFrac, "LT", schCanvasWFrac, schCanvasHFrac)
+    -- Initial wheel layout at scroll 0 — matches every tool's own
+    -- fraction-based position above exactly (so this is a no-op for their
+    -- on-screen spot), but it's what actually populates
+    -- _schematicDockScrolledOut the first time, before love.update's own
+    -- per-frame call ever runs. Needs mainCanvas to already exist (just
+    -- above) since it reads the canvas's own live height.
+    _schematicDockLayoutApply()
     -- So the paint-mode swatch palette cascades from the PAINT dock button
     -- itself (see _paintPaletteGeometry in schematic_gdsGuiLib.lua) instead
     -- of floating at an unrelated spot on the canvas.
@@ -7608,6 +7809,15 @@ function love.update(dt)
     -- Update GUI
     gdsGui_update(dt)
     _syncAiPanelInputBlock()
+    -- Dock wheel: re-clamps/repositions every tool against the live canvas
+    -- height every frame (cheap — at most 6 buttons) so a resize or a mode
+    -- switch self-corrects without its own call site, same convention as
+    -- _syncAiPanelInputBlock just above. _syncSchematicDockScrollRect also
+    -- keeps the drag-catching rect itself in sync.
+    if gdsGui_page_currentName() == "SystemSchematic" then
+        _schematicDockLayoutApply()
+        _syncSchematicDockScrollRect()
+    end
 
     -- Fires the one-time-per-APP_VERSION schematic data compatibility notice
     -- (built in love.load(), see _buildSchematicCompatNotice) the first
@@ -8482,6 +8692,14 @@ function _applySchematicModeButtons(designing)
     _schematicDockSetToolHidden("schematicAiBtn", not designing)
     gdsGui_button_setState("schematicBackGroundBtn", designing and "released" or "deactivated")
     _schematicDockSetToolHidden("schematicBackGroundBtn", not designing)
+    -- TEST ONLY — remove alongside schematicTestBtn1/2/3 (see
+    -- _SCHEMATIC_DOCK_ORDER_DESIGN's own comment).
+    gdsGui_button_setState("schematicTestBtn1", designing and "released" or "deactivated")
+    _schematicDockSetToolHidden("schematicTestBtn1", not designing)
+    gdsGui_button_setState("schematicTestBtn2", designing and "released" or "deactivated")
+    _schematicDockSetToolHidden("schematicTestBtn2", not designing)
+    gdsGui_button_setState("schematicTestBtn3", designing and "released" or "deactivated")
+    _schematicDockSetToolHidden("schematicTestBtn3", not designing)
     _relays.refreshGearButtons(designing)
     gdsGui_button_setState("schematicFullScreenToggle", designing and "deactivated" or "released")
 end
