@@ -286,7 +286,7 @@ local _THEME_DARK = {
     text        = {1.00, 1.00, 1.00, 1},
     progressBar = {1.00, 1.00, 0.00, 1},
     canvasBg    = {0.10, 0.10, 0.12, 1},
-    canvasGrid  = {1.00, 1.00, 1.00, 0.06},
+    canvasGrid  = {80 / 255, 80 / 255, 80 / 255, 0.06},
 }
 local _THEME_LIGHT = {
     app         = {0.88, 0.88, 0.88, 1},
