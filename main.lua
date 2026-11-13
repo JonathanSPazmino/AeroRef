@@ -219,6 +219,21 @@ _schematicVersionJustUpdated = false
 -- _schematicVersionJustUpdated just above.
 _aircraftCompatStatus = {}
 
+-- Which systemId mainCanvas was actually populated with (by
+-- _openSystemIntoCanvas) this session, or nil if nothing has been loaded
+-- into it yet. navGoToSystemSchematic (the footer dock icon) assumes
+-- mainCanvas already holds schematicStore.currentSystemId's content and
+-- jumps straight to the canvas without reloading it -- true once some
+-- schematic-flow page has actually been visited this session, but false on
+-- the very first trip in after a cold boot that lands on MainMenu (cold
+-- boot itself never resumes straight into the canvas -- see the
+-- schematicLastPage handling in love.load), when currentSystemId still
+-- points at whatever was open last session but mainCanvas itself is still
+-- the empty one love.load() started with. Compared against
+-- schematicStore.currentSystemId there to tell the two cases apart. Global,
+-- not local: see _schematicVersionJustUpdated just above.
+_canvasLoadedSystemId = nil
+
 -------------------------------------------------------------------------------
 -- HELPER FUNCTIONS
 -------------------------------------------------------------------------------
@@ -4333,6 +4348,7 @@ local function _openSystemIntoCanvas(systemId, mode)
     _relays.checkLogic = true
 
     schematicStore.currentSystemId = systemId
+    _canvasLoadedSystemId = systemId
     schematicRefreshGlow()
     local catalogEntry = sys.systemType and _findCatalogEntryForType(sys.systemType)
     gdsGui_schematic_setPipeConnectors("mainCanvas", catalogEntry and catalogEntry.pipeConnectors)
@@ -8369,6 +8385,9 @@ function navGoToSystemSchematic()
         return
     end
     if schematicStore.currentSystemId and _findSystem(schematicStore.currentSystemId) then
+        if _canvasLoadedSystemId ~= schematicStore.currentSystemId then
+            _openSystemIntoCanvas(schematicStore.currentSystemId, appSettings.schematicEditMode and "design" or "control")
+        end
         _navSyncAll("SystemSchematic")
         gdsGui_page_switch("LoadingSchematic", 7, 3, false)
         return

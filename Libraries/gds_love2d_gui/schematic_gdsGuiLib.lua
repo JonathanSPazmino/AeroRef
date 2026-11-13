@@ -873,6 +873,17 @@ _shapePoly.HANDLE_HIT_PX = 14  -- reach of a corner handle or side, in screen pi
 _shapePoly.EMPTY_SHADE = 0.25  -- brightness of the part of a tank above its fill line (see drawLevel)
 _shapePoly.parsedCache = setmetatable({}, { __mode = "k" })
 
+-- Writes drawFn's shape into the stencil buffer only (color output masked
+-- off), standing in for the old love.graphics.stencil(drawFn, "replace", v).
+-- A field on _shapePoly rather than its own local -- this file is already at
+-- Lua's 200-local-per-chunk ceiling (see _shapePoly's own global comment above).
+function _shapePoly._stencilMask(drawFn, value)
+    love.graphics.setStencilState("replace", "always", value)
+    love.graphics.setColorMask(false, false, false, false)
+    drawFn()
+    love.graphics.setColorMask(true, true, true, true)
+end
+
 -- Decoded shapePoints, cached per table (each edit stores a brand-new one):
 -- corners (the draggable vertices), edges (each corner to the next), triangles
 -- (the fill), and runs (each row's spans of grid squares the shape reaches
@@ -1316,21 +1327,21 @@ function _shapePoly.drawLocal(e, ew, eh, r, g, b, a, outlineAlpha)
     -- an arc "fill" "pie" slice -- is one the GPU rasterizes directly, with
     -- no polygon validity question to get a different answer on.
     local segs, arcs = _shapePoly.roundedOutline(p, ew, eh, radius)
-    love.graphics.stencil(fillSharpBody, "replace", 1)
+    _shapePoly._stencilMask(fillSharpBody, 1)
     for _, arc in ipairs(arcs) do
         if arc.r > 0 then
-            love.graphics.stencil(function()
+            _shapePoly._stencilMask(function()
                 love.graphics.polygon("fill", arc.px, arc.py, arc.entryX, arc.entryY, arc.exitX, arc.exitY)
-            end, "replace", 0)
-            love.graphics.stencil(function()
+            end, 0)
+            _shapePoly._stencilMask(function()
                 love.graphics.arc("fill", "pie", arc.cx, arc.cy, arc.r, arc.a1, arc.a2, _shapePoly.arcSegments(arc.r))
-            end, "replace", 1)
+            end, 1)
         end
     end
-    love.graphics.setStencilTest("gequal", 1)
+    love.graphics.setStencilState("keep", "gequal", 1)
     love.graphics.setColor(r, g, b, a)
     fillSharpBody()
-    love.graphics.setStencilTest()
+    love.graphics.setStencilState()
 
     love.graphics.setColor(1, 1, 1, outlineAlpha)
     for _, seg in ipairs(segs) do love.graphics.line(seg[1], seg[2], seg[3], seg[4]) end
@@ -1439,13 +1450,13 @@ function _shapePoly.drawLevel(canvas, e, drawBody, r, g, b, a)
     table.insert(points, bottom)
     local maskTop = math.floor(screenLineY - amp) - 1
 
-    love.graphics.stencil(function() love.graphics.polygon("fill", points) end, "replace", 1)
-    love.graphics.setStencilTest("gequal", 1)
+    _shapePoly._stencilMask(function() love.graphics.polygon("fill", points) end, 1)
+    love.graphics.setStencilState("keep", "gequal", 1)
     drawBody(r, g, b, a)
-    love.graphics.setStencilTest()
-    love.graphics.stencil(function()
+    love.graphics.setStencilState()
+    _shapePoly._stencilMask(function()
         love.graphics.rectangle("fill", left, maskTop, right - left, bottom - maskTop)
-    end, "replace", 0)
+    end, 0)
 end
 
 -- Reshape-mode affordance: a square handle on every draggable corner.
@@ -2132,20 +2143,33 @@ function _shapePoly.movePortTo(canvas, e, index, x, y)
 end
 
 -- e's ports, and what to do next while ADD PORT, REMOVE PORT or MOVE PORT waits
--- on a tap. MOVE PORT's picked port is drawn in the snap color.
+-- on a tap. MOVE PORT's picked port is drawn in the snap color. The outer
+-- ring is always theme-colored (white in dark mode, gray in light mode); the
+-- inner fill is the element's own resolved fluid color in control mode (so a
+-- port reads as "part of the tank"), or the theme's plain text color
+-- (black/white per light/dark) in design mode, where there's no fluid state
+-- to show and the ports instead read as plain editable markers.
 function _shapePoly.drawPorts(canvas, e)
     if not _shapePoly.allowed(canvas, e) then return end
     local radius = math.max(2.5, math.min(6, canvas.zoom))
     local pending = canvas.pendingPort
     if pending and pending.elementId ~= e.id then pending = nil end
+    local isLight = globApp.themeIsDark == false
+    local ringR, ringG, ringB = isLight and 0.55 or 1, isLight and 0.55 or 1, isLight and 0.55 or 1
+    local fillR, fillG, fillB, fillA
+    if canvas.mode == "control" then
+        fillR, fillG, fillB, fillA = gdsGui_schematic_resolveDisplayColor(canvas.name, "element", e.id)
+    else
+        fillR, fillG, fillB, fillA = isLight and 0 or 1, isLight and 0 or 1, isLight and 0 or 1, 1
+    end
     for i in ipairs(e.terminals or {}) do
         local tx, ty = _terminals.point(canvas, e, i)
-        love.graphics.setColor(0, 0, 0, 1)
+        love.graphics.setColor(ringR, ringG, ringB, 1)
         love.graphics.circle("fill", tx, ty, radius + 1)
         if pending and pending.moving == i then
             love.graphics.setColor(_CONNECTOR_SNAP_COLOR[1], _CONNECTOR_SNAP_COLOR[2], _CONNECTOR_SNAP_COLOR[3], 1)
         else
-            love.graphics.setColor(1, 1, 1, 1)
+            love.graphics.setColor(fillR, fillG, fillB, fillA)
         end
         love.graphics.circle("fill", tx, ty, radius)
     end

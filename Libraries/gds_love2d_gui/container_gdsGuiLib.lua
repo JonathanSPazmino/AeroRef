@@ -832,10 +832,11 @@ end
 local function _setRoundedStencil(roundedFrame)
     if not roundedFrame then return end
     local f = roundedFrame.f
-    love.graphics.stencil(function()
-        love.graphics.rectangle("fill", f.x, f.y, f.width, f.height, roundedFrame.radius, roundedFrame.radius)
-    end, "replace", 1)
-    love.graphics.setStencilTest("gequal", 1)
+    love.graphics.setStencilState("replace", "always", 1)
+    love.graphics.setColorMask(false, false, false, false)
+    love.graphics.rectangle("fill", f.x, f.y, f.width, f.height, roundedFrame.radius, roundedFrame.radius)
+    love.graphics.setColorMask(true, true, true, true)
+    love.graphics.setStencilState("keep", "gequal", 1)
 end
 
 local function _drawWidget(obj, clip, roundedFrame)
@@ -952,7 +953,7 @@ local function _drawContainer(cont, clip)
         end
     end
 
-    if rounded then love.graphics.setStencilTest() end
+    if rounded then love.graphics.setStencilState() end
     love.graphics.setScissor()
 end
 
