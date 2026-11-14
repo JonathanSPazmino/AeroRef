@@ -850,8 +850,24 @@ local SCHEMATIC_CATALOG = {
         { label = "SHUTOFF VALVE", abbrev = "HSOV", kind = "control",
           presets = { {"CLOSED", "OPEN"}, {"CLOSED", "OPEN", "AUTO"} },
           spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate", terminals = _SWITCH_TERMINALS },
-        { label = "RESERVOIR", abbrev = "RSVR", kind = "element", shapeType = "circle",
-          gridW = 3, gridH = 3, componentType = "sink" },
+        -- componentType "source", not "sink" -- same role FUEL TANK plays
+        -- one system over (model/graph.lua's own role-vocabulary comment
+        -- already lists "a fuel/hydraulic tank" as a source example), and
+        -- the only way to get its fluid-level animation/LEVEL-QUANTITY
+        -- placement rows for free: both _holdsFluid (gates _tankRows AND
+        -- model/fluid.lua's drain/fill simulation) and _drawElement's own
+        -- wave-fill dispatch key off entity.componentType == "source" /
+        -- entity.fillPercent, not off any RESERVOIR-specific check. A
+        -- fixed vertical rect (3x5), NOT reshapable (deliberately no
+        -- reshapable = true, unlike FUEL TANK) -- mirrors ACCUMULATOR's own
+        -- fixed/no-terminals pattern just above rather than FUEL TANK's
+        -- freeform-outline one; _shapePoly.drawLevel itself never needs
+        -- e.shapePoints (falls back to the plain gridW/gridH rect when
+        -- absent), so the wave animation and rounded corners both still
+        -- apply with no reshape editing (no ADD PORT/MIRROR/free rotation)
+        -- opted into.
+        { label = "RESERVOIR", abbrev = "RSVR", kind = "element", shapeType = "rect",
+          gridW = 3, gridH = 5, componentType = "source" },
     }},
     { system = "FUEL", pipeConnectors = "PIPE", items = {
         -- reshapable: its outline can be redrawn and it rotates to any angle
@@ -933,6 +949,19 @@ local SCHEMATIC_CATALOG = {
         -- valve preventing backflow).
         { label = "CHECK VALVE", abbrev = "BCVL", kind = "element", shapeType = "diode",
           gridW = 2, gridH = 2, componentType = "directionalGate", terminals = _CHECK_VALVE_TERMINALS },
+        -- A jet pump, same role/physics as FUEL's own EJECTOR above (see its
+        -- comment): no moving parts and nothing to switch, so an element;
+        -- bleed air an engine/APU drives into its motive port draws more in
+        -- through its suction port (e.g. a precooler/anti-ice ejector pulling
+        -- ambient air), both leaving through its discharge (model/fluid.lua).
+        -- A one-way role like CHECK VALVE's, so its ports alone set the
+        -- direction. Shares FUEL's own sprite/terminals globals -- the
+        -- symbol and port geometry are medium-agnostic (see those globals'
+        -- own comment).
+        { label = "EJECTOR", abbrev = "BEJC", kind = "element", shapeType = "diode",
+          spritePath = _EJECTOR_SPRITE_PATH,
+          gridW = 3, gridH = 3, componentType = "directionalGate",
+          terminals = _EJECTOR_TERMINALS },
         -- The pilot-operated shutoff itself, same single-item pattern as
         -- ELECTRICAL's own SWITCH (the valve body IS the control; there's
         -- no separate static "valve element" + "switch control" pair).
@@ -1091,15 +1120,9 @@ local _SCHEMATIC_CONTROL_DOCK_TOOLS = {
 -- above are keyed by role instead of ordered, so they can't drive layout
 -- math on their own. Global, not local: main.lua is at Lua's 200-local
 -- ceiling.
--- TEST ONLY — schematicTestBtn1/2/3 (created further down, alongside
--- BACKGROUND) exist purely so the scrollable wheel has something to scroll
--- to on a screen tall enough to already fit all six real tools. Remove
--- these three names (and their gdsGui_button_create calls, and the matching
--- gdsGui_button_setFloatingShadow calls) once manual testing is done.
 _SCHEMATIC_DOCK_ORDER_DESIGN = {
     "schematicAddBtn", "schematicPaintBtn", "schematicAnnunciatorBtn",
     "schematicGearBtn", "schematicAiBtn", "schematicBackGroundBtn",
-    "schematicTestBtn1", "schematicTestBtn2", "schematicTestBtn3",
 }
 _SCHEMATIC_DOCK_ORDER_CONTROL = { "schematicGearCtlBtn" }
 -- COMBINATION PREV/NEXT's own fixed width (see their create calls near
@@ -1325,11 +1348,6 @@ function schematicDockTogglePressed(newState)
     end
     _schematicDockSetToolHidden("schematicGearBtn", not designing)
     _schematicDockSetToolHidden("schematicAiBtn", not designing)
-    -- TEST ONLY — remove alongside schematicTestBtn1/2/3 (see
-    -- _SCHEMATIC_DOCK_ORDER_DESIGN's own comment).
-    _schematicDockSetToolHidden("schematicTestBtn1", not designing)
-    _schematicDockSetToolHidden("schematicTestBtn2", not designing)
-    _schematicDockSetToolHidden("schematicTestBtn3", not designing)
     for _, name in pairs(_SCHEMATIC_CONTROL_DOCK_TOOLS) do
         _schematicDockSetToolHidden(name, designing)
     end
@@ -7082,37 +7100,6 @@ function love.load()
         0.97, schCanvasYFrac + 6 * schDockPitchFrac, "RT", 36, 36,
         "schematicBackGroundBtnPressed", globApp.BUTTON_STATES.RELEASED, true, nil
     )
-    -- TEST ONLY — three placeholder tools (reusing existing sprites, no
-    -- callback of their own) so the scrollable wheel has something to
-    -- scroll to even on a screen tall enough to already fit all six real
-    -- tools. Remove these three gdsGui_button_create calls, their matching
-    -- gdsGui_button_setFloatingShadow calls just below, and every other
-    -- spot tagged "TEST ONLY — ... schematicTestBtn1/2/3" once manual
-    -- testing of the wheel is done.
-    gdsGui_button_create("schematicTestBtn1", "SystemSchematic", "toggle",
-        "Sprites/button_schematicHomeNew_pressed.png",
-        "Sprites/button_schematicHomeNew_released.png",
-        "Sprites/button_schematicHomeNew_deactivated.png",
-        0.97, schCanvasYFrac + 7 * schDockPitchFrac, "RT", 36, 36,
-        nil, globApp.BUTTON_STATES.RELEASED, true, nil
-    )
-    gdsGui_button_create("schematicTestBtn2", "SystemSchematic", "toggle",
-        "Sprites/button_schematicHomeLoad_pressed.png",
-        "Sprites/button_schematicHomeLoad_released.png",
-        "Sprites/button_schematicHomeLoad_deactivated.png",
-        0.97, schCanvasYFrac + 8 * schDockPitchFrac, "RT", 36, 36,
-        nil, globApp.BUTTON_STATES.RELEASED, true, nil
-    )
-    gdsGui_button_create("schematicTestBtn3", "SystemSchematic", "toggle",
-        "Sprites/button_schematicBack_pressed.png",
-        "Sprites/button_schematicBack_released.png",
-        "Sprites/button_schematicBack_deactivated.png",
-        0.97, schCanvasYFrac + 9 * schDockPitchFrac, "RT", 36, 36,
-        nil, globApp.BUTTON_STATES.RELEASED, true, nil
-    )
-    gdsGui_button_setFloatingShadow("schematicTestBtn1", true)
-    gdsGui_button_setFloatingShadow("schematicTestBtn2", true)
-    gdsGui_button_setFloatingShadow("schematicTestBtn3", true)
     -- The dock starts in whatever state _schematicDockOpen already was (true
     -- the first time love.load() runs this; otherwise whatever the user last
     -- left it, since reopening the SystemSchematic page re-runs this setup
@@ -8729,14 +8716,6 @@ function _applySchematicModeButtons(designing)
     _schematicDockSetToolHidden("schematicAiBtn", not designing)
     gdsGui_button_setState("schematicBackGroundBtn", designing and "released" or "deactivated")
     _schematicDockSetToolHidden("schematicBackGroundBtn", not designing)
-    -- TEST ONLY — remove alongside schematicTestBtn1/2/3 (see
-    -- _SCHEMATIC_DOCK_ORDER_DESIGN's own comment).
-    gdsGui_button_setState("schematicTestBtn1", designing and "released" or "deactivated")
-    _schematicDockSetToolHidden("schematicTestBtn1", not designing)
-    gdsGui_button_setState("schematicTestBtn2", designing and "released" or "deactivated")
-    _schematicDockSetToolHidden("schematicTestBtn2", not designing)
-    gdsGui_button_setState("schematicTestBtn3", designing and "released" or "deactivated")
-    _schematicDockSetToolHidden("schematicTestBtn3", not designing)
     _relays.refreshGearButtons(designing)
     gdsGui_button_setState("schematicFullScreenToggle", designing and "deactivated" or "released")
 end

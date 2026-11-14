@@ -3404,10 +3404,19 @@ _actionSheet.CANCEL_TEXT = "CANCEL"
 -- text/textDim: plain (non-action) row label colors — used by the
 -- annunciator panel's toggle rows, which read as list items rather than
 -- iOS action-sheet commands, so they don't borrow the blue `action` color.
+-- headerBg: the title row's and the RETURN/CANCEL button's own background —
+-- a step lighter than bg in dark mode, a step darker in light mode (NOT
+-- just the title's dim text color, which was already distinct via `title`
+-- below) so both read as a visually separate chrome strip from the plain
+-- option rows above/below them, the way an iOS sheet's own header/footer
+-- groups usually sit a shade off from its list body. Roughly half of
+-- `pressed`'s own distance from `bg`, so it's a step, not a jump.
 _actionSheet.DARK = { bg = {0.17, 0.17, 0.18, 1}, pressed = {0.26, 0.26, 0.28, 1}, separator = {0.33, 0.33, 0.35, 1},
+    headerBg = {0.22, 0.22, 0.23, 1},
     title = {0.60, 0.60, 0.63, 1}, action = {0.04, 0.52, 1, 1}, destructive = {1, 0.27, 0.23, 1},
     text = {1, 1, 1, 1}, textDim = {0.5, 0.5, 0.5, 1} }
 _actionSheet.LIGHT = { bg = {0.97, 0.97, 0.97, 1}, pressed = {0.84, 0.84, 0.86, 1}, separator = {0.78, 0.78, 0.80, 1},
+    headerBg = {0.90, 0.90, 0.91, 1},
     title = {0.43, 0.43, 0.45, 1}, action = {0, 0.48, 1, 1}, destructive = {1, 0.23, 0.19, 1},
     text = {0.07, 0.07, 0.08, 1}, textDim = {0.6, 0.6, 0.6, 1} }
 
@@ -3752,6 +3761,8 @@ local function _drawMenuBox(owner, menu)
     love.graphics.setColor(palette.bg)
     gdsGui_general_drawRoundedRect(x, layout.y, w, layout.h, _actionSheet.RADIUS_PX)
     if menu.title then
+        love.graphics.setColor(palette.headerBg)
+        _actionSheet.fill(x, layout.y, w, layout.titleH, true, false)
         love.graphics.setColor(palette.title)
         love.graphics.printf(menu.title, x, layout.y + 8, w, "center")
     end
@@ -3788,6 +3799,15 @@ local function _drawMenuBox(owner, menu)
 
     for k, row in ipairs(layout.rows) do
         local atTop = row.y <= layout.y + 0.5
+        -- A RETURN/CANCEL that stayed an ordinary row instead of becoming
+        -- its own detached button (menu.anchorButtonName dock popups never
+        -- get the sheet's separate cancel group -- see _menuGeometry's own
+        -- `sheet` check) still gets the same headerBg shade the detached
+        -- one uses below, so it reads as a distinct exit control either way.
+        if pressed ~= row.index and _actionSheet.isExitOption(menu.options[row.index]) then
+            love.graphics.setColor(palette.headerBg)
+            _actionSheet.fill(x, row.y, w, row.h, atTop, k == #layout.rows)
+        end
         if pressed == row.index then
             love.graphics.setColor(palette.pressed)
             _actionSheet.fill(x, row.y, w, row.h, atTop, k == #layout.rows)
@@ -3810,7 +3830,7 @@ local function _drawMenuBox(owner, menu)
         if pressed ~= cancel.hit then
             gdsGui_general_drawShadow(x, cancel.y, w, cancel.h, _actionSheet.RADIUS_PX, 0, 4, 14, 0.35 * layout.reveal)
         end
-        love.graphics.setColor(pressed == cancel.hit and palette.pressed or palette.bg)
+        love.graphics.setColor(pressed == cancel.hit and palette.pressed or palette.headerBg)
         gdsGui_general_drawRoundedRect(x, cancel.y, w, cancel.h, _actionSheet.RADIUS_PX)
         love.graphics.setColor(palette.action)
         love.graphics.printf(cancel.text, x, cancel.y + (cancel.h - love.graphics.getFont():getHeight()) / 2, w, "center")
@@ -4991,6 +5011,8 @@ local function _drawAnnunciatorPanel(canvas)
 
     love.graphics.setColor(palette.bg)
     love.graphics.rectangle("fill", x, y, w, h, _actionSheet.RADIUS_PX, _actionSheet.RADIUS_PX)
+    love.graphics.setColor(palette.headerBg)
+    _actionSheet.fill(x, y, w, headerH, true, false)
 
     love.graphics.setFont(globApp.appFont or love.graphics.getFont())
     love.graphics.setColor(palette.title)
