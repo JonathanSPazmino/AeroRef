@@ -1122,6 +1122,10 @@ local _schematicZoomFullScreenFont = nil
 -- appSettings) since it's a screen-space convenience, not a durable
 -- preference. Global, not local: main.lua is at Lua's 200-local ceiling.
 _schematicDockOpen = true
+-- Paints the dock's own metallic backing panel (drawSchematicDockBackground
+-- below) between the schematic canvas's own draw pass and the dock buttons'
+-- -- see general_gdsGuiLib.lua's own comment on this hook.
+globApp.preButtonDrawHook = "drawSchematicDockBackground"
 
 -- Same open/closed convenience for the SchematicFullScreen page's own
 -- RETURN/GEAR column (schematicFullScreenDockToggle, that page's top-right
@@ -1265,6 +1269,39 @@ end
 function schematicDockScrolled(deltaY)
     _schematicDockScrollY = _schematicDockScrollY - deltaY
     _schematicDockLayoutApply()
+end
+
+-- Small metallic gray backing panel for the dock column -- a vertical top/
+-- highlight/bottom gray gradient (gdsGui_general_drawRoundedRectGradient)
+-- plus a soft drop shadow and a thin dark rim, so the toggle/tools read as
+-- mounted on a brushed-metal plate instead of floating bare over the
+-- canvas. Registered as globApp.preButtonDrawHook above, so this paints
+-- after the schematic canvas's own draw pass but before the dock buttons
+-- themselves. Spans from the toggle's own top down to the scrollable
+-- wheel's own bottom edge (_schematicDockWindow) -- the toggle sits on the
+-- SAME plate as the tools below it even though it doesn't scroll with
+-- them, since visually they're one dock. Hidden entirely while the dock is
+-- collapsed (only the toggle would be left to back, not worth a whole
+-- plate for).
+_SCHEMATIC_DOCK_PANEL_PAD    = 5
+_SCHEMATIC_DOCK_PANEL_RADIUS = 12
+function drawSchematicDockBackground(pageName)
+    if pageName ~= "SystemSchematic" or not _schematicDockOpen then return end
+    local toggle, windowTop, windowH = _schematicDockWindow()
+    if not toggle then return end
+    local pad = _SCHEMATIC_DOCK_PANEL_PAD
+    local px  = toggle.myx - pad
+    local py  = toggle.myy - pad
+    local pw  = toggle.mywidth + 2 * pad
+    local ph  = (windowTop + windowH) - toggle.myy + 2 * pad
+    gdsGui_general_drawShadow(px, py, pw, ph, _SCHEMATIC_DOCK_PANEL_RADIUS, 0, 2, 7, 0.30)
+    gdsGui_general_drawRoundedRectGradient(px, py, pw, ph, _SCHEMATIC_DOCK_PANEL_RADIUS,
+        { 0.44, 0.45, 0.47 }, { 0.78, 0.79, 0.81 }, { 0.18, 0.19, 0.21 }, 0.14)
+    love.graphics.setColor(0.10, 0.10, 0.11, 0.9)
+    love.graphics.setLineWidth(1)
+    love.graphics.rectangle("line", px + 0.5, py + 0.5, pw - 1, ph - 1,
+        _SCHEMATIC_DOCK_PANEL_RADIUS, _SCHEMATIC_DOCK_PANEL_RADIUS)
+    love.graphics.setColor(1, 1, 1, 1)
 end
 
 -- The dock's own open/closed arrow (schematicDockToggle): collapses/expands

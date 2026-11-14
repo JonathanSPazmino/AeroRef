@@ -219,6 +219,17 @@ function gdsGui_general_draw ()
 	gdsGui_rotaryKnob_draw (activePageName)
 	gdsGui_schematic_draw (activePageName)
 	gdsGui_schematicGallery_draw (activePageName)
+	-- Optional by-name hook (nil by default, costing nothing) -- lets
+	-- app-layer code draw chrome that needs to sit ABOVE everything else on
+	-- the page but still BEHIND the floating buttons drawn right after it
+	-- (e.g. a backing panel mounted under a dock of buttons), without this
+	-- library needing to know anything about what that chrome actually is.
+	-- Same "resolve a string via _G" convention as every other by-name
+	-- callback already in this library.
+	if globApp.preButtonDrawHook then
+		local fn = _G[globApp.preButtonDrawHook]
+		if fn then fn(activePageName) end
+	end
 	gdsGui_button_draw (activePageName)
 
 end
@@ -568,6 +579,76 @@ function gdsGui_general_drawShadow(x, y, w, h, radius, ox, oy, blur, alpha)
 	love.graphics.rectangle("fill", x + ox - pad, y + oy - pad, w + pad * 2, h + pad * 2)
 	love.graphics.setShader(prevShader)
 	love.graphics.setColor(pr, pg, pb, pa)
+end
+
+--------------------------------------------------------------------------------
+-- ROUNDED-RECT GRADIENT SDF SHADER
+--
+-- Same crisp analytic-edge rounded rect as _sdf above, but filled with a
+-- vertical three-stop gradient (top -> a highlight band -> bottom) instead
+-- of a single flat color -- a cheap way to read as a brushed-metal panel
+-- (a bright sheen catching an overhead light, darker toward both edges)
+-- without a texture asset. A separate shader/module from _sdf rather than
+-- extending it, so the far more common plain-color path stays untouched.
+--------------------------------------------------------------------------------
+
+local _sdfGrad = { failed = false, shader = nil }
+
+function _sdfGrad.ensureShader()
+	if _sdfGrad.failed then return false end
+	if _sdfGrad.shader then return true end
+	local ok, shader = pcall(love.graphics.newShader, [[
+		uniform vec2 pixelSize;     // full size of the drawn quad, in pixels
+		uniform vec2 halfSize;      // half the SHAPE's own size (unpadded), in pixels
+		uniform float radius;       // corner radius, in pixels
+		uniform vec4 topColor;
+		uniform vec4 highlightColor;
+		uniform vec4 bottomColor;
+		uniform float highlightPos; // 0..1 fraction down from the top where the sheen peaks
+		vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
+			vec2 p = (tc - 0.5) * pixelSize;
+			vec2 q = abs(p) - halfSize + radius;
+			float dist = min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - radius;
+			float edge = 0.75;
+			float alpha = 1.0 - smoothstep(-edge, edge, dist);
+			float t = clamp((p.y + halfSize.y) / (2.0 * halfSize.y), 0.0, 1.0);
+			vec4 fillColor = t < highlightPos
+				? mix(topColor, highlightColor, t / max(highlightPos, 0.0001))
+				: mix(highlightColor, bottomColor, (t - highlightPos) / max(1.0 - highlightPos, 0.0001));
+			return vec4(fillColor.rgb, fillColor.a * alpha) * color.a;
+		}
+	]])
+	if not ok then _sdfGrad.failed = true; return false end
+	_sdfGrad.shader = shader
+	return true
+end
+
+-- Crisp, MSAA-independent rounded rect filled with a vertical top/highlight/
+-- bottom gradient (each a {r,g,b[,a]} table; a defaults to 1) -- see the
+-- module comment above. highlightPos (default 0.3) is how far down the
+-- sheen band sits, 0 (top edge) to 1 (bottom edge). Falls back to a plain
+-- flat-colored rounded rect (via gdsGui_general_drawRoundedRect, using the
+-- highlight color) if the shader ever fails to compile on some backend.
+function gdsGui_general_drawRoundedRectGradient(x, y, w, h, radius, topColor, highlightColor, bottomColor, highlightPos)
+	if not _sdfGrad.ensureShader() then
+		local pr, pg, pb, pa = love.graphics.getColor()
+		love.graphics.setColor(highlightColor[1], highlightColor[2], highlightColor[3], highlightColor[4] or 1)
+		gdsGui_general_drawRoundedRect(x, y, w, h, radius)
+		love.graphics.setColor(pr, pg, pb, pa)
+		return
+	end
+	radius = math.min(radius, math.min(w, h) / 2)
+	local prevShader = love.graphics.getShader()
+	_sdfGrad.shader:send("pixelSize", {w, h})
+	_sdfGrad.shader:send("halfSize", {w / 2, h / 2})
+	_sdfGrad.shader:send("radius", radius)
+	_sdfGrad.shader:send("topColor", {topColor[1], topColor[2], topColor[3], topColor[4] or 1})
+	_sdfGrad.shader:send("highlightColor", {highlightColor[1], highlightColor[2], highlightColor[3], highlightColor[4] or 1})
+	_sdfGrad.shader:send("bottomColor", {bottomColor[1], bottomColor[2], bottomColor[3], bottomColor[4] or 1})
+	_sdfGrad.shader:send("highlightPos", highlightPos or 0.3)
+	love.graphics.setShader(_sdfGrad.shader)
+	love.graphics.rectangle("fill", x, y, w, h)
+	love.graphics.setShader(prevShader)
 end
 
 function gdsGui_general_smartFontScaling (minFontPercentSize, maxFontPercentSize)
