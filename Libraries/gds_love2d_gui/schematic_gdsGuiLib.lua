@@ -7867,6 +7867,18 @@ function gdsGui_schematic_setPipeConnectors(canvasName, noun)
     canvas.connectorNoun = noun
 end
 
+-- flowStyle: the current system's medium's own flow table (model/media/*.lua
+-- -- e.g. {kind="dash", speedPxPerSec=.., dashPx=..} or {kind="shimmer",
+-- speedPxPerSec=.., bandPx=.., alpha=..}), or nil for a medium with no flow
+-- animation (e.g. ELECTRICAL, still just the breathing glow). Read by
+-- _pipes.drawAllFlow/drawFlowDashes/drawFlowShimmer below -- this file stays
+-- domain-blind, only ever reading the numbers/kind string handed to it here,
+-- never a systemType.
+function gdsGui_schematic_setFlowStyle(canvasName, flowStyle)
+    local canvas = _findCanvas(canvasName)
+    if canvas then canvas.flowStyle = flowStyle end
+end
+
 -- Names every kind of element on this canvas whose outline can be redrawn
 -- (see _shapePoly) — kinds: an array of {shapeType, componentType} pairs
 -- (e.g. a system with both a reshapable TANK ("rect"/"source") and a
@@ -8105,6 +8117,18 @@ function _pipes.isLiquid(canvas)
     return canvas.pipeConnectors and canvas.connectorNoun == "PIPE"
 end
 
+-- True for a liquid PIPE (see isLiquid above) OR a gas DUCT (BLEED AIR/
+-- PRESSURIZATION) -- the broader "something moves through this run and
+-- should show a flow animation/direction cue" gate, as opposed to isLiquid's
+-- narrower "pools, drains, and leaks like a liquid" one. Draw passes that are
+-- genuinely medium-agnostic (the flow dash/shimmer pass, the direction
+-- chevron, the direction-cycling gesture) key off this one; passes that are
+-- liquid-specific (leak spray, the emptied-run drained-pipe visual) stay on
+-- isLiquid itself.
+function _pipes.hasFlow(canvas)
+    return canvas.pipeConnectors and (canvas.connectorNoun == "PIPE" or canvas.connectorNoun == "DUCT")
+end
+
 -- none -> forward -> reverse -> none -> ...
 function _pipes.cycleGravityDirection(w)
     if w.gravityDirection == nil then
@@ -8315,13 +8339,19 @@ end
 
 -- Marching dashes along w's own path, in the color r,g,b (the pipe's own
 -- resolved fluid color), traveling toward w.pumpedDirection/gravityDirection.
--- Same dash length/speed as _selection.drawConnector's unlocked-wire dashes,
--- just colored and timed by flow instead of a hold-to-unlock gesture.
+-- Length/speed come from canvas.flowStyle (model/media/fuel.lua's and
+-- model/media/hydraulic.lua's own "dash" flow tables -- see
+-- gdsGui_schematic_setFlowStyle), falling back to the same constants
+-- _selection.drawConnector's unlocked-wire dashes use if a canvas has no
+-- flow style of its own (shouldn't happen for a "dash"-kind medium, but
+-- keeps this function safe to call regardless).
 function _pipes.drawFlowDashes(canvas, w, plan, width, r, g, b)
     local dir = w.pumpedDirection or w.gravityDirection
     local pieces, total = _pipes.pathPieces(canvas, plan)
-    local dash = _selection.DASH_PX
-    local speed = (dir == "reverse") and -_selection.DASH_SPEED or _selection.DASH_SPEED
+    local style = canvas.flowStyle or {}
+    local dash = style.dashPx or _selection.DASH_PX
+    local baseSpeed = style.speedPxPerSec or _selection.DASH_SPEED
+    local speed = (dir == "reverse") and -baseSpeed or baseSpeed
     local offset = (_selection.now() * speed) % (dash * 2)
     love.graphics.setColor(r, g, b, 0.9)
     love.graphics.setLineWidth(width + 4)
@@ -8337,18 +8367,80 @@ function _pipes.drawFlowDashes(canvas, w, plan, width, r, g, b)
     love.graphics.setLineWidth(1)
 end
 
--- The marching dashes (see above) over every liquid pipe with fluid running
--- through it. Drawn over the fluid, before its shine and the drained stretch,
--- which covers the dashes where the pipe is empty.
+-- A soft, wide, low-alpha traveling band along w's own path -- the gas-duct
+-- counterpart to drawFlowDashes above (model/media/bleedAir.lua's and
+-- model/media/pressurization.lua's own "shimmer" flow tables). Three
+-- concentric passes (wide/faint outer, narrower/stronger core) stand in for
+-- a soft-edged gradient LÖVE's plain line stroke can't draw directly, so a
+-- band reads as a diffuse puff of gas rather than fuel/hydraulic's crisp
+-- marching dashes. Same pathPieces/strokePiece stepping machinery as
+-- drawFlowDashes, just a wider gap between band centers (period) so bands
+-- read as sparse pulses, not a tight marching pattern.
+function _pipes.drawFlowShimmer(canvas, w, plan, width, r, g, b)
+    local dir = w.pumpedDirection or w.gravityDirection
+    local pieces, total = _pipes.pathPieces(canvas, plan)
+    local style = canvas.flowStyle or {}
+    local band = style.bandPx or 16
+    local alpha = style.alpha or 0.3
+    local baseSpeed = style.speedPxPerSec or 24
+    local speed = (dir == "reverse") and -baseSpeed or baseSpeed
+    local period = band * 3
+    local offset = (_selection.now() * speed) % period
+    local function drawBand(halfWidth, a)
+        love.graphics.setColor(r, g, b, a)
+        love.graphics.setLineWidth(width + halfWidth * 2)
+        local start = offset - period
+        while start < total do
+            local lo, hi = math.max(0, start - halfWidth), math.min(total, start + halfWidth)
+            for _, piece in ipairs(pieces) do
+                local t0, t1 = math.max(0, lo - piece.d0), math.min(piece.len, hi - piece.d0)
+                if t1 - t0 > 0.01 then _pipes.strokePiece(piece, t0, t1) end
+            end
+            start = start + period
+        end
+    end
+    drawBand(band, alpha * 0.4)
+    drawBand(band * 0.55, alpha * 0.7)
+    drawBand(band * 0.22, alpha)
+    love.graphics.setLineWidth(1)
+end
+
+-- Grays (and white) read as "not actually flowing" -- same saturation test
+-- _glow.applies uses to tell a plain/unpowered color from a lit one, reused
+-- here (without requiring canvas.glow itself to be enabled, which stays
+-- ELECTRICAL-only) so a gas DUCT -- which has no fluidMoving/tank-drain
+-- simulation at all (model/fluid.lua's step() only ever runs for PIPE
+-- systems; see main.lua's _fluidTick) -- still gets a flow animation purely
+-- from its own resolved, already-conducting-state-driven color.
+function _pipes.looksPowered(r, g, b)
+    return math.max(r, g, b) - math.min(r, g, b) >= 0.12
+end
+
+-- The flow animation (marching dashes or a soft shimmer band, dispatched by
+-- canvas.flowStyle.kind -- see drawFlowDashes/drawFlowShimmer above) over
+-- every PIPE/DUCT run that's actually carrying something right now: a liquid
+-- pipe with fluid moving (w.fluidMoving, model/fluid.lua's own simulation),
+-- or a gas duct whose resolved color already reads as powered (see
+-- looksPowered above -- gas ducts have no fluidMoving flag of their own).
+-- Drawn over the fluid, before its shine and the drained stretch, which
+-- covers the dashes where a liquid pipe is empty.
 function _pipes.drawAllFlow(canvas, plans, isVisible, signature)
-    if not _pipes.isLiquid(canvas) or canvas.mode ~= "control" then return end
+    if not _pipes.hasFlow(canvas) or canvas.mode ~= "control" then return end
     local width = _pipes.fluidWidth(canvas)
+    local isGas = canvas.connectorNoun == "DUCT"
     for _, w in ipairs(canvas.wires) do
         local dir = w.pumpedDirection or w.gravityDirection
         local plan = plans[w.id]
-        if w.fluidMoving and dir and plan and isVisible(plan) then
+        if dir and plan and isVisible(plan) then
             local r, g, b = gdsGui_schematic_resolveDisplayColor(canvas.name, "wire", w.id, signature)
-            _pipes.drawFlowDashes(canvas, w, plan, width, r, g, b)
+            local flowing = isGas and _pipes.looksPowered(r, g, b) or w.fluidMoving
+            if flowing then
+                if canvas.flowStyle and canvas.flowStyle.kind == "shimmer" then
+                    _pipes.drawFlowShimmer(canvas, w, plan, width, r, g, b)
+                else
+                    _pipes.drawFlowDashes(canvas, w, plan, width, r, g, b)
+                end
+            end
         end
     end
     love.graphics.setColor(1, 1, 1, 1)
@@ -10595,11 +10687,14 @@ function gdsGui_schematic_draw(pageName)
             -- mark on a stretch shared with another pipe (bundled) still
             -- shows on top instead of being painted over by that later
             -- bundle-band pass.
-            if _pipes.isLiquid(canvas) then
+            if _pipes.hasFlow(canvas) then
                 for _, w in ipairs(canvas.wires) do
                     local plan = wirePlans[w.id]
                     if plan and wireVisible(plan) then
-                        _pipes.drawEmptiedRun(canvas, w, plan)
+                        -- drawEmptiedRun stays liquid-only: a gas duct has no
+                        -- tank-drain fill level to run dry (see _pipes.looksPowered's
+                        -- own comment on why gas ducts have no fluidMoving flag).
+                        if _pipes.isLiquid(canvas) then _pipes.drawEmptiedRun(canvas, w, plan) end
                         _pipes.drawDirectionArrow(canvas, w, plan)
                     end
                 end
@@ -12123,13 +12218,14 @@ function gdsGui_schematic_released(touchId, x, y)
                 -- Rebending/direction mode is already unlocked on this wire
                 -- (see gdsGui_schematic_pressed's isActiveMoveTarget branch)
                 -- and this tap never actually dragged a new bend direction.
-                -- For a LIQUID pipe (_pipes.isLiquid — HYDRAULIC/FUEL, not a
-                -- gas DUCT), that plain tap cycles its gravity-flow direction
-                -- instead of reopening the edit menu (see
-                -- _pipes.cycleGravityDirection) — quick and repeatable, same
-                -- spirit as the direction-drag itself. Every other wire
-                -- keeps the previous tap-to-edit behavior.
-                local w = _pipes.isLiquid(canvas) and _findWire(canvas, canvas.selectedWireId)
+                -- For a PIPE or DUCT run (_pipes.hasFlow — HYDRAULIC/FUEL/
+                -- BLEED AIR/PRESSURIZATION, not a plain electrical WIRE),
+                -- that plain tap cycles its flow direction instead of
+                -- reopening the edit menu (see _pipes.cycleGravityDirection)
+                -- — quick and repeatable, same spirit as the direction-drag
+                -- itself. Every other wire keeps the previous tap-to-edit
+                -- behavior.
+                local w = _pipes.hasFlow(canvas) and _findWire(canvas, canvas.selectedWireId)
                 if w then
                     _pushUndo(canvas)
                     _pipes.cycleGravityDirection(w)

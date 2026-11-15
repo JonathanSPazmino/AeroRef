@@ -62,6 +62,7 @@ local ELECTRICAL_MEDIUM = require("model.media.electrical")
 require("model.media.hydraulic")
 require("model.media.fuel")
 require("model.media.bleedAir")
+require("model.media.pressurization")
 -- Global, not local: this file is at Lua's 200-top-level-local ceiling.
 ModelFluid = require("model.fluid")
 
@@ -4313,9 +4314,20 @@ end
 -- the panel fits BETWEEN the COMBINATION PREV/NEXT buttons (now flush with
 -- this same bottom edge — see their own create-call comment) instead of
 -- running underneath them.
+-- Deliberately NOT gdsGui_schematic_getCanvasRect: the embedded canvas's own
+-- box progressively grows toward full-screen size as zoom increases past 1x
+-- (see _schematicCanvasZoomedLayout above), and a panel pinned to that live
+-- box would grow/shrink right along with it. The AI panel instead pins to
+-- _schematicCanvasNormalLayout — the canvas's fixed, zoom-invariant embedded
+-- footprint — so its own size stays constant regardless of canvas zoom.
 local function _aiPanelRect()
-    local cx, cy, cw, ch = gdsGui_schematic_getCanvasRect("mainCanvas")
-    if not cx then return nil end
+    local l = _schematicCanvasNormalLayout
+    if not l then return nil end
+    local cw = l.wFrac * globApp.safeScreenArea.w
+    local ch = l.hFrac * globApp.safeScreenArea.h
+    local pos = gdsGui_general_relativePosition(l.anchorPoint, l.x, l.y, cw, ch,
+        globApp.safeScreenArea.x, globApp.safeScreenArea.y, globApp.safeScreenArea.w, globApp.safeScreenArea.h)
+    local cx, cy = pos[1], pos[2]
     local panelH = ch * 0.25
     return cx + _SCHEMATIC_COMB_BTN_W, cy + ch - panelH, cw - 2 * _SCHEMATIC_COMB_BTN_W, panelH
 end
@@ -4563,6 +4575,7 @@ local function _openSystemIntoCanvas(systemId, mode)
     schematicRefreshGlow()
     local catalogEntry = sys.systemType and _findCatalogEntryForType(sys.systemType)
     gdsGui_schematic_setPipeConnectors("mainCanvas", catalogEntry and catalogEntry.pipeConnectors)
+    gdsGui_schematic_setFlowStyle("mainCanvas", _currentMedium().flow)
     -- Every reshapable item this system's catalog offers (e.g. FUEL's own
     -- FUEL TANK and FUEL MANIFOLD both are) — not just the last one found,
     -- which would silently cost every earlier one its own ADD PORT/MIRROR

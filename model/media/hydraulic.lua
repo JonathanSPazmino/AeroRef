@@ -35,6 +35,11 @@ local HYDRAULIC = {
     magnitudeLabel = "PRESSURE",
     -- See model/media/electrical.lua's own comment on magnitudeUnit.
     magnitudeUnit = "PSI",
+    -- Marching-dash flow cue (schematic_gdsGuiLib.lua's _pipes.drawFlowDashes,
+    -- fed via gdsGui_schematic_setFlowStyle) -- faster and tighter than
+    -- FUEL's own flow table, reading as a high-pressure, fast-moving fluid
+    -- rather than fuel's slower, more viscous flow.
+    flow = { kind = "dash", speedPxPerSec = 40, dashPx = 5 },
 }
 
 Registry.register(HYDRAULIC.name, HYDRAULIC)

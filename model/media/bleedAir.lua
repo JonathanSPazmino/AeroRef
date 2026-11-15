@@ -21,6 +21,13 @@ local BLEED_AIR = {
     magnitudeLabel = "PRESSURE",
     -- See model/media/electrical.lua's own comment on magnitudeUnit.
     magnitudeUnit = "PSI",
+    -- Soft traveling shimmer (schematic_gdsGuiLib.lua's _pipes.drawFlowShimmer,
+    -- fed via gdsGui_schematic_setFlowStyle) rather than FUEL/HYDRAULIC's
+    -- crisp marching dashes -- a compressible gas has no visible droplets, so
+    -- it reads as a wide, soft, low-alpha band sweeping down the duct instead
+    -- of discrete dashes. model/media/pressurization.lua shares this same
+    -- "shimmer" kind, just gentler.
+    flow = { kind = "shimmer", speedPxPerSec = 30, bandPx = 16, alpha = 0.35 },
 }
 
 Registry.register(BLEED_AIR.name, BLEED_AIR)
