@@ -869,6 +869,39 @@ local SCHEMATIC_CATALOG = {
         -- opted into.
         { label = "RESERVOIR", abbrev = "RSVR", kind = "element", shapeType = "rect",
           gridW = 3, gridH = 5, componentType = "source" },
+        -- An actuator: pressurized fluid is used up here and never returns
+        -- to the system -- same "the consuming end itself" role ENGINE plays
+        -- for FUEL FLOW one system over, and RELIEF VALVE/SAFETY VALVE play
+        -- for their own vent, componentType "sink" either way. One generic
+        -- entry rather than a separate FLAP/GEAR/RUDDER ACTUATOR apiece --
+        -- NAME on the placement grid is free text regardless (always has
+        -- been, for every catalog item), so the pilot names this one
+        -- whatever it actually is (GEAR, FLAPS, RUDDER, SPOILERS, ...) right
+        -- there instead of picking from a handful of catalog rows that could
+        -- never cover every airframe's own actuator list anyway.
+        -- defaultProperties = {"PSI REQUIREMENT"} asks for this actuator's
+        -- own minimum operating pressure right on that same grid, same
+        -- free-text row ENGINE's own FUEL FLOW already is -- NOT yet wired
+        -- into any pressure-threshold model (same deliberate scope limit
+        -- RELIEF VALVE/SAFETY VALVE's own comments already explain for
+        -- their systems); just the element and its own stated requirement
+        -- for now, read back off entity.properties the same way any other
+        -- custom property is. shapeType "circle" is a placeholder look
+        -- (reusing RELIEF VALVE/SAFETY VALVE's own plain-sink shape) until
+        -- a real actuator symbol replaces it.
+        -- suggestedName = "USER#_ACT" (gdsGui_schematic_armElementPlacement's
+        -- own optional override, see its own comment) pre-fills the
+        -- placement grid's NAME with that literal text instead of the usual
+        -- "ACT_1" auto-increment -- reading as a fill-in-the-blank template:
+        -- the pilot overwrites "USER#" with whatever this one actually is
+        -- (GEAR, FLAPS, RUDDER, ...), leaving "_ACT" in place, same as
+        -- retyping the whole field has always worked too. abbrev stays
+        -- "ACT" (same short-code convention every other item's own abbrev
+        -- follows) purely for this one's own generated element id, since
+        -- suggestedName now covers the NAME row entirely.
+        { label = "ACTUATOR", abbrev = "ACT", kind = "element", shapeType = "circle",
+          defaultProperties = {"PSI REQUIREMENT"}, gridW = 2, gridH = 2, componentType = "sink",
+          suggestedName = "USER#_ACT" },
     }},
     { system = "FUEL", pipeConnectors = "PIPE", items = {
         -- reshapable: its outline can be redrawn and it rotates to any angle
@@ -945,6 +978,19 @@ local SCHEMATIC_CATALOG = {
         -- gives).
         { label = "DUCT", abbrev = "DUCT", kind = "element", shapeType = "rect",
           gridW = 4, gridH = 2, componentType = "path" },
+        -- Same generated, NOT reshapable, relocate/cardinal-rotate-only
+        -- design as HYDRAULIC's own MANIFOLD above (see that entry's own
+        -- comment) — one trunk duct splitting into n outflow ducts off a
+        -- header spine. Structurally identical to this same catalog's own
+        -- DUCT just above (componentType "path" + shapeType "rect" + no
+        -- sprite is the only signature schematicElementPlacementConfigured
+        -- matches to build the tube-split graphic — see its own comment) —
+        -- DUCT already picks up the same OUTFLOW PORTS prompt for that
+        -- reason; this entry just gives the branching case its own name in
+        -- the catalog instead of leaving pilots to discover it by placing
+        -- a plain DUCT.
+        { label = "MANIFOLD", abbrev = "BMFD", kind = "element", shapeType = "rect",
+          gridW = 8, gridH = 3, componentType = "path", terminals = _MANIFOLD_TERMINALS },
         -- Same non-user-operated, one-way role as the other systems' own
         -- CHECK VALVE above (e.g. an engine-to-engine isolation check
         -- valve preventing backflow).
@@ -970,6 +1016,32 @@ local SCHEMATIC_CATALOG = {
           spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate", terminals = _SWITCH_TERMINALS },
     }},
     { system = "PRESSURIZATION", pipeConnectors = "DUCT", items = {
+        -- The cabin's own pressurization air supply -- bled off the
+        -- engines/APU, the same physical air BLEED AIR's own BLEED AIR
+        -- SOURCE represents one system over, just given its own element
+        -- here since a PRESSURIZATION system models the cabin side of
+        -- that air, not the duct run feeding it from the engine (that's
+        -- BLEED AIR's own job). Always "there" whenever placed, same
+        -- always-on-when-placed role BLEED AIR SOURCE/BATTERY/FUEL TANK
+        -- play in their own systems -- this system has no separate
+        -- switchable source control. No defaultProperties -- PRESSURE
+        -- already comes from the placement grid's own source TYPE/VALUE
+        -- row (same reasoning BATTERY's own comment, above in the
+        -- ELECTRICAL catalog, gives for VOLTAGE).
+        { label = "BLEED AIR SOURCE", abbrev = "PSRC", kind = "element", shapeType = "circle",
+          gridW = 3, gridH = 3, componentType = "source" },
+        -- The cabin's own automatic positive-pressure relief valve --
+        -- vents excess cabin pressure on its own if OUTFLOW VALVE (and
+        -- CONTROLLER/MODE SWITCH behind it) ever let differential
+        -- pressure climb too high, same "just the vented end itself" role
+        -- FUEL's own RELIEF VALVE plays one system over (see that entry's
+        -- own comment) -- componentType "sink", not "gate": it isn't
+        -- pilot-operated, so there's no switch position to give it. NOT
+        -- wired into any pressure-threshold model yet, same deliberate
+        -- scope limit FUEL's RELIEF VALVE comment already explains --
+        -- this is just the element.
+        { label = "SAFETY VALVE", abbrev = "SFVL", kind = "element", shapeType = "circle",
+          gridW = 2, gridH = 2, componentType = "sink" },
         -- Converted from a static element to a control (like ELECTRICAL's
         -- own SWITCH) — a real outflow valve IS pilot-operable in MANUAL
         -- mode, not a fixed symbol. componentType = "gate": open lets
@@ -977,6 +1049,13 @@ local SCHEMATIC_CATALOG = {
         -- VALVE/BLEED VALVE play in their own systems.
         { label = "OUTFLOW VALVE", abbrev = "OFVL", kind = "control", presets = { {"CLOSED", "OPEN"} },
           spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate", terminals = _SWITCH_TERMINALS },
+        -- Same generated, NOT reshapable, relocate/cardinal-rotate-only
+        -- design as HYDRAULIC's own MANIFOLD above (see that entry's own
+        -- comment) — this system's first "path" element, splitting one
+        -- duct into several (e.g. feeding more than one OUTFLOW VALVE off
+        -- a single cabin pressure line).
+        { label = "MANIFOLD", abbrev = "PMFD", kind = "element", shapeType = "rect",
+          gridW = 8, gridH = 3, componentType = "path", terminals = _MANIFOLD_TERMINALS },
         -- Deliberately untagged: an avionics logic box, not a flow node —
         -- nothing current/fluid/air passes THROUGH a controller the way it
         -- does through every componentType above, so no source/path/gate/
@@ -3039,6 +3118,42 @@ local function _solveCurrentSchematic()
                 or medium.style.unpowered
         end
     end
+    -- A gas DUCT has no fluid-pressure model of its own (model/fluid.lua's
+    -- step() only ever runs for a PIPE system -- see _pipes.hasFlow's own
+    -- comment in schematic_gdsGuiLib.lua), so nothing else ever sets a DUCT
+    -- wire's own pumpedDirection/leaking/leakPressure -- the flow-animation
+    -- and leak-spray/puff draw passes there read those exact three fields
+    -- regardless of medium, so the wire loop below sets them for a DUCT
+    -- wire too, right where feedId (which end is actually feeding it) is
+    -- already being worked out anyway. The dead-end/leak CRITERIA itself
+    -- (ductConducting/ModelFluid.conducts/ModelFluid.pipesOnNode) is the
+    -- exact same one a liquid PIPE's own leakNodes uses, not a separate
+    -- lookalike -- ductConducting comes from the very same
+    -- _fluidFlowInputs() a PIPE system's own computeFlow call above is fed
+    -- from, so a valve/manifold reads as conducting (or not) by identical
+    -- rules whether the path behind it carries liquid or gas.
+    local isDuct = canvas.connectorNoun == "DUCT"
+    local ductConducting, ductPipesOnNode
+    if isDuct then
+        ductConducting = _fluidFlowInputs(canvas, componentTypes)
+        ductPipesOnNode = ModelFluid.pipesOnNode(graph)
+    end
+    -- The highest PRESSURE among the source(s) attribution already says
+    -- reach nodeId -- same dominance tie-break _colorForPoweredNode's own
+    -- comment describes, just pulling a number (entity.voltage) instead of
+    -- a color, for the leak-puff draw's own intensity scaling.
+    local function maxPressureReaching(nodeId)
+        local ids = attribution[nodeId]
+        if not ids then return nil end
+        local best
+        for id in pairs(ids) do
+            local entity = _findSourceEntity(canvas, id)
+            local psi = entity and tonumber(entity.voltage)
+            if psi and (not best or psi > best) then best = psi end
+        end
+        return best
+    end
+
     -- A wire is live only when one of its ends actually feeds power into
     -- it (ModelSolver.wireFeed), and takes that end's color. Being reached
     -- isn't enough: an open switch/pole or an off source is marked powered
@@ -3062,6 +3177,21 @@ local function _solveCurrentSchematic()
             -- begin with, so it keeps whatever solve() predicted above.
             if fluidReachable and w.gravityDirection and not fluidReachable[w.id] then
                 result.wires[w.id] = medium.style.unpowered
+            end
+            if isDuct then
+                if feedId then
+                    w.pumpedDirection = (feedId == w.fromElementId) and "forward" or "reverse"
+                    -- The end fluid is heading TOWARD -- the one feedId
+                    -- ISN'T -- is where a dead end (and so a leak) would
+                    -- sit, same "whichever side it's heading toward" rule
+                    -- _pipes.leakOutputPoint's own comment gives.
+                    local farId = (feedId == w.fromElementId) and w.toElementId or w.fromElementId
+                    local farConducts = graph.nodes[farId] and ModelFluid.conducts(graph.nodes[farId], ductConducting)
+                    w.leaking = farConducts and ductPipesOnNode[farId] == 1
+                    w.leakPressure = w.leaking and maxPressureReaching(farId) or nil
+                else
+                    w.pumpedDirection, w.leaking, w.leakPressure = nil, false, nil
+                end
             end
         end
     end
@@ -5170,7 +5300,8 @@ function schematicCatalogItemChosen(canvasName, index, optionText)
     -- gdsGui_schematic_internal_onElementEditChosen).
     if item.kind == "element" then
         gdsGui_schematic_armElementPlacement(canvasName, item.shapeType, item.abbrev or item.label, nil, item.label,
-            item.defaultProperties, item.spritePath, item.gridW, item.gridH, item.componentType, item.terminals)
+            item.defaultProperties, item.spritePath, item.gridW, item.gridH, item.componentType, item.terminals,
+            item.suggestedName)
     elseif item.kind == "load" then
         -- Not a placement at all — see the catalog entry's own comment
         -- (ELECTRICAL's LIGHT/MOTOR/HEATER). Asks which bus this new load

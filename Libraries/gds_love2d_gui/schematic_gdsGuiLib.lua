@@ -546,7 +546,8 @@ end
 function _openElementPlacementGrid(canvasName, pending)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
-    local rows = { { key = "__name", label = "NAME", value = _suggestedPlacementName(canvas, pending.label) } }
+    local rows = { { key = "__name", label = "NAME",
+        value = pending.suggestedName or _suggestedPlacementName(canvas, pending.label) } }
     if canvas.elementPlacementExtraRows then
         local fn = _G[canvas.elementPlacementExtraRows]
         local extra = fn and fn(canvasName, pending.componentType, pending)
@@ -757,6 +758,25 @@ local function _calculateGeometry(canvas)
     canvas.y = pos[2]
     canvas.controlRadius = _CONTROL_RADIUS_FRAC * math.min(canvas.contentW, canvas.contentH)
     _clampPan(canvas)
+
+    -- A zoom-invariant counterpart to x/y/w/h above -- same anchor, but
+    -- sized off contentW/H alone (never zoomedOriginal's own growth, same
+    -- "always derived from canvas.original" rule contentW/H itself
+    -- follows). Every MENU/PROMPT this canvas opens (gdsGui_schematic_
+    -- openMenu and the swatch/choice/property-grid variants -- see
+    -- _menuGeometry/_choiceGrid.geometry/_propertyGrid.geometry, all of
+    -- which read normalX/Y/W/H instead of x/y/w/h for exactly this reason)
+    -- sizes and centers against THIS instead -- the live box's own "grows
+    -- toward full-screen as zoom increases" behavior is a deliberate
+    -- per-canvas VIEWPORT feature (see this function's own header comment)
+    -- that has nothing to do with how big a modal overlay floating on top
+    -- of it should read, so a menu docked/sized off the live box would
+    -- otherwise visibly widen (or jump between two row-height choices) as
+    -- the pilot zooms, with no edit actually made.
+    local normalPos = gdsGui_general_relativePosition(o.anchorPoint, o.x, o.y, canvas.contentW, canvas.contentH,
+        globApp.safeScreenArea.x, globApp.safeScreenArea.y, globApp.safeScreenArea.w, globApp.safeScreenArea.h)
+    canvas.normalX, canvas.normalY = normalPos[1], normalPos[2]
+    canvas.normalW, canvas.normalH = canvas.contentW, canvas.contentH
 end
 
 -- Convert an element/control's 0-1 fractional position into live canvas
@@ -3014,7 +3034,16 @@ end
 -- through unchanged, onto canvas.pendingPlacement, for _commitNamedPlacement
 -- to pass on to the real addElement call once the user names the placement.
 -- terminals (optional): see gdsGui_schematic_addElement.
-function gdsGui_schematic_armElementPlacement(canvasName, shapeType, label, defaultColor, idPrefix, defaultPropertyKeys, spritePath, gridW, gridH, componentType, terminals)
+-- suggestedName (optional): the placement grid's own NAME row pre-fills
+-- with this verbatim instead of _suggestedPlacementName's usual
+-- "<label>_<N>" auto-increment (see _openElementPlacementGrid) — for a
+-- catalog item (e.g. a generic ACTUATOR, named freely per instance by the
+-- pilot) where that auto-incremented placeholder would read as a real
+-- suggestion rather than the fill-in-the-blank template it actually is.
+-- Still just a pre-fill, not a reserved/enforced value — NAME stays free
+-- text, and _labelInUse's own uniqueness check (same as any other name)
+-- still fires if it's left as-is on a second placement.
+function gdsGui_schematic_armElementPlacement(canvasName, shapeType, label, defaultColor, idPrefix, defaultPropertyKeys, spritePath, gridW, gridH, componentType, terminals, suggestedName)
     local canvas = _findCanvas(canvasName)
     if not canvas then return end
     -- At most one of pendingPlacement/pendingConnectorColor/
@@ -3027,7 +3056,7 @@ function gdsGui_schematic_armElementPlacement(canvasName, shapeType, label, defa
     canvas.pendingPlacement = { kind = "element", shapeType = shapeType, label = label,
         defaultColor = defaultColor, idPrefix = idPrefix or label, defaultPropertyKeys = defaultPropertyKeys,
         spritePath = spritePath, gridW = gridW, gridH = gridH,
-        componentType = componentType, terminals = terminals }
+        componentType = componentType, terminals = terminals, suggestedName = suggestedName }
 end
 
 -- spritePaths, overlaySpritePath (both optional): see
@@ -3457,6 +3486,17 @@ end
 -- through the opening slide (see _drawMenuBox, which starts it).
 local function _menuGeometry(owner, menu)
     local M = _actionSheet.MARGIN_PX
+    -- normalW/H/X/Y (see _calculateGeometry's own comment) are a SCHEMATIC
+    -- CANVAS's zoom-invariant size/anchor -- every size/position computed
+    -- below from "oW/oH/oX/oY" uses them instead of owner's own live
+    -- w/h/x/y so this menu reads the same size no matter how far zoomed in
+    -- owner currently is. Falls back to owner's own w/h/x/y unchanged for
+    -- anything that ISN'T a schematic canvas (a schematicGallery, which has
+    -- no zoom-growth behavior at all -- gdsGui_schematicGallery_openMenu
+    -- shares this exact function -- so its own w/h/x/y already is its
+    -- fixed size).
+    local oW, oH = owner.normalW or owner.w, owner.normalH or owner.h
+    local oX, oY = owner.normalX or owner.x, owner.normalY or owner.y
     local anchorBtn = menu.anchorButtonName and _findButton(menu.anchorButtonName)
     local sheet = not menu.isSwatchPicker and not anchorBtn
     local n = #menu.options
@@ -3472,41 +3512,45 @@ local function _menuGeometry(owner, menu)
         end
     end
 
-    local w = sheet and math.min(owner.w - 2 * M, _actionSheet.MAX_W_PX) or owner.w * (menu.widthFrac or _MENU_WIDTH_FRAC)
+    local w = sheet and math.min(oW - 2 * M, _actionSheet.MAX_W_PX) or oW * (menu.widthFrac or _MENU_WIDTH_FRAC)
     local titleH = _titleHeight(w, menu.title)
     local swatchH = menu.isSwatchPicker and _SWATCH_ROW_H_PX or 0
     local rowCount = lastRow - firstRow + 1
     local rowH = sheet and _actionSheet.ROW_H_PX or _MENU_ROW_H
     local function totalFor(h) return titleH + swatchH + rowCount * h + (cancel and (_actionSheet.GAP_PX + h) or 0) end
-    if sheet and totalFor(rowH) > owner.h - 2 * M then rowH = _MENU_ROW_H end
+    if sheet and totalFor(rowH) > oH - 2 * M then rowH = _MENU_ROW_H end
     -- Still too tall: the separate CANCEL button goes (a tap outside still
     -- cancels, and a trailing CANCEL/RETURN goes back to being its last row).
-    if sheet and cancel and totalFor(rowH) > owner.h - 2 * M then
+    if sheet and cancel and totalFor(rowH) > oH - 2 * M then
         cancel = nil
         lastRow = n
         rowCount = lastRow - firstRow + 1
     end
     local groupH = titleH + swatchH + rowCount * rowH
 
-    local x = owner.x + (owner.w - w) / 2
+    local x = oX + (oW - w) / 2
     local y
     if anchorBtn then
         -- Opened by a dock tool (see gdsGui_schematic_setMenuAnchorButton):
         -- pinned just left of that tool's button at the canvas's top edge.
+        -- Position only, still tracking the LIVE canvas edge/button (owner,
+        -- not oX/oY) -- a dock popup is deliberately meant to stay visually
+        -- attached to its own button, wherever that currently sits; w above
+        -- is already zoom-invariant regardless of which edge it opens from.
         x, y = _toolPopupOrigin(owner, anchorBtn, w)
     elseif menu.isSwatchPicker then
         -- The selected-item color picker is anchored in the bottom third of
         -- the canvas/gallery area (rather than dead-center) so it sits below
         -- the item being edited instead of covering it; clamped back inside
         -- owner bounds in case the band is shorter than the menu itself.
-        local bandY = owner.y + owner.h * 2 / 3
-        local bandH = owner.h / 3
+        local bandY = oY + oH * 2 / 3
+        local bandH = oH / 3
         y = bandY + (bandH - groupH) / 2
-        y = math.max(owner.y, math.min(y, owner.y + owner.h - groupH))
+        y = math.max(oY, math.min(y, oY + oH - groupH))
     else
         -- Docked at the bottom, but never above the owner's top edge, so the
         -- title and first rows of a long menu stay on screen and tappable.
-        y = math.max(owner.y, owner.y + owner.h - M - totalFor(rowH))
+        y = math.max(oY, oY + oH - M - totalFor(rowH))
     end
 
     -- The opening slide, eased out: from just below the owner's bottom edge.
@@ -3515,7 +3559,7 @@ local function _menuGeometry(owner, menu)
         local t = (love.timer.getTime() - menu._openedAt) / _actionSheet.SLIDE_SECONDS
         if t < 1 then
             reveal = 1 - (1 - math.max(0, t)) ^ 3
-            y = y + (1 - reveal) * (owner.y + owner.h - y)
+            y = y + (1 - reveal) * (oY + oH - y)
         end
     end
 
@@ -3879,9 +3923,15 @@ function _choiceGrid.remaining(menu)
     return n
 end
 
--- Box, rows viewport and footer geometry, plus the scroll limit.
+-- Box, rows viewport and footer geometry, plus the scroll limit. Sized/
+-- centered off owner.normalW/H/X/Y (see _calculateGeometry's own comment),
+-- not owner's own live w/h/x/y, so this grid reads the same size no matter
+-- how far zoomed in the schematic canvas currently is -- falls back to
+-- owner's own w/h/x/y unchanged for anything that isn't a schematic canvas.
 function _choiceGrid.geometry(owner, menu)
-    local w = owner.w * 0.94
+    local oW, oH = owner.normalW or owner.w, owner.normalH or owner.h
+    local oX, oY = owner.normalX or owner.x, owner.normalY or owner.y
+    local w = oW * 0.94
     local titleH = _titleHeight(w, menu.title)
     local headerH = menu.header and _MENU_ROW_H or 0
     -- Rows grow to fit the tallest multi-line label.
@@ -3892,11 +3942,11 @@ function _choiceGrid.geometry(owner, menu)
     end
     local rowH = math.max(_choiceGrid.ROW_H, maxLines * love.graphics.getFont():getHeight() + 14)
     local contentH = #menu.rows * rowH
-    local maxBodyH = owner.h * 0.92 - titleH - headerH - _choiceGrid.FOOTER_H
+    local maxBodyH = oH * 0.92 - titleH - headerH - _choiceGrid.FOOTER_H
     local bodyH = math.max(rowH, math.min(contentH, maxBodyH))
     local h = titleH + headerH + bodyH + _choiceGrid.FOOTER_H
-    local x = owner.x + (owner.w - w) / 2
-    local y = owner.y + math.max(0, (owner.h - h) / 2)
+    local x = oX + (oW - w) / 2
+    local y = oY + math.max(0, (oH - h) / 2)
     return { x = x, y = y, w = w, h = h, titleH = titleH, headerH = headerH, rowH = rowH,
         bodyY = y + titleH + headerH, bodyH = bodyH, footerY = y + h - _choiceGrid.FOOTER_H,
         maxScroll = math.max(0, contentH - bodyH) }
@@ -4144,8 +4194,15 @@ function _propertyGrid.footerButtons(g)
     return { cancel = { x = g.x + 4, y = y, w = half, h = h }, save = { x = g.x + 8 + half, y = y, w = half, h = h } }
 end
 
+-- Sized/positioned off owner.normalW/H/X/Y (see _calculateGeometry's own
+-- comment), not owner's own live w/h/x/y, so the placement/properties
+-- grid reads the same size no matter how far zoomed in the schematic
+-- canvas currently is -- falls back to owner's own w/h/x/y unchanged for
+-- anything that isn't a schematic canvas.
 function _propertyGrid.geometry(owner, menu)
-    local w = owner.w * 0.94
+    local oW, oH = owner.normalW or owner.w, owner.normalH or owner.h
+    local oX, oY = owner.normalX or owner.x, owner.normalY or owner.y
+    local w = oW * 0.94
     local titleH = _titleHeight(w, menu.title)
     -- errorText takes over the header's own slot (see _propertyGrid.draw),
     -- so it reserves the same space whichever of the two is actually showing.
@@ -4160,11 +4217,11 @@ function _propertyGrid.geometry(owner, menu)
     -- keyboard it can get instead of leaving half of it unused above a
     -- box that was centered for a keyboard-less layout.
     local M = _actionSheet.MARGIN_PX
-    local maxBodyH = owner.h - M * 2 - titleH - headerH - _propertyGrid.FOOTER_H
+    local maxBodyH = oH - M * 2 - titleH - headerH - _propertyGrid.FOOTER_H
     local bodyH = math.max(rowH, math.min(contentH, maxBodyH))
     local h = titleH + headerH + bodyH + _propertyGrid.FOOTER_H
-    local x = owner.x + (owner.w - w) / 2
-    local y = owner.y + M
+    local x = oX + (oW - w) / 2
+    local y = oY + M
     return { x = x, y = y, w = w, h = h, titleH = titleH, headerH = headerH, rowH = rowH,
         bodyY = y + titleH + headerH, bodyH = bodyH, footerY = y + h - _propertyGrid.FOOTER_H,
         maxScroll = math.max(0, contentH - bodyH) }
@@ -8367,15 +8424,23 @@ function _pipes.drawFlowDashes(canvas, w, plan, width, r, g, b)
     love.graphics.setLineWidth(1)
 end
 
--- A soft, wide, low-alpha traveling band along w's own path -- the gas-duct
+-- A soft, low-alpha traveling pulse along w's own path -- the gas-duct
 -- counterpart to drawFlowDashes above (model/media/bleedAir.lua's and
 -- model/media/pressurization.lua's own "shimmer" flow tables). Three
--- concentric passes (wide/faint outer, narrower/stronger core) stand in for
--- a soft-edged gradient LÖVE's plain line stroke can't draw directly, so a
--- band reads as a diffuse puff of gas rather than fuel/hydraulic's crisp
--- marching dashes. Same pathPieces/strokePiece stepping machinery as
--- drawFlowDashes, just a wider gap between band centers (period) so bands
--- read as sparse pulses, not a tight marching pattern.
+-- overlapping passes (long/wide/faint outer, shorter/narrower/stronger
+-- core) stand in for a soft-edged gradient LÖVE's plain line stroke can't
+-- draw directly, both along the duct (fades in/out as it travels, unlike
+-- fuel/hydraulic's crisp marching dashes) AND across it (bleeds softly
+-- past the duct's own hard outline instead of stopping dead at it, the way
+-- a real gas plume would). Bounded, though -- the widest (outermost) pass
+-- reaches exactly SHIMMER_CROSS_UNITS duct-widths out from the centerline
+-- on EACH side, never more, so the glow stays a controlled, proportional
+-- bleed rather than the unbounded flat-pixel overflow an earlier version
+-- of this let it balloon into. Same pathPieces/strokePiece stepping
+-- machinery as drawFlowDashes, just a wider gap between pulse centers
+-- (period) so they read as sparse pulses, not a tight marching pattern.
+_pipes.SHIMMER_CROSS_UNITS = 1 -- how far the widest pass reaches from the duct's own centerline,
+                                 -- in multiples of the duct's own width -- "1 unit on each side"
 function _pipes.drawFlowShimmer(canvas, w, plan, width, r, g, b)
     local dir = w.pumpedDirection or w.gravityDirection
     local pieces, total = _pipes.pathPieces(canvas, plan)
@@ -8386,12 +8451,16 @@ function _pipes.drawFlowShimmer(canvas, w, plan, width, r, g, b)
     local speed = (dir == "reverse") and -baseSpeed or baseSpeed
     local period = band * 3
     local offset = (_selection.now() * speed) % period
-    local function drawBand(halfWidth, a)
+    -- The widest pass' own half-width, in px, on EACH side of the
+    -- centerline -- SHIMMER_CROSS_UNITS duct-widths. setLineWidth takes
+    -- the FULL stroke width (both sides together), hence the *2.
+    local outerHalf = width * _pipes.SHIMMER_CROSS_UNITS
+    local function drawBand(crossFrac, halfLen, a)
         love.graphics.setColor(r, g, b, a)
-        love.graphics.setLineWidth(width + halfWidth * 2)
+        love.graphics.setLineWidth(outerHalf * crossFrac * 2)
         local start = offset - period
         while start < total do
-            local lo, hi = math.max(0, start - halfWidth), math.min(total, start + halfWidth)
+            local lo, hi = math.max(0, start - halfLen), math.min(total, start + halfLen)
             for _, piece in ipairs(pieces) do
                 local t0, t1 = math.max(0, lo - piece.d0), math.min(piece.len, hi - piece.d0)
                 if t1 - t0 > 0.01 then _pipes.strokePiece(piece, t0, t1) end
@@ -8399,9 +8468,38 @@ function _pipes.drawFlowShimmer(canvas, w, plan, width, r, g, b)
             start = start + period
         end
     end
-    drawBand(band, alpha * 0.4)
-    drawBand(band * 0.55, alpha * 0.7)
-    drawBand(band * 0.22, alpha)
+    drawBand(1, band, alpha * 0.4)
+    drawBand(0.55, band * 0.55, alpha * 0.7)
+    drawBand(0.22, band * 0.22, alpha)
+    love.graphics.setLineWidth(1)
+end
+
+-- IDLE PULSE: a liquid pipe genuinely holding fluid (hasFluid in
+-- drawAllFlow below -- w.fluidPercent nil or > 0) but not currently
+-- w.fluidMoving reads as a slow, synchronized brightening/dimming pulse
+-- over its whole length -- "there's pressurized fluid sitting in here,
+-- just not traveling anywhere right now," as distinct from drawFlowDashes'
+-- own directional marching (which implies actual motion) and from a flat
+-- static fill (which would read as empty/unpowered, indistinguishable from
+-- a genuinely dry line). Every pipe reads this off the same _selection.now()
+-- clock, unparameterized by wire id, so a whole idle system pulses in
+-- lockstep like a resting heartbeat rather than each pipe drifting out of
+-- phase with its neighbors.
+_pipes.IDLE_PULSE_PERIOD_SECONDS = 2.2
+_pipes.IDLE_PULSE_MIN_ALPHA = 0.15
+_pipes.IDLE_PULSE_MAX_ALPHA = 0.55
+function _pipes.drawIdlePulse(canvas, plan, width, r, g, b)
+    local pieces = _pipes.pathPieces(canvas, plan)
+    local t = (_selection.now() % _pipes.IDLE_PULSE_PERIOD_SECONDS) / _pipes.IDLE_PULSE_PERIOD_SECONDS
+    -- Eased (half cosine), not linear, so it reads as a soft pulse rather
+    -- than a mechanical blink.
+    local phase = (1 - math.cos(t * math.pi * 2)) / 2
+    local alpha = _pipes.IDLE_PULSE_MIN_ALPHA + (_pipes.IDLE_PULSE_MAX_ALPHA - _pipes.IDLE_PULSE_MIN_ALPHA) * phase
+    love.graphics.setColor(r, g, b, alpha)
+    love.graphics.setLineWidth(width + 4)
+    for _, piece in ipairs(pieces) do
+        _pipes.strokePiece(piece, 0, piece.len)
+    end
     love.graphics.setLineWidth(1)
 end
 
@@ -8422,8 +8520,11 @@ end
 -- pipe with fluid moving (w.fluidMoving, model/fluid.lua's own simulation),
 -- or a gas duct whose resolved color already reads as powered (see
 -- looksPowered above -- gas ducts have no fluidMoving flag of their own).
+-- A liquid pipe that's holding still instead (not w.fluidMoving, but
+-- genuinely not empty either) gets the IDLE PULSE below instead of nothing --
+-- a gas duct has no such in-between state here (looksPowered is binary).
 -- Drawn over the fluid, before its shine and the drained stretch, which
--- covers the dashes where a liquid pipe is empty.
+-- covers either animation where a liquid pipe is empty.
 function _pipes.drawAllFlow(canvas, plans, isVisible, signature)
     if not _pipes.hasFlow(canvas) or canvas.mode ~= "control" then return end
     local width = _pipes.fluidWidth(canvas)
@@ -8440,6 +8541,8 @@ function _pipes.drawAllFlow(canvas, plans, isVisible, signature)
                 else
                     _pipes.drawFlowDashes(canvas, w, plan, width, r, g, b)
                 end
+            elseif not isGas and (w.fluidPercent == nil or w.fluidPercent > 0) then
+                _pipes.drawIdlePulse(canvas, plan, width, r, g, b)
             end
         end
     end
@@ -8624,7 +8727,7 @@ end
 -- _drawDiodeSymbol, both using the same "rotation 0 points +x" convention).
 -- A check valve that's the dead end of a leaking wire realistically leaks
 -- PAST its own seal, out this side, not back out the pipe feeding its
--- other (input) side -- see _pipes.drawLeakSpray below, the only caller.
+-- other (input) side -- see _pipes.leakOutputPoint below, the only caller.
 function _pipes.directionalGateOutputPoint(canvas, e)
     local _, _, ew, eh = _elementPixelRect(canvas, e)
     local cx, cy = _elementCenter(canvas, e)
@@ -8637,24 +8740,113 @@ function _pipes.directionalGateOutputPoint(canvas, e)
     return cx + fx * half, cy + fy * half, fx, fy
 end
 
-function _pipes.drawLeakSpray(canvas, w, plan, r, g, b)
+-- Shared by both leak renderers below (liquid droplets and gas puffs) --
+-- where a leaking wire w's own dead end actually sits, and which way it
+-- points. The dead end is whichever side of the wire fluid/air is heading
+-- TOWARD (forward: the "to" element; reverse: the "from" one) -- if that's
+-- a check valve, spray from its own output side (directionalGateOutputPoint
+-- above) instead of the wire's own literal end, which sits at the valve's
+-- INPUT side. Returns nil (no x) when w has no direction at all, same as
+-- every caller already handled inline before this was pulled out.
+function _pipes.leakOutputPoint(canvas, w, plan)
     local dir = w.pumpedDirection or w.gravityDirection
-    if not dir then return end
-    -- The dead end is whichever side of the wire fluid is heading TOWARD
-    -- (forward: the "to" element; reverse: the "from" one) -- if that's a
-    -- check valve, spray from its own output side (above) instead of the
-    -- wire's own literal end, which sits at the valve's INPUT side.
+    if not dir then return nil end
     local deadEndId = (dir == "reverse") and w.fromElementId or w.toElementId
     local gate = deadEndId and _findElement(canvas, deadEndId)
-    local x, y, tx, ty
     if gate and gate.componentType == "directionalGate" then
-        x, y, tx, ty = _pipes.directionalGateOutputPoint(canvas, gate)
-    else
-        local pieces, total = _pipes.pathPieces(canvas, plan)
-        x, y, tx, ty = _pipes.outputPoint(pieces, total, dir, _pipes.LEAK_INSET_PX, canvas.zoom)
+        return _pipes.directionalGateOutputPoint(canvas, gate)
     end
+    -- A multi-port generated shape (a MANIFOLD's own "tube-like splits" --
+    -- e.pipeRoutes/e.terminals is that signature, see
+    -- _manifoldShapeAndTerminals in main.lua) gets its own PER-PORT open-
+    -- end leak from drawOpenPortLeaks below instead -- model/fluid.lua's
+    -- own leakNodes test only ever sees the WHOLE node (pipesOnNode == 1,
+    -- i.e. exactly one wire total), so it can't tell WHICH of several
+    -- tubes is the actually-open one, or that only SOME are while others
+    -- are genuinely wired, the way drawOpenPortLeaks can by checking each
+    -- terminal directly. Bailing out here avoids a second, wrongly-
+    -- positioned spray right at this wire's own end against the
+    -- manifold's INPUT side, on top of the correct one(s)
+    -- drawOpenPortLeaks already draws at each open tube's own tip.
+    -- Liquid only -- a gas DUCT has no drawOpenPortLeaks coverage yet (see
+    -- that function's own isLiquid gate), so it still needs this wire-
+    -- level fallback for now, mispositioned or not.
+    if _pipes.isLiquid(canvas) and gate and gate.terminals and gate.pipeRoutes then
+        return nil
+    end
+    local pieces, total = _pipes.pathPieces(canvas, plan)
+    return _pipes.outputPoint(pieces, total, dir, _pipes.LEAK_INSET_PX, canvas.zoom)
+end
+
+function _pipes.drawLeakSpray(canvas, w, plan, r, g, b)
+    local x, y, tx, ty = _pipes.leakOutputPoint(canvas, w, plan)
     if not x then return end
     _pipes.drawLeakSprayAt(canvas, w.id, x, y, tx, ty, w.leakPressure, r, g, b)
+end
+
+--------------------------------------------------------------------------------
+-- AIR LEAK PUFFS: the gas-DUCT counterpart to the LEAK SPRAY above -- a
+-- compressible gas has no surface tension to bead into droplets, so an open
+-- duct end blows outward as a faint ring expanding and fading, not a jet of
+-- teardrops. w.leaking/w.leakPressure here come from main.lua's own
+-- _solveCurrentSchematic, not model/fluid.lua (which only ever runs for
+-- liquid PIPE systems -- see _pipes.hasFlow's own comment): a DUCT wire is
+-- "leaking" when its fed (powered) end is a conducting "path"/
+-- "directionalGate"/open-"gate" node with no OTHER wire on it to carry the
+-- air any further, same dead-end test model/fluid.lua's own leakNodes uses
+-- for a liquid pipe, just computed generically off the graph instead of the
+-- pressure/pump model.
+--------------------------------------------------------------------------------
+_pipes.AIR_PUFFS = 4           -- rings in flight at once, evenly spaced in phase
+_pipes.AIR_PUFF_SPEED = 0.7    -- puff cycles a second, at AIR_PUFF_SPEED_MAX_PSI -- no eased
+                                 -- speed transition the way LEAK_SPEED gets (see that constant's
+                                 -- own comment): a ring's speed/size jumping the instant a valve
+                                 -- opens/closes reads fine for a soft, infrequent puff, unlike a
+                                 -- liquid jet's continuous droplet stream.
+_pipes.AIR_PUFF_SPEED_MAX_PSI = 50
+_pipes.AIR_PUFF_SPEED_MIN_FACTOR = 0.25
+_pipes.AIR_PUFF_RANGE_MULT = 4        -- how far a ring's center travels, in duct fluid-widths
+_pipes.AIR_PUFF_START_RADIUS_MULT = 0.35
+_pipes.AIR_PUFF_END_RADIUS_MULT = 1.5 -- scaled further by pressure intensity below, unlike the
+                                         -- liquid spray's fixed-reach droplets -- a harder-pressurized
+                                         -- duct visibly puffs bigger, not just faster.
+_pipes.AIR_PUFF_REFERENCE_PSI = 15
+_pipes.AIR_PUFF_MIN_INTENSITY = 0.6
+_pipes.AIR_PUFF_MAX_INTENSITY = 2.0
+
+-- The air puff rings (see the section header) blowing out of x,y along unit
+-- direction tx,ty, colored r,g,b (the duct's own resolved color). pressure
+-- is w.leakPressure -- nil reads as AIR_PUFF_REFERENCE_PSI's own full
+-- intensity, same "nil means reference strength" convention
+-- drawLeakSprayAt's own leakPressure uses.
+function _pipes.drawAirPuffsAt(canvas, x, y, tx, ty, pressure, r, g, b)
+    local fluidW = _pipes.fluidWidth(canvas)
+    local intensity = math.max(_pipes.AIR_PUFF_MIN_INTENSITY, math.min(_pipes.AIR_PUFF_MAX_INTENSITY,
+        (pressure or _pipes.AIR_PUFF_REFERENCE_PSI) / _pipes.AIR_PUFF_REFERENCE_PSI))
+    local speedFactor = math.max(_pipes.AIR_PUFF_SPEED_MIN_FACTOR, math.min(1,
+        (pressure or _pipes.AIR_PUFF_SPEED_MAX_PSI) / _pipes.AIR_PUFF_SPEED_MAX_PSI))
+    local speed = _pipes.AIR_PUFF_SPEED * speedFactor
+    local range = fluidW * _pipes.AIR_PUFF_RANGE_MULT
+    local startRadius = fluidW * _pipes.AIR_PUFF_START_RADIUS_MULT
+    local endRadius = fluidW * _pipes.AIR_PUFF_END_RADIUS_MULT * intensity
+    local onePx = 1 / love.graphics.getDPIScale()
+    local now = _selection.now()
+    for i = 1, _pipes.AIR_PUFFS do
+        local phase = (now * speed + (i - 1) / _pipes.AIR_PUFFS) % 1
+        local cx, cy = x + tx * range * phase, y + ty * range * phase
+        local radius = startRadius + (endRadius - startRadius) * phase
+        local alpha = (1 - phase) * 0.6
+        -- Same bright-rim-for-contrast trick the droplet spray's own
+        -- teardrops use, drawn as a ring outline instead of a filled shape
+        -- so it reads as a hollow puff of gas, not a solid bead of liquid.
+        love.graphics.setLineWidth(onePx * 2)
+        love.graphics.setColor(1, 1, 1, alpha * 0.5)
+        love.graphics.circle("line", cx, cy, radius + onePx)
+        love.graphics.setColor(r, g, b, alpha)
+        love.graphics.circle("line", cx, cy, radius)
+    end
+    love.graphics.setLineWidth(1)
+    love.graphics.setColor(1, 1, 1, 1)
 end
 
 -- Whether element e has any terminal with no wire plugged into it at all --
@@ -8689,40 +8881,77 @@ function gdsGui_schematic_elementHasOpenPort(canvasName, elementId)
     return e ~= nil and _elementHasOpenTerminal(canvas, e)
 end
 
--- A tank (or any other fluid-holding source) with a port that has no wire
--- plugged into it at all -- not a dead-end PIPE (see the section header
--- and _pipes.drawLeak/drawLeakSpray above, model/fluid.lua's own leak
--- detection), just an opening in the element's own body with nothing
--- connected -- sprays the same way, aimed along the straight line from the
--- element's own center through that port (not the port's stored exit
--- normal -- a port off the element's own centerline would otherwise aim
--- parallel to the edge instead of outward through the opening itself).
+-- Whether a multi-port "path" element (a MANIFOLD's own generated shape --
+-- e.pipeRoutes/e.terminals is that signature, see
+-- _manifoldShapeAndTerminals in main.lua) is actually receiving fluid
+-- right now, so an open (disconnected) port of its own should spray --
+-- unlike a tank (drawOpenPortLeaks' own "source" branch just below, which
+-- can assume "always has fluid to leak" the same way that function's own
+-- fillPercent check does), a "path" node has no store of its own: it only
+-- ever carries whatever's actively being fed through it. True when at
+-- least one of e's own CONNECTED wires is w.fluidMoving AND flowing INTO
+-- e, per w.pumpedDirection/gravityDirection's own "forward is
+-- fromElementId -> toElementId" convention (model/fluid.lua's header
+-- comment).
+function _pipes.pathElementIsWet(canvas, e)
+    for _, w in ipairs(canvas.wires) do
+        if w.fluidMoving then
+            local dir = w.pumpedDirection or w.gravityDirection
+            if dir then
+                local feedsInto = (dir == "forward" and w.toElementId == e.id)
+                    or (dir == "reverse" and w.fromElementId == e.id)
+                if feedsInto then return true end
+            end
+        end
+    end
+    return false
+end
+
+-- A tank (or any other fluid-holding source), OR a MANIFOLD's own
+-- multi-port "path" shape currently carrying fluid (_pipes.pathElementIsWet
+-- above), with a port that has no wire plugged into it at all -- not a
+-- dead-end PIPE (see the section header and _pipes.drawLeak/drawLeakSpray
+-- above, model/fluid.lua's own leak detection, which bails out of drawing
+-- a manifold's own wire-level leak for exactly this reason -- see
+-- leakOutputPoint's own comment), just an opening in the element's own
+-- body with nothing connected -- sprays the same way, aimed along the
+-- straight line from the element's own center through that port (not the
+-- port's stored exit normal -- a port off the element's own centerline
+-- would otherwise aim parallel to the edge instead of outward through the
+-- opening itself).
 function _pipes.drawOpenPortLeaks(canvas, signature)
     if not _pipes.isLiquid(canvas) or canvas.mode ~= "control" then return end
     for _, e in ipairs(canvas.elements) do
-        if e.componentType == "source" and e.shapeType and e.terminals and (e.fillPercent or 100) > 0 then
-            local connected, tankPsi = {}, 0
+        local isOpenSource = e.componentType == "source" and (e.fillPercent or 100) > 0
+        local isOpenPath = e.componentType == "path" and e.pipeRoutes and _pipes.pathElementIsWet(canvas, e)
+        if (isOpenSource or isOpenPath) and e.shapeType and e.terminals then
+            local connected, openPortPsi = {}, 0
             for _, w in ipairs(canvas.wires) do
                 if w.fromElementId == e.id and w.fromTerminal then connected[w.fromTerminal] = true end
                 if w.toElementId == e.id and w.toTerminal then connected[w.toTerminal] = true end
-                -- Whether a pump wired to this tank (through one of its
-                -- OTHER, connected ports) is actually switched on right now,
-                -- and if so its own real PSI -- its own position's LABEL,
-                -- not w.pumpedDirection (set only once the model has
+                -- Whether a pump wired to this element (through one of its
+                -- OTHER, connected ports -- a tank's own, or one of a
+                -- MANIFOLD's own other tubes) is actually switched on right
+                -- now, and if so its own real PSI -- its own position's
+                -- LABEL, not w.pumpedDirection (set only once the model has
                 -- actually resolved a full delivery route for it, which a
                 -- pump switched on but routing its flow through a different
                 -- port, or into an already-full tank with nowhere to put
                 -- it, would leave unset even though the pump itself is
                 -- genuinely running and genuinely pressurizing this port
-                -- too) -- so a pump control sitting OFF leaves tankPsi at 0
-                -- exactly as the open port itself has no pump of its own.
-                -- A tank's own fill level does NOT factor in here (it did
-                -- before -- see model/fluid.lua's own "no tank pressure
+                -- too) -- so a pump control sitting OFF leaves openPortPsi
+                -- at 0 exactly as the open port itself has no pump of its
+                -- own. A tank's own fill level does NOT factor in here (it
+                -- did before -- see model/fluid.lua's own "no tank pressure
                 -- concept" comment on the FUEL TANK catalog entry -- a
                 -- full-but-unpumped tank isn't actually under any more
                 -- pressure than an empty one in this model, so its leak
                 -- shouldn't look stronger either). The highest PSI of
-                -- possibly several pumps wins.
+                -- possibly several pumps wins. Only ever finds a pump
+                -- DIRECTLY wired to e -- a MANIFOLD fed by a pump several
+                -- pipes further upstream still falls back to the flat
+                -- baseline below, same limitation a tank one hop further
+                -- from its own pump already had.
                 if w.fromElementId == e.id or w.toElementId == e.id then
                     local otherId = (w.fromElementId == e.id) and w.toElementId or w.fromElementId
                     local pump = _findControl(canvas, otherId)
@@ -8730,7 +8959,7 @@ function _pipes.drawOpenPortLeaks(canvas, signature)
                         local label = pump.positions and pump.positions[(pump.detentIndex or 0) + 1]
                         if label ~= "OFF" and label ~= "CLOSED" then
                             local psi = tonumber(pump.voltage)
-                            if psi and psi > tankPsi then tankPsi = psi end
+                            if psi and psi > openPortPsi then openPortPsi = psi end
                         end
                     end
                 end
@@ -8749,10 +8978,10 @@ function _pipes.drawOpenPortLeaks(canvas, signature)
                             -- carry a real PSI -- 0 (same as a dead-end
                             -- PIPE leak with nothing pushing it -- see
                             -- drawLeakSpray above) unless a pump elsewhere
-                            -- on this same tank is actually running right
-                            -- now (tankPsi, above), in which case that
+                            -- on this same element is actually running right
+                            -- now (openPortPsi, above), in which case that
                             -- pump's own real PSI applies here too.
-                            _pipes.drawLeakSprayAt(canvas, e.id .. i, px, py, tx, ty, tankPsi, r, g, b)
+                            _pipes.drawLeakSprayAt(canvas, e.id .. i, px, py, tx, ty, openPortPsi, r, g, b)
                         end
                     end
                 end
@@ -8761,12 +8990,21 @@ function _pipes.drawOpenPortLeaks(canvas, signature)
     end
 end
 
--- The leak spray, drawn only in control mode and only on a pipe step()
--- actually marked w.leaking.
+-- The leak spray/puffs, drawn only in control mode and only on a wire
+-- actually marked w.leaking (a liquid pipe step(), or a gas duct's own
+-- leak detection -- see each one's own comment). Liquid droplets for a
+-- PIPE, air puff rings (AIR LEAK PUFFS above) for a DUCT -- isLiquid is the
+-- same "pools, drains, and leaks like a liquid" gate every other
+-- liquid-specific pass in this file already keys off.
 function _pipes.drawLeak(canvas, w, plan, signature)
     if canvas.mode ~= "control" or not w.leaking then return end
     local r, g, b = gdsGui_schematic_resolveDisplayColor(canvas.name, "wire", w.id, signature)
-    _pipes.drawLeakSpray(canvas, w, plan, r, g, b)
+    if _pipes.isLiquid(canvas) then
+        _pipes.drawLeakSpray(canvas, w, plan, r, g, b)
+    else
+        local x, y, tx, ty = _pipes.leakOutputPoint(canvas, w, plan)
+        if x then _pipes.drawAirPuffsAt(canvas, x, y, tx, ty, w.leakPressure, r, g, b) end
+    end
 end
 
 -- Draws an orthogonal connector line between two anchors' centers, clamped
@@ -10719,17 +10957,23 @@ function gdsGui_schematic_draw(pageName)
                     if lift > 0 then love.graphics.pop() end
                 end
             end
-            -- Leak spray (see _pipes.drawLeak): drawn after elements/controls,
-            -- not in the per-wire pass above -- a dead-end leak sits right at
-            -- a valve/manifold port, and that element's own redraw (just
-            -- above) would otherwise paint straight over the spray.
-            if _pipes.isLiquid(canvas) then
+            -- Leak spray/puffs (see _pipes.drawLeak): drawn after elements/
+            -- controls, not in the per-wire pass above -- a dead-end leak
+            -- sits right at a valve/manifold/duct port, and that element's
+            -- own redraw (just above) would otherwise paint straight over
+            -- it. hasFlow, not isLiquid -- drawLeak itself dispatches
+            -- liquid droplets vs. gas puff rings (see its own comment);
+            -- drawOpenPortLeaks stays liquid-only below it, a tank-specific
+            -- (componentType "source") concern no gas DUCT system has.
+            if _pipes.hasFlow(canvas) then
                 for _, w in ipairs(canvas.wires) do
                     local plan = wirePlans[w.id]
                     if plan and wireVisible(plan) then
                         _pipes.drawLeak(canvas, w, plan, signature)
                     end
                 end
+            end
+            if _pipes.isLiquid(canvas) then
                 _pipes.drawOpenPortLeaks(canvas, signature)
             end
             _glow.finish(canvas)
@@ -11133,6 +11377,13 @@ function gdsGui_schematic_pressed(touchId, x, y)
                 gridSize = canvas.pendingPlacement.gridSize,
                 colorDarkenMul = canvas.pendingPlacement.colorDarkenMul,
                 terminals = canvas.pendingPlacement.terminals,
+                -- Same oversight as componentType/gridSize's own comment
+                -- just above -- gdsGui_schematic_armElementPlacement's own
+                -- suggestedName (see its comment) never made it into this
+                -- struct either, so _openElementPlacementGrid always fell
+                -- back to the plain "<label>_<N>" auto-increment regardless
+                -- of what the catalog item actually asked for.
+                suggestedName = canvas.pendingPlacement.suggestedName,
             }
             -- Every tap-to-place item (element or control — never an
             -- annunciator, which has no canvas position to tap for and

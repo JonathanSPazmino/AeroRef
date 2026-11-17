@@ -351,13 +351,28 @@ end
 -- pressures (optional): {pumpId -> PSI}, what drives each pump. stores
 -- (optional): {id -> entity with tankMaxCapacity/fillPercent}, read here only to
 -- tell whether a tank downstream has room to receive gravity flow.
-local function computeFlow(graph, wires, conducting, offSources, pressures, stores)
-    local edgeById, pipesOnNode = {}, {}
+-- How many edges touch each node at all, counted off the RESOLVED graph
+-- edges (edge.fromId/toId -- post directional-gate resolution, see
+-- model/graph.lua's own buildGraph comment on why those can differ from a
+-- wire's own literal fromElementId/toElementId near a CHECK VALVE/EJECTOR)
+-- rather than the raw wire list. The "exactly one pipe on an otherwise-
+-- conducting node" half of the dead-end/leak test below, pulled out to its
+-- own function so a non-liquid caller (a gas DUCT, which has no fluid
+-- model of its own to run computeFlow through) can still use the EXACT
+-- same test main.lua's own leak detection used to duplicate by hand.
+local function _pipesOnNode(graph)
+    local pipesOnNode = {}
     for _, e in ipairs(graph.edges) do
-        edgeById[e.id] = e
         pipesOnNode[e.fromId] = (pipesOnNode[e.fromId] or 0) + 1
         pipesOnNode[e.toId] = (pipesOnNode[e.toId] or 0) + 1
     end
+    return pipesOnNode
+end
+
+local function computeFlow(graph, wires, conducting, offSources, pressures, stores)
+    local edgeById = {}
+    for _, e in ipairs(graph.edges) do edgeById[e.id] = e end
+    local pipesOnNode = _pipesOnNode(graph)
 
     local runs, incoming, outgoing = {}, {}, {}
     for _, w in ipairs(wires) do
@@ -917,4 +932,14 @@ local function step(flow, stores, pipeUnits, dt)
 end
 
 return { computeFlow = computeFlow, step = step, DRAIN_RATE = DRAIN_RATE, PIPE_VOLUME_PER_UNIT = PIPE_VOLUME_PER_UNIT,
-    PUMP_RATE_PER_PSI = PUMP_RATE_PER_PSI, EJECTOR_ENTRAINMENT = EJECTOR_ENTRAINMENT }
+    PUMP_RATE_PER_PSI = PUMP_RATE_PER_PSI, EJECTOR_ENTRAINMENT = EJECTOR_ENTRAINMENT,
+    -- Exported so a non-liquid (gas DUCT) caller with no fluid model of its
+    -- own can still run the exact same conduction/dead-end CRITERIA this
+    -- module uses for a liquid PIPE's own leak detection -- see each
+    -- function's own comment (_conducts above computeFlow, _pipesOnNode
+    -- just above it). Medium-agnostic by construction already (both key
+    -- off graph.nodes' role vocabulary alone, never anything liquid-
+    -- specific like pressure/gravity), so sharing them doesn't blur this
+    -- file's own liquid-only scope -- only its simulation functions
+    -- (computeFlow/step) are liquid-specific.
+    conducts = _conducts, pipesOnNode = _pipesOnNode }
