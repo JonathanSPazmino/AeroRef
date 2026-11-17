@@ -508,6 +508,20 @@ local function computeFlow(graph, wires, conducting, offSources, pressures, stor
                         out.receivingStores[id][run.down] = true
                     else
                         if leakNodes[run.down] then out.leakingWires[run.wire.id] = true end
+                        -- A sink (an engine, a vent) genuinely consumes
+                        -- whatever reaches it -- nothing else here records
+                        -- that (it's neither a store to credit nor a
+                        -- leakNode, which only covers a dead-end
+                        -- conducting node, not a sink role), yet step()'s
+                        -- own drain still needs to know this source's loss
+                        -- was real. Recorded separately from leakingWires
+                        -- (which is wire-keyed, for the leak-spray cue) --
+                        -- this is source-keyed, for step()'s own "did
+                        -- anything actually leave" gate just below.
+                        if graph.nodes[run.down].role == "sink" then
+                            out.reachedSink = out.reachedSink or {}
+                            out.reachedSink[id] = true
+                        end
                         table.insert(stack, run.down)
                     end
                 end
@@ -520,7 +534,7 @@ local function computeFlow(graph, wires, conducting, offSources, pressures, stor
     -- gravity even structurally reaches at all. receivingStores/
     -- leakingWires here are provisional (contention-unaware) and thrown
     -- away once resolution is known; pass 2 below produces the real ones.
-    local discard = { receivingStores = {}, leakingWires = {} }
+    local discard = { receivingStores = {}, leakingWires = {}, reachedSink = {} }
     for id, node in pairs(graph.nodes) do
         if node.role == "source" and not (offSources and offSources[id]) then
             walkSource(id, nil, discard)
@@ -612,16 +626,18 @@ local function computeFlow(graph, wires, conducting, offSources, pressures, stor
     -- Pass 2: the real, final walk, now contention-aware -- see
     -- walkSource's own comment for why this has to be a fresh walk rather
     -- than a patch of pass 1's output.
-    local feeding, receivingStores, leakingWires = {}, {}, {}
+    local feeding, receivingStores, leakingWires, reachedSink = {}, {}, {}, {}
     for id, node in pairs(graph.nodes) do
         if node.role == "source" and not (offSources and offSources[id]) then
-            local fed = walkSource(id, reversed, { receivingStores = receivingStores, leakingWires = leakingWires })
+            local fed = walkSource(id, reversed,
+                { receivingStores = receivingStores, leakingWires = leakingWires, reachedSink = reachedSink })
             if next(fed) then feeding[id] = fed end
         end
     end
 
     return { graph = graph, wires = wires, runs = runs, incoming = incoming, feeding = feeding,
-        receivingStores = receivingStores, leakingWires = leakingWires, wetWires = wetWires, conducting = conducting,
+        receivingStores = receivingStores, leakingWires = leakingWires, reachedSink = reachedSink,
+        wetWires = wetWires, conducting = conducting,
         pipesOnNode = pipesOnNode, pumps = pumps, downstream = downstream, upstream = upstream, passes = passes,
         reversed = reversed }
 end
@@ -834,8 +850,29 @@ local function step(flow, stores, pipeUnits, dt)
                     changed = true
                 end
             end
-            store.fillPercent = math.max(0, (gallons - amount) / capacity * 100)
-            changed = true
+            -- Only actually lose the fluid if it genuinely left somewhere:
+            -- credited into another store (receivers, above), consumed by a
+            -- sink (flow.reachedSink -- an engine, a vent), or sprayed out
+            -- a real dead end (one of this source's own fed wires is
+            -- flow.leakingWires). Without any of those, every pipe this
+            -- source "feeds" loops right back into the SAME store
+            -- (walkSource's own self-credit guard deliberately excludes
+            -- crediting a store from draining itself in the same tick --
+            -- see its own comment) -- a closed loop that circulates but
+            -- never actually drains, same as it physically wouldn't. Before
+            -- this gate, that loop still hit the unconditional drain below
+            -- every tick with nowhere for the lost fluid to go, silently
+            -- emptying the source for no physical reason.
+            local reachedExternal = receivers ~= nil or (flow.reachedSink and flow.reachedSink[id]) or false
+            if not reachedExternal then
+                for wireId in pairs(fed) do
+                    if flow.leakingWires[wireId] then reachedExternal = true break end
+                end
+            end
+            if reachedExternal then
+                store.fillPercent = math.max(0, (gallons - amount) / capacity * 100)
+                changed = true
+            end
         end
     end
 

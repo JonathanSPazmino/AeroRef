@@ -1,13 +1,33 @@
 # AeroRef — Per-System Monetization Roadmap
 
-Business model: each schematic system type (ELECTRICAL, HYDRAULIC, FUEL, BLEED AIR,
-PRESSURIZATION) sells separately in the App Store. Users pay to unlock each type, so
-each one needs its own unique, attractive animation to justify a standalone purchase.
+Business model: each schematic system type sells separately in the App Store. Users pay to
+unlock each type, so each one needs its own unique, attractive animation to justify a
+standalone purchase.
+
+**Pricing decision (locked in):**
+- Free tier: **OXYGEN system** — the simplest of all systems, chosen specifically for this
+  role. **Not yet created** — needs full design/build (catalog items, medium file, signature
+  animation) before it can anchor anything else below.
+- All other systems (ELECTRICAL, HYDRAULIC, FUEL, BLEED AIR, PRESSURIZATION): paid, one flat
+  price across all of them. Exact price TBD — decided when the app is ready to ship, not before.
+
+## 0. Build the OXYGEN system (new, free-tier anchor)
+- [ ] Design its catalog: likely SOURCE (oxygen bottle/generator), PATH (manifold/line,
+      reusing the existing generated tube-split pattern), GATE (shutoff valve, reusing SWITCH
+      sprites), SINK (mask/regulator/outlet — candidate for the same generic "user-named sink"
+      treatment ACTUATOR got)
+- [ ] Decide its medium: a pressurized-gas system like BLEED AIR/PRESSURIZATION (DUCT
+      connectors, shimmer flow) is the closest existing fit — register via a new
+      `model/media/oxygen.lua`, same shape as `hydraulic.lua`/`bleedAir.lua`
+- [ ] Give it its own signature idle/flow animation (see §2) — since it's the one system every
+      user sees for free, it's also the app's de facto first impression
+- [ ] Add the new system type to `SCHEMATIC_CATALOG` and the systems gallery
 
 ## 1. Paywall / entitlement architecture
-- [ ] Decide the free tier: is any system permanently free as a hook, or is everything paid?
+- [x] Decide the free tier — see pricing decision above (OXYGEN free, rest paid at one flat TBD price)
 - [ ] Add an `entitlements` table (which systemTypes are unlocked) — persisted like `appSettings`,
-      but validated against StoreKit on launch, not just a local flag
+      but validated against StoreKit on launch, not just a local flag. OXYGEN is always
+      unlocked unconditionally (not entitlement-gated at all)
 - [ ] Gate the systems gallery: locked tiles show price + a teaser animation instead of opening the editor
 - [ ] Gate schematic creation/editing itself (not just the gallery tap) — a locked system must not be
       reachable via any other path (deep link, catalog, duplicate, etc.)
@@ -46,11 +66,12 @@ distinct *identity* per system, not just functional cues:
       one per system
 - [ ] Sandbox-test purchase, restore, and failure/cancel flows on-device before anything else here matters
 - [ ] Receipt validation: on-device/local-flag is fine for this scale — make the call explicitly
-- [ ] Price tier decisions per system (equal pricing vs. complexity-based)
+- [x] Price tier decision — flat price across all paid systems (OXYGEN free); exact number TBD at ship time
 
 ## 4. Functional polish / known gaps
-- [ ] Fix the fluid-vanishing bug in `model/fluid.lua`'s `step()` (a self-looping pipe run drains its
-      source with no credited receiver) — fix before systems are paid products
+- [x] Fix the fluid-vanishing bug in `model/fluid.lua`'s `step()` (a self-looping pipe run drains its
+      source with no credited receiver) — fixed; verified live (reservoir held steady at 27%/102L for
+      60s of idle simulation, vs. continuous drain before the fix)
 - [ ] Verify the ELECTRICAL "powered" color actually triggers in normal use (inference/prediction path)
 - [ ] Sweep each system's catalog for the same "generic sink, user-named" treatment ACTUATOR got, where
       it makes sense (e.g. does ELECTRICAL need a generic LOAD beyond LIGHT/MOTOR/HEATER?)
