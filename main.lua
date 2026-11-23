@@ -63,6 +63,7 @@ require("model.media.hydraulic")
 require("model.media.fuel")
 require("model.media.bleedAir")
 require("model.media.pressurization")
+require("model.media.oxygen")
 -- Global, not local: this file is at Lua's 200-top-level-local ceiling.
 ModelFluid = require("model.fluid")
 
@@ -682,6 +683,46 @@ end
 -- this entry needs its own matching fix-up there, or it's stuck looking/
 -- behaving like the old entry forever.
 local SCHEMATIC_CATALOG = {
+    -- The app's one free-tier system (see TODO.md) -- listed first so it's
+    -- the gallery's own first impression, and deliberately the thinnest
+    -- catalog of the six: one source, one path, one gate, one sink, none
+    -- of them asking for a defaultProperties row. A gas DUCT system like
+    -- BLEED AIR/PRESSURIZATION, with its own medium (model/media/oxygen.lua).
+    { system = "OXYGEN", pipeConnectors = "DUCT", items = {
+        -- The bottle/generator itself -- always "there" whenever placed,
+        -- same always-on-when-placed role BLEED AIR SOURCE/PRESSURIZATION's
+        -- own BLEED AIR SOURCE play in their own systems. No
+        -- defaultProperties -- PRESSURE already comes from the placement
+        -- grid's own source TYPE/VALUE row (same reasoning BATTERY's own
+        -- comment, above in the ELECTRICAL catalog, gives for VOLTAGE).
+        { label = "OXYGEN SOURCE", abbrev = "OSRC", kind = "element", shapeType = "circle",
+          gridW = 3, gridH = 3, componentType = "source" },
+        -- Same generated, NOT reshapable, relocate/cardinal-rotate-only
+        -- design as every other system's own MANIFOLD above (see
+        -- HYDRAULIC's own entry for the full comment) -- one trunk duct
+        -- splitting into n outflow lines off a header spine.
+        { label = "MANIFOLD", abbrev = "OMFD", kind = "element", shapeType = "rect",
+          gridW = 8, gridH = 3, componentType = "path", terminals = _MANIFOLD_TERMINALS },
+        -- The pilot-operated shutoff itself, same single-item pattern as
+        -- HYDRAULIC/FUEL's own SHUTOFF VALVE.
+        { label = "SHUTOFF VALVE", abbrev = "OSOV", kind = "control",
+          presets = { {"CLOSED", "OPEN"} },
+          spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate", terminals = _SWITCH_TERMINALS },
+        -- The consuming end -- a crew or passenger mask, a walk-around
+        -- bottle outlet, whatever it actually is. One generic entry rather
+        -- than a separate catalog row per mask location, same reasoning
+        -- HYDRAULIC's own ACTUATOR entry gives: NAME is free text
+        -- regardless, so the pilot names this one CREW/PAX/CKPT/etc. right
+        -- there. suggestedName = "USER#_OUT" is the same fill-in-the-blank
+        -- template ACTUATOR's own "USER#_ACT" is (see
+        -- gdsGui_schematic_armElementPlacement's own comment) -- overwrite
+        -- "USER#" with whatever this one actually is, leaving "_OUT" in
+        -- place. No defaultProperties -- deliberately the one sink in this
+        -- whole catalog with no required property at all, matching
+        -- OXYGEN's own "simplest system" role.
+        { label = "OXYGEN OUTLET", abbrev = "OOUT", kind = "element", shapeType = "circle",
+          gridW = 2, gridH = 2, componentType = "sink", suggestedName = "USER#_OUT" },
+    }},
     { system = "ELECTRICAL", items = {
         -- componentType: this item's role in the inference model's graph
         -- (model/graph.lua) — "source" | "path" | "gate" | "directionalGate"

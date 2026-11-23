@@ -6,22 +6,24 @@ standalone purchase.
 
 **Pricing decision (locked in):**
 - Free tier: **OXYGEN system** — the simplest of all systems, chosen specifically for this
-  role. **Not yet created** — needs full design/build (catalog items, medium file, signature
-  animation) before it can anchor anything else below.
+  role. Built (see §0) — catalog items, medium file, and signature shimmer/color all in place.
 - All other systems (ELECTRICAL, HYDRAULIC, FUEL, BLEED AIR, PRESSURIZATION): paid, one flat
   price across all of them. Exact price TBD — decided when the app is ready to ship, not before.
 
 ## 0. Build the OXYGEN system (new, free-tier anchor)
-- [ ] Design its catalog: likely SOURCE (oxygen bottle/generator), PATH (manifold/line,
-      reusing the existing generated tube-split pattern), GATE (shutoff valve, reusing SWITCH
-      sprites), SINK (mask/regulator/outlet — candidate for the same generic "user-named sink"
-      treatment ACTUATOR got)
-- [ ] Decide its medium: a pressurized-gas system like BLEED AIR/PRESSURIZATION (DUCT
-      connectors, shimmer flow) is the closest existing fit — register via a new
-      `model/media/oxygen.lua`, same shape as `hydraulic.lua`/`bleedAir.lua`
-- [ ] Give it its own signature idle/flow animation (see §2) — since it's the one system every
-      user sees for free, it's also the app's de facto first impression
-- [ ] Add the new system type to `SCHEMATIC_CATALOG` and the systems gallery
+- [x] Design its catalog: SOURCE (OXYGEN SOURCE, bottle/generator), PATH (MANIFOLD, reusing the
+      existing generated tube-split pattern), GATE (SHUTOFF VALVE, reusing SWITCH sprites), SINK
+      (OXYGEN OUTLET — the same generic "user-named sink" treatment ACTUATOR got, via
+      `suggestedName`)
+- [x] Decide its medium: a pressurized-gas system like BLEED AIR/PRESSURIZATION (DUCT
+      connectors, shimmer flow) — registered via `model/media/oxygen.lua`, same shape as
+      `hydraulic.lua`/`bleedAir.lua`
+- [x] Give it its own signature idle/flow animation (see §2) — own saturated green + shimmer
+      speed/band/alpha tuned between BLEED AIR's and PRESSURIZATION's
+- [x] Add the new system type to `SCHEMATIC_CATALOG` (listed first) — the systems gallery
+      derives its tiles from `SCHEMATIC_CATALOG` directly, so no separate gallery wiring was
+      needed. No `SYSTEM_THUMBNAILS` entry yet (needs a dedicated sprite asset) — falls back to
+      the gallery's default elements/wires mini-diagram preview until one is made
 
 ## 1. Paywall / entitlement architecture
 - [x] Decide the free tier — see pricing decision above (OXYGEN free, rest paid at one flat TBD price)
