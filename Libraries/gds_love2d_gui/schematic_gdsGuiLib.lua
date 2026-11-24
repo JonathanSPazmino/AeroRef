@@ -3415,13 +3415,23 @@ end
 -- itself, see its module header) — and the same wrap width (mw, no extra
 -- padding) that printf wraps against, so the measured height always matches
 -- what's actually drawn.
+-- Shared by _titleHeight (below) and _menuGeometry's per-row sizing: how
+-- tall a block of wrapped text needs, floored at minH, so a long label never
+-- bleeds past the box its height is reserving for it. A bare global, not a
+-- top-level local -- this file is already at Lua's 200-local ceiling (see
+-- _actionSheet's own comment above its definition, and _shapePoly's).
+function _wrappedBlockHeight(mw, text, minH, vpad)
+    if type(text) ~= "string" then return minH end
+    local font = love.graphics.getFont()
+    local _, lines = font:getWrap(text, mw)
+    local numLines = math.max(1, #lines)
+    return math.max(minH, numLines * font:getHeight() + vpad)
+end
+
 local function _titleHeight(mw, title)
     if not title then return 0 end
-    local titleVPad = 16 -- 8px top inset (matches rowY + 8 below) + 8px bottom
-    local font = love.graphics.getFont()
-    local _, lines = font:getWrap(title, mw)
-    local numLines = math.max(1, #lines)
-    return math.max(_MENU_ROW_H, numLines * font:getHeight() + titleVPad)
+    -- 8px top inset (matches rowY + 8 below) + 8px bottom
+    return _wrappedBlockHeight(mw, title, _MENU_ROW_H, 16)
 end
 
 -- Menus are drawn the way iOS draws an action sheet: a rounded group of options
@@ -3536,7 +3546,20 @@ local function _menuGeometry(owner, menu)
         lastRow = n
         rowCount = lastRow - firstRow + 1
     end
-    local groupH = titleH + swatchH + rowCount * rowH
+    -- A row's label can be long enough to wrap (e.g. a catalog item name in
+    -- a narrow anchored popup, like "BLEED AIR SOURCE") -- grow just that
+    -- row past rowH so a wrapped second line doesn't spill into the row
+    -- below it instead of overlapping it. A toggle row's label shares its
+    -- width with the switch (see _actionSheet.drawToggleRow's own pad/switch
+    -- math), so it wraps against the narrower width the label actually gets.
+    local toggleTextW = w - 16 * 2 - _actionSheet.SWITCH_W
+    local rowHeights, rowHSum = {}, 0
+    for i = firstRow, lastRow do
+        local h = _wrappedBlockHeight(menu.toggleStates and toggleTextW or w, menu.options[i], rowH, 16)
+        rowHeights[i] = h
+        rowHSum = rowHSum + h
+    end
+    local groupH = titleH + swatchH + rowHSum
 
     local x = oX + (oW - w) / 2
     local y
@@ -3580,10 +3603,12 @@ local function _menuGeometry(owner, menu)
         rowY = rowY + swatchH
     end
     for i = firstRow, lastRow do
-        table.insert(layout.rows, { index = i, y = rowY, h = rowH })
-        rowY = rowY + rowH
+        table.insert(layout.rows, { index = i, y = rowY, h = rowHeights[i] })
+        rowY = rowY + rowHeights[i]
     end
-    if cancel then cancel.y, cancel.h = y + groupH + _actionSheet.GAP_PX, rowH end
+    if cancel then
+        cancel.y, cancel.h = y + groupH + _actionSheet.GAP_PX, _wrappedBlockHeight(w, cancel.text, rowH, 16)
+    end
     return layout
 end
 
@@ -3738,7 +3763,14 @@ local function _drawMenuTextRow(x, w, y, h, opt, confirmColor, holdFrac, palette
         love.graphics.rectangle("fill", x + 4, y + 3, (w - 8) * math.min(1, holdFrac), h - 6, 6, 6)
     end
     love.graphics.setColor(color)
-    love.graphics.printf(opt, x, y + (h - love.graphics.getFont():getHeight()) / 2, w, "center")
+    -- Centered against the FULL wrapped block (numLines * font height), not
+    -- just one line -- h was sized in _menuGeometry to fit however many
+    -- lines opt wraps to at this same width w, so centering against a
+    -- single line here would leave a wrapped row's text sitting high, with
+    -- a bigger gap above it than below (and than a single-line row gets).
+    local font = love.graphics.getFont()
+    local _, lines = font:getWrap(opt, w)
+    love.graphics.printf(opt, x, y + (h - math.max(1, #lines) * font:getHeight()) / 2, w, "center")
 end
 
 -- iOS-style ON/OFF switch size, for a toggle-menu row (menu.toggleStates —
@@ -3777,9 +3809,14 @@ end
 -- destructive the way a plain row can.
 function _actionSheet.drawToggleRow(x, w, y, h, label, isOn, palette)
     local pad = 16
+    local labelW = w - pad * 2 - _actionSheet.SWITCH_W
     love.graphics.setColor(palette.text)
-    love.graphics.printf(label, x + pad, y + (h - love.graphics.getFont():getHeight()) / 2,
-        w - pad * 2 - _actionSheet.SWITCH_W, "left")
+    -- Centered against the full wrapped block, same reasoning as
+    -- _drawMenuTextRow's own comment (h was sized in _menuGeometry to fit
+    -- however many lines label wraps to at this same labelW).
+    local font = love.graphics.getFont()
+    local _, lines = font:getWrap(label, labelW)
+    love.graphics.printf(label, x + pad, y + (h - math.max(1, #lines) * font:getHeight()) / 2, labelW, "left")
     _actionSheet.drawSwitch(x + w - pad - _actionSheet.SWITCH_W, y + (h - _actionSheet.SWITCH_H) / 2, isOn, palette)
 end
 
