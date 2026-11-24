@@ -136,11 +136,50 @@ distinct *identity* per system, not just functional cues:
 - [x] Fix the fluid-vanishing bug in `model/fluid.lua`'s `step()` (a self-looping pipe run drains its
       source with no credited receiver) — fixed; verified live (reservoir held steady at 27%/102L for
       60s of idle simulation, vs. continuous drain before the fix)
-- [ ] Verify the ELECTRICAL "powered" color actually triggers in normal use (inference/prediction path)
-- [ ] Sweep each system's catalog for the same "generic sink, user-named" treatment ACTUATOR got, where
-      it makes sense (e.g. does ELECTRICAL need a generic LOAD beyond LIGHT/MOTOR/HEATER?)
-- [ ] Confirm save/load round-trips cleanly for a schematic in each system after a purchase lapses/returns
-- [ ] Undo/redo and snapshot behavior sanity-checked per system now that each is a standalone paid feature
+- [x] Verify the ELECTRICAL "powered" color actually triggers in normal use (inference/prediction path) —
+      traced the real write path end to end: a typed VOLTAGE genuinely reaches `entity.voltage` through
+      the PROPERTIES-edit grid's own SAVE handler (`gdsGui_schematic_internal_onPropertiesSaved`,
+      schematic_gdsGuiLib.lua — the same generic `entity[row.key] = tonumber(row.value)` write the
+      placement grid's `_applyPlacementExtraRows` also uses), and a bus-tie/relay gate with no learned
+      position yet withholds power rather than guessing (model/solver.lua's own documented safe default) —
+      correct, not a gap. The existing `colorForPoweredNode_*` tests all hand-injected `entity.voltage`
+      into a bare fixture rather than exercising that real write path in one shot — closed with
+      `schematicPropertiesSavedVoltageReachesPoweredColorTest` (main.lua), which drives the real SAVE
+      function then chains into the same `buildGraph -> solve -> solveSourceAttribution` path
+      `schematicVoltageTieBreakIntegrationTest` already uses
+- [x] Sweep each system's catalog for the same "generic sink, user-named" treatment ACTUATOR got, where
+      it makes sense (e.g. does ELECTRICAL need a generic LOAD beyond LIGHT/MOTOR/HEATER?) — ELECTRICAL
+      needs no catalog change: a load's NAME is already free text pre-filled by whichever of
+      LIGHT/MOTOR/HEATER was tapped (`_openLoadPropertiesGrid`), and a BUS's own green "+" row reaches the
+      identical ADD LOAD flow with no catalog item at all, already fully generic. The real gap the sweep
+      found was BLEED AIR: the only system with zero "sink"-tagged catalog item at all, already flagged in
+      a code comment as "deliberately blank for now, not a bug" (`_openFundamentalsMenu`,
+      main.lua) rather than an oversight — gave it its own BLEED AIR OUTLET (componentType "sink",
+      suggestedName = "USER#_OUT", same template OXYGEN OUTLET uses), and corrected that now-stale comment
+      (ELECTRICAL already has sink-tagged LIGHT/MOTOR/HEATER loads from this same session's earlier §2 work)
+- [x] Confirm save/load round-trips cleanly for a schematic in each system after a purchase lapses/returns —
+      `appSettings.entitlements` and `schematicStore` are two entirely separate `love.filesystem.write`
+      targets (`_saveAppSettings`/`_saveSchematicStore`); nothing in either save path or
+      `gdsGui_saveLoad_loadFileContents` reads entitlement state at all, so a locked system's data
+      saves/loads byte-for-byte the same as an unlocked one — only the NAVIGATION path to it
+      (`schematicSystemGallerySelected`/`navGoToSystemSchematic`) is gated. Locked in with
+      `schematicStoreRoundTripsLockedSystemTypeTest` (main.lua): a real disk save/reload round trip (its
+      own throwaway save filename, never the real one) of a HYDRAULIC system saved while
+      `entitlements.HYDRAULIC == false`, confirming its element data survives intact
+- [x] Undo/redo and snapshot behavior sanity-checked per system now that each is a standalone paid feature —
+      confirmed by tracing `_openSystemIntoCanvas` (main.lua): every system switch unconditionally calls
+      `gdsGui_schematic_clearUndo("mainCanvas")` first (the function's own comment already names the exact
+      risk — "a leftover undo snapshot could otherwise splice a DIFFERENT system's elements/wires/controls
+      back in") and repopulates `canvas.snapshots` from that system's own saved `sys.snapshots`, so neither
+      ever bleeds across a system switch; the "jump straight back into the live canvas" shortcut
+      (`navGoToSystemSchematic`) only skips this when `_canvasLoadedSystemId == schematicStore.currentSystemId`
+      — the SAME system, never a different one. All of this is systemType-agnostic by construction (one
+      shared canvas populate/clear routine, no per-system branches), and entitlement gating only added an
+      earlier check in front of it, never touched it. No test added here — the only way to exercise this
+      for real touches the single live "mainCanvas" singleton, which this codebase's own existing tests
+      already deliberately avoid doing (see `schematicOpenGateShowsUnpoweredColorTest`'s own comment on
+      the identical constraint) since a test run mid-session (the dev panel's re-run button) would
+      otherwise hijack whatever real schematic the user has open
 
 ## 5. Compliance & store readiness
 - [ ] Update `terms.txt` / privacy policy to cover payments, restore, and refunds

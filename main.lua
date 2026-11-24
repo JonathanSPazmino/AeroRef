@@ -1055,6 +1055,23 @@ local SCHEMATIC_CATALOG = {
         -- no separate static "valve element" + "switch control" pair).
         { label = "BLEED VALVE", abbrev = "BVLV", kind = "control", presets = { {"CLOSED", "OPEN"} },
           spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate", terminals = _SWITCH_TERMINALS },
+        -- TODO.md §4's catalog sweep: this system had no "sink"-tagged item
+        -- at all (see _openFundamentalsMenu's own comment, which already
+        -- flagged this as "deliberately blank for now, not a bug" rather
+        -- than an oversight) -- the one gap OXYGEN OUTLET/ACTUATOR's own
+        -- "generic sink, user-named" treatment hadn't reached yet. Same
+        -- reasoning as both of those: the real consuming end here (an
+        -- anti-ice valve, a pack/pressurization supply point, an APU
+        -- starter duct, ...) varies per airframe and per system-canvas --
+        -- this system models only the supply side, so whatever actually
+        -- uses the air is this one generic, freely-renamed entry rather
+        -- than a separate catalog row per use. suggestedName = "USER#_OUT"
+        -- is the identical fill-in-the-blank template OXYGEN OUTLET already
+        -- uses (same "_OUT" suffix, since both are a duct system's generic
+        -- consuming end) -- overwrite "USER#" with whatever this one
+        -- actually is, leaving "_OUT" in place.
+        { label = "BLEED AIR OUTLET", abbrev = "BOUT", kind = "element", shapeType = "circle",
+          gridW = 2, gridH = 2, componentType = "sink", suggestedName = "USER#_OUT" },
     }},
     { system = "PRESSURIZATION", pipeConnectors = "DUCT", items = {
         -- The cabin's own pressurization air supply -- bled off the
@@ -5184,9 +5201,12 @@ function _openFundamentalsMenu(canvasName, sys)
     end
     -- SINK always shows regardless of present["sink"] -- unlike the other
     -- four roles, every system gets this button up front even before any
-    -- sink-tagged catalog item exists for it (ELECTRICAL/BLEED AIR don't
-    -- yet). Tapping it just opens _openTypeMenu's own empty-list-plus-
-    -- RETURN case until one does -- deliberately blank for now, not a bug.
+    -- sink-tagged catalog item exists for it (every system now has one --
+    -- see TODO.md §4's catalog sweep, which gave BLEED AIR its own
+    -- BLEED AIR OUTLET -- but this still covers whatever future system adds
+    -- its own sink-less gap). Tapping it just opens _openTypeMenu's own
+    -- empty-list-plus-RETURN case until one does -- deliberately blank for
+    -- now, not a bug.
     present.sink = true
     local names = {}
     for _, role in ipairs(roleOrder) do
@@ -9033,6 +9053,48 @@ function schematicGalleryEntitlementGateTest()
     return oxygenNeverLocked, paidItemLocked, redirectedToPaywall
 end
 
+-- TODO.md §4 asked whether save/load round-trips cleanly for a schematic in
+-- each system "after a purchase lapses/returns". Tracing it: _isSystemTypeEntitled
+-- only ever READS appSettings.entitlements (a separate top-level save file
+-- from schematicStore -- see _saveAppSettings/_saveSchematicStore, two
+-- distinct love.filesystem.write targets) -- nothing in _saveSchematicStore,
+-- gdsGui_saveLoad_loadFileContents, or anywhere else filters/strips a
+-- system's data by its systemType's entitlement state. A locked system's
+-- data is saved/loaded identically to an unlocked one; only the NAVIGATION
+-- path to it is gated (schematicSystemGallerySelected/navGoToSystemSchematic).
+-- This locks that in with a real save-to-disk/reload-from-disk round trip
+-- (a distinct test filename, never the real "schematicProjects.lua") of a
+-- throwaway schematicStore holding one locked-at-save-time HYDRAULIC system,
+-- restoring the real live schematicStore afterward the same way
+-- entitlementsTableTest above restores appSettings.
+function schematicStoreRoundTripsLockedSystemTypeTest()
+    local realStore = schematicStore
+    local priorHydraulic = appSettings.entitlements.HYDRAULIC
+    local testFile = "unitTestLockedSystemRoundTrip.lua"
+
+    local ok, voltageSurvived = pcall(function()
+        schematicStore = { aircraft = { { id = "ac1", systems = { {
+            systemType = "HYDRAULIC",
+            elements = { { id = "rsv1", componentType = "source", voltage = 3000, label = "RSVR 1" } },
+            controls = {}, wires = {},
+        } } } } }
+        appSettings.entitlements.HYDRAULIC = false -- "purchase lapsed" at save time
+
+        _saveSchematicStore(testFile)
+        schematicStore = nil -- prove the reload below repopulates it, not a stale reference
+        if not gdsGui_saveLoad_loadFileContents(testFile) then error("reload failed") end
+        return schematicStore.aircraft[1].systems[1].elements[1].voltage == 3000
+    end)
+
+    love.filesystem.remove(testFile)
+    love.filesystem.remove(testFile .. ".bak")
+    love.filesystem.remove(testFile .. ".tmp")
+    appSettings.entitlements.HYDRAULIC = priorHydraulic
+    schematicStore = realStore
+
+    return ok, voltageSurvived
+end
+
 function simulatePurchaseSchematic()
     unlockSchematicFeature()
     _refreshSchematicHomeAvailability()
@@ -10392,6 +10454,53 @@ function schematicVoltageTieBreakIntegrationTest()
     canvas.voltageColors = { [24] = _TEST_RED, [28] = _TEST_YELLOW } -- per-system, not an appSettings global
     canvas.elements[1].voltage = 24
     canvas.controls[1].voltage = 28
+
+    local componentTypes = _buildComponentTypeMap(canvas)
+    local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes, _nodePositionsForGraph(canvas))
+    local sourceStates = _currentSourceStates(canvas, componentTypes)
+    local gateStates = _currentGateStates(canvas, componentTypes)
+    local nodeStates = ModelSolver.solve(graph, sourceStates, gateStates)
+    if nodeStates.bus1 ~= "powered" then return "fail: bus1 not powered" end
+
+    local attribution = ModelSolver.solveSourceAttribution(graph, sourceStates, gateStates)
+    local color = _colorForPoweredNode("bus1", attribution, canvas, ELECTRICAL_MEDIUM.style.powered)
+    return color[1], color[2], color[3]
+end
+
+-- TODO.md §4 asked whether ELECTRICAL's powered color actually triggers in
+-- normal use, not just via the colorForPoweredNode_* tests above, which all
+-- hand-inject entity.voltage straight into a bare fixture table. This drives
+-- the real PROPERTIES-edit SAVE function instead
+-- (gdsGui_schematic_internal_onPropertiesSaved, schematic_gdsGuiLib.lua) —
+-- the same entity[row.key] = tonumber(row.value) write a typed VOLTAGE
+-- actually goes through — then chains into the same full-stack
+-- buildGraph -> solve -> solveSourceAttribution path
+-- schematicVoltageTieBreakIntegrationTest above does, proving a typed
+-- VOLTAGE genuinely reaches the solved powered color end to end, not just
+-- the color-math function in isolation.
+function schematicPropertiesSavedVoltageReachesPoweredColorTest()
+    gdsGui_schematic_delete("unitTestCanvas29")
+    gdsGui_schematic_create("unitTestCanvas29", "UnitTestPage", 0, 0, "LT", 1, 1)
+    gdsGui_schematic_addElement("unitTestCanvas29", "batt1", "rect", 0, 0, 0.1, 0.1, "BATT 1", nil, nil, nil, nil, "source")
+    gdsGui_schematic_addElement("unitTestCanvas29", "bus1", "rect", 0.6, 0, 0.1, 0.1, "BUS 1", nil, nil, nil, nil, "path")
+    gdsGui_schematic_addWire("unitTestCanvas29", "w1", "batt1", "bus1", nil)
+
+    local canvas = nil
+    for _, c in ipairs(globApp.objects.schematics) do
+        if c.name == "unitTestCanvas29" then canvas = c end
+    end
+    if not canvas then return "fail: canvas not found" end
+    canvas.voltageColors = { [24] = _TEST_RED }
+
+    -- Same shadow-row shape the PROPERTIES-edit grid hands SAVE (row 1 is
+    -- NAME; row 2 is the real VOLTAGE row _sourceTypeVoltageRows builds).
+    canvas._propertyEditTargetId = "batt1"
+    canvas._pendingPropertyRows = {
+        { value = "BATT 1" },
+        { key = "voltage", target = "field", numeric = true, value = "24" },
+    }
+    gdsGui_schematic_internal_onPropertiesSaved("unitTestCanvas29")
+    if canvas.elements[1].voltage ~= 24 then return "fail: voltage not written" end
 
     local componentTypes = _buildComponentTypeMap(canvas)
     local graph = ModelGraph.buildGraph(canvas.elements, canvas.controls, canvas.wires, componentTypes, _nodePositionsForGraph(canvas))
@@ -13688,6 +13797,11 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcParameters"]={0},
         ["funcExpctOutput"]={1, 1, 0}}
 
+    gdsGui_dev_testExecute {["id"]="schematic_propertiesSavedVoltage_reachesPoweredColor",
+        ["funcName"]={"schematicPropertiesSavedVoltageReachesPoweredColorTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={1, 0, 0}}
+
     gdsGui_dev_testExecute {["id"]="schematic_openGate_showsUnpoweredColor",
         ["funcName"]={"schematicOpenGateShowsUnpoweredColorTest"},
         ["funcParameters"]={0},
@@ -13727,6 +13841,11 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcName"]={"schematicGalleryEntitlementGateTest"},
         ["funcParameters"]={0},
         ["funcExpctOutput"]={true, true, true}}
+
+    gdsGui_dev_testExecute {["id"]="schematicStore_roundTripsLockedSystemType",
+        ["funcName"]={"schematicStoreRoundTripsLockedSystemTypeTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={true, true}}
 
     gdsGui_dev_testExecute {["id"]="schematic_annunciatorEditMenu_deletesViaConfirm",
         ["funcName"]={"schematicAnnunciatorDeleteTest"},
