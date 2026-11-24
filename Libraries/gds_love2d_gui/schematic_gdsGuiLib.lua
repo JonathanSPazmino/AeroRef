@@ -8852,11 +8852,12 @@ function _pipes.leakOutputPoint(canvas, w, plan)
     -- terminal directly. Bailing out here avoids a second, wrongly-
     -- positioned spray right at this wire's own end against the
     -- manifold's INPUT side, on top of the correct one(s)
-    -- drawOpenPortLeaks already draws at each open tube's own tip.
-    -- Liquid only -- a gas DUCT has no drawOpenPortLeaks coverage yet (see
-    -- that function's own isLiquid gate), so it still needs this wire-
-    -- level fallback for now, mispositioned or not.
-    if _pipes.isLiquid(canvas) and gate and gate.terminals and gate.pipeRoutes then
+    -- drawOpenPortLeaks already draws at each open tube's own tip. Applies
+    -- regardless of medium -- drawOpenPortLeaks covers a MANIFOLD's own
+    -- open ports for gas too now (see pathElementIsWet's own comment), so a
+    -- gas MANIFOLD's fed-but-connected INPUT wire no longer needs this
+    -- mispositioned fallback either.
+    if gate and gate.terminals and gate.pipeRoutes then
         return nil
     end
     local pieces, total = _pipes.pathPieces(canvas, plan)
@@ -8968,28 +8969,38 @@ end
 
 -- Whether a multi-port "path" element (a MANIFOLD's own generated shape --
 -- e.pipeRoutes/e.terminals is that signature, see
--- _manifoldShapeAndTerminals in main.lua) is actually receiving fluid
--- right now, so an open (disconnected) port of its own should spray --
+-- _manifoldShapeAndTerminals in main.lua) is actually receiving fluid/air
+-- right now, so an open (disconnected) port of its own should spray/puff --
 -- unlike a tank (drawOpenPortLeaks' own "source" branch just below, which
 -- can assume "always has fluid to leak" the same way that function's own
 -- fillPercent check does), a "path" node has no store of its own: it only
--- ever carries whatever's actively being fed through it. True when at
--- least one of e's own CONNECTED wires is w.fluidMoving AND flowing INTO
--- e, per w.pumpedDirection/gravityDirection's own "forward is
--- fromElementId -> toElementId" convention (model/fluid.lua's header
--- comment).
-function _pipes.pathElementIsWet(canvas, e)
-    for _, w in ipairs(canvas.wires) do
-        if w.fluidMoving then
-            local dir = w.pumpedDirection or w.gravityDirection
-            if dir then
-                local feedsInto = (dir == "forward" and w.toElementId == e.id)
-                    or (dir == "reverse" and w.fromElementId == e.id)
-                if feedsInto then return true end
+-- ever carries whatever's actively being fed through it.
+-- Liquid: true when at least one of e's own CONNECTED wires is
+-- w.fluidMoving AND flowing INTO e, per w.pumpedDirection/gravityDirection's
+-- own "forward is fromElementId -> toElementId" convention (model/fluid.lua's
+-- header comment).
+-- Gas: model/fluid.lua never runs at all (liquid-only), so there's no
+-- w.fluidMoving to read -- "wet" here just means the element's own resolved
+-- color currently reads as powered/conducting, the same looksPowered test
+-- drawAllFlow already uses to decide a gas WIRE is actively carrying air
+-- (see that function's own comment). signature is threaded through from
+-- drawOpenPortLeaks' own caller for this resolveDisplayColor lookup.
+function _pipes.pathElementIsWet(canvas, e, signature)
+    if _pipes.isLiquid(canvas) then
+        for _, w in ipairs(canvas.wires) do
+            if w.fluidMoving then
+                local dir = w.pumpedDirection or w.gravityDirection
+                if dir then
+                    local feedsInto = (dir == "forward" and w.toElementId == e.id)
+                        or (dir == "reverse" and w.fromElementId == e.id)
+                    if feedsInto then return true end
+                end
             end
         end
+        return false
     end
-    return false
+    local r, g, b = gdsGui_schematic_resolveDisplayColor(canvas.name, "element", e.id, signature)
+    return _pipes.looksPowered(r, g, b)
 end
 
 -- A tank (or any other fluid-holding source), OR a MANIFOLD's own
@@ -9012,17 +9023,20 @@ end
 -- with an open port) already sprayed -- a real "family" gap, not a tuning
 -- difference. Now draws for every medium, gas included -- _pipes.isLiquid
 -- below only picks WHICH renderer (droplets vs. puff rings), same as
--- drawLeak's own dispatch. pathElementIsWet (the MANIFOLD branch) still
--- only ever returns true for liquid in practice -- model/fluid.lua is the
--- only thing that ever sets w.fluidMoving -- so a gas MANIFOLD's own open
--- port keeps relying on the wire-level fallback it already had
--- (leakOutputPoint's own comment); only a gas SOURCE's open port is new
--- coverage here.
+-- drawLeak's own dispatch. pathElementIsWet (the MANIFOLD branch) is now
+-- medium-aware too (its own comment), closing a real, user-visible bug: a
+-- gas MANIFOLD's own open port used to show nothing here, which meant
+-- leakOutputPoint's wire-level fallback (mispositioned against the
+-- manifold's connected INPUT side, by design -- see its own comment) was
+-- the only thing ever drawn for one, reading as a leak at the WRONG end of
+-- a perfectly good connection. Both a gas SOURCE's and a gas MANIFOLD's own
+-- open ports are covered here now, and leakOutputPoint's mispositioned
+-- fallback is suppressed for both media alike.
 function _pipes.drawOpenPortLeaks(canvas, signature)
     if canvas.mode ~= "control" then return end
     for _, e in ipairs(canvas.elements) do
         local isOpenSource = e.componentType == "source" and (e.fillPercent or 100) > 0
-        local isOpenPath = e.componentType == "path" and e.pipeRoutes and _pipes.pathElementIsWet(canvas, e)
+        local isOpenPath = e.componentType == "path" and e.pipeRoutes and _pipes.pathElementIsWet(canvas, e, signature)
         if (isOpenSource or isOpenPath) and e.shapeType and e.terminals then
             local connected, openPortPsi = {}, 0
             for _, w in ipairs(canvas.wires) do
@@ -11064,10 +11078,11 @@ function gdsGui_schematic_draw(pageName)
             -- controls, not in the per-wire pass above -- a dead-end leak
             -- sits right at a valve/manifold/duct port, and that element's
             -- own redraw (just above) would otherwise paint straight over
-            -- it. hasFlow, not isLiquid -- drawLeak itself dispatches
-            -- liquid droplets vs. gas puff rings (see its own comment);
-            -- drawOpenPortLeaks stays liquid-only below it, a tank-specific
-            -- (componentType "source") concern no gas DUCT system has.
+            -- it. hasFlow, not isLiquid -- both drawLeak and drawOpenPortLeaks
+            -- dispatch liquid droplets vs. gas puff rings internally now (see
+            -- each one's own comment); isLiquid itself never gates whether
+            -- either pass runs at all any more (see _pipes.hasFlow's own
+            -- header comment on this exact rule).
             if _pipes.hasFlow(canvas) then
                 for _, w in ipairs(canvas.wires) do
                     local plan = wirePlans[w.id]
@@ -11075,8 +11090,6 @@ function gdsGui_schematic_draw(pageName)
                         _pipes.drawLeak(canvas, w, plan, signature)
                     end
                 end
-            end
-            if _pipes.isLiquid(canvas) then
                 _pipes.drawOpenPortLeaks(canvas, signature)
             end
             _glow.finish(canvas)
