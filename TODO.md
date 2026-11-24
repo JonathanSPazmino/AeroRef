@@ -116,8 +116,41 @@ distinct *identity* per system, not just functional cues:
       `..._blankOrMissingReturnsNilTest`
 - [ ] Per system: a short looping "hero" preview (2-4s) usable both as the in-app locked-tile teaser and as
       App Store marketing material
-- [ ] Settle on a consistent visual language across the 5 (color, motion style, leak behavior) so they read
-      as a family of products, not unrelated reskins
+- [x] Settle on a consistent visual language across the 5 (color, motion style, leak behavior) so they read
+      as a family of products, not unrelated reskins — audited all three axes across all 6 media files
+      (`model/media/*.lua`):
+      - **Color**: already fully consistent — every medium shares the identical
+        `unpowered = {0.55,0.55,0.55,1}` gray (the one anchor that reads as "one app's design system"),
+        each medium's own `powered` hue is unique across all 6 (yellow/red-orange/amber/light-blue/
+        pale-green-cyan/saturated-green, no collisions), and `magnitudeLabel`/`magnitudeUnit` follow one
+        shared VOLTAGE-or-PRESSURE/V-or-PSI convention. No change needed.
+      - **Motion style**: already a coherent, physically-grounded split, not arbitrary per-system
+        tuning — liquid media (HYDRAULIC/FUEL) march dashes, gas media (BLEED AIR/PRESSURIZATION/OXYGEN)
+        sweep a soft shimmer, ELECTRICAL breathes a glow pulse — tied to what each medium actually IS
+        (droplets vs. compressible gas vs. current), not a style pick per system. IDLE PULSE (a liquid
+        pipe holding pressurized fluid but not moving) is deliberately liquid-only too
+        (`_pipes.drawAllFlow`'s own comment: "a gas duct has no such in-between state... looksPowered is
+        binary") — confirmed intentional, not a gap: a gas DUCT's powered/unpowered split has no
+        third "holding still" state the way a liquid's fluidPercent/fluidMoving pair does.
+      - **Leak behavior**: found and fixed a real inconsistency here. `_pipes.drawOpenPortLeaks`
+        (schematic_gdsGuiLib.lua) — a source/manifold's own disconnected port spraying/puffing, as
+        opposed to `_pipes.drawLeak`'s wire-dead-end case — was gated `if not _pipes.isLiquid(canvas)...
+        then return end`, categorically excluding every gas DUCT system, while `_pipes.hasFlow`'s own
+        header comment already establishes the house rule that only the genuinely liquid-specific passes
+        (drained-pipe visual) should ever gate on `isLiquid` outright — every other flow/leak pass is
+        meant to dispatch BY medium, not exclude one. Changed the gate to `canvas.mode ~= "control"` only,
+        with `isLiquid` now purely picking the renderer (`drawLeakSprayAt` droplets vs. `drawAirPuffsAt`
+        puff rings), matching `drawLeak`'s own existing dispatch shape exactly. Updated `hasFlow`'s own
+        header comment to state the corrected rule. Verified live (placed a BLEED AIR SOURCE with an
+        unwired port in a throwaway test aircraft, switched to control mode): no visible change today —
+        traced why and confirmed it's expected, not a bug in the fix: no "source" catalog item in ANY
+        system (liquid included) authors an explicit `terminals` array, and the MANIFOLD "path" branch's
+        own wetness check (`pathElementIsWet`'s `w.fluidMoving`) is liquid-only (model/fluid.lua never
+        runs for gas), so neither branch is reachable by today's catalog for gas regardless of this fix.
+        The fix is still correct and worth keeping — it removes an unjustified categorical exclusion and
+        future-proofs the day a gas catalog item gets explicit terminals (or `pathElementIsWet` is
+        ever generalized), rather than needing this same discovery repeated later. Test aircraft/data
+        used for the live check was deleted afterward — no save-file residue
 
 ## 3. In-App Purchase / App Store technical setup
 - [x] Feasibility investigated — see Appendix below. **Verdict: feasible.**

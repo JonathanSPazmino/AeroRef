@@ -8216,9 +8216,14 @@ end
 -- should show a flow animation/direction cue" gate, as opposed to isLiquid's
 -- narrower "pools, drains, and leaks like a liquid" one. Draw passes that are
 -- genuinely medium-agnostic (the flow dash/shimmer pass, the direction
--- chevron, the direction-cycling gesture) key off this one; passes that are
--- liquid-specific (leak spray, the emptied-run drained-pipe visual) stay on
--- isLiquid itself.
+-- chevron, the direction-cycling gesture, and -- since TODO.md §2's visual-
+-- consistency pass -- both leak renderers' own top-level gate, drawLeak's
+-- w.leaking check and drawOpenPortLeaks' canvas.mode check) key off this
+-- one or run unconditionally; isLiquid itself now only ever decides WHICH
+-- renderer a pass uses (droplets vs. puff rings), never whether one runs at
+-- all. The one draw pass still genuinely liquid-only, gate and all, is the
+-- emptied-run drained-pipe visual (_pipes.drawEmptiedRun) -- a gas duct has
+-- no fillPercent/drained concept to show in the first place.
 function _pipes.hasFlow(canvas)
     return canvas.pipeConnectors and (canvas.connectorNoun == "PIPE" or canvas.connectorNoun == "DUCT")
 end
@@ -8999,8 +9004,22 @@ end
 -- port's stored exit normal -- a port off the element's own centerline
 -- would otherwise aim parallel to the edge instead of outward through the
 -- opening itself).
+-- TODO.md §2's visual-consistency pass: this used to be liquid-only (a gas
+-- DUCT had no open-port leak at all -- see leakOutputPoint's own "no
+-- drawOpenPortLeaks coverage yet" comment), so a BLEED AIR SOURCE/OXYGEN
+-- SOURCE/PRESSURIZATION source sitting with a disconnected port showed
+-- nothing, while the exact equivalent liquid case (an ACCUMULATOR/RESERVOIR
+-- with an open port) already sprayed -- a real "family" gap, not a tuning
+-- difference. Now draws for every medium, gas included -- _pipes.isLiquid
+-- below only picks WHICH renderer (droplets vs. puff rings), same as
+-- drawLeak's own dispatch. pathElementIsWet (the MANIFOLD branch) still
+-- only ever returns true for liquid in practice -- model/fluid.lua is the
+-- only thing that ever sets w.fluidMoving -- so a gas MANIFOLD's own open
+-- port keeps relying on the wire-level fallback it already had
+-- (leakOutputPoint's own comment); only a gas SOURCE's open port is new
+-- coverage here.
 function _pipes.drawOpenPortLeaks(canvas, signature)
-    if not _pipes.isLiquid(canvas) or canvas.mode ~= "control" then return end
+    if canvas.mode ~= "control" then return end
     for _, e in ipairs(canvas.elements) do
         local isOpenSource = e.componentType == "source" and (e.fillPercent or 100) > 0
         local isOpenPath = e.componentType == "path" and e.pipeRoutes and _pipes.pathElementIsWet(canvas, e)
@@ -9061,7 +9080,11 @@ function _pipes.drawOpenPortLeaks(canvas, signature)
                             -- on this same element is actually running right
                             -- now (openPortPsi, above), in which case that
                             -- pump's own real PSI applies here too.
-                            _pipes.drawLeakSprayAt(canvas, e.id .. i, px, py, tx, ty, openPortPsi, r, g, b)
+                            if _pipes.isLiquid(canvas) then
+                                _pipes.drawLeakSprayAt(canvas, e.id .. i, px, py, tx, ty, openPortPsi, r, g, b)
+                            else
+                                _pipes.drawAirPuffsAt(canvas, px, py, tx, ty, openPortPsi, r, g, b)
+                            end
                         end
                     end
                 end
