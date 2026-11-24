@@ -13004,9 +13004,13 @@ end
 -- to fit inside (tx,ty,tw,th), letterboxed to preserve aspect ratio. The
 -- library has no idea what the image depicts — it's just an item.thumbnailPath
 -- string the app layer resolved, same arm's-length relationship as item.name.
-local function _drawThumbnailImage(path, tx, ty, tw, th)
+-- alpha (default 1): multiplies every color drawn here, so a locked tile can
+-- fade the actual artwork (see gdsGui_schematicGallery_draw's own use of
+-- _galleryLock.TILE_ALPHA) instead of a flat dark overlay rect hiding it.
+local function _drawThumbnailImage(path, tx, ty, tw, th, alpha)
+    alpha = alpha or 1
     local bg = _thumbnailBgColor()
-    love.graphics.setColor(bg[1], bg[2], bg[3], bg[4])
+    love.graphics.setColor(bg[1], bg[2], bg[3], bg[4] * alpha)
     love.graphics.rectangle("fill", tx, ty, tw, th)
     local image = _loadGalleryImage(path)
     local iw, ih = image:getDimensions()
@@ -13014,16 +13018,18 @@ local function _drawThumbnailImage(path, tx, ty, tw, th)
     local avail = math.min(tw, th) - pad * 2
     local scale = avail / math.max(iw, ih)
     local drawW, drawH = iw * scale, ih * scale
-    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.setColor(1, 1, 1, alpha)
     love.graphics.draw(image, tx + (tw - drawW) / 2, ty + (th - drawH) / 2, 0, scale, scale)
 end
 
 -- Pure geometry preview: draws the item's real elements/wires, scaled into an
 -- arbitrary (tx,ty,tw,th) rect. Always uses each entity's defaultColor (no
 -- snapshot/signature resolution — a gallery tile has no "live" control state).
-local function _drawMiniDiagram(elements, wires, controls, tx, ty, tw, th)
+-- alpha (default 1): see _drawThumbnailImage's own comment on the same param.
+local function _drawMiniDiagram(elements, wires, controls, tx, ty, tw, th, alpha)
+    alpha = alpha or 1
     local bg = _thumbnailBgColor()
-    love.graphics.setColor(bg[1], bg[2], bg[3], bg[4])
+    love.graphics.setColor(bg[1], bg[2], bg[3], bg[4] * alpha)
     love.graphics.rectangle("fill", tx, ty, tw, th)
 
     local function toPixel(fx, fy) return tx + fx * tw, ty + fy * th end
@@ -13049,7 +13055,7 @@ local function _drawMiniDiagram(elements, wires, controls, tx, ty, tw, th)
         local x2, y2 = anchorCenter(w.toElementId)
         if x1 and x2 then
             local c = w.defaultColor or _DEFAULT_COLOR
-            love.graphics.setColor(c[1], c[2], c[3], c[4])
+            love.graphics.setColor(c[1], c[2], c[3], c[4] * alpha)
             love.graphics.setLineWidth(2)
             -- Through a user-drawn path's points (see _wirePath), if it has one.
             local px, py = x1, y1
@@ -13067,21 +13073,22 @@ local function _drawMiniDiagram(elements, wires, controls, tx, ty, tw, th)
         local ex, ey = toPixel(e.x, e.y)
         local ew, eh = e.w * tw, e.h * th
         local c = e.defaultColor or _DEFAULT_COLOR
+        local ca = c[4] * alpha
         if e.spritePath then
-            _drawElementSprite(e.spritePath, ex, ey, ew, eh, c[1], c[2], c[3], c[4], e.rotation)
+            _drawElementSprite(e.spritePath, ex, ey, ew, eh, c[1], c[2], c[3], ca, e.rotation)
         elseif e.shapePoints then
             love.graphics.push()
             love.graphics.translate(ex + ew / 2, ey + eh / 2)
             love.graphics.rotate(math.rad(e.rotation or 0))
-            _shapePoly.drawLocal(e, ew, eh, c[1], c[2], c[3], c[4], 0)
+            _shapePoly.drawLocal(e, ew, eh, c[1], c[2], c[3], ca, 0)
             love.graphics.pop()
         elseif e.shapeType == "circle" then
-            love.graphics.setColor(c[1], c[2], c[3], c[4])
+            love.graphics.setColor(c[1], c[2], c[3], ca)
             love.graphics.ellipse("fill", ex + ew / 2, ey + eh / 2, ew / 2, eh / 2)
         elseif e.shapeType == "diode" then
-            _drawDiodeSymbol(ex + ew / 2, ey + eh / 2, ew, eh, e.rotation, c[1], c[2], c[3], c[4])
+            _drawDiodeSymbol(ex + ew / 2, ey + eh / 2, ew, eh, e.rotation, c[1], c[2], c[3], ca)
         else
-            love.graphics.setColor(c[1], c[2], c[3], c[4])
+            love.graphics.setColor(c[1], c[2], c[3], ca)
             love.graphics.rectangle("fill", ex, ey, ew, eh)
         end
     end
@@ -13095,12 +13102,14 @@ end
 -- span, same released/pressed sprite-pair convention a real button uses,
 -- if the item supplied one; falls back to the plain thumbnailPath otherwise
 -- (an item with no pressed variant just doesn't animate on press).
-local function _drawGalleryTilePreview(item, tx, ty, tw, th, isPressed)
+-- alpha (default 1): see _drawThumbnailImage's own comment on the same param
+-- — gdsGui_schematicGallery_draw passes _galleryLock.TILE_ALPHA for a locked item.
+local function _drawGalleryTilePreview(item, tx, ty, tw, th, isPressed, alpha)
     local path = (isPressed and item.thumbnailPressedPath) or item.thumbnailPath
     if path then
-        _drawThumbnailImage(path, tx, ty, tw, th)
+        _drawThumbnailImage(path, tx, ty, tw, th, alpha)
     else
-        _drawMiniDiagram(item.elements, item.wires, item.controls, tx, ty, tw, th)
+        _drawMiniDiagram(item.elements, item.wires, item.controls, tx, ty, tw, th, alpha)
     end
 end
 
@@ -13179,20 +13188,26 @@ function gdsGui_schematicGallery_drawBadgeIcon(cx, cy, r, kind)
     love.graphics.setColor(1, 1, 1, 1)
 end
 
--- A dimming overlay + centered padlock + optional label over a tile the app
--- marks item.locked = true (item.lockedLabel: e.g. "PREMIUM" or a price —
--- the library has no idea which, same arm's-length relationship _galleryBadge's
--- own comment above gives: purely cosmetic, no idea what "locked" means
--- (entitlements, IAP, ...), only how to paint it. A global table, not
--- "local", for the same 200-local-ceiling reason _galleryBadge itself is one.
+-- A centered padlock + optional label over a tile the app marks item.locked
+-- = true (item.lockedLabel: e.g. "PREMIUM" or a price — the library has no
+-- idea which, same arm's-length relationship _galleryBadge's own comment
+-- above gives: purely cosmetic, no idea what "locked" means (entitlements,
+-- IAP, ...), only how to paint it. A global table, not "local", for the same
+-- 200-local-ceiling reason _galleryBadge itself is one.
 _galleryLock = {}
+-- The tile's own artwork fades to this instead of staying hidden behind a
+-- flat dark overlay rect — see gdsGui_schematicGallery_draw's _drawGalleryTilePreview
+-- call and _drawThumbnailImage/_drawMiniDiagram's own alpha param.
+_galleryLock.TILE_ALPHA = 0.3
 
 function _galleryLock.draw(tx, ty, tw, th, label)
-    love.graphics.setColor(0, 0, 0, 0.6)
-    love.graphics.rectangle("fill", tx, ty, tw, th)
-
     local cx, cy = tx + tw / 2, ty + th / 2 - 6
     local r = math.min(tw, th) * 0.14
+    -- A soft dark backdrop behind the padlock so it stays legible over ANY
+    -- thumbnail color/artwork now that the tile is faded via alpha rather
+    -- than hidden under a full black overlay.
+    love.graphics.setColor(0, 0, 0, 0.45)
+    love.graphics.circle("fill", cx, cy + r * 0.15, r * 2)
     love.graphics.setColor(1, 1, 1, 0.95)
     love.graphics.rectangle("fill", cx - r, cy, r * 2, r * 1.3, 2, 2)
     love.graphics.setLineWidth(2)
@@ -13200,8 +13215,11 @@ function _galleryLock.draw(tx, ty, tw, th, label)
     love.graphics.setLineWidth(1)
 
     if label then
+        local labelY = cy + r * 1.3 + 6
+        love.graphics.setColor(0, 0, 0, 0.45)
+        love.graphics.rectangle("fill", tx, labelY - 2, tw, love.graphics.getFont():getHeight() + 4)
         love.graphics.setColor(1, 1, 1, 1)
-        love.graphics.printf(label, tx, cy + r * 1.3 + 6, tw, "center")
+        love.graphics.printf(label, tx, labelY, tw, "center")
     end
     love.graphics.setColor(1, 1, 1, 1)
 end
@@ -13229,7 +13247,8 @@ function gdsGui_schematicGallery_draw(pageName)
                             -- left, the item's name/timestamp and its list of
                             -- control positions filling the rest of the row.
                             local diagW = th
-                            _drawGalleryTilePreview(item, tx, ty, diagW, th, isPressed)
+                            _drawGalleryTilePreview(item, tx, ty, diagW, th, isPressed,
+                                item.locked and _galleryLock.TILE_ALPHA or 1)
                             love.graphics.setColor(1, 1, 0, 1)
                             love.graphics.rectangle("line", tx, ty, diagW, th)
                             love.graphics.setColor(1, 1, 1, 1)
@@ -13238,7 +13257,8 @@ function gdsGui_schematicGallery_draw(pageName)
                             love.graphics.printf(table.concat(item.statusLines, "\n"), textX, ty + 18, textW, "left")
                             if item.locked then _galleryLock.draw(tx, ty, diagW, th, item.lockedLabel) end
                         else
-                            _drawGalleryTilePreview(item, tx, ty, tw, th, isPressed)
+                            _drawGalleryTilePreview(item, tx, ty, tw, th, isPressed,
+                                item.locked and _galleryLock.TILE_ALPHA or 1)
                             love.graphics.setColor(1, 1, 0, 1)
                             love.graphics.rectangle("line", tx, ty, tw, th)
                             love.graphics.setColor(1, 1, 1, 1)

@@ -1830,6 +1830,17 @@ local function _systemGalleryItems(aircraft)
         if not _isSystemTypeEntitled(catalogEntry.system) then
             item.locked = true
             item.lockedLabel = "PREMIUM"
+        elseif #item.elements > 0 or #item.wires > 0 or #(item.controls or {}) > 0 then
+            -- An owned (entitled) system the user has actually started
+            -- building gets a small green checkmark badge in its tile's top-
+            -- right corner (item.compatBadge — same cosmetic field/glyph the
+            -- aircraft gallery uses for its own "ok" update-compatibility
+            -- result; this gallery never set it before, so it's free to reuse
+            -- for "has user data" here -- _galleryBadge.draw is agnostic to
+            -- what "ok" means, see its own header comment). A still-empty
+            -- placeholder (never created, or created but never edited) gets
+            -- no badge.
+            item.compatBadge = "ok"
         end
         table.insert(items, item)
     end
@@ -6126,7 +6137,7 @@ function schematicSystemGallerySelected(galleryName, systemId)
     local sys = _findSystem(systemId)
     local systemType = sys and sys.systemType or systemId
     if systemType and not _isSystemTypeEntitled(systemType) then
-        gdsGui_page_switch("LoadingPaywall", 8, 2, false)
+        _openSchematicPaywall(systemType)
         return
     end
     if sys then
@@ -7180,6 +7191,23 @@ function love.load()
         "Sprites/button_checkbox_deactivated.png",
         settingsBtnX, settingsRowY2, "RT", settingsCheckboxSize, settingsCheckboxSize,
         "volumeUnitLitersSelected", globApp.BUTTON_STATES.RELEASED, true, "volumeUnitSettings"
+    )
+
+    -- TEMPORARY (testing only — remove before release, along with
+    -- resetAppForTesting() above): one-tap dev control that wipes every
+    -- aircraft and re-locks every paid system, simulating a genuine first
+    -- launch, for testing the paywall/locked-tile/onboarding flow without
+    -- manually deleting save files on disk.
+    gdsGui_container_create("testingSettings", "Settings", "TESTING (DEV ONLY)", 32, 0)
+    gdsGui_outputTxtBox_create("testingResetPurchasesLabel", "Settings", nil,
+        12, settingsRowY, "LT", settingsLabelW, settingsLabelH,
+        {1, 1, 1, 1}, "RESET APP (FRESH INSTALL)", settingsFontSize, "testingSettings"
+    )
+    gdsGui_button_create("testingResetPurchasesBtn", "Settings", "pushonoff",
+        "Sprites/button_reset_pressed.png", "Sprites/button_reset_released.png",
+        "Sprites/button_reset_deactivated.png",
+        settingsBtnX, settingsRowY, "RT", settingsCheckboxSize, settingsCheckboxSize,
+        "resetAppForTesting", globApp.BUTTON_STATES.RELEASED, true, "testingSettings"
     )
 
     ---------------------------------------------------------------------------
@@ -8911,7 +8939,7 @@ function navGoToSystemSchematic()
         -- A system with no systemType (legacy data) is left alone, same
         -- permissive treatment that function gives it too.
         if currentSystem.systemType and not _isSystemTypeEntitled(currentSystem.systemType) then
-            gdsGui_page_switch("LoadingPaywall", 8, 2, false)
+            _openSchematicPaywall(currentSystem.systemType)
             return
         end
         if _canvasLoadedSystemId ~= schematicStore.currentSystemId then
@@ -8948,38 +8976,99 @@ end
 -- SCHEMATIC PAYWALL CALLBACKS
 -------------------------------------------------------------------------------
 
--- Sets the placeholder entitlement flag, and -- since the business model is
--- one flat price unlocking every paid systemType at once (TODO.md's pricing
--- decision; there's no per-system purchase) -- every paid systemType's
--- entitlements entry along with it. This doubles as this build's testing
--- backdoor into paid features: the paywall page's own "Simulate Purchase"
--- button (see createSchematicPaywallObjects/simulatePurchaseSchematic
--- below) calls this, and its body text already says so outright -- no real
--- payment is ever processed. Separated from simulatePurchaseSchematic()
--- (which also navigates) so the flag-setting logic itself is directly
--- unit-testable.
-function unlockSchematicFeature()
+-- Which systemType the SchematicPaywall page is currently about (set by
+-- _openSchematicPaywall just below, read by simulatePurchaseSchematic) --
+-- nil whenever the paywall isn't open. Global, not local: main.lua sits at
+-- Lua's 200-local ceiling (see _paidSystemTypes' own comment on the same
+-- constraint).
+_paywallTargetSystemType = nil
+
+-- The business model is per-system (à la carte) purchases (TODO.md's
+-- pricing decision), not one flat price unlocking everything -- so unlike a
+-- generic "SYSTEM SCHEMATIC is a premium feature" message, the paywall has
+-- to say which systemType is actually being bought. Both real redirects
+-- (schematicSystemGallerySelected's gallery-tile tap, and navGoToSystemSchematic's
+-- "jump back into the live canvas" shortcut) funnel through here instead of
+-- calling gdsGui_page_switch directly, so the title/body text and
+-- _paywallTargetSystemType always agree with whichever tile sent the user here.
+function _openSchematicPaywall(systemType)
+    _paywallTargetSystemType = systemType
+    gdsGui_outputTxtBox_setText("paywall_pageTitle", "UNLOCK " .. (systemType or "SYSTEM"))
+    gdsGui_outputTxtBox_setText("paywallBodyText",
+        (systemType or "This system") .. " is a premium feature.\n\n" ..
+        "This build lets you simulate the purchase to unlock it for testing — no real payment is processed.")
+    gdsGui_page_switch("LoadingPaywall", 8, 2, false)
+end
+
+-- Sets the placeholder entitlement flag, and the ONE systemType the paywall
+-- is currently about (TODO.md's pricing decision: per-system/à la carte,
+-- not one flat price unlocking everything -- every other paid systemType
+-- stays locked). This doubles as this build's testing backdoor into paid
+-- features: the paywall page's own "Simulate Purchase" button (see
+-- createSchematicPaywallObjects/simulatePurchaseSchematic below) calls this
+-- with _paywallTargetSystemType, and its body text already says so outright
+-- -- no real payment is ever processed. Separated from
+-- simulatePurchaseSchematic() (which also navigates) so the flag-setting
+-- logic itself is directly unit-testable.
+function unlockSystemTypeForTesting(systemType)
+    if not systemType then return false end
+    -- QoL flag only (see _syncPaidLoadingScreenSkip) -- once the user has
+    -- bought ANYTHING, every page transition stops parking on the artificial
+    -- loading screen. Not a per-system gate; _isSystemTypeEntitled/
+    -- appSettings.entitlements is the only real gate.
     appSettings.schematicUnlocked = true
+    appSettings.entitlements[systemType] = true
+    _syncPaidLoadingScreenSkip()
+    _saveAppSettings()
+    return appSettings.entitlements[systemType]
+end
+
+-- TEMPORARY (testing only — remove before release, along with the Settings-
+-- page button that calls this): a full reset back to a genuine first-launch
+-- state, for testing the paywall/locked-tile flow and the whole onboarding
+-- path without manually deleting save files and relaunching. Re-locks every
+-- paid systemType (the inverse of unlockSystemTypeForTesting() above), AND wipes
+-- every aircraft — a bare empty aircraft list, no demo aircraft/system
+-- seeded (unlike love.load()'s own "schematicStore == nil" branch, which
+-- seeds one via _buildDemoSystem() so a real fresh install never looks
+-- empty) — this is a dev reset, not a simulated real install, so NEW
+-- AIRCRAFT/MY AIRCRAFT genuinely start from zero. Persisted immediately
+-- (both save files), so the reset state survives a relaunch too.
+function resetAppForTesting()
+    appSettings.schematicUnlocked = false
     for _, systemType in ipairs(_paidSystemTypes()) do
-        appSettings.entitlements[systemType] = true
+        appSettings.entitlements[systemType] = false
     end
     _syncPaidLoadingScreenSkip()
     _saveAppSettings()
-    return appSettings.schematicUnlocked
+
+    schematicStore = {
+        aircraft = {},
+        currentAircraftId = nil, currentSystemId = nil,
+        nextAircraftNum = 1,
+    }
+    _aircraftCompatStatus = {}
+    _manageMenuAircraftId = nil
+    _manageMenuSystemId = nil
+    _clearMainCanvas()
+    _saveSchematicStore()
+    gdsGui_schematicGallery_setItems("aircraftGallery", _aircraftGalleryItems())
+    _refreshSchematicHomeAvailability()
 end
 
--- Exercises unlockSchematicFeature() without permanently flipping the real
--- paywall entitlement on this install: unlockSchematicFeature() itself
--- persists appSettings.schematicUnlocked and appSettings.entitlements to
--- disk, so a bare call from a unit test (which can run any time developer
--- mode's dev panel re-runs the suite) would silently and permanently unlock
--- every paid system. This restores whatever both were before the test ran,
--- then re-persists those original values.
-function unlockSchematicFeatureTest()
+-- Exercises unlockSystemTypeForTesting() without permanently flipping the
+-- real paywall entitlement on this install: unlockSystemTypeForTesting()
+-- itself persists appSettings.schematicUnlocked and appSettings.entitlements
+-- to disk, so a bare call from a unit test (which can run any time
+-- developer mode's dev panel re-runs the suite) would silently and
+-- permanently unlock a paid system. This restores whatever both were before
+-- the test ran, then re-persists those original values.
+function unlockSystemTypeForTestingTest()
+    local paidType = _paidSystemTypes()[1]
     local priorUnlocked = appSettings.schematicUnlocked
     local priorEntitlements = {}
     for systemType, unlocked in pairs(appSettings.entitlements) do priorEntitlements[systemType] = unlocked end
-    local result = unlockSchematicFeature()
+    local result = unlockSystemTypeForTesting(paidType)
     appSettings.schematicUnlocked = priorUnlocked
     appSettings.entitlements = priorEntitlements
     _syncPaidLoadingScreenSkip()
@@ -8989,29 +9078,34 @@ end
 
 -- Exercises the per-systemType entitlements table itself: OXYGEN reads as
 -- entitled with no entitlements key at all; a paid systemType starts
--- un-entitled; unlockSchematicFeature() (the paywall's Simulate Purchase
--- testing backdoor) grants every paid systemType at once. Restores
+-- un-entitled; unlockSystemTypeForTesting() (the paywall's Simulate
+-- Purchase testing backdoor) grants ONLY the one systemType it's passed —
+-- TODO.md's pricing decision is per-system (à la carte), not one flat price
+-- unlocking everything, so a SECOND paid systemType must stay un-entitled
+-- (otherSystemStaysLocked below is what actually locks that in). Restores
 -- appSettings.entitlements/schematicUnlocked afterward, the same reasoning
--- unlockSchematicFeatureTest gives for doing so.
+-- unlockSystemTypeForTestingTest gives for doing so.
 function entitlementsTableTest()
-    local paidType = _paidSystemTypes()[1]
+    local paidType, otherPaidType = _paidSystemTypes()[1], _paidSystemTypes()[2]
     local priorEntitlements = {}
     for systemType, unlocked in pairs(appSettings.entitlements) do priorEntitlements[systemType] = unlocked end
     local priorUnlocked = appSettings.schematicUnlocked
 
     local oxygenAlwaysEntitled = _isSystemTypeEntitled("OXYGEN")
     appSettings.entitlements[paidType] = false
+    appSettings.entitlements[otherPaidType] = false
     local startsLocked = not _isSystemTypeEntitled(paidType)
 
-    unlockSchematicFeature()
+    unlockSystemTypeForTesting(paidType)
     local unlockedByBackdoor = _isSystemTypeEntitled(paidType)
+    local otherSystemStaysLocked = not _isSystemTypeEntitled(otherPaidType)
 
     appSettings.entitlements = priorEntitlements
     appSettings.schematicUnlocked = priorUnlocked
     _syncPaidLoadingScreenSkip()
     _saveAppSettings()
 
-    return oxygenAlwaysEntitled, startsLocked, unlockedByBackdoor
+    return oxygenAlwaysEntitled, startsLocked, unlockedByBackdoor, otherSystemStaysLocked
 end
 
 -- The systems gallery's own per-systemType gate (TODO.md §1), on top of the
@@ -9045,12 +9139,18 @@ function schematicGalleryEntitlementGateTest()
     globApp.skipPageLoadingScreens = true
     schematicSystemGallerySelected("manageGallery", paidType)
     local redirectedToPaywall = (gdsGui_page_currentName() == "SchematicPaywall")
+    -- Locks in _openSchematicPaywall actually threading the TAPPED systemType
+    -- through (TODO.md's per-system pricing decision), not just redirecting
+    -- generically -- simulatePurchaseSchematic reads this same global to know
+    -- which one system to unlock.
+    local paywallTargetsTheRightSystem = (_paywallTargetSystemType == paidType)
 
     appSettings.entitlements = priorEntitlements
     globApp.currentPageIndex = priorPageIndex
+    _paywallTargetSystemType = nil
     _syncPaidLoadingScreenSkip()
 
-    return oxygenNeverLocked, paidItemLocked, redirectedToPaywall
+    return oxygenNeverLocked, paidItemLocked, redirectedToPaywall, paywallTargetsTheRightSystem
 end
 
 -- TODO.md §4 asked whether save/load round-trips cleanly for a schematic in
@@ -9096,13 +9196,15 @@ function schematicStoreRoundTripsLockedSystemTypeTest()
 end
 
 function simulatePurchaseSchematic()
-    unlockSchematicFeature()
+    unlockSystemTypeForTesting(_paywallTargetSystemType)
+    _paywallTargetSystemType = nil
     _refreshSchematicHomeAvailability()
     _navSyncAll("SchematicHome")
     gdsGui_page_switch("LoadingSchematicHome", 9, 2, false)
 end
 
 function cancelSchematicPaywall()
+    _paywallTargetSystemType = nil
     gdsGui_page_switch("LoadingMainMenu", 3, 3, false)
 end
 
@@ -13827,20 +13929,20 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcParameters"]={0},
         ["funcExpctOutput"]={true, true}}
 
-    gdsGui_dev_testExecute {["id"]="unlockSchematicFeature_setsEntitlementFlag",
-        ["funcName"]={"unlockSchematicFeatureTest"},
+    gdsGui_dev_testExecute {["id"]="unlockSystemTypeForTesting_setsEntitlementFlag",
+        ["funcName"]={"unlockSystemTypeForTestingTest"},
         ["funcParameters"]={0},
         ["funcExpctOutput"]={true}}
 
-    gdsGui_dev_testExecute {["id"]="entitlements_oxygenFreePaidGatedBackdoorUnlocks",
+    gdsGui_dev_testExecute {["id"]="entitlements_oxygenFreePaidGatedBackdoorUnlocksOneSystemOnly",
         ["funcName"]={"entitlementsTableTest"},
         ["funcParameters"]={0},
-        ["funcExpctOutput"]={true, true, true}}
+        ["funcExpctOutput"]={true, true, true, true}}
 
     gdsGui_dev_testExecute {["id"]="schematicGallery_lockedTileGatesToPaywall",
         ["funcName"]={"schematicGalleryEntitlementGateTest"},
         ["funcParameters"]={0},
-        ["funcExpctOutput"]={true, true, true}}
+        ["funcExpctOutput"]={true, true, true, true}}
 
     gdsGui_dev_testExecute {["id"]="schematicStore_roundTripsLockedSystemType",
         ["funcName"]={"schematicStoreRoundTripsLockedSystemTypeTest"},

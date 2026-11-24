@@ -7,8 +7,11 @@ standalone purchase.
 **Pricing decision (locked in):**
 - Free tier: **OXYGEN system** — the simplest of all systems, chosen specifically for this
   role. Built (see §0) — catalog items, medium file, and signature shimmer/color all in place.
-- All other systems (ELECTRICAL, HYDRAULIC, FUEL, BLEED AIR, PRESSURIZATION): paid, one flat
-  price across all of them. Exact price TBD — decided when the app is ready to ship, not before.
+- All other systems (ELECTRICAL, HYDRAULIC, FUEL, BLEED AIR, PRESSURIZATION): paid, purchased
+  separately per system (à la carte) — buying one system type unlocks only that type, for any
+  current or future aircraft; every other paid system stays locked until bought on its own.
+  No bundle/flat-price-for-all option. Exact per-system price TBD — decided when the app is
+  ready to ship, not before.
 
 ## 0. Build the OXYGEN system (new, free-tier anchor)
 - [x] Design its catalog: SOURCE (OXYGEN SOURCE, bottle/generator), PATH (MANIFOLD, reusing the
@@ -26,14 +29,19 @@ standalone purchase.
       the gallery's default elements/wires mini-diagram preview until one is made
 
 ## 1. Paywall / entitlement architecture
-- [x] Decide the free tier — see pricing decision above (OXYGEN free, rest paid at one flat TBD price)
+- [x] Decide the free tier — see pricing decision above (OXYGEN free, rest paid separately per
+      system — à la carte, no bundle — at a TBD price each)
 - [x] Add an `entitlements` table (which systemTypes are unlocked) — persisted like `appSettings`
       (`appSettings.entitlements`, keyed by systemType, OXYGEN never gets a key and reads as
       entitled unconditionally via `_isSystemTypeEntitled`). StoreKit-launch validation still
       TODO — this is the local-flag half only, same placeholder status `schematicUnlocked` already
       had. The paywall's "Simulate Purchase" button is the testing backdoor —
-      `unlockSchematicFeature()` grants every paid systemType at once (matches the
-      one-flat-price-for-all-paid-systems pricing decision)
+      `unlockSystemTypeForTesting(systemType)` grants only the one systemType the paywall was
+      opened for (matches the à la carte pricing decision above; revised from an earlier
+      all-paid-systems-at-once version once that decision changed). `_openSchematicPaywall`
+      (main.lua) tracks which systemType a given paywall visit is about
+      (`_paywallTargetSystemType`), set by both real redirect sites so the paywall's title/body
+      name the specific system and Simulate Purchase only unlocks that one
 - [x] Gate the systems gallery: a locked tile (`_systemGalleryItems`' `item.locked`/`.lockedLabel`)
       draws dimmed with a padlock + "PREMIUM" via the gallery widget's new `_galleryLock.draw`
       (schematic_gdsGuiLib.lua) — purely cosmetic, same arm's-length relationship `_galleryBadge`
@@ -54,7 +62,8 @@ standalone purchase.
       out of sync with a real purchase once StoreKit exists (see the unchecked bullets below)
 - [ ] "Restore Purchases" button, and a launch-time StoreKit sync so a reinstall/new device recognizes
       prior purchases
-- [ ] Decide bundle pricing (all 5 at a discount) vs. à la carte only — affects App Store Connect product setup
+- [x] Decide bundle pricing (all 5 at a discount) vs. à la carte only — à la carte only, no
+      bundle (see pricing decision above); each paid system is its own separate purchase
 - [ ] Handle "already have a schematic in a system you no longer own" (refund, family-sharing revoke) —
       read-only fallback vs. hidden
 
@@ -159,11 +168,12 @@ distinct *identity* per system, not just functional cues:
 - [ ] Link `StoreKit.framework` in `love.xcodeproj`
 - [ ] Add native purchase/restore/query functions (`ios.mm` + a small Lua-facing wrap, mirroring the
       existing `vibrate()`/`getSafeArea()` pattern)
-- [ ] Create 5 (or 6, with a bundle) In-App Purchase products in App Store Connect — non-consumable,
-      one per system
+- [ ] Create 5 non-consumable In-App Purchase products in App Store Connect, one per paid system
+      (no bundle product — à la carte only, per the pricing decision above)
 - [ ] Sandbox-test purchase, restore, and failure/cancel flows on-device before anything else here matters
 - [ ] Receipt validation: on-device/local-flag is fine for this scale — make the call explicitly
-- [x] Price tier decision — flat price across all paid systems (OXYGEN free); exact number TBD at ship time
+- [x] Price tier decision — separate per-system price, à la carte, no bundle (OXYGEN free); exact
+      numbers TBD at ship time
 
 ## 4. Functional polish / known gaps
 - [x] Fix the fluid-vanishing bug in `model/fluid.lua`'s `step()` (a self-looping pipe run drains its
