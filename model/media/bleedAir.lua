@@ -26,9 +26,22 @@ local BLEED_AIR = {
     -- crisp marching dashes -- a compressible gas has no visible droplets, so
     -- it reads as a soft, low-alpha pulse sweeping down the duct (drawn at
     -- the duct's own width, not wider) instead of discrete dashes.
-    -- model/media/pressurization.lua shares this same "shimmer" kind, just
-    -- gentler.
-    flow = { kind = "shimmer", speedPxPerSec = 30, bandPx = 16, alpha = 0.35 },
+    -- model/media/pressurization.lua shares this same "shimmer" kind -- see
+    -- that medium's own comment on how it's now told apart from this one:
+    -- its shimmer stays smooth/still (no wiggleAmp below) and ties its own
+    -- speedPxPerSec to the live CONTROLLER instead.
+    --
+    -- wiggleAmp/wigglePeriodPx/wiggleSpeed (all three _pipes.drawFlowShimmer-
+    -- only, PRESSURIZATION leaves them unset) lay a lateral sine jitter over
+    -- the travelling pulse -- hot engine/APU bleed air directly off the
+    -- source reads as actual heat-haze distortion, not just a plain moving
+    -- glow, the way PRESSURIZATION's own cooled, already-settled cabin air
+    -- never would. 2.2px peak deflection, a full wobble cycle every ~38px
+    -- of duct, wobbling a little faster (3.4 rad/s) than it travels --
+    -- enough to read as shimmer at this app's own small on-screen duct
+    -- widths without the duct's own outline visibly warping.
+    flow = { kind = "shimmer", speedPxPerSec = 30, bandPx = 16, alpha = 0.35,
+        wiggleAmp = 2.2, wigglePeriodPx = 38, wiggleSpeed = 3.4 },
 }
 
 Registry.register(BLEED_AIR.name, BLEED_AIR)

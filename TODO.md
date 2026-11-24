@@ -27,12 +27,31 @@ standalone purchase.
 
 ## 1. Paywall / entitlement architecture
 - [x] Decide the free tier — see pricing decision above (OXYGEN free, rest paid at one flat TBD price)
-- [ ] Add an `entitlements` table (which systemTypes are unlocked) — persisted like `appSettings`,
-      but validated against StoreKit on launch, not just a local flag. OXYGEN is always
-      unlocked unconditionally (not entitlement-gated at all)
-- [ ] Gate the systems gallery: locked tiles show price + a teaser animation instead of opening the editor
-- [ ] Gate schematic creation/editing itself (not just the gallery tap) — a locked system must not be
-      reachable via any other path (deep link, catalog, duplicate, etc.)
+- [x] Add an `entitlements` table (which systemTypes are unlocked) — persisted like `appSettings`
+      (`appSettings.entitlements`, keyed by systemType, OXYGEN never gets a key and reads as
+      entitled unconditionally via `_isSystemTypeEntitled`). StoreKit-launch validation still
+      TODO — this is the local-flag half only, same placeholder status `schematicUnlocked` already
+      had. The paywall's "Simulate Purchase" button is the testing backdoor —
+      `unlockSchematicFeature()` grants every paid systemType at once (matches the
+      one-flat-price-for-all-paid-systems pricing decision)
+- [x] Gate the systems gallery: a locked tile (`_systemGalleryItems`' `item.locked`/`.lockedLabel`)
+      draws dimmed with a padlock + "PREMIUM" via the gallery widget's new `_galleryLock.draw`
+      (schematic_gdsGuiLib.lua) — purely cosmetic, same arm's-length relationship `_galleryBadge`
+      already has. The real gate is in `schematicSystemGallerySelected`, which redirects to
+      `SchematicPaywall` for a locked systemType on either the "not yet created" placeholder tile
+      or an already-created system's tile, before ever creating/opening/menu-ing it. No specific
+      price shown yet (exact number still TBD at ship time, per the pricing decision above). No
+      hero teaser *animation* yet — that's tied to §2's per-system signature animations, still TBD
+- [x] Gate schematic creation/editing itself (not just the gallery tap) — removed the old
+      whole-feature `schematicUnlocked` paywall check from `navBackToSchematicHome`/
+      `navGoToSystemSchematic` entirely (OXYGEN must stay reachable with zero purchases at all,
+      per the free-tier decision), and added the same `_isSystemTypeEntitled` check to
+      `navGoToSystemSchematic`'s "jump straight back into the live canvas" shortcut (the one other
+      path, besides the gallery tap, that can reach `_openSystemIntoCanvas` for an existing
+      system) — a system opened while entitled, or opened before entitlements existed, no longer
+      stays reachable once its systemType is locked. No deep-link/duplicate mechanism exists in
+      this app to worry about beyond that. Still open: `appSettings.entitlements` itself can get
+      out of sync with a real purchase once StoreKit exists (see the unchecked bullets below)
 - [ ] "Restore Purchases" button, and a launch-time StoreKit sync so a reinstall/new device recognizes
       prior purchases
 - [ ] Decide bundle pricing (all 5 at a discount) vs. à la carte only — affects App Store Connect product setup
@@ -42,16 +61,59 @@ standalone purchase.
 ## 2. Per-system "signature animation"
 The mechanical pieces exist (flow dashes, shimmer, leak spray/puffs, idle pulse). What's missing is a
 distinct *identity* per system, not just functional cues:
-- [ ] **ELECTRICAL** — define its own idle/hero motion (glow pulse along powered buses exists via `_glow`;
-      decide if that's the signature or if it needs more, e.g. a traveling spark)
-- [ ] **HYDRAULIC** — red/orange dashes + leak spray + idle pulse (built). Confirm the "powered" red-orange
-      color is actually reachable in practice (stayed gray during testing — verify the predicted-color/
-      inference path, not just the draw code)
-- [ ] **FUEL** — currently shares HYDRAULIC's dash style, tuned slower. Give it its own signature (amber
-      tint, viscosity cue; tank wave-fill is a good differentiator to lean into)
-- [ ] **BLEED AIR** — shimmer band (built); wants a heat-haze/pressure-wave feel distinct from PRESSURIZATION's
-- [ ] **PRESSURIZATION** — shares BLEED AIR's shimmer "just gentler" per the code comment; needs its own
-      distinguishing motion (e.g. cabin-altitude-tied pacing) so it doesn't read as a reskin
+- [x] **ELECTRICAL** — define its own idle/hero motion: decided the existing breathing glow pulse
+      (`_glow` in schematic_gdsGuiLib.lua) IS the signature, as-is — no traveling-spark/dash motion
+      added on top. (Considered: fast marching dashes reusing HYDRAULIC/FUEL's mechanism, discrete
+      spark dots, an irregular/flickering pulse — user chose to keep the current smooth breathing
+      glow unchanged.)
+- [x] **HYDRAULIC** — red/orange dashes + leak spray + idle pulse (built). Confirmed reachable: traced
+      `_colorForSource`/`_colorForPoweredNode` (main.lua) and they're medium-agnostic — not a bug.
+      The gray came from `_colorForSource`'s own deliberate rule that a source with no PRESSURE
+      value entered yet (still `entity.voltage` internally) shows flat gray rather than a guessed
+      powered color — same rule ELECTRICAL's sources are subject to, just never hit because every
+      electrical demo/seed/test canvas sets a VOLTAGE and nothing analogous seeds HYDRAULIC's
+      PRESSURE. Locked in with a new test,
+      `colorForPoweredNode_hydraulicPressureReachesPoweredColorTest`, proving the real red-orange
+      constant (`model/media/hydraulic.lua`'s `style.powered`) is reached once PRESSURE is set.
+      No code change needed. Follow-up not done here: PRESSURE isn't actually enforced as required
+      on a HYDRAULIC source (the main.lua comment calling it "Required" is aspirational, unchecked
+      anywhere) — worth revisiting under §4's save/validation sweep if a tester hits this again
+- [x] **FUEL** — the amber tint already existed (`model/media/fuel.lua`'s `style.powered`), and the
+      dash speed/length were already slower/longer than HYDRAULIC's — just not enough of a
+      qualitative difference on their own. Leaned into the tank wave-fill per the TODO's own
+      suggestion: added a per-medium `wave` override (`model/media/fuel.lua`'s new `wave` table —
+      slower speed, fewer cycles, smaller amplitude than the shared default), threaded through a
+      new `gdsGui_schematic_setWaveStyle`/`canvas.waveStyle` (schematic_gdsGuiLib.lua), read by
+      `_shapePoly.drawLevel`, same optional-override-with-fallback shape `flowStyle` already has
+      for the dash/shimmer animation. HYDRAULIC's RESERVOIR is untouched — no `wave` table of its
+      own, so it keeps the original shared constants unchanged. FUEL's tank now visibly sloshes
+      lazier/flatter (viscous) than a hydraulic reservoir's quicker multi-ripple
+- [x] **BLEED AIR** — added a real heat-haze wiggle: `_pipes.strokePieceWavy`
+      (`schematic_gdsGuiLib.lua`) samples each shimmer band as a polyline and offsets it
+      perpendicular to the duct by a sine wave (amplitude, period, speed all opt-in via the
+      flow table's new `wiggleAmp`/`wigglePeriodPx`/`wiggleSpeed`), scaled down per band by the
+      same `crossFrac` the band's own width already scales by so the narrow bright core wobbles
+      less than the wide faint glow. `model/media/bleedAir.lua`'s `flow` table is the only one
+      that sets these three fields — a plain `_pipes.strokePiece` straight stroke otherwise,
+      zero behavior change for FUEL/HYDRAULIC's dashes or PRESSURIZATION's own shimmer
+- [x] **PRESSURIZATION** — stays smooth (no wiggle — cooled, settled cabin air next to hot
+      engine/APU bleed air), and its pacing now actually ties to live cabin-altitude data instead
+      of a fixed dial, closing the "just gentler" gap the code comment flagged. Added real numeric
+      plumbing for CONTROLLER's `RATE` property (its own `defaultProperties` row, free text until
+      now, same as every other system's custom properties): a new
+      `gdsGui_schematic_setNumericPropertyKeys`/`canvas.numericPropertyKeys` hook
+      (`schematic_gdsGuiLib.lua`) flags a key's property-grid row numeric at both placement and
+      edit time, fed from `model/media/pressurization.lua`'s new `numericPropertyKeys = {RATE =
+      true}` (`CABIN ALT` stays plain free text — it's a setpoint, not a tempo, and nothing reads
+      it back). `main.lua`'s new `_pressurizationControllerRateFPM` scans the canvas for a numeric
+      `RATE` value; `_refreshPressurizationFlowPace` (gated on `systemType == "PRESSURIZATION"`,
+      same explicit-check pattern `schematicRefreshGlow` uses for ELECTRICAL) maps `|RATE|` up to
+      2000fpm onto the shimmer's `speedPxPerSec` (16 px/s idle/no-CONTROLLER up to 40 px/s at a
+      brisk climb/descent) and overwrites `canvas.flowStyle` with it — called once when the system
+      opens and again from `schematicCanvasChanged()`, so typing a new RATE re-paces the shimmer
+      immediately, not just on next open. Locked in with
+      `pressurizationControllerRateFPM_readsNumericRatePropertyTest` and
+      `..._blankOrMissingReturnsNilTest`
 - [ ] Per system: a short looping "hero" preview (2-4s) usable both as the in-app locked-tile teaser and as
       App Store marketing material
 - [ ] Settle on a consistent visual language across the 5 (color, motion style, leak behavior) so they read

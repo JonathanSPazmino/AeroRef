@@ -24,6 +24,15 @@ local FUEL = {
     -- HYDRAULIC's own flow table, reading as a lower-pressure, more viscous
     -- fluid than hydraulic's fast, tight dashes.
     flow = { kind = "dash", speedPxPerSec = 20, dashPx = 7 },
+    -- Tank wave-fill cue (schematic_gdsGuiLib.lua's _shapePoly.drawLevel,
+    -- fed via gdsGui_schematic_setWaveStyle) -- overrides that function's own
+    -- shared WAVE_* defaults (HYDRAULIC's RESERVOIR still uses those,
+    -- unmodified) with a slower, flatter, single-hump ripple instead of the
+    -- default's quicker multi-ripple: a real viscous liquid settles into a
+    -- lazier, simpler slosh than a thin one, same "more viscous" cue the
+    -- flow table above gives the dash animation, just applied to the tank
+    -- surface instead of the pipe.
+    wave = { speed = 0.22, cycles = 1, amplitude = 0.4 },
 }
 
 Registry.register(FUEL.name, FUEL)

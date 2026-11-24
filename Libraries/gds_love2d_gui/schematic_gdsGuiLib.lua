@@ -554,7 +554,8 @@ function _openElementPlacementGrid(canvasName, pending)
         for _, r in ipairs(extra or {}) do table.insert(rows, r) end
     end
     for _, key in ipairs(pending.defaultPropertyKeys or {}) do
-        table.insert(rows, { key = key, label = key, value = "" })
+        local numeric = canvas.numericPropertyKeys and canvas.numericPropertyKeys[key:upper()]
+        table.insert(rows, { key = key, label = key, value = "", numeric = numeric, numericOnly = numeric })
     end
     _pendingNamedPlacement = pending
     _pendingPlacementRows = rows
@@ -1404,6 +1405,12 @@ function _shapePoly.levelLineY(canvas, e)
     return maxY - (maxY - minY) * e.fillPercent / 100, maxY
 end
 
+-- Shared defaults -- canvas.waveStyle (set via gdsGui_schematic_setWaveStyle,
+-- fed from the current system's medium's own optional "wave" table, e.g.
+-- model/media/fuel.lua's) overrides amplitude/cycles/speed per medium below;
+-- a medium with no "wave" table of its own (HYDRAULIC's RESERVOIR included)
+-- just gets these, unchanged -- same optional-override-with-fallback shape
+-- canvas.flowStyle already has for the dash/shimmer animation.
 _shapePoly.WAVE_AMPLITUDE_PX = 0.6 -- how far the fluid's top surface rises/dips, screen px at zoom 1
 _shapePoly.WAVE_CYCLES = 1.8       -- how many full up/down cycles span the tank's own on-screen width
 _shapePoly.WAVE_SPEED = 0.5        -- cycles/second the ripple travels sideways
@@ -1453,14 +1460,17 @@ function _shapePoly.drawLevel(canvas, e, drawBody, r, g, b, a)
     local _, screenLineY = love.graphics.transformPoint(0, lineY)
     local _, screenMaxY = love.graphics.transformPoint(0, maxY)
     local bottom = math.ceil(screenMaxY) + 1
+    local wave = canvas.waveStyle or {}
     local taper = math.min(1, (100 - e.fillPercent) / _shapePoly.WAVE_TAPER_PERCENT)
-    local amp = _shapePoly.WAVE_AMPLITUDE_PX * canvas.zoom * taper
+    local amp = (wave.amplitude or _shapePoly.WAVE_AMPLITUDE_PX) * canvas.zoom * taper
+    local cycles = wave.cycles or _shapePoly.WAVE_CYCLES
+    local speed = wave.speed or _shapePoly.WAVE_SPEED
     local now = _selection.now()
 
     local points = {}
     for s = 0, _shapePoly.WAVE_SAMPLES do
         local t = s / _shapePoly.WAVE_SAMPLES
-        local phase = t * _shapePoly.WAVE_CYCLES * math.pi * 2 + now * _shapePoly.WAVE_SPEED
+        local phase = t * cycles * math.pi * 2 + now * speed
         table.insert(points, left + (right - left) * t)
         table.insert(points, screenLineY + amp * math.sin(phase))
     end
@@ -5998,7 +6008,8 @@ function _openPropertiesMenu(canvasName, elementId)
         for _, r in ipairs((fn and fn(canvasName, elementId)) or {}) do table.insert(rows, r) end
     end
     for _, p in ipairs(el.properties or {}) do
-        table.insert(rows, { key = p.key, label = p.key, value = p.value or "" })
+        local numeric = canvas.numericPropertyKeys and canvas.numericPropertyKeys[p.key:upper()]
+        table.insert(rows, { key = p.key, label = p.key, value = p.value or "", numeric = numeric, numericOnly = numeric })
     end
     -- Stashed here, not read back via canvas.menu.rows in onPropertiesSaved
     -- below — by the time SAVE's callback fires, _propertyGrid.release has
@@ -7936,6 +7947,32 @@ function gdsGui_schematic_setFlowStyle(canvasName, flowStyle)
     if canvas then canvas.flowStyle = flowStyle end
 end
 
+-- waveStyle: the current system's medium's own optional wave table
+-- (model/media/*.lua -- e.g. {speed=.., cycles=.., amplitude=..}), or nil
+-- for a medium with no override (every tank just uses _shapePoly.drawLevel's
+-- own shared WAVE_* defaults below, unchanged). Same domain-blind shape as
+-- flowStyle above -- read by _shapePoly.drawLevel, never a systemType.
+function gdsGui_schematic_setWaveStyle(canvasName, waveStyle)
+    local canvas = _findCanvas(canvasName)
+    if canvas then canvas.waveStyle = waveStyle end
+end
+
+-- keys: a set of UPPERCASE defaultProperty key strings (e.g. {RATE = true})
+-- that should accept numeric-only keystrokes and be flagged row.numeric, both
+-- at placement time (_openElementPlacementGrid's defaultPropertyKeys loop)
+-- and when re-editing an existing element's own custom properties
+-- (_openPropertiesMenu's el.properties loop) -- or nil for "every
+-- defaultProperty on this canvas stays plain free text," the behavior every
+-- other medium still gets (e.g. FUEL's ENGINE FUEL FLOW, HYDRAULIC's
+-- ACTUATOR PSI REQUIREMENT -- see main.lua's own comments on why those stay
+-- free text). Same domain-blind "just the numbers/strings the app handed
+-- over" relationship flowStyle/waveStyle above have -- this file never
+-- knows WHY a given key is numeric, only that it is.
+function gdsGui_schematic_setNumericPropertyKeys(canvasName, keys)
+    local canvas = _findCanvas(canvasName)
+    if canvas then canvas.numericPropertyKeys = keys end
+end
+
 -- Names every kind of element on this canvas whose outline can be redrawn
 -- (see _shapePoly) — kinds: an array of {shapeType, componentType} pairs
 -- (e.g. a system with both a reshapable TANK ("rect"/"source") and a
@@ -8245,6 +8282,29 @@ function _pipes.pointOnPiece(piece, t)
     return piece.x1 + dx * f, piece.y1 + dy * f, ux, uy
 end
 
+-- Same stroke as strokePiece below, but sampled as a polyline and pushed
+-- sideways off the path by a sine wave in piece-local distance (amp px at
+-- its peak, one full cycle every periodPx, phase in radians) -- the
+-- heat-haze "pressure-wave" wiggle _pipes.drawFlowShimmer's own drawBand
+-- opts individual bands into via style.wiggleAmp (model/media/bleedAir.lua),
+-- never used for a straight strokePiece call. Sampled every ~6px of path
+-- (never fewer than 2 segments) -- plenty dense for this duct's own on-
+-- screen size, and these runs are always short (one shimmer band's worth of
+-- length), so the extra pointOnPiece calls versus a single straight
+-- love.graphics.line are cheap.
+function _pipes.strokePieceWavy(piece, t0, t1, amp, periodPx, phase)
+    local n = math.max(2, math.ceil((t1 - t0) / 6))
+    local pts = {}
+    for i = 0, n do
+        local t = t0 + (t1 - t0) * i / n
+        local x, y, ux, uy = _pipes.pointOnPiece(piece, t)
+        local off = amp * math.sin(2 * math.pi * (piece.d0 + t) / periodPx + phase)
+        table.insert(pts, x - uy * off)
+        table.insert(pts, y + ux * off)
+    end
+    love.graphics.line(pts)
+end
+
 -- Draws the part of piece from t0 to t1 as one stroke, at the current line width.
 function _pipes.strokePiece(piece, t0, t1)
     local bend = piece.bend
@@ -8455,15 +8515,35 @@ function _pipes.drawFlowShimmer(canvas, w, plan, width, r, g, b)
     -- centerline -- SHIMMER_CROSS_UNITS duct-widths. setLineWidth takes
     -- the FULL stroke width (both sides together), hence the *2.
     local outerHalf = width * _pipes.SHIMMER_CROSS_UNITS
+    -- Heat-haze wiggle (model/media/bleedAir.lua's own style.wiggleAmp;
+    -- nil for every other shimmer medium, PRESSURIZATION included -- see
+    -- that medium's own comment on why its shimmer stays smooth) -- a
+    -- lateral sine jitter riding on top of the straight stroke, scaled down
+    -- per band by the same crossFrac the width itself already scales by, so
+    -- the narrow bright core wobbles less than the wide faint outer glow
+    -- (a real heat shimmer reads strongest at its hazy edges, not its core).
+    -- Timed off its own independent phase clock (wiggleSpeed), not the
+    -- band's own travel offset -- this is a stationary lateral jitter, not
+    -- something that should visibly travel along with the pulse.
+    local wiggleAmp = style.wiggleAmp
+    local wigglePeriod = style.wigglePeriodPx or band * 2.4
+    local wigglePhase = _selection.now() * (style.wiggleSpeed or 3)
     local function drawBand(crossFrac, halfLen, a)
         love.graphics.setColor(r, g, b, a)
         love.graphics.setLineWidth(outerHalf * crossFrac * 2)
+        local bandAmp = wiggleAmp and wiggleAmp * crossFrac
         local start = offset - period
         while start < total do
             local lo, hi = math.max(0, start - halfLen), math.min(total, start + halfLen)
             for _, piece in ipairs(pieces) do
                 local t0, t1 = math.max(0, lo - piece.d0), math.min(piece.len, hi - piece.d0)
-                if t1 - t0 > 0.01 then _pipes.strokePiece(piece, t0, t1) end
+                if t1 - t0 > 0.01 then
+                    if bandAmp then
+                        _pipes.strokePieceWavy(piece, t0, t1, bandAmp, wigglePeriod, wigglePhase)
+                    else
+                        _pipes.strokePiece(piece, t0, t1)
+                    end
+                end
             end
             start = start + period
         end
@@ -13026,6 +13106,33 @@ function gdsGui_schematicGallery_drawBadgeIcon(cx, cy, r, kind)
     love.graphics.setColor(1, 1, 1, 1)
 end
 
+-- A dimming overlay + centered padlock + optional label over a tile the app
+-- marks item.locked = true (item.lockedLabel: e.g. "PREMIUM" or a price —
+-- the library has no idea which, same arm's-length relationship _galleryBadge's
+-- own comment above gives: purely cosmetic, no idea what "locked" means
+-- (entitlements, IAP, ...), only how to paint it. A global table, not
+-- "local", for the same 200-local-ceiling reason _galleryBadge itself is one.
+_galleryLock = {}
+
+function _galleryLock.draw(tx, ty, tw, th, label)
+    love.graphics.setColor(0, 0, 0, 0.6)
+    love.graphics.rectangle("fill", tx, ty, tw, th)
+
+    local cx, cy = tx + tw / 2, ty + th / 2 - 6
+    local r = math.min(tw, th) * 0.14
+    love.graphics.setColor(1, 1, 1, 0.95)
+    love.graphics.rectangle("fill", cx - r, cy, r * 2, r * 1.3, 2, 2)
+    love.graphics.setLineWidth(2)
+    love.graphics.arc("line", "open", cx, cy, r * 0.75, math.pi, math.pi * 2)
+    love.graphics.setLineWidth(1)
+
+    if label then
+        love.graphics.setColor(1, 1, 1, 1)
+        love.graphics.printf(label, tx, cy + r * 1.3 + 6, tw, "center")
+    end
+    love.graphics.setColor(1, 1, 1, 1)
+end
+
 function gdsGui_schematicGallery_draw(pageName)
     for _, gallery in ipairs(globApp.objects.schematicGalleries) do
         if gallery.page == pageName then
@@ -13056,13 +13163,18 @@ function gdsGui_schematicGallery_draw(pageName)
                             local textX, textW = tx + diagW + 8, tw - diagW - 8
                             love.graphics.printf(item.name or item.id, textX, ty, textW, "left")
                             love.graphics.printf(table.concat(item.statusLines, "\n"), textX, ty + 18, textW, "left")
+                            if item.locked then _galleryLock.draw(tx, ty, diagW, th, item.lockedLabel) end
                         else
                             _drawGalleryTilePreview(item, tx, ty, tw, th, isPressed)
                             love.graphics.setColor(1, 1, 0, 1)
                             love.graphics.rectangle("line", tx, ty, tw, th)
                             love.graphics.setColor(1, 1, 1, 1)
                             love.graphics.printf(item.name or item.id, tx, ty + th + 2, tw, "center")
-                            _galleryBadge.draw(tx, ty, tw, item.compatBadge)
+                            if item.locked then
+                                _galleryLock.draw(tx, ty, tw, th, item.lockedLabel)
+                            else
+                                _galleryBadge.draw(tx, ty, tw, item.compatBadge)
+                            end
                         end
                     end
                 end

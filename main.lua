@@ -1149,6 +1149,30 @@ local function _findCatalogEntryForType(systemType)
     return nil
 end
 
+-- Every SCHEMATIC_CATALOG systemType except OXYGEN (TODO.md §1's paid tier --
+-- OXYGEN is the one free-tier anchor, unconditionally, and never gets an
+-- entitlements entry at all -- see _isSystemTypeEntitled). Deliberately a
+-- global, not "local function" like most of this file's other small
+-- catalog helpers -- main.lua sits at Lua's 200-local ceiling (see
+-- schematicStore/appSettings's own comment, above), and this one has no
+-- need to be local: nothing here calls it before it's defined.
+function _paidSystemTypes()
+    local types = {}
+    for _, sys in ipairs(SCHEMATIC_CATALOG) do
+        if sys.system ~= "OXYGEN" then table.insert(types, sys.system) end
+    end
+    return types
+end
+
+-- Per-systemType paid-feature gate (TODO.md §1): OXYGEN is always
+-- accessible, no matter what appSettings.entitlements says (or whether it's
+-- even been initialized yet -- see love.load's nil-guard below); every other
+-- systemType depends on its own appSettings.entitlements[systemType] entry.
+function _isSystemTypeEntitled(systemType)
+    if systemType == "OXYGEN" then return true end
+    return appSettings.entitlements ~= nil and appSettings.entitlements[systemType] == true
+end
+
 -- "Bleed Air" from "BLEED AIR", for a friendlier default system name.
 local function _titleCase(s)
     local words = {}
@@ -1778,6 +1802,17 @@ local function _systemGalleryItems(aircraft)
         if thumb then
             item.thumbnailPath = thumb.path
             item.thumbnailPressedPath = thumb.pressedPath
+        end
+        -- Entitlement gate (TODO.md §1): item.locked/.lockedLabel are purely
+        -- cosmetic fields the gallery widget knows how to dim and badge (see
+        -- _galleryLock in schematic_gdsGuiLib.lua) -- the real gate is in
+        -- schematicSystemGallerySelected above, which the widget calls
+        -- regardless of how a tile looks. No specific price yet (TODO.md's
+        -- pricing decision: exact number TBD at ship time), so this just
+        -- says "paid", not how much.
+        if not _isSystemTypeEntitled(catalogEntry.system) then
+            item.locked = true
+            item.lockedLabel = "PREMIUM"
         end
         table.insert(items, item)
     end
@@ -3294,6 +3329,14 @@ function schematicCanvasChanged()
     -- gdsGui_schematic_internal_onElementEditChosen's DELETE branch).
     _recomputeDeducedGateStates()
     _relays.checkLogic = true -- a new switch position or relay may need logic set
+    -- A CONTROLLER's own RATE property is edited through this exact
+    -- PROPERTIES-menu SAVE path (schematicElementPropertiesSaved, wired to
+    -- fire this hook same as every other design-mode edit) -- re-deriving
+    -- the live shimmer pace here, rather than only at _openSystemIntoCanvas
+    -- time, is what makes typing a new RATE visibly change the pacing right
+    -- away instead of only on the next system re-open. A no-op off a non-
+    -- PRESSURIZATION canvas -- see _refreshPressurizationFlowPace's own comment.
+    _refreshPressurizationFlowPace()
     _requestSchematicSave()
 end
 
@@ -4747,6 +4790,9 @@ local function _openSystemIntoCanvas(systemId, mode)
     local catalogEntry = sys.systemType and _findCatalogEntryForType(sys.systemType)
     gdsGui_schematic_setPipeConnectors("mainCanvas", catalogEntry and catalogEntry.pipeConnectors)
     gdsGui_schematic_setFlowStyle("mainCanvas", _currentMedium().flow)
+    gdsGui_schematic_setWaveStyle("mainCanvas", _currentMedium().wave)
+    gdsGui_schematic_setNumericPropertyKeys("mainCanvas", _currentMedium().numericPropertyKeys)
+    _refreshPressurizationFlowPace()
     -- Every reshapable item this system's catalog offers (e.g. FUEL's own
     -- FUEL TANK and FUEL MANIFOLD both are) — not just the last one found,
     -- which would silently cost every earlier one its own ADD PORT/MIRROR
@@ -6048,8 +6094,21 @@ end
 -- start editing." No RENAME on the real-system menu either — a system's
 -- name is its catalog type (see SCHEMATIC_CATALOG/_findCatalogEntryForType),
 -- not a freeform label, so there's nothing for the user to type.
+--
+-- Entitlement gate (TODO.md §1): checked here, not left to the tile's own
+-- dimmed/locked look (_systemGalleryItems' item.locked is purely cosmetic —
+-- the gallery widget fires onSelect no matter what a tile looks like), so a
+-- locked tile is unreachable by this one tap-handling path no matter which
+-- of the two branches below it would have taken. A system record with no
+-- systemType at all (stray legacy data) is left alone, same permissive
+-- treatment _systemGalleryItems itself already gives that case.
 function schematicSystemGallerySelected(galleryName, systemId)
     local sys = _findSystem(systemId)
+    local systemType = sys and sys.systemType or systemId
+    if systemType and not _isSystemTypeEntitled(systemType) then
+        gdsGui_page_switch("LoadingPaywall", 8, 2, false)
+        return
+    end
     if sys then
         _manageMenuSystemId = systemId
         -- DELETE (index 3) is this menu's own confirmIndex row — holding IT
@@ -6411,6 +6470,20 @@ function love.load()
     -- entitlement flag (no real store/IAP integration exists in this pure-Lua
     -- app yet) flipped true by the Simulate Purchase button on the paywall page.
     if appSettings.schematicUnlocked == nil then appSettings.schematicUnlocked = false end
+    -- Per-systemType paid-feature entitlements (TODO.md §1), replacing
+    -- schematicUnlocked's single whole-feature flag as the real source of
+    -- truth going forward -- OXYGEN never gets a key here; it's always free
+    -- (see _isSystemTypeEntitled). An install that already had
+    -- schematicUnlocked == true from before this table existed keeps
+    -- whatever paid access it already had: every paid systemType starts
+    -- entitled on first load after this change, rather than silently
+    -- re-locking a feature already "purchased" under the old placeholder flag.
+    if appSettings.entitlements == nil then
+        appSettings.entitlements = {}
+        for _, systemType in ipairs(_paidSystemTypes()) do
+            appSettings.entitlements[systemType] = (appSettings.schematicUnlocked == true)
+        end
+    end
     if appSettings.schematicEditMode == nil then appSettings.schematicEditMode = true  end
     -- Which schematic-flow page (SchematicHome/AircraftGallery/
     -- SchematicManageGallery/SystemSchematic) the app was sitting on the last
@@ -7607,8 +7680,14 @@ function love.load()
     -- see _saveSchematicResumeState), in which case that page's own setup is
     -- done right here before the very first page switch below ever lands on
     -- MainMenu at all.
+    -- No appSettings.schematicUnlocked check here any more (TODO.md §1):
+    -- OXYGEN is free, so resuming straight back into the schematic flow
+    -- shouldn't depend on ever having unlocked anything. Safe either way --
+    -- every branch below lands on a gallery page, never straight into a
+    -- system's live canvas (see this block's own comment above), so a
+    -- locked system stays behind its own gallery tile's entitlement gate.
     local showTC = (appSettings.tcAcceptedVersion ~= APP_VERSION)
-    local lastSchematicPage = (not showTC) and appSettings.schematicUnlocked and appSettings.schematicLastPage
+    local lastSchematicPage = (not showTC) and appSettings.schematicLastPage
 
     -- A cold boot never reopens straight into a specific system's canvas
     -- (lastSchematicPage == "SystemSchematic") -- it lands on that system's
@@ -8751,12 +8830,13 @@ end
 -- "step back up one level", used by the back buttons on AircraftGallery/
 -- SchematicManageGallery (which are already one level below Home) and by
 -- navGoToSystemSchematic below as its own no-aircraft-yet fallback.
+-- No whole-feature paywall check here any more (TODO.md §1): OXYGEN is
+-- always free, so System Schematic itself must stay reachable with zero
+-- entitlements at all -- gating now happens per systemType, at the gallery
+-- tile itself (see _systemGalleryItems' item.locked) and its tap handler
+-- (schematicSystemGallerySelected), not at this front door.
 function navBackToSchematicHome()
     if gdsGui_page_currentName() == "SystemSchematic" then _saveCurrentSystemIfDirty() end
-    if not appSettings.schematicUnlocked then
-        gdsGui_page_switch("LoadingPaywall", 8, 2, false)
-        return
-    end
     -- An update was just installed over the previous build, and no system
     -- was ever opened last session — land on AircraftGallery instead of the
     -- aircraft picker, so existing aircraft are immediately visible (see
@@ -8790,12 +8870,10 @@ end
 -- badges rather than a canvas that gives no sign a check even ran. A
 -- first-ever visit this session with no update pending, or a deleted/missing
 -- current system, falls through to navBackToSchematicHome as before.
+-- No whole-feature paywall check here either, for the same reason
+-- navBackToSchematicHome's own comment above gives.
 function navGoToSystemSchematic()
     if gdsGui_page_currentName() == "SystemSchematic" then _saveCurrentSystemIfDirty() end
-    if not appSettings.schematicUnlocked then
-        gdsGui_page_switch("LoadingPaywall", 8, 2, false)
-        return
-    end
     if _schematicVersionJustUpdated and #schematicStore.aircraft > 0 then
         _schematicVersionJustUpdated = false
         gdsGui_schematicGallery_setItems("aircraftGallery", _aircraftGalleryItems())
@@ -8803,7 +8881,19 @@ function navGoToSystemSchematic()
         gdsGui_page_switch("LoadingAircraftGallery", 12, 2, false)
         return
     end
-    if schematicStore.currentSystemId and _findSystem(schematicStore.currentSystemId) then
+    local currentSystem = schematicStore.currentSystemId and _findSystem(schematicStore.currentSystemId)
+    if currentSystem then
+        -- Still entitlement-checked, even on this "jump straight back into
+        -- the live canvas" shortcut: a system opened while entitled (or
+        -- opened before entitlements existed at all) must not stay reachable
+        -- by this path alone once its systemType is locked, same as a fresh
+        -- tap on its gallery tile would be (schematicSystemGallerySelected).
+        -- A system with no systemType (legacy data) is left alone, same
+        -- permissive treatment that function gives it too.
+        if currentSystem.systemType and not _isSystemTypeEntitled(currentSystem.systemType) then
+            gdsGui_page_switch("LoadingPaywall", 8, 2, false)
+            return
+        end
         if _canvasLoadedSystemId ~= schematicStore.currentSystemId then
             _openSystemIntoCanvas(schematicStore.currentSystemId, appSettings.schematicEditMode and "design" or "control")
         end
@@ -8838,10 +8928,21 @@ end
 -- SCHEMATIC PAYWALL CALLBACKS
 -------------------------------------------------------------------------------
 
--- Sets the placeholder entitlement flag. Separated from simulatePurchaseSchematic()
--- (which also navigates) so the flag-setting logic itself is directly unit-testable.
+-- Sets the placeholder entitlement flag, and -- since the business model is
+-- one flat price unlocking every paid systemType at once (TODO.md's pricing
+-- decision; there's no per-system purchase) -- every paid systemType's
+-- entitlements entry along with it. This doubles as this build's testing
+-- backdoor into paid features: the paywall page's own "Simulate Purchase"
+-- button (see createSchematicPaywallObjects/simulatePurchaseSchematic
+-- below) calls this, and its body text already says so outright -- no real
+-- payment is ever processed. Separated from simulatePurchaseSchematic()
+-- (which also navigates) so the flag-setting logic itself is directly
+-- unit-testable.
 function unlockSchematicFeature()
     appSettings.schematicUnlocked = true
+    for _, systemType in ipairs(_paidSystemTypes()) do
+        appSettings.entitlements[systemType] = true
+    end
     _syncPaidLoadingScreenSkip()
     _saveAppSettings()
     return appSettings.schematicUnlocked
@@ -8849,18 +8950,87 @@ end
 
 -- Exercises unlockSchematicFeature() without permanently flipping the real
 -- paywall entitlement on this install: unlockSchematicFeature() itself
--- persists appSettings.schematicUnlocked to disk, so a bare call from a
--- unit test (which can run any time developer mode's dev panel re-runs the
--- suite) would silently and permanently unlock the paid feature. This
--- restores whatever the flag was before the test ran, then re-persists
--- that original value.
+-- persists appSettings.schematicUnlocked and appSettings.entitlements to
+-- disk, so a bare call from a unit test (which can run any time developer
+-- mode's dev panel re-runs the suite) would silently and permanently unlock
+-- every paid system. This restores whatever both were before the test ran,
+-- then re-persists those original values.
 function unlockSchematicFeatureTest()
-    local prior = appSettings.schematicUnlocked
+    local priorUnlocked = appSettings.schematicUnlocked
+    local priorEntitlements = {}
+    for systemType, unlocked in pairs(appSettings.entitlements) do priorEntitlements[systemType] = unlocked end
     local result = unlockSchematicFeature()
-    appSettings.schematicUnlocked = prior
+    appSettings.schematicUnlocked = priorUnlocked
+    appSettings.entitlements = priorEntitlements
     _syncPaidLoadingScreenSkip()
     _saveAppSettings()
     return result
+end
+
+-- Exercises the per-systemType entitlements table itself: OXYGEN reads as
+-- entitled with no entitlements key at all; a paid systemType starts
+-- un-entitled; unlockSchematicFeature() (the paywall's Simulate Purchase
+-- testing backdoor) grants every paid systemType at once. Restores
+-- appSettings.entitlements/schematicUnlocked afterward, the same reasoning
+-- unlockSchematicFeatureTest gives for doing so.
+function entitlementsTableTest()
+    local paidType = _paidSystemTypes()[1]
+    local priorEntitlements = {}
+    for systemType, unlocked in pairs(appSettings.entitlements) do priorEntitlements[systemType] = unlocked end
+    local priorUnlocked = appSettings.schematicUnlocked
+
+    local oxygenAlwaysEntitled = _isSystemTypeEntitled("OXYGEN")
+    appSettings.entitlements[paidType] = false
+    local startsLocked = not _isSystemTypeEntitled(paidType)
+
+    unlockSchematicFeature()
+    local unlockedByBackdoor = _isSystemTypeEntitled(paidType)
+
+    appSettings.entitlements = priorEntitlements
+    appSettings.schematicUnlocked = priorUnlocked
+    _syncPaidLoadingScreenSkip()
+    _saveAppSettings()
+
+    return oxygenAlwaysEntitled, startsLocked, unlockedByBackdoor
+end
+
+-- The systems gallery's own per-systemType gate (TODO.md §1), on top of the
+-- bare entitlement check entitlementsTableTest already covers:
+-- _systemGalleryItems marks a locked tile cosmetically (item.locked), and
+-- schematicSystemGallerySelected's tap handler redirects a locked tile
+-- straight to the paywall instead of creating/opening it. Exercised on the
+-- "not yet created" placeholder path (systemId is the catalog type name
+-- itself) -- schematicSystemGallerySelected's entitlement check runs before
+-- it ever looks up a real aircraft, so this needs no actual aircraft/system
+-- record in schematicStore, just a throwaway {systems = {}} table for
+-- _systemGalleryItems' own read. globApp.skipPageLoadingScreens is forced on
+-- so the redirect lands immediately instead of behind a timed loading page
+-- (see gdsGui_page_switch) -- restored via _syncPaidLoadingScreenSkip
+-- afterward, same as entitlementsTableTest's own appSettings restore.
+function schematicGalleryEntitlementGateTest()
+    local paidType = _paidSystemTypes()[1]
+    local priorEntitlements = {}
+    for systemType, unlocked in pairs(appSettings.entitlements) do priorEntitlements[systemType] = unlocked end
+    local priorPageIndex = globApp.currentPageIndex
+
+    appSettings.entitlements[paidType] = false
+    local oxygenItem, paidItem
+    for _, item in ipairs(_systemGalleryItems({ systems = {} })) do
+        if item.id == "OXYGEN" then oxygenItem = item end
+        if item.id == paidType then paidItem = item end
+    end
+    local oxygenNeverLocked = oxygenItem ~= nil and oxygenItem.locked == nil
+    local paidItemLocked = paidItem ~= nil and paidItem.locked == true
+
+    globApp.skipPageLoadingScreens = true
+    schematicSystemGallerySelected("manageGallery", paidType)
+    local redirectedToPaywall = (gdsGui_page_currentName() == "SchematicPaywall")
+
+    appSettings.entitlements = priorEntitlements
+    globApp.currentPageIndex = priorPageIndex
+    _syncPaidLoadingScreenSkip()
+
+    return oxygenNeverLocked, paidItemLocked, redirectedToPaywall
 end
 
 function simulatePurchaseSchematic()
@@ -9932,6 +10102,59 @@ function schematicRefreshGlow()
     gdsGui_schematic_setGlow("mainCanvas", sys ~= nil and sys.systemType == "ELECTRICAL", { medium.style.unpowered })
 end
 
+-- The live cabin-altitude RATE (fpm) typed into this canvas' own CONTROLLER
+-- element (PRESSURIZATION's defaultProperties -- see SCHEMATIC_CATALOG),
+-- or nil if there's no CONTROLLER placed yet, or its RATE property is
+-- blank/non-numeric. CABIN ALT is deliberately not read here at all --
+-- unlike RATE, it's a setpoint, not a tempo, and model/media/pressurization.lua's
+-- own flow table only ever asks for a pace. Scans every element rather than
+-- matching on label == "CONTROLLER" specifically: RATE is itself a property
+-- key no other PRESSURIZATION catalog item's defaultProperties ever uses
+-- (SAFETY VALVE/OUTFLOW VALVE/MANIFOLD/BLEED AIR SOURCE all have none), so
+-- the match is already unambiguous without also checking which element it
+-- came from.
+function _pressurizationControllerRateFPM(canvas)
+    if not canvas then return nil end
+    for _, e in ipairs(canvas.elements or {}) do
+        for _, p in ipairs(e.properties or {}) do
+            if type(p.key) == "string" and p.key:upper() == "RATE" then
+                return tonumber(p.value)
+            end
+        end
+    end
+    return nil
+end
+
+-- Re-derives mainCanvas' own flowStyle.speedPxPerSec from the live RATE
+-- above, for a PRESSURIZATION system only (same explicit systemType ==
+-- "PRESSURIZATION" gate schematicRefreshGlow's own comment explains for
+-- ELECTRICAL -- _currentMedium()'s nil-systemType fallback is irrelevant
+-- either way, since a system with no medium of its own has no flow table to
+-- override in the first place). A no-op for every other system, so calling
+-- this from schematicCanvasChanged (below) costs nothing on an ELECTRICAL/
+-- HYDRAULIC/FUEL/BLEED AIR canvas. Only speedPxPerSec is recomputed --
+-- bandPx/alpha/wiggle* all stay exactly model/media/pressurization.lua's
+-- own flow table (there is no wiggle* on PRESSURIZATION's -- see its own
+-- comment), so this never risks drifting that table's other fields out of
+-- sync with a second copy of them here.
+--
+-- |RATE| up to 2000fpm (a brisk cabin climb/descent) linearly maps the
+-- shimmer's base 16px/s up to 40px/s at and above that -- a system with no
+-- CONTROLLER yet, or one left blank, just keeps the medium's own unmodified
+-- 16px/s fallback (tonumber(nil) is nil, ends the whole expression nil,
+-- `or` falls through to it) rather than reading as broken or frozen.
+function _refreshPressurizationFlowPace()
+    local sys = schematicStore and _findSystem(schematicStore.currentSystemId)
+    if not sys or sys.systemType ~= "PRESSURIZATION" then return end
+    local medium = _currentMedium()
+    local canvas = _findSchematicCanvas()
+    local rate = _pressurizationControllerRateFPM(canvas)
+    local speed = rate and (medium.flow.speedPxPerSec + math.min(math.abs(rate), 2000) / 2000 * 24)
+    gdsGui_schematic_setFlowStyle("mainCanvas", {
+        kind = medium.flow.kind, bandPx = medium.flow.bandPx, alpha = medium.flow.alpha,
+        speedPxPerSec = speed or medium.flow.speedPxPerSec })
+end
+
 function schematicPoweredColorChosen(canvasName, index)
     local color = gdsGui_schematic_getColorPaletteEntry(index)
     if not color then return end
@@ -10007,6 +10230,46 @@ function colorForPoweredNode_singleSourceNoVoltageShowsUnpoweredTest()
     local color = _colorForPoweredNode("bus1", { bus1 = { batt1 = true } }, canvas, _TEST_DEFAULT)
     local unpowered = _currentMedium().style.unpowered
     return color[1] == unpowered[1] and color[2] == unpowered[2] and color[3] == unpowered[3]
+end
+
+-- TODO.md §2 flagged HYDRAULIC's red-orange "powered" color as possibly
+-- unreachable ("stayed gray during testing"). Traced the actual path:
+-- _colorForPoweredNode/_colorForSource above are medium-agnostic
+-- (defaultColor is just a parameter, same as every other caller in this
+-- file) -- the gray came from _colorForSource's own deliberate "no
+-- PRESSURE entered yet" rule (its own comment, right above it), not a bug
+-- in the color-resolution code itself. This locks in that HYDRAULIC's own
+-- real red-orange constant (model/media/hydraulic.lua's style.powered) IS
+-- reached once a source's PRESSURE (still entity.voltage internally — see
+-- hydraulic.lua's own magnitudeLabel comment) is actually set. The
+-- no-pressure fallback case is already covered generically by
+-- colorForPoweredNode_singleSourceNoVoltageShowsUnpoweredTest above.
+function colorForPoweredNode_hydraulicPressureReachesPoweredColorTest()
+    local hydraulic = require("model.media.registry").get("HYDRAULIC")
+    local canvas = { elements = { { id = "acc1", voltage = 3000 } }, controls = {}, voltageColors = {} }
+    local color = _colorForPoweredNode("bus1", { bus1 = { acc1 = true } }, canvas, hydraulic.style.powered)
+    return color[1] == hydraulic.style.powered[1]
+        and color[2] == hydraulic.style.powered[2]
+        and color[3] == hydraulic.style.powered[3]
+end
+
+-- TODO.md §2 asked for PRESSURIZATION's shimmer pacing to actually tie to
+-- live cabin-altitude data rather than a fixed dial -- these two lock in
+-- _pressurizationControllerRateFPM's own numeric-parsing half of that (the
+-- live-recompute half, _refreshPressurizationFlowPace, is exercised for
+-- real every time a PRESSURIZATION canvas opens/changes; it isn't re-tested
+-- here since it only ever reads this same function's own return value).
+function pressurizationControllerRateFPM_readsNumericRatePropertyTest()
+    local canvas = { elements = { { id = "ctlr1",
+        properties = { { key = "CABIN ALT", value = "8000" }, { key = "RATE", value = "750" } } } } }
+    return _pressurizationControllerRateFPM(canvas)
+end
+
+function pressurizationControllerRateFPM_blankOrMissingReturnsNilTest()
+    local blank = _pressurizationControllerRateFPM({ elements = { { id = "ctlr1",
+        properties = { { key = "RATE", value = "" } } } } })
+    local missing = _pressurizationControllerRateFPM({ elements = {} })
+    return blank == nil and missing == nil
 end
 
 function colorForPoweredNode_tieHigherVoltageWinsTest()
@@ -13357,10 +13620,28 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcParameters"]={0},
         ["funcExpctOutput"]={true}}
 
+    gdsGui_dev_testExecute {["id"]="colorForPoweredNode_hydraulicPressureReachesPoweredColor",
+        ["funcName"]={"colorForPoweredNode_hydraulicPressureReachesPoweredColorTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={true}}
+
     gdsGui_dev_testExecute {["id"]="colorForPoweredNode_tieHigherVoltageWins",
         ["funcName"]={"colorForPoweredNode_tieHigherVoltageWinsTest"},
         ["funcParameters"]={0},
         ["funcExpctOutput"]={1, 1, 0}}
+
+    --------------------------------------------------------------------------
+    --  PRESSURIZATION's CONTROLLER RATE -> live shimmer pacing
+    --------------------------------------------------------------------------
+    gdsGui_dev_testExecute {["id"]="pressurizationControllerRateFPM_readsNumericRateProperty",
+        ["funcName"]={"pressurizationControllerRateFPM_readsNumericRatePropertyTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={750}}
+
+    gdsGui_dev_testExecute {["id"]="pressurizationControllerRateFPM_blankOrMissingReturnsNil",
+        ["funcName"]={"pressurizationControllerRateFPM_blankOrMissingReturnsNilTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={true}}
 
     gdsGui_dev_testExecute {["id"]="colorForPoweredNode_tieNoVoltageDashes",
         ["funcName"]={"colorForPoweredNode_tieNoVoltageDashesTest"},
@@ -13436,6 +13717,16 @@ gdsGui_unitTests_registerSuite("app", function()
         ["funcName"]={"unlockSchematicFeatureTest"},
         ["funcParameters"]={0},
         ["funcExpctOutput"]={true}}
+
+    gdsGui_dev_testExecute {["id"]="entitlements_oxygenFreePaidGatedBackdoorUnlocks",
+        ["funcName"]={"entitlementsTableTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={true, true, true}}
+
+    gdsGui_dev_testExecute {["id"]="schematicGallery_lockedTileGatesToPaywall",
+        ["funcName"]={"schematicGalleryEntitlementGateTest"},
+        ["funcParameters"]={0},
+        ["funcExpctOutput"]={true, true, true}}
 
     gdsGui_dev_testExecute {["id"]="schematic_annunciatorEditMenu_deletesViaConfirm",
         ["funcName"]={"schematicAnnunciatorDeleteTest"},
