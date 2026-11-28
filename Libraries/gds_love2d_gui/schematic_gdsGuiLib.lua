@@ -13237,6 +13237,14 @@ function gdsGui_schematicGallery_draw(pageName)
                 love.graphics.printf(gallery.emptyText, gallery.x, gallery.y + gallery.h / 2 - 10,
                     gallery.w, "center")
             else
+                -- WHITE MODE: the tile-outline rectangle swaps from its
+                -- default yellow to black (yellow reads poorly against the
+                -- light canvas), and the name/status label swaps from white
+                -- to navy, same light-mode re-tint _applyTheme already does
+                -- for checkboxes/learn-page text elsewhere.
+                local isLight = globApp.themeIsDark == false
+                local tileOutlineColor = isLight and {0, 0, 0, 1} or {1, 1, 0, 1}
+                local labelColor = isLight and {0.05, 0.10, 0.40, 1} or {1, 1, 1, 1}
                 for i, item in ipairs(gallery.items) do
                     local tx, ty, tw, th = _galleryTileRect(gallery, i)
                     local isPressed = (i == gallery.pressedTileIndex)
@@ -13249,9 +13257,13 @@ function gdsGui_schematicGallery_draw(pageName)
                             local diagW = th
                             _drawGalleryTilePreview(item, tx, ty, diagW, th, isPressed,
                                 item.locked and _galleryLock.TILE_ALPHA or 1)
-                            love.graphics.setColor(1, 1, 0, 1)
+                            if item.locked then
+                                love.graphics.setColor(_DEFAULT_COLOR)
+                            else
+                                love.graphics.setColor(tileOutlineColor)
+                            end
                             love.graphics.rectangle("line", tx, ty, diagW, th)
-                            love.graphics.setColor(1, 1, 1, 1)
+                            love.graphics.setColor(labelColor)
                             local textX, textW = tx + diagW + 8, tw - diagW - 8
                             love.graphics.printf(item.name or item.id, textX, ty, textW, "left")
                             love.graphics.printf(table.concat(item.statusLines, "\n"), textX, ty + 18, textW, "left")
@@ -13259,9 +13271,13 @@ function gdsGui_schematicGallery_draw(pageName)
                         else
                             _drawGalleryTilePreview(item, tx, ty, tw, th, isPressed,
                                 item.locked and _galleryLock.TILE_ALPHA or 1)
-                            love.graphics.setColor(1, 1, 0, 1)
+                            if item.locked then
+                                love.graphics.setColor(_DEFAULT_COLOR)
+                            else
+                                love.graphics.setColor(tileOutlineColor)
+                            end
                             love.graphics.rectangle("line", tx, ty, tw, th)
-                            love.graphics.setColor(1, 1, 1, 1)
+                            love.graphics.setColor(labelColor)
                             love.graphics.printf(item.name or item.id, tx, ty + th + 2, tw, "center")
                             if item.locked then
                                 _galleryLock.draw(tx, ty, tw, th, item.lockedLabel)

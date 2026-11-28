@@ -684,10 +684,8 @@ end
 -- behaving like the old entry forever.
 local SCHEMATIC_CATALOG = {
     -- The app's one free-tier system (see TODO.md) -- listed first so it's
-    -- the gallery's own first impression, and deliberately the thinnest
-    -- catalog of the six: one source, one path, one gate, one sink, none
-    -- of them asking for a defaultProperties row. A gas DUCT system like
-    -- BLEED AIR/PRESSURIZATION, with its own medium (model/media/oxygen.lua).
+    -- the gallery's own first impression. A gas DUCT system like BLEED AIR/
+    -- PRESSURIZATION, with its own medium (model/media/oxygen.lua).
     { system = "OXYGEN", pipeConnectors = "DUCT", items = {
         -- The bottle/generator itself -- always "there" whenever placed,
         -- same always-on-when-placed role BLEED AIR SOURCE/PRESSURIZATION's
@@ -697,17 +695,66 @@ local SCHEMATIC_CATALOG = {
         -- comment, above in the ELECTRICAL catalog, gives for VOLTAGE).
         { label = "OXYGEN SOURCE", abbrev = "OSRC", kind = "element", shapeType = "circle",
           gridW = 3, gridH = 3, componentType = "source" },
+        -- Steps the bottle's own high stored pressure down to regulated line
+        -- pressure before it ever reaches MANIFOLD -- a real fitting between
+        -- OXYGEN SOURCE and the rest of the system, same inline placement a
+        -- real aircraft's own reducer sits at. componentType "path" ("just
+        -- carries whatever reaches it", per model/graph.lua's own node-role
+        -- comment), not "gate": it isn't pilot-operated, so there's nothing
+        -- to switch. No terminals/sprite of its own -- same generic
+        -- anywhere-on-the-body connection RELIEF VALVE/OXYGEN OUTLET below
+        -- already use, until real art exists. NOT wired into any pressure
+        -- model -- model/fluid.lua only ever tracks a flat yes/no flow state
+        -- for a gas/fluid system, never a PSI value, same deliberate scope
+        -- limit FUEL's own RELIEF VALVE comment below already explains; this
+        -- is just the element.
+        { label = "PRESSURE REGULATOR", abbrev = "OREG", kind = "element", shapeType = "circle",
+          gridW = 2, gridH = 2, componentType = "path" },
         -- Same generated, NOT reshapable, relocate/cardinal-rotate-only
         -- design as every other system's own MANIFOLD above (see
         -- HYDRAULIC's own entry for the full comment) -- one trunk duct
         -- splitting into n outflow lines off a header spine.
         { label = "MANIFOLD", abbrev = "OMFD", kind = "element", shapeType = "rect",
           gridW = 8, gridH = 3, componentType = "path", terminals = _MANIFOLD_TERMINALS },
+        -- The bottle/manifold's own automatic overpressure relief -- vents on
+        -- its own if PRESSURE REGULATOR ever lets line pressure climb too
+        -- high, same "just the vented end itself" role FUEL's own RELIEF
+        -- VALVE and PRESSURIZATION's own SAFETY VALVE play one system over
+        -- (see either entry's own comment) -- componentType "sink", not
+        -- "gate": it isn't pilot-operated, so there's no switch position to
+        -- give it. NOT wired into any pressure-threshold model yet, same
+        -- deliberate scope limit those entries' own comments already
+        -- explain -- this is just the element.
+        { label = "RELIEF VALVE", abbrev = "ORLV", kind = "element", shapeType = "circle",
+          gridW = 2, gridH = 2, componentType = "sink" },
+        -- Non-user-operated, one-way flow -- same role/geometry-derived
+        -- conduction direction as every other system's own CHECK VALVE above
+        -- (see HYDRAULIC's own entry for the full comment), e.g. isolating a
+        -- walk-around bottle so it can't bleed back into the main supply.
+        { label = "CHECK VALVE", abbrev = "OCVL", kind = "element", shapeType = "diode",
+          gridW = 2, gridH = 2, componentType = "directionalGate", terminals = _CHECK_VALVE_TERMINALS },
         -- The pilot-operated shutoff itself, same single-item pattern as
         -- HYDRAULIC/FUEL's own SHUTOFF VALVE.
         { label = "SHUTOFF VALVE", abbrev = "OSOV", kind = "control",
           presets = { {"CLOSED", "OPEN"} },
           spritePaths = _SWITCH_SPRITE_PATHS, gridSize = 2, componentType = "gate", terminals = _SWITCH_TERMINALS },
+        -- A branch-mounted supply-pressure readout, not a through-flow point
+        -- -- modeled as a dead-end "sink" tap off the line, same role
+        -- vocabulary RELIEF VALVE above and HYDRAULIC's own ACTUATOR give a
+        -- non-flow-continuing element. defaultProperties = {"PSI READING"}
+        -- reuses ACTUATOR's own free-text-property pattern -- asked right on
+        -- the placement grid, same as its own "PSI REQUIREMENT" row (see
+        -- schematicSourceElementPlaced's own comment: "any plain element's
+        -- defaultProperties are collected up front by the unified placement
+        -- grid itself") -- so the pilot states the indicated reading there
+        -- and can retype it later from PROPERTIES same as any other
+        -- property. NOT a live sensed value (unlike ELECTRICAL's BUS own
+        -- VOLTAGE/CURRENT, schematicElementSensedValues): model/fluid.lua
+        -- carries no pressure value to actually sense yet, same deliberate
+        -- scope limit every other PRESSURE-flavored entry above already
+        -- explains.
+        { label = "PRESSURE GAUGE", abbrev = "OGAU", kind = "element", shapeType = "circle",
+          defaultProperties = {"PSI READING"}, gridW = 2, gridH = 2, componentType = "sink" },
         -- The consuming end -- a crew or passenger mask, a walk-around
         -- bottle outlet, whatever it actually is. One generic entry rather
         -- than a separate catalog row per mask location, same reasoning
@@ -717,9 +764,9 @@ local SCHEMATIC_CATALOG = {
         -- template ACTUATOR's own "USER#_ACT" is (see
         -- gdsGui_schematic_armElementPlacement's own comment) -- overwrite
         -- "USER#" with whatever this one actually is, leaving "_OUT" in
-        -- place. No defaultProperties -- deliberately the one sink in this
-        -- whole catalog with no required property at all, matching
-        -- OXYGEN's own "simplest system" role.
+        -- place. No defaultProperties -- unlike PRESSURE GAUGE above, this
+        -- one asks nothing extra on the placement grid at all, matching
+        -- OXYGEN's own original "simplest system" sink.
         { label = "OXYGEN OUTLET", abbrev = "OOUT", kind = "element", shapeType = "circle",
           gridW = 2, gridH = 2, componentType = "sink", suggestedName = "USER#_OUT" },
     }},
@@ -1198,6 +1245,87 @@ local function _titleCase(s)
     end
     return table.concat(words, " ")
 end
+
+-- One pre-built, read-only system per SCHEMATIC_CATALOG type, shipped
+-- together inside the DEMO AIRCRAFT (see _buildDemoAircraft) so every paid
+-- system type has something to look at, in CONTROL mode, with no purchase
+-- at all. Same minimal source -> wire -> sink, gated by one switch with a
+-- single pre-taught snapshot, as _buildDemoSystem above -- just
+-- parameterized per systemType instead of hardcoded to ELECTRICAL, and
+-- colored from that type's own medium (model/media/registry.lua) instead
+-- of a hardcoded green, so the wire actually shows that system's own
+-- signature "powered" color once the switch is flipped ON. No
+-- componentType on any element/control here, same as _buildDemoSystem's own
+-- gen1/pump1/sw1 -- it's only consulted by design-mode graph inference,
+-- which a snapshot-driven control-mode-only showcase never exercises.
+-- Not local: see _paidSystemTypes' own comment on main.lua's 200-local
+-- ceiling.
+function _buildDemoCatalogSystem(catalogEntry)
+    local systemType = catalogEntry.system
+    local medium = require("model.media.registry").get(systemType)
+    local poweredColor = (medium and medium.style and medium.style.powered) or {1, 1, 0, 1}
+    local now = os.date("%Y-%m-%d %H:%M:%S")
+    local typeName = _titleCase(systemType)
+    return {
+        id = "sys_demo_" .. systemType, name = typeName .. " System", systemType = systemType,
+        createdAt = now, modifiedAt = now,
+        elements = {
+            { id = "demoSrc", shapeType = "rect", x = 0.15, y = 0.15, w = 0.16, h = 0.10,
+              label = typeName .. " SRC", defaultColor = {0.55, 0.55, 0.55, 1} },
+            { id = "demoSink", shapeType = "circle", x = 0.70, y = 0.65, w = 0.14, h = 0.10,
+              label = typeName .. " OUT", defaultColor = {0.55, 0.55, 0.55, 1} },
+        },
+        wires = {
+            { id = "demoWire", fromElementId = "demoSrc", toElementId = "demoSink",
+              defaultColor = {0.55, 0.55, 0.55, 1} },
+        },
+        controls = {
+            { id = "demoSw", x = 0.15, y = 0.55, numDetents = 2, positions = {"OFF", "ON"},
+              detentIndex = 0, label = "SW", callbackFunc = "schematicDemoSwitchChanged" },
+        },
+        annunciators = {},
+        snapshots = {
+            ["demoSw=1"] = { elements = {}, wires = { demoWire = poweredColor }, timestamp = now },
+        },
+    }
+end
+
+-- The app's one shipped, non-editable showcase aircraft: every
+-- SCHEMATIC_CATALOG system type, pre-built (see _buildDemoCatalogSystem), so
+-- the paywall never applies to it (schematicSystemGallerySelected/
+-- _systemGalleryItems both special-case aircraft.isDemo) and it's viewable
+-- in CONTROL mode only -- DESIGN mode, RENAME, and DELETE are all
+-- unreachable for it, by aircraft and by system (schematicModeToggled,
+-- schematicAircraftGallerySelected, schematicSystemGallerySelected). Seeded
+-- once, idempotently, on every love.load (not only a fresh install) so an
+-- existing save picks it up too -- see the "missing demo aircraft" check
+-- right after schematicStore's own migration branches.
+function _buildDemoAircraft()
+    local now = os.date("%Y-%m-%d %H:%M:%S")
+    local systems = {}
+    for _, catalogEntry in ipairs(SCHEMATIC_CATALOG) do
+        table.insert(systems, _buildDemoCatalogSystem(catalogEntry))
+    end
+    return {
+        id = "aircraft_demo", name = "DEMO AIRCRAFT", isDemo = true,
+        createdAt = now, modifiedAt = now, thumbnail = "jet", systems = systems,
+        bgAircraft = true, bgAsu = true, bgGpu = true, bgFuel = true,
+    }
+end
+
+-- Session-only backdoor for building/editing the shipped DEMO AIRCRAFT's own
+-- system content before release (see the "TESTING (DEV ONLY)" section of the
+-- Settings page, testingDemoEditToggled/testingExportDemoAircraftPressed)
+-- -- deliberately NOT in appSettings: it always resets to false on the next
+-- launch, so there's no persisted flag that could ship accidentally left on.
+-- true makes schematicSystemGallerySelected/schematicModeToggled/
+-- navGoToSystemSchematic all treat the demo aircraft's systems as perfectly
+-- ordinary (entitled, editable) ones -- ordinary DESIGN mode, ordinary DELETE,
+-- no paywall. Edits land in the live save file, same as any real aircraft;
+-- testingExportDemoAircraftPressed is the deliberate, human-reviewed step
+-- that turns that into something pasted back into _buildDemoCatalogSystem's
+-- source before shipping.
+_devDemoEditUnlocked = false
 
 -- App-layer state for the in-progress cascading menu / control-select flow
 -- (menu selection and placement itself are handled inside the library; this
@@ -1776,6 +1904,8 @@ local SYSTEM_THUMBNAILS = {
                        pressedPath = "Sprites/systemThumb_bleedAir_pressed.png" },
     PRESSURIZATION = { path = "Sprites/systemThumb_pressurization_released.png",
                         pressedPath = "Sprites/systemThumb_pressurization_pressed.png" },
+    OXYGEN     = { path = "Sprites/systemThumb_oxygen_released.png",
+                   pressedPath = "Sprites/systemThumb_oxygen_pressed.png" },
 }
 
 -- Builds the manageGallery's item list from SCHEMATIC_CATALOG, not from
@@ -1826,8 +1956,10 @@ local function _systemGalleryItems(aircraft)
         -- schematicSystemGallerySelected above, which the widget calls
         -- regardless of how a tile looks. No specific price yet (TODO.md's
         -- pricing decision: exact number TBD at ship time), so this just
-        -- says "paid", not how much.
-        if not _isSystemTypeEntitled(catalogEntry.system) then
+        -- says "paid", not how much. The DEMO AIRCRAFT (aircraft.isDemo) is
+        -- never locked -- every one of its tiles is pre-built and viewable
+        -- for free, in CONTROL mode only (see _buildDemoAircraft).
+        if not aircraft.isDemo and not _isSystemTypeEntitled(catalogEntry.system) then
             item.locked = true
             item.lockedLabel = "PREMIUM"
         elseif #item.elements > 0 or #item.wires > 0 or #(item.controls or {}) > 0 then
@@ -1839,7 +1971,12 @@ local function _systemGalleryItems(aircraft)
             -- for "has user data" here -- _galleryBadge.draw is agnostic to
             -- what "ok" means, see its own header comment). A still-empty
             -- placeholder (never created, or created but never edited) gets
-            -- no badge.
+            -- no badge. Shown for the DEMO AIRCRAFT too, not just real
+            -- aircraft -- every one of its catalog tiles is already a real,
+            -- pre-built system (_buildDemoCatalogSystem never leaves one
+            -- empty, unlike a normal aircraft's not-yet-created placeholder
+            -- tiles), so every DEMO AIRCRAFT tile gets this badge: all of
+            -- them genuinely are "available," none are a future empty slot.
             item.compatBadge = "ok"
         end
         table.insert(items, item)
@@ -6031,13 +6168,54 @@ end
 function schematicAircraftGallerySelected(galleryName, aircraftId)
     local aircraft = _findAircraft(aircraftId)
     if not aircraft then return end
+    -- The DEMO AIRCRAFT has nothing to RENAME/DELETE (it ships fixed, same
+    -- as every one of its systems — see _buildDemoAircraft), so its tile
+    -- skips the action menu entirely and opens straight into its systems
+    -- gallery instead.
+    if aircraft.isDemo then
+        schematicStore.currentAircraftId = aircraftId
+        navGoToAircraftSystems()
+        return
+    end
     _manageMenuAircraftId = aircraftId
-    -- DELETE (index 3) is this menu's own confirmIndex row — holding IT down
+    -- DELETE (index 4) is this menu's own confirmIndex row — holding IT down
     -- for the usual hold duration is the whole confirmation, no separate
-    -- "DELETE \"X\"?" popup. OPEN AIRCRAFT/RENAME/CANCEL stay plain-tap.
+    -- "DELETE \"X\"?" popup. OPEN AIRCRAFT/RENAME/EXPORT AIRCRAFT/CANCEL stay
+    -- plain-tap.
     gdsGui_schematicGallery_openMenu(galleryName, aircraft.name,
-        {"OPEN AIRCRAFT", "RENAME", "DELETE", "CANCEL"},
-        "schematicAircraftActionChosen", nil, 3)
+        {"OPEN AIRCRAFT", "RENAME", "EXPORT AIRCRAFT", "DELETE", "CANCEL"},
+        "schematicAircraftActionChosen", nil, 4)
+end
+
+-- EXPORT AIRCRAFT counterpart to testingExportDemoAircraftPressed (Settings'
+-- TESTING (DEV ONLY) row), but a real, always-available feature rather than a
+-- dev-only one, reached from any non-demo aircraft's action menu above.
+-- Writes the aircraft record to its own file as plain Lua source
+-- (table.show, the same serializer schematicStore/appSettings already use)
+-- and hands it to the native share sheet on iOS (love.system.shareFile) so
+-- it can go straight to Drive/AirDrop/etc.; everywhere else (desktop, during
+-- dev) there's no share sheet binding, so this just reports where the file
+-- landed on disk instead. The file name folds in both the aircraft's own
+-- name (sanitized to safe filename characters, for a human-readable file)
+-- and its own unique id (gdsGui_saveLoad_createIdNumber, so RENAME can never
+-- collide two aircraft onto it) -- name alone would let two aircraft sharing
+-- a display name silently overwrite each other's export.
+function _exportAircraft(aircraftId)
+    local aircraft = _findAircraft(aircraftId)
+    if not aircraft then return end
+    local safeName = aircraft.name:gsub("[^%w%-]", "_")
+    local fileName = "aircraftExport_" .. safeName .. "_" .. aircraft.id .. ".lua"
+    local ok, err = love.filesystem.write(fileName, table.show(aircraft, "aircraftExport"))
+    if not ok then
+        gdsGui_choiceMenu_open("Export failed: " .. tostring(err), {"OK"}, nil, nil)
+        return
+    end
+    if love.system.shareFile then
+        love.system.shareFile(love.filesystem.getSaveDirectory() .. "/" .. fileName)
+    else
+        gdsGui_choiceMenu_open("Exported to " .. fileName .. " in:\n" .. love.filesystem.getSaveDirectory(),
+            {"OK"}, nil, nil)
+    end
 end
 
 -- Deleting an aircraft cascades to every system it owns (they live only
@@ -6055,6 +6233,8 @@ function schematicAircraftActionChosen(galleryName, index, optionText)
         if aircraft then
             gdsGui_textPrompt_open("RENAME AIRCRAFT", aircraft.name, 24, "schematicAircraftRenameConfirmed", nil)
         end
+    elseif optionText == "EXPORT AIRCRAFT" and _manageMenuAircraftId then
+        _exportAircraft(_manageMenuAircraftId)
     elseif optionText == "DELETE" and _manageMenuAircraftId then
         for i = #schematicStore.aircraft, 1, -1 do
             if schematicStore.aircraft[i].id == _manageMenuAircraftId then
@@ -6078,10 +6258,10 @@ function schematicAircraftActionChosen(galleryName, index, optionText)
             gdsGui_page_switch("LoadingSchematicHome", 9, 2, false)
         end
     end
-    -- "CANCEL" (or tapping outside), OPEN AIRCRAFT, and RENAME all
-    -- leave _manageMenuAircraftId set — RENAME's text prompt confirms later,
-    -- asynchronously, and still needs it; it's simply overwritten next time
-    -- an aircraft tile is tapped.
+    -- "CANCEL" (or tapping outside), OPEN AIRCRAFT, RENAME, and EXPORT
+    -- AIRCRAFT all leave _manageMenuAircraftId set — RENAME's text prompt
+    -- confirms later, asynchronously, and still needs it; it's simply
+    -- overwritten next time an aircraft tile is tapped.
 end
 
 function schematicAircraftRenameConfirmed(newName)
@@ -6136,7 +6316,32 @@ end
 function schematicSystemGallerySelected(galleryName, systemId)
     local sys = _findSystem(systemId)
     local systemType = sys and sys.systemType or systemId
-    if systemType and not _isSystemTypeEntitled(systemType) then
+    local aircraft = _findCurrentAircraft()
+    -- Requires sys (not just aircraft.isDemo) so this can only ever take the
+    -- demo shortcut for a system that actually resolved to a real record on
+    -- the current aircraft -- under ordinary navigation the demo aircraft
+    -- always has one pre-built sys per catalog type, so this never excludes
+    -- a legitimate tap; it only keeps a stale/ambient currentAircraftId (sys
+    -- nil because systemId doesn't belong to it) from silently no-opping
+    -- here instead of falling through to the ordinary entitlement check
+    -- below, the way schematicGalleryEntitlementGateTest calls this function
+    -- directly, with no prior navigation to set currentAircraftId itself.
+    local isDemo = aircraft and aircraft.isDemo and sys ~= nil
+    -- The DEMO AIRCRAFT's systems are all pre-built (_buildDemoAircraft) and
+    -- never paywalled, but also never editable or deletable -- tapping one
+    -- skips both the entitlement check and the OPEN IN.../DELETE action menu
+    -- below entirely, opening straight into CONTROL mode. _devDemoEditUnlocked
+    -- (TESTING (DEV ONLY) in Settings — see testingDemoEditToggled) is the
+    -- one override: with it on, a demo system falls straight through to the
+    -- ordinary entitled-system menu below instead, so its content can
+    -- actually be built/edited before shipping.
+    if isDemo and not _devDemoEditUnlocked then
+        _openSystemIntoCanvas(systemId, "control")
+        _navSyncAll("SystemSchematic")
+        gdsGui_page_switch("LoadingSchematic", 7, 3, false)
+        return
+    end
+    if not isDemo and systemType and not _isSystemTypeEntitled(systemType) then
         _openSchematicPaywall(systemType)
         return
     end
@@ -6150,7 +6355,6 @@ function schematicSystemGallerySelected(galleryName, systemId)
             "schematicSystemActionChosen", nil, 3)
         return
     end
-    local aircraft = _findCurrentAircraft()
     if not aircraft or not _findCatalogEntryForType(systemId) then return end
     local id = gdsGui_saveLoad_createIdNumber(aircraft.systems, "id", 17)
     local now = os.date("%Y-%m-%d %H:%M:%S")
@@ -6589,6 +6793,20 @@ function love.load()
             currentAircraftId = nil, currentSystemId = nil,
             nextAircraftNum = 2,
         }
+        _saveSchematicStore()
+    end
+
+    -- The shipped DEMO AIRCRAFT (see _buildDemoAircraft) must always be
+    -- present -- added here, not just in the fresh-install branches above,
+    -- so an existing save picks it up too on the first launch after this
+    -- feature shipped. Checked by aircraft.isDemo, not by id, so a
+    -- hand-edited save missing it still gets it back.
+    local _hasDemoAircraft = false
+    for _, a in ipairs(schematicStore.aircraft) do
+        if a.isDemo then _hasDemoAircraft = true; break end
+    end
+    if not _hasDemoAircraft then
+        table.insert(schematicStore.aircraft, 1, _buildDemoAircraft())
         _saveSchematicStore()
     end
 
@@ -7207,7 +7425,62 @@ function love.load()
         "Sprites/button_reset_pressed.png", "Sprites/button_reset_released.png",
         "Sprites/button_reset_deactivated.png",
         settingsBtnX, settingsRowY, "RT", settingsCheckboxSize, settingsCheckboxSize,
-        "resetAppForTesting", globApp.BUTTON_STATES.RELEASED, true, "testingSettings"
+        "testingResetPurchasesPressed", globApp.BUTTON_STATES.RELEASED, true, "testingSettings"
+    )
+
+    -- TEMPORARY (testing only — remove before release): backdoor into
+    -- editing the shipped DEMO AIRCRAFT's own system content (see
+    -- _devDemoEditUnlocked's own comment, above SCHEMATIC_CATALOG). A plain
+    -- "toggle" (not stickyToggle) so its own pressed/released visual always
+    -- reflects _devDemoEditUnlocked directly. Resets to released (off)
+    -- every launch along with the flag itself — never persisted.
+    local settingsRowY3 = settingsRowY2 + settingsLabelH
+    gdsGui_outputTxtBox_create("testingDemoEditLabel", "Settings", nil,
+        12, settingsRowY2, "LT", settingsLabelW, settingsLabelH,
+        {1, 1, 1, 1}, "UNLOCK DEMO AIRCRAFT EDITING", settingsFontSize, "testingSettings"
+    )
+    gdsGui_button_create("testingDemoEditToggle", "Settings", "toggle",
+        "Sprites/button_checkbox_pressed.png", "Sprites/button_checkbox_released.png",
+        "Sprites/button_checkbox_deactivated.png",
+        settingsBtnX, settingsRowY2, "RT", settingsCheckboxSize, settingsCheckboxSize,
+        "testingDemoEditToggled", globApp.BUTTON_STATES.RELEASED, true, "testingSettings"
+    )
+    -- Writes the DEMO AIRCRAFT's current (live, possibly just-edited) record
+    -- to its own standalone save-dir file as plain Lua source (table.show,
+    -- same serializer appSettings/schematicStore already use) — read it from
+    -- love.filesystem.getSaveDirectory() and hand-copy the systems you're
+    -- happy with into _buildDemoCatalogSystem/_buildDemoAircraft's own
+    -- source. Deliberately not an automatic source-file rewrite: a human
+    -- reviewing and pasting the result in is the actual safety step here,
+    -- same reasoning _devDemoEditUnlocked's own comment gives for keeping
+    -- that flag session-only.
+    gdsGui_outputTxtBox_create("testingExportDemoLabel", "Settings", nil,
+        12, settingsRowY3, "LT", settingsLabelW, settingsLabelH,
+        {1, 1, 1, 1}, "EXPORT DEMO AIRCRAFT", settingsFontSize, "testingSettings"
+    )
+    gdsGui_button_create("testingExportDemoBtn", "Settings", "pushonoff",
+        "Sprites/button_export_pressed.png", "Sprites/button_export_released.png",
+        "Sprites/button_export_deactivated.png",
+        settingsBtnX, settingsRowY3, "RT", settingsCheckboxSize, settingsCheckboxSize,
+        "testingExportDemoAircraftPressed", globApp.BUTTON_STATES.RELEASED, true, "testingSettings"
+    )
+    -- Round-trip counterpart to EXPORT above: drop a demoAircraftExport.lua
+    -- (exported from a phone, carried over via Drive/AirDrop/whatever) into
+    -- THIS machine's own save directory (love.filesystem.getSaveDirectory()
+    -- -- same file EXPORT itself writes, so exporting then importing on the
+    -- same machine is a harmless no-op round-trip), then tap this to load it
+    -- and replace the live aircraft_demo record with it, so it opens in
+    -- MY AIRCRAFT > DEMO AIRCRAFT immediately, no relaunch needed.
+    local settingsRowY4 = settingsRowY3 + settingsLabelH
+    gdsGui_outputTxtBox_create("testingImportDemoLabel", "Settings", nil,
+        12, settingsRowY4, "LT", settingsLabelW, settingsLabelH,
+        {1, 1, 1, 1}, "IMPORT DEMO AIRCRAFT", settingsFontSize, "testingSettings"
+    )
+    gdsGui_button_create("testingImportDemoBtn", "Settings", "pushonoff",
+        "Sprites/button_import_pressed.png", "Sprites/button_import_released.png",
+        "Sprites/button_import_deactivated.png",
+        settingsBtnX, settingsRowY4, "RT", settingsCheckboxSize, settingsCheckboxSize,
+        "testingImportDemoAircraftPressed", globApp.BUTTON_STATES.RELEASED, true, "testingSettings"
     )
 
     ---------------------------------------------------------------------------
@@ -8931,19 +9204,29 @@ function navGoToSystemSchematic()
     end
     local currentSystem = schematicStore.currentSystemId and _findSystem(schematicStore.currentSystemId)
     if currentSystem then
+        local aircraft = _findCurrentAircraft()
+        local isDemoSystem = aircraft and aircraft.isDemo and not _devDemoEditUnlocked
         -- Still entitlement-checked, even on this "jump straight back into
         -- the live canvas" shortcut: a system opened while entitled (or
         -- opened before entitlements existed at all) must not stay reachable
         -- by this path alone once its systemType is locked, same as a fresh
         -- tap on its gallery tile would be (schematicSystemGallerySelected).
         -- A system with no systemType (legacy data) is left alone, same
-        -- permissive treatment that function gives it too.
-        if currentSystem.systemType and not _isSystemTypeEntitled(currentSystem.systemType) then
+        -- permissive treatment that function gives it too. The DEMO
+        -- AIRCRAFT's own systems are never paywalled either way (same
+        -- isDemo bypass as that function), so this check is skipped for them.
+        if not isDemoSystem and currentSystem.systemType and not _isSystemTypeEntitled(currentSystem.systemType) then
             _openSchematicPaywall(currentSystem.systemType)
             return
         end
         if _canvasLoadedSystemId ~= schematicStore.currentSystemId then
-            _openSystemIntoCanvas(schematicStore.currentSystemId, appSettings.schematicEditMode and "design" or "control")
+            -- A DEMO AIRCRAFT system always opens in CONTROL mode, regardless
+            -- of appSettings.schematicEditMode (a global, persisted preference
+            -- that could still read true from editing a different, real
+            -- aircraft's system before this one was last opened) -- it's
+            -- never editable, so "resume in design mode" can never apply to it.
+            local mode = isDemoSystem and "control" or (appSettings.schematicEditMode and "design" or "control")
+            _openSystemIntoCanvas(schematicStore.currentSystemId, mode)
         end
         _navSyncAll("SystemSchematic")
         gdsGui_page_switch("LoadingSchematic", 7, 3, false)
@@ -9034,6 +9317,20 @@ end
 -- empty) — this is a dev reset, not a simulated real install, so NEW
 -- AIRCRAFT/MY AIRCRAFT genuinely start from zero. Persisted immediately
 -- (both save files), so the reset state survives a relaunch too.
+-- Confirmation gate for the Settings-page RESET APP button above — the
+-- reset wipes every aircraft and re-locks every paid system with no undo,
+-- so a stray tap shouldn't be able to trigger it directly.
+function testingResetPurchasesPressed()
+    gdsGui_choiceMenu_open("RESET APP TO FRESH INSTALL?\nThis wipes every aircraft and re-locks all paid systems.",
+        {"RESET", "CANCEL"}, "testingResetPurchasesConfirmed", nil)
+end
+
+function testingResetPurchasesConfirmed(optionText)
+    if optionText == "RESET" then
+        resetAppForTesting()
+    end
+end
+
 function resetAppForTesting()
     appSettings.schematicUnlocked = false
     for _, systemType in ipairs(_paidSystemTypes()) do
@@ -9054,6 +9351,100 @@ function resetAppForTesting()
     _saveSchematicStore()
     gdsGui_schematicGallery_setItems("aircraftGallery", _aircraftGalleryItems())
     _refreshSchematicHomeAvailability()
+end
+
+-- TEMPORARY (testing only — remove before release, along with the toggle
+-- above and _devDemoEditUnlocked itself): session-only, never persisted —
+-- see _devDemoEditUnlocked's own comment for why. Toggling it doesn't touch
+-- anything already on screen; it only changes what the NEXT tap into a demo
+-- system does.
+function testingDemoEditToggled(newState)
+    _devDemoEditUnlocked = (newState == globApp.BUTTON_STATES.PRESSED)
+end
+
+-- TEMPORARY (testing only — remove before release, along with the button
+-- above): dumps the DEMO AIRCRAFT's current live record — whatever's been
+-- built/edited this session with editing unlocked — to its own file in
+-- love.filesystem.getSaveDirectory(), as plain Lua source (table.show, the
+-- same serializer appSettings.lua/schematicStore.lua already use). Nothing
+-- reads this file back automatically: open it, eyeball the result, and
+-- hand-copy the systems you want into _buildDemoCatalogSystem/
+-- _buildDemoAircraft's own source before shipping — see _devDemoEditUnlocked's
+-- own comment for why this is a manual step, not an auto-rewrite.
+-- Correction (also see project memory): love.filesystem.getSaveDirectory()
+-- on iOS is actually Application Support, a SIBLING of Documents, not inside
+-- it — UIFileSharingEnabled/LSSupportsOpeningDocumentsInPlace only expose
+-- Documents, so the Files-app route this comment used to describe never
+-- actually worked. love.system.shareFile (below) sidesteps the whole
+-- question by handing the file straight to the native share sheet from
+-- wherever it actually lives, instead of relying on it being exposed
+-- externally at all.
+function testingExportDemoAircraftPressed()
+    local aircraft = _findAircraft("aircraft_demo")
+    if not aircraft then
+        gdsGui_choiceMenu_open("No demo aircraft found to export.", {"OK"}, nil, nil)
+        return
+    end
+    local fileName = "demoAircraftExport.lua"
+    local ok, err = love.filesystem.write(fileName, table.show(aircraft, "demoAircraftExport"))
+    if not ok then
+        gdsGui_choiceMenu_open("Export failed: " .. tostring(err), {"OK"}, nil, nil)
+        return
+    end
+    if love.system.shareFile then
+        -- Custom LÖVE binding, iOS-only (see src/common/ios.mm +
+        -- modules/system/{System.cpp,wrap_System.cpp} in the Xcode
+        -- project's vendored engine source, under ~/softDev/love2d_AeroRef)
+        -- -- presents the native share sheet for this exact file so it can
+        -- go straight to Drive/AirDrop/etc. That sheet is confirmation
+        -- enough on its own; no extra popup on top of it.
+        love.system.shareFile(love.filesystem.getSaveDirectory() .. "/" .. fileName)
+    else
+        -- Every other platform (Mac, during dev) has no native share sheet
+        -- binding -- say where the write actually landed instead.
+        gdsGui_choiceMenu_open("Exported to " .. fileName .. " in:\n" .. love.filesystem.getSaveDirectory(),
+            {"OK"}, nil, nil)
+    end
+end
+
+-- Round-trip counterpart to EXPORT above (see the Settings-row comment) --
+-- loads demoAircraftExport.lua from THIS machine's own save directory
+-- (gdsGui_saveLoad_loadFileContents is the same load()+pcall-run helper
+-- appSettings/schematicDesign already use -- nothing gets replaced if the
+-- file is missing, unparsable, or errors on run, so a bad file can't crash
+-- the app) and replaces the live aircraft_demo record with it -- the file
+-- itself has to get here first, e.g. copied out of wherever Drive/AirDrop/
+-- etc. synced a phone's export to, into love.filesystem.getSaveDirectory().
+function testingImportDemoAircraftPressed()
+    demoAircraftExport = nil
+    local loaded = gdsGui_saveLoad_loadFileContents("demoAircraftExport.lua")
+    local imported = demoAircraftExport
+    demoAircraftExport = nil
+    if not loaded or type(imported) ~= "table" or type(imported.systems) ~= "table" then
+        gdsGui_choiceMenu_open(
+            "No valid demoAircraftExport.lua found in:\n" .. love.filesystem.getSaveDirectory(),
+            {"OK"}, nil, nil)
+        return
+    end
+    imported.isDemo = true -- defensive -- see this function's own comment
+    -- Every hard-coded "aircraft_demo" lookup elsewhere (this file's own
+    -- currentAircraftId check two lines down, _findAircraft("aircraft_demo")
+    -- in testingExportDemoAircraftPressed above) assumes this exact id --
+    -- force it here too, regardless of whatever id the exported file
+    -- actually carried, so re-importing can't silently orphan those lookups.
+    imported.id = "aircraft_demo"
+    local replaced = false
+    for i, a in ipairs(schematicStore.aircraft) do
+        if a.isDemo or a.id == "aircraft_demo" then
+            schematicStore.aircraft[i] = imported
+            replaced = true
+            break
+        end
+    end
+    if not replaced then table.insert(schematicStore.aircraft, 1, imported) end
+    if schematicStore.currentAircraftId == imported.id then _clearMainCanvas() end
+    _saveSchematicStore()
+    gdsGui_choiceMenu_open("Demo aircraft imported — reopen MY AIRCRAFT to see it.", {"OK"}, nil, nil)
 end
 
 -- Exercises unlockSystemTypeForTesting() without permanently flipping the
@@ -9205,7 +9596,7 @@ end
 
 function cancelSchematicPaywall()
     _paywallTargetSystemType = nil
-    gdsGui_page_switch("LoadingMainMenu", 3, 3, false)
+    navGoToAircraftSystems()
 end
 
 -------------------------------------------------------------------------------
@@ -9239,8 +9630,36 @@ function _applySchematicModeButtons(designing)
     gdsGui_button_setState("schematicFullScreenToggle", designing and "deactivated" or "released")
 end
 
+-- Reminds the user a DEMO AIRCRAFT system (see _buildDemoAircraft) can't be
+-- designed/edited without owning the real thing -- reached only from
+-- schematicModeToggled's own isDemo guard just below. Two explicit choices
+-- rather than a silent refusal: stay right here in CONTROL mode (also what
+-- happens on cancel/tap-outside -- gdsGui_choiceMenu_open calls
+-- onCancelFunc with no arguments, so optionText is nil there too, same
+-- "do nothing" branch), or step back out to this aircraft's systems gallery.
+function _demoEditBlockedChosen(optionText)
+    if optionText == "SYSTEMS GALLERY" then
+        navBackToAircraftSystems()
+    end
+end
+
 function schematicModeToggled(newState)
     local designing = (newState == globApp.BUTTON_STATES.PRESSED)
+    if designing then
+        local aircraft = _findCurrentAircraft()
+        if aircraft and aircraft.isDemo and not _devDemoEditUnlocked then
+            -- The toggle button already flipped to PRESSED (buttons fire
+            -- their callback right after the state change -- see
+            -- gdsGui_button_pressed in buttons_gdsGuiLib.lua) -- revert that
+            -- visual since the mode itself never actually changes.
+            gdsGui_button_setState("schematicModeToggle", "released")
+            gdsGui_choiceMenu_open(
+                "This system ships with the demo aircraft and can't be edited.\n\nPurchase it on your own aircraft to design/edit it.",
+                {"STAY IN CONTROL MODE", "SYSTEMS GALLERY"},
+                "_demoEditBlockedChosen", "_demoEditBlockedChosen")
+            return
+        end
+    end
     appSettings.schematicEditMode = designing
     -- Changing mode fires _onSchematicModeChanged below, which does the
     -- actual button/dock-tool/AI-panel sync — the one place that happens,
@@ -14093,3 +14512,4 @@ end)
 
 -- Build the unit-test table widget now that both "gui" and "app" suites are registered.
 gdsGui_dev_createUnitTestObjects()
+
